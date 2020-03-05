@@ -6,8 +6,31 @@ The authors of source files are important in many applications, but are often no
 
 In this project, we propose a benchmark called CodA. In our benchmark, we accurately extracted the code authors for 12,131 files. In a source file, we marked authors line by line. Furthermore, based on our benchmark, we conduct an empirical study to reveal the challenges of identifying code authors. 
 
-Here is the list of our [benchmark](/reportedbug.xlsx).
+Here is the list of our [benchmark](/benchmark.zip).
 
+An example:
+```Java
+1:09c2697:     ValueNode bindExpression(
+1:71c8e86:     FromList fromList, SubqueryList subqueryList, List<AggregateNode> aggregates)
+1:eac0369:         throws StandardException
+...
+
+author:Richard N. Hillegas
+commit:71c8e86
+/////////////////////////////////////////////////////////////////////////
+1:     FromList fromList, SubqueryList subqueryList, List<AggregateNode> aggregates)
+commit:09c2697
+/////////////////////////////////////////////////////////////////////////
+1:     ValueNode bindExpression(
+0:     FromList fromList, SubqueryList subqueryList, List aggregates)
+1:         super.bindExpression(fromList, subqueryList, aggregates);
+/////////////////////////////////////////////////////////////////////////
+...
+author:Daniel John Debrunner
+commit:eac0369
+...
+1: 			throws StandardException
+```
 
 ## Reference
 [1] Aylin Caliskan-Islam, Richard Harang, Andrew Liu, Arvind Narayanan, Clare Voss, Fabian Yamaguchi, and Rachel Greenstadt. 2015. De-anonymizing programmers via code stylometry. In Proc. USENIX Security. 255¨C270.
