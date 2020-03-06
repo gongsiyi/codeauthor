@@ -1,0 +1,963 @@
+1:194bad2: /*
+1:194bad2:  * Licensed to the Apache Software Foundation (ASF) under one
+1:194bad2:  * or more contributor license agreements.  See the NOTICE file
+1:194bad2:  * distributed with this work for additional information
+1:194bad2:  * regarding copyright ownership.  The ASF licenses this file
+1:194bad2:  * to you under the Apache License, Version 2.0 (the
+1:194bad2:  * "License"); you may not use this file except in compliance
+1:194bad2:  * with the License.  You may obtain a copy of the License at
+1:194bad2:  *
+1:194bad2:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:194bad2:  *
+1:194bad2:  * Unless required by applicable law or agreed to in writing, software
+1:194bad2:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:194bad2:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:194bad2:  * See the License for the specific language governing permissions and
+1:194bad2:  * limitations under the License.
+1:194bad2:  */
+1:194bad2: package org.apache.cassandra.service;
+1:194bad2: 
+1:194bad2: import java.io.File;
+1:194bad2: import java.io.IOException;
+1:194bad2: import java.nio.file.*;
+1:194bad2: import java.nio.file.attribute.BasicFileAttributes;
+1:194bad2: import java.util.*;
+1:194bad2: 
+1:194bad2: import com.google.common.base.Joiner;
+1:194bad2: import com.google.common.collect.ImmutableList;
+1:194bad2: import com.google.common.collect.Iterables;
+1:194bad2: import org.slf4j.Logger;
+1:194bad2: import org.slf4j.LoggerFactory;
+1:194bad2: 
+1:194bad2: import org.apache.cassandra.config.CFMetaData;
+1:194bad2: import org.apache.cassandra.config.DatabaseDescriptor;
+1:194bad2: import org.apache.cassandra.config.Schema;
+1:9797511: import org.apache.cassandra.config.SchemaConstants;
+1:c17cbe1: import org.apache.cassandra.db.ColumnFamilyStore;
+1:c17cbe1: import org.apache.cassandra.db.Directories;
+1:c17cbe1: import org.apache.cassandra.db.SystemKeyspace;
+1:194bad2: import org.apache.cassandra.exceptions.ConfigurationException;
+1:194bad2: import org.apache.cassandra.exceptions.StartupException;
+1:194bad2: import org.apache.cassandra.io.sstable.Descriptor;
+1:e616867: import org.apache.cassandra.io.util.FileUtils;
+1:c17cbe1: import org.apache.cassandra.utils.CLibrary;
+1:c17cbe1: import org.apache.cassandra.utils.FBUtilities;
+1:c17cbe1: import org.apache.cassandra.utils.SigarLibrary;
+1:194bad2: 
+1:194bad2: /**
+1:194bad2:  * Verifies that the system and environment is in a fit state to be started.
+1:194bad2:  * Used in CassandraDaemon#setup() to check various settings and invariants.
+1:194bad2:  *
+1:194bad2:  * Each individual test is modelled as an implementation of StartupCheck, these are run
+1:194bad2:  * at the start of CassandraDaemon#setup() before any local state is mutated. The default
+1:194bad2:  * checks are a mix of informational tests (inspectJvmOptions), initialization
+1:194bad2:  * (initSigarLibrary, checkCacheServiceInitialization) and invariant checking
+1:194bad2:  * (checkValidLaunchDate, checkSystemKeyspaceState, checkSSTablesFormat).
+1:194bad2:  *
+1:194bad2:  * In addition, if checkSystemKeyspaceState determines that the release version has
+1:194bad2:  * changed since last startup (i.e. the node has been upgraded) it snapshots the system
+1:194bad2:  * keyspace to make it easier to back out if necessary.
+1:194bad2:  *
+1:194bad2:  * If any check reports a failure, then the setup method exits with an error (after
+1:194bad2:  * logging any output from the tests). If all tests report success, setup can continue.
+1:194bad2:  * We should be careful in future to ensure anything which mutates local state (such as
+1:194bad2:  * writing new sstables etc) only happens after we've verified the initial setup.
+1:194bad2:  */
+1:194bad2: public class StartupChecks
+1:194bad2: {
+1:194bad2:     private static final Logger logger = LoggerFactory.getLogger(StartupChecks.class);
+1:194bad2: 
+1:194bad2:     // List of checks to run before starting up. If any test reports failure, startup will be halted.
+1:194bad2:     private final List<StartupCheck> preFlightChecks = new ArrayList<>();
+1:194bad2: 
+1:194bad2:     // The default set of pre-flight checks to run. Order is somewhat significant in that we probably
+1:194bad2:     // always want the system keyspace check run last, as this actually loads the schema for that
+1:194bad2:     // keyspace. All other checks should not require any schema initialization.
+1:0ff13d2:     private final List<StartupCheck> DEFAULT_TESTS = ImmutableList.of(checkJemalloc,
+1:0ff13d2:                                                                       checkValidLaunchDate,
+1:194bad2:                                                                       checkJMXPorts,
+1:c17cbe1:                                                                       checkJMXProperties,
+1:194bad2:                                                                       inspectJvmOptions,
+1:194bad2:                                                                       checkJnaInitialization,
+1:194bad2:                                                                       initSigarLibrary,
+1:194bad2:                                                                       checkDataDirs,
+1:194bad2:                                                                       checkSSTablesFormat,
+1:a4da379:                                                                       checkSystemKeyspaceState,
+1:a4da379:                                                                       checkDatacenter,
+1:a4da379:                                                                       checkRack);
+1:194bad2: 
+1:194bad2:     public StartupChecks withDefaultTests()
+1:194bad2:     {
+1:194bad2:         preFlightChecks.addAll(DEFAULT_TESTS);
+1:194bad2:         return this;
+1:194bad2:     }
+1:194bad2: 
+1:194bad2:     /**
+1:194bad2:      * Add system test to be run before schema is loaded during startup
+1:194bad2:      * @param test the system test to include
+1:194bad2:      */
+1:194bad2:     public StartupChecks withTest(StartupCheck test)
+1:194bad2:     {
+1:194bad2:         preFlightChecks.add(test);
+1:194bad2:         return this;
+1:194bad2:     }
+1:194bad2: 
+1:194bad2:     /**
+1:194bad2:      * Run the configured tests and return a report detailing the results.
+1:194bad2:      * @throws org.apache.cassandra.exceptions.StartupException if any test determines that the
+1:194bad2:      * system is not in an valid state to startup
+1:194bad2:      */
+1:194bad2:     public void verify() throws StartupException
+1:194bad2:     {
+1:194bad2:         for (StartupCheck test : preFlightChecks)
+1:194bad2:             test.execute();
+1:194bad2:     }
+1:194bad2: 
+1:0ff13d2:     public static final StartupCheck checkJemalloc = new StartupCheck()
+1:0ff13d2:     {
+1:fed476f:         public void execute()
+1:0ff13d2:         {
+1:54836ec:             if (FBUtilities.isWindows)
+1:0ff13d2:                 return;
+1:0ff13d2:             String jemalloc = System.getProperty("cassandra.libjemalloc");
+1:0ff13d2:             if (jemalloc == null)
+1:0ff13d2:                 logger.warn("jemalloc shared library could not be preloaded to speed up memory allocations");
+1:0ff13d2:             else if ("-".equals(jemalloc))
+1:0ff13d2:                 logger.info("jemalloc preload explicitly disabled");
+1:0ff13d2:             else
+1:0ff13d2:                 logger.info("jemalloc seems to be preloaded from {}", jemalloc);
+1:0ff13d2:         }
+1:0ff13d2:     };
+1:0ff13d2: 
+1:194bad2:     public static final StartupCheck checkValidLaunchDate = new StartupCheck()
+1:194bad2:     {
+1:194bad2:         /**
+1:194bad2:          * The earliest legit timestamp a casandra instance could have ever launched.
+1:194bad2:          * Date roughly taken from http://perspectives.mvdirona.com/2008/07/12/FacebookReleasesCassandraAsOpenSource.aspx
+1:194bad2:          * We use this to ensure the system clock is at least somewhat correct at startup.
+1:194bad2:          */
+1:194bad2:         private static final long EARLIEST_LAUNCH_DATE = 1215820800000L;
+1:0ff13d2:         public void execute() throws StartupException
+1:194bad2:         {
+1:194bad2:             long now = System.currentTimeMillis();
+1:194bad2:             if (now < EARLIEST_LAUNCH_DATE)
+1:11910c6:                 throw new StartupException(StartupException.ERR_WRONG_MACHINE_STATE,
+1:11910c6:                                            String.format("current machine time is %s, but that is seemingly incorrect. exiting now.",
+1:194bad2:                                                          new Date(now).toString()));
+1:194bad2:         }
+1:194bad2:     };
+1:194bad2: 
+1:194bad2:     public static final StartupCheck checkJMXPorts = new StartupCheck()
+1:194bad2:     {
+1:194bad2:         public void execute()
+1:194bad2:         {
+1:7b0c716:             String jmxPort = System.getProperty("cassandra.jmx.remote.port");
+1:194bad2:             if (jmxPort == null)
+1:194bad2:             {
+1:194bad2:                 logger.warn("JMX is not enabled to receive remote connections. Please see cassandra-env.sh for more info.");
+1:194bad2:                 jmxPort = System.getProperty("cassandra.jmx.local.port");
+1:194bad2:                 if (jmxPort == null)
+1:194bad2:                     logger.error("cassandra.jmx.local.port missing from cassandra-env.sh, unable to start local JMX service.");
+1:194bad2:             }
+1:194bad2:             else
+1:194bad2:             {
+1:f147ca9:                 logger.info("JMX is enabled to receive remote connections on port: {}", jmxPort);
+1:194bad2:             }
+1:194bad2:         }
+1:194bad2:     };
+1:194bad2: 
+1:c17cbe1:     public static final StartupCheck checkJMXProperties = new StartupCheck()
+1:c17cbe1:     {
+1:c17cbe1:         public void execute()
+1:c17cbe1:         {
+1:c17cbe1:             if (System.getProperty("com.sun.management.jmxremote.port") != null)
+1:c17cbe1:             {
+1:c17cbe1:                 logger.warn("Use of com.sun.management.jmxremote.port at startup is deprecated. " +
+1:c17cbe1:                             "Please use cassandra.jmx.remote.port instead.");
+1:c17cbe1:             }
+1:c17cbe1:         }
+1:c17cbe1:     };
+1:c17cbe1: 
+1:194bad2:     public static final StartupCheck inspectJvmOptions = new StartupCheck()
+1:194bad2:     {
+1:194bad2:         public void execute()
+1:194bad2:         {
+1:194bad2:             // log warnings for different kinds of sub-optimal JVMs.  tldr use 64-bit Oracle >= 1.6u32
+1:194bad2:             if (!DatabaseDescriptor.hasLargeAddressSpace())
+1:194bad2:                 logger.warn("32bit JVM detected.  It is recommended to run Cassandra on a 64bit JVM for better performance.");
+1:194bad2: 
+1:194bad2:             String javaVmName = System.getProperty("java.vm.name");
+1:194bad2:             if (javaVmName.contains("OpenJDK"))
+1:194bad2:             {
+1:194bad2:                 // There is essentially no QA done on OpenJDK builds, and
+1:194bad2:                 // clusters running OpenJDK have seen many heap and load issues.
+1:194bad2:                 logger.warn("OpenJDK is not recommended. Please upgrade to the newest Oracle Java release");
+1:194bad2:             }
+1:194bad2:             else if (!javaVmName.contains("HotSpot"))
+1:194bad2:             {
+1:194bad2:                 logger.warn("Non-Oracle JVM detected.  Some features, such as immediate unmap of compacted SSTables, may not work as intended");
+1:194bad2:             }
+1:194bad2:         }
+1:194bad2:     };
+1:194bad2: 
+1:194bad2:     public static final StartupCheck checkJnaInitialization = new StartupCheck()
+1:194bad2:     {
+1:194bad2:         public void execute() throws StartupException
+1:194bad2:         {
+1:194bad2:             // Fail-fast if JNA is not available or failing to initialize properly
+1:194bad2:             if (!CLibrary.jnaAvailable())
+1:11910c6:                 throw new StartupException(StartupException.ERR_WRONG_MACHINE_STATE, "JNA failing to initialize properly. ");
+1:194bad2:         }
+1:194bad2:     };
+1:194bad2: 
+1:194bad2:     public static final StartupCheck initSigarLibrary = new StartupCheck()
+1:194bad2:     {
+1:194bad2:         public void execute()
+1:194bad2:         {
+1:47e8ef9:             SigarLibrary.instance.warnIfRunningInDegradedMode();
+1:194bad2:         }
+1:194bad2:     };
+1:194bad2: 
+1:96d41f0:     public static final StartupCheck checkDataDirs = () ->
+1:194bad2:     {
+1:194bad2:         // check all directories(data, commitlog, saved cache) for existence and permission
+1:194bad2:         Iterable<String> dirs = Iterables.concat(Arrays.asList(DatabaseDescriptor.getAllDataFileLocations()),
+1:194bad2:                                                  Arrays.asList(DatabaseDescriptor.getCommitLogLocation(),
+1:96d41f0:                                                                DatabaseDescriptor.getSavedCachesLocation(),
+1:96d41f0:                                                                DatabaseDescriptor.getHintsDirectory().getAbsolutePath()));
+1:194bad2:         for (String dataDir : dirs)
+1:194bad2:         {
+1:194bad2:             logger.debug("Checking directory {}", dataDir);
+1:194bad2:             File dir = new File(dataDir);
+1:194bad2: 
+1:194bad2:             // check that directories exist.
+1:194bad2:             if (!dir.exists())
+1:194bad2:             {
+1:cd46ca1:                 logger.warn("Directory {} doesn't exist", dataDir);
+1:194bad2:                 // if they don't, failing their creation, stop cassandra.
+1:194bad2:                 if (!dir.mkdirs())
+1:11910c6:                     throw new StartupException(StartupException.ERR_WRONG_DISK_STATE,
+1:11910c6:                                                "Has no permission to create directory "+ dataDir);
+1:194bad2:             }
+1:194bad2: 
+1:194bad2:             // if directories exist verify their permissions
+1:194bad2:             if (!Directories.verifyFullPermissions(dir, dataDir))
+1:11910c6:                 throw new StartupException(StartupException.ERR_WRONG_DISK_STATE,
+1:11910c6:                                            "Insufficient permissions on directory " + dataDir);
+1:194bad2:         }
+1:194bad2:     };
+1:194bad2: 
+1:194bad2:     public static final StartupCheck checkSSTablesFormat = new StartupCheck()
+1:194bad2:     {
+1:194bad2:         public void execute() throws StartupException
+1:194bad2:         {
+1:194bad2:             final Set<String> invalid = new HashSet<>();
+1:e616867:             final Set<String> nonSSTablePaths = new HashSet<>();
+1:e616867:             nonSSTablePaths.add(FileUtils.getCanonicalPath(DatabaseDescriptor.getCommitLogLocation()));
+1:e616867:             nonSSTablePaths.add(FileUtils.getCanonicalPath(DatabaseDescriptor.getSavedCachesLocation()));
+1:e616867:             nonSSTablePaths.add(FileUtils.getCanonicalPath(DatabaseDescriptor.getHintsDirectory()));
+1:e616867: 
+1:194bad2:             FileVisitor<Path> sstableVisitor = new SimpleFileVisitor<Path>()
+1:194bad2:             {
+1:fed476f:                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
+1:194bad2:                 {
+1:b09e60f:                     if (!Descriptor.isValidFile(file.getFileName().toString()))
+1:20c5ea0:                         return FileVisitResult.CONTINUE;
+1:20c5ea0: 
+1:194bad2:                     try
+1:194bad2:                     {
+1:194bad2:                         if (!Descriptor.fromFilename(file.toString()).isCompatible())
+1:194bad2:                             invalid.add(file.toString());
+1:194bad2:                     }
+1:194bad2:                     catch (Exception e)
+1:194bad2:                     {
+1:194bad2:                         invalid.add(file.toString());
+1:194bad2:                     }
+1:194bad2:                     return FileVisitResult.CONTINUE;
+1:194bad2:                 }
+1:194bad2: 
+1:194bad2:                 public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException
+1:194bad2:                 {
+1:194bad2:                     String name = dir.getFileName().toString();
+1:b09e60f:                     return (name.equals(Directories.SNAPSHOT_SUBDIR)
+1:e616867:                             || name.equals(Directories.BACKUPS_SUBDIR)
+1:e616867:                             || nonSSTablePaths.contains(dir.toFile().getCanonicalPath()))
+1:194bad2:                            ? FileVisitResult.SKIP_SUBTREE
+1:194bad2:                            : FileVisitResult.CONTINUE;
+1:194bad2:                 }
+1:194bad2:             };
+1:194bad2: 
+1:194bad2:             for (String dataDir : DatabaseDescriptor.getAllDataFileLocations())
+1:194bad2:             {
+1:194bad2:                 try
+1:194bad2:                 {
+1:194bad2:                     Files.walkFileTree(Paths.get(dataDir), sstableVisitor);
+1:194bad2:                 }
+1:194bad2:                 catch (IOException e)
+1:194bad2:                 {
+1:194bad2:                     throw new StartupException(3, "Unable to verify sstable files on disk", e);
+1:194bad2:                 }
+1:194bad2:             }
+1:194bad2: 
+1:194bad2:             if (!invalid.isEmpty())
+1:11910c6:                 throw new StartupException(StartupException.ERR_WRONG_DISK_STATE,
+1:11910c6:                                            String.format("Detected unreadable sstables %s, please check " +
+1:194bad2:                                                          "NEWS.txt and ensure that you have upgraded through " +
+1:194bad2:                                                          "all required intermediate versions, running " +
+1:194bad2:                                                          "upgradesstables",
+1:194bad2:                                                          Joiner.on(",").join(invalid)));
+1:194bad2: 
+1:194bad2:         }
+1:194bad2:     };
+1:194bad2: 
+1:194bad2:     public static final StartupCheck checkSystemKeyspaceState = new StartupCheck()
+1:194bad2:     {
+1:194bad2:         public void execute() throws StartupException
+1:194bad2:         {
+1:194bad2:             // check the system keyspace to keep user from shooting self in foot by changing partitioner, cluster name, etc.
+1:194bad2:             // we do a one-off scrub of the system keyspace first; we can't load the list of the rest of the keyspaces,
+1:194bad2:             // until system keyspace is opened.
+1:194bad2: 
+1:9797511:             for (CFMetaData cfm : Schema.instance.getTablesAndViews(SchemaConstants.SYSTEM_KEYSPACE_NAME))
+1:194bad2:                 ColumnFamilyStore.scrubDataDirectories(cfm);
+1:194bad2: 
+1:194bad2:             try
+1:194bad2:             {
+1:194bad2:                 SystemKeyspace.checkHealth();
+1:194bad2:             }
+1:194bad2:             catch (ConfigurationException e)
+1:194bad2:             {
+1:194bad2:                 throw new StartupException(100, "Fatal exception during initialization", e);
+1:194bad2:             }
+1:194bad2:         }
+1:194bad2:     };
+1:194bad2: 
+1:a4da379:     public static final StartupCheck checkDatacenter = new StartupCheck()
+1:194bad2:     {
+1:194bad2:         public void execute() throws StartupException
+1:194bad2:         {
+1:a4da379:             if (!Boolean.getBoolean("cassandra.ignore_dc"))
+3:a4da379:             {
+1:a4da379:                 String storedDc = SystemKeyspace.getDatacenter();
+1:a4da379:                 if (storedDc != null)
+1:a4da379:                 {
+1:a4da379:                     String currentDc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(FBUtilities.getBroadcastAddress());
+1:a4da379:                     if (!storedDc.equals(currentDc))
+1:a4da379:                     {
+1:a4da379:                         String formatMessage = "Cannot start node if snitch's data center (%s) differs from previous data center (%s). " +
+1:a4da379:                                                "Please fix the snitch configuration, decommission and rebootstrap this node or use the flag -Dcassandra.ignore_dc=true.";
+1:9dafa43: 
+1:11910c6:                         throw new StartupException(StartupException.ERR_WRONG_CONFIG, String.format(formatMessage, currentDc, storedDc));
+1:194bad2:                     }
+1:194bad2:                 }
+1:194bad2:             }
+3:a4da379:         }
+1:a4da379:     };
+3:a4da379: 
+1:a4da379:     public static final StartupCheck checkRack = new StartupCheck()
+1:a4da379:     {
+1:194bad2:         public void execute() throws StartupException
+1:a4da379:         {
+1:a4da379:             if (!Boolean.getBoolean("cassandra.ignore_rack"))
+1:a4da379:             {
+1:a4da379:                 String storedRack = SystemKeyspace.getRack();
+1:a4da379:                 if (storedRack != null)
+1:a4da379:                 {
+1:a4da379:                     String currentRack = DatabaseDescriptor.getEndpointSnitch().getRack(FBUtilities.getBroadcastAddress());
+1:a4da379:                     if (!storedRack.equals(currentRack))
+1:a4da379:                     {
+1:a4da379:                         String formatMessage = "Cannot start node if snitch's rack (%s) differs from previous rack (%s). " +
+1:a4da379:                                                "Please fix the snitch configuration, decommission and rebootstrap this node or use the flag -Dcassandra.ignore_rack=true.";
+1:a4da379: 
+1:11910c6:                         throw new StartupException(StartupException.ERR_WRONG_CONFIG, String.format(formatMessage, currentRack, storedRack));
+1:a4da379:                     }
+1:a4da379:                 }
+1:a4da379:             }
+1:a4da379:         }
+1:a4da379:     };
+1:a4da379: }
+============================================================================
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:9797511
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.config.SchemaConstants;
+/////////////////////////////////////////////////////////////////////////
+1:             for (CFMetaData cfm : Schema.instance.getTablesAndViews(SchemaConstants.SYSTEM_KEYSPACE_NAME))
+commit:54836ec
+/////////////////////////////////////////////////////////////////////////
+1:             if (FBUtilities.isWindows)
+commit:242b973
+commit:0ff13d2
+/////////////////////////////////////////////////////////////////////////
+1:     private final List<StartupCheck> DEFAULT_TESTS = ImmutableList.of(checkJemalloc,
+1:                                                                       checkValidLaunchDate,
+/////////////////////////////////////////////////////////////////////////
+1:     public static final StartupCheck checkJemalloc = new StartupCheck()
+1:     {
+1:         public void execute() throws StartupException
+1:         {
+0:             if (FBUtilities.isWindows())
+1:                 return;
+1:             String jemalloc = System.getProperty("cassandra.libjemalloc");
+1:             if (jemalloc == null)
+1:                 logger.warn("jemalloc shared library could not be preloaded to speed up memory allocations");
+1:             else if ("-".equals(jemalloc))
+1:                 logger.info("jemalloc preload explicitly disabled");
+1:             else
+1:                 logger.info("jemalloc seems to be preloaded from {}", jemalloc);
+1:         }
+1:     };
+1: 
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:f147ca9
+/////////////////////////////////////////////////////////////////////////
+1:                 logger.info("JMX is enabled to receive remote connections on port: {}", jmxPort);
+commit:fed476f
+/////////////////////////////////////////////////////////////////////////
+1:         public void execute()
+/////////////////////////////////////////////////////////////////////////
+1:                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
+author:Sam Tunnicliffe
+-------------------------------------------------------------------------------
+commit:c17cbe1
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.ColumnFamilyStore;
+1: import org.apache.cassandra.db.Directories;
+1: import org.apache.cassandra.db.SystemKeyspace;
+1: import org.apache.cassandra.utils.CLibrary;
+1: import org.apache.cassandra.utils.FBUtilities;
+1: import org.apache.cassandra.utils.SigarLibrary;
+/////////////////////////////////////////////////////////////////////////
+1:                                                                       checkJMXProperties,
+/////////////////////////////////////////////////////////////////////////
+1:     public static final StartupCheck checkJMXProperties = new StartupCheck()
+1:     {
+1:         public void execute()
+1:         {
+1:             if (System.getProperty("com.sun.management.jmxremote.port") != null)
+1:             {
+1:                 logger.warn("Use of com.sun.management.jmxremote.port at startup is deprecated. " +
+1:                             "Please use cassandra.jmx.remote.port instead.");
+1:             }
+1:         }
+1:     };
+1: 
+commit:7b0c716
+/////////////////////////////////////////////////////////////////////////
+1:             String jmxPort = System.getProperty("cassandra.jmx.remote.port");
+commit:2e3b12f
+commit:e616867
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.io.util.FileUtils;
+/////////////////////////////////////////////////////////////////////////
+1:             final Set<String> nonSSTablePaths = new HashSet<>();
+1:             nonSSTablePaths.add(FileUtils.getCanonicalPath(DatabaseDescriptor.getCommitLogLocation()));
+1:             nonSSTablePaths.add(FileUtils.getCanonicalPath(DatabaseDescriptor.getSavedCachesLocation()));
+1:             nonSSTablePaths.add(FileUtils.getCanonicalPath(DatabaseDescriptor.getHintsDirectory()));
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                             || name.equals(Directories.BACKUPS_SUBDIR)
+1:                             || nonSSTablePaths.contains(dir.toFile().getCanonicalPath()))
+commit:5ad8114
+commit:b61da9b
+/////////////////////////////////////////////////////////////////////////
+0:                 throw new StartupException(3, "JNA failing to initialize properly. ");
+commit:20c5ea0
+/////////////////////////////////////////////////////////////////////////
+0:                     if (!file.toString().endsWith(".db"))
+1:                         return FileVisitResult.CONTINUE;
+1: 
+commit:194bad2
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.service;
+1: 
+1: import java.io.File;
+1: import java.io.IOException;
+1: import java.nio.file.*;
+1: import java.nio.file.attribute.BasicFileAttributes;
+1: import java.util.*;
+1: 
+1: import com.google.common.base.Joiner;
+1: import com.google.common.collect.ImmutableList;
+1: import com.google.common.collect.Iterables;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import org.apache.cassandra.config.CFMetaData;
+1: import org.apache.cassandra.config.DatabaseDescriptor;
+1: import org.apache.cassandra.config.Schema;
+0: import org.apache.cassandra.db.*;
+1: import org.apache.cassandra.exceptions.ConfigurationException;
+1: import org.apache.cassandra.exceptions.StartupException;
+1: import org.apache.cassandra.io.sstable.Descriptor;
+0: import org.apache.cassandra.utils.*;
+1: 
+1: /**
+1:  * Verifies that the system and environment is in a fit state to be started.
+1:  * Used in CassandraDaemon#setup() to check various settings and invariants.
+1:  *
+1:  * Each individual test is modelled as an implementation of StartupCheck, these are run
+1:  * at the start of CassandraDaemon#setup() before any local state is mutated. The default
+1:  * checks are a mix of informational tests (inspectJvmOptions), initialization
+1:  * (initSigarLibrary, checkCacheServiceInitialization) and invariant checking
+1:  * (checkValidLaunchDate, checkSystemKeyspaceState, checkSSTablesFormat).
+1:  *
+1:  * In addition, if checkSystemKeyspaceState determines that the release version has
+1:  * changed since last startup (i.e. the node has been upgraded) it snapshots the system
+1:  * keyspace to make it easier to back out if necessary.
+1:  *
+1:  * If any check reports a failure, then the setup method exits with an error (after
+1:  * logging any output from the tests). If all tests report success, setup can continue.
+1:  * We should be careful in future to ensure anything which mutates local state (such as
+1:  * writing new sstables etc) only happens after we've verified the initial setup.
+1:  */
+1: public class StartupChecks
+1: {
+1:     private static final Logger logger = LoggerFactory.getLogger(StartupChecks.class);
+1: 
+1:     // List of checks to run before starting up. If any test reports failure, startup will be halted.
+1:     private final List<StartupCheck> preFlightChecks = new ArrayList<>();
+1: 
+1:     // The default set of pre-flight checks to run. Order is somewhat significant in that we probably
+1:     // always want the system keyspace check run last, as this actually loads the schema for that
+1:     // keyspace. All other checks should not require any schema initialization.
+0:     private final List<StartupCheck> DEFAULT_TESTS = ImmutableList.of(checkValidLaunchDate,
+1:                                                                       checkJMXPorts,
+1:                                                                       inspectJvmOptions,
+1:                                                                       checkJnaInitialization,
+1:                                                                       initSigarLibrary,
+1:                                                                       checkDataDirs,
+1:                                                                       checkSSTablesFormat,
+0:                                                                       checkSystemKeyspaceState);
+1: 
+1:     public StartupChecks withDefaultTests()
+1:     {
+1:         preFlightChecks.addAll(DEFAULT_TESTS);
+1:         return this;
+1:     }
+1: 
+1:     /**
+1:      * Add system test to be run before schema is loaded during startup
+1:      * @param test the system test to include
+1:      */
+1:     public StartupChecks withTest(StartupCheck test)
+1:     {
+1:         preFlightChecks.add(test);
+1:         return this;
+1:     }
+1: 
+1:     /**
+1:      * Run the configured tests and return a report detailing the results.
+1:      * @throws org.apache.cassandra.exceptions.StartupException if any test determines that the
+1:      * system is not in an valid state to startup
+1:      */
+1:     public void verify() throws StartupException
+1:     {
+1:         for (StartupCheck test : preFlightChecks)
+1:             test.execute();
+1:     }
+1: 
+1:     public static final StartupCheck checkValidLaunchDate = new StartupCheck()
+1:     {
+1:         /**
+1:          * The earliest legit timestamp a casandra instance could have ever launched.
+1:          * Date roughly taken from http://perspectives.mvdirona.com/2008/07/12/FacebookReleasesCassandraAsOpenSource.aspx
+1:          * We use this to ensure the system clock is at least somewhat correct at startup.
+1:          */
+1:         private static final long EARLIEST_LAUNCH_DATE = 1215820800000L;
+1:         public void execute() throws StartupException
+1:         {
+1:             long now = System.currentTimeMillis();
+1:             if (now < EARLIEST_LAUNCH_DATE)
+0:                 throw new StartupException(1, String.format("current machine time is %s, but that is seemingly incorrect. exiting now.",
+1:                                                             new Date(now).toString()));
+1:         }
+1:     };
+1: 
+1:     public static final StartupCheck checkJMXPorts = new StartupCheck()
+1:     {
+1:         public void execute()
+1:         {
+0:             String jmxPort = System.getProperty("com.sun.management.jmxremote.port");
+1:             if (jmxPort == null)
+1:             {
+1:                 logger.warn("JMX is not enabled to receive remote connections. Please see cassandra-env.sh for more info.");
+1:                 jmxPort = System.getProperty("cassandra.jmx.local.port");
+1:                 if (jmxPort == null)
+1:                     logger.error("cassandra.jmx.local.port missing from cassandra-env.sh, unable to start local JMX service.");
+1:             }
+1:             else
+1:             {
+0:                 logger.info("JMX is enabled to receive remote connections on port: " + jmxPort);
+1:             }
+1:         }
+1:     };
+1: 
+1:     public static final StartupCheck inspectJvmOptions = new StartupCheck()
+1:     {
+1:         public void execute()
+1:         {
+1:             // log warnings for different kinds of sub-optimal JVMs.  tldr use 64-bit Oracle >= 1.6u32
+1:             if (!DatabaseDescriptor.hasLargeAddressSpace())
+1:                 logger.warn("32bit JVM detected.  It is recommended to run Cassandra on a 64bit JVM for better performance.");
+1: 
+1:             String javaVmName = System.getProperty("java.vm.name");
+1:             if (javaVmName.contains("OpenJDK"))
+1:             {
+1:                 // There is essentially no QA done on OpenJDK builds, and
+1:                 // clusters running OpenJDK have seen many heap and load issues.
+1:                 logger.warn("OpenJDK is not recommended. Please upgrade to the newest Oracle Java release");
+1:             }
+1:             else if (!javaVmName.contains("HotSpot"))
+1:             {
+1:                 logger.warn("Non-Oracle JVM detected.  Some features, such as immediate unmap of compacted SSTables, may not work as intended");
+1:             }
+1:         }
+1:     };
+1: 
+1:     public static final StartupCheck checkJnaInitialization = new StartupCheck()
+1:     {
+1:         public void execute() throws StartupException
+1:         {
+1:             // Fail-fast if JNA is not available or failing to initialize properly
+0:             // except with -Dcassandra.boot_without_jna=true. See CASSANDRA-6575.
+1:             if (!CLibrary.jnaAvailable())
+1:             {
+0:                 boolean jnaRequired = !Boolean.getBoolean("cassandra.boot_without_jna");
+1: 
+0:                 if (jnaRequired)
+0:                     throw new StartupException(3, "JNA failing to initialize properly. " +
+0:                                                   "Use -Dcassandra.boot_without_jna=true to bootstrap even so.");
+1:             }
+1:         }
+1:     };
+1: 
+1:     public static final StartupCheck initSigarLibrary = new StartupCheck()
+1:     {
+1:         public void execute()
+1:         {
+0:             new SigarLibrary().warnIfRunningInDegradedMode();
+1:         }
+1:     };
+1: 
+0:     public static final StartupCheck checkDataDirs = new StartupCheck()
+1:     {
+1:         public void execute() throws StartupException
+1:         {
+1:             // check all directories(data, commitlog, saved cache) for existence and permission
+1:             Iterable<String> dirs = Iterables.concat(Arrays.asList(DatabaseDescriptor.getAllDataFileLocations()),
+1:                                                      Arrays.asList(DatabaseDescriptor.getCommitLogLocation(),
+0:                                                                    DatabaseDescriptor.getSavedCachesLocation()));
+1:             for (String dataDir : dirs)
+1:             {
+1:                 logger.debug("Checking directory {}", dataDir);
+1:                 File dir = new File(dataDir);
+1: 
+1:                 // check that directories exist.
+1:                 if (!dir.exists())
+1:                 {
+0:                     logger.error("Directory {} doesn't exist", dataDir);
+1:                     // if they don't, failing their creation, stop cassandra.
+1:                     if (!dir.mkdirs())
+0:                         throw new StartupException(3, "Has no permission to create directory "+ dataDir);
+1:                 }
+1: 
+1:                 // if directories exist verify their permissions
+1:                 if (!Directories.verifyFullPermissions(dir, dataDir))
+0:                     throw new StartupException(3, "Insufficient permissions on directory " + dataDir);
+1: 
+1:             }
+1:         }
+1:     };
+1: 
+1:     public static final StartupCheck checkSSTablesFormat = new StartupCheck()
+1:     {
+1:         public void execute() throws StartupException
+1:         {
+1:             final Set<String> invalid = new HashSet<>();
+1:             FileVisitor<Path> sstableVisitor = new SimpleFileVisitor<Path>()
+1:             {
+0:                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException
+1:                 {
+1:                     try
+1:                     {
+1:                         if (!Descriptor.fromFilename(file.toString()).isCompatible())
+1:                             invalid.add(file.toString());
+1:                     }
+1:                     catch (Exception e)
+1:                     {
+1:                         invalid.add(file.toString());
+1:                     }
+1:                     return FileVisitResult.CONTINUE;
+1:                 }
+1: 
+1:                 public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException
+1:                 {
+1:                     String name = dir.getFileName().toString();
+0:                     return (name.equals("snapshots") || name.equals("backups"))
+1:                            ? FileVisitResult.SKIP_SUBTREE
+1:                            : FileVisitResult.CONTINUE;
+1:                 }
+1:             };
+1: 
+1:             for (String dataDir : DatabaseDescriptor.getAllDataFileLocations())
+1:             {
+1:                 try
+1:                 {
+1:                     Files.walkFileTree(Paths.get(dataDir), sstableVisitor);
+1:                 }
+1:                 catch (IOException e)
+1:                 {
+1:                     throw new StartupException(3, "Unable to verify sstable files on disk", e);
+1:                 }
+1:             }
+1: 
+1:             if (!invalid.isEmpty())
+0:                 throw new StartupException(3, String.format("Detected unreadable sstables %s, please check " +
+1:                                                             "NEWS.txt and ensure that you have upgraded through " +
+1:                                                             "all required intermediate versions, running " +
+1:                                                             "upgradesstables",
+1:                                                             Joiner.on(",").join(invalid)));
+1: 
+1:         }
+1:     };
+1: 
+1:     public static final StartupCheck checkSystemKeyspaceState = new StartupCheck()
+1:     {
+1:         public void execute() throws StartupException
+1:         {
+1:             // check the system keyspace to keep user from shooting self in foot by changing partitioner, cluster name, etc.
+1:             // we do a one-off scrub of the system keyspace first; we can't load the list of the rest of the keyspaces,
+1:             // until system keyspace is opened.
+0:             Keyspace systemKs = Keyspace.open(SystemKeyspace.NAME);
+0:             for (CFMetaData cfm : Schema.instance.getKeyspaceMetaData(SystemKeyspace.NAME).values())
+1:                 ColumnFamilyStore.scrubDataDirectories(cfm);
+1: 
+1:             try
+1:             {
+1:                 SystemKeyspace.checkHealth();
+1:             }
+1:             catch (ConfigurationException e)
+1:             {
+1:                 throw new StartupException(100, "Fatal exception during initialization", e);
+1:             }
+1:         }
+1:     };
+1: }
+author:Stefania Alborghetti
+-------------------------------------------------------------------------------
+commit:11910c6
+/////////////////////////////////////////////////////////////////////////
+1:                 throw new StartupException(StartupException.ERR_WRONG_MACHINE_STATE,
+1:                                            String.format("current machine time is %s, but that is seemingly incorrect. exiting now.",
+0:                                                          new Date(now).toString()));
+/////////////////////////////////////////////////////////////////////////
+1:                 throw new StartupException(StartupException.ERR_WRONG_MACHINE_STATE, "JNA failing to initialize properly. ");
+/////////////////////////////////////////////////////////////////////////
+1:                     throw new StartupException(StartupException.ERR_WRONG_DISK_STATE,
+1:                                                "Has no permission to create directory "+ dataDir);
+1:                 throw new StartupException(StartupException.ERR_WRONG_DISK_STATE,
+1:                                            "Insufficient permissions on directory " + dataDir);
+/////////////////////////////////////////////////////////////////////////
+1:                 throw new StartupException(StartupException.ERR_WRONG_DISK_STATE,
+1:                                            String.format("Detected unreadable sstables %s, please check " +
+0:                                                          "NEWS.txt and ensure that you have upgraded through " +
+0:                                                          "all required intermediate versions, running " +
+0:                                                          "upgradesstables",
+0:                                                          Joiner.on(",").join(invalid)));
+/////////////////////////////////////////////////////////////////////////
+1:                         throw new StartupException(StartupException.ERR_WRONG_CONFIG, String.format(formatMessage, currentDc, storedDc));
+/////////////////////////////////////////////////////////////////////////
+1:                         throw new StartupException(StartupException.ERR_WRONG_CONFIG, String.format(formatMessage, currentRack, storedRack));
+commit:5726625
+/////////////////////////////////////////////////////////////////////////
+0:                             || name.equals(Directories.BACKUPS_SUBDIR))
+commit:b09e60f
+/////////////////////////////////////////////////////////////////////////
+1:                     if (!Descriptor.isValidFile(file.getFileName().toString()))
+/////////////////////////////////////////////////////////////////////////
+1:                     return (name.equals(Directories.SNAPSHOT_SUBDIR)
+0:                             || name.equals(Directories.BACKUPS_SUBDIR)
+0:                             || name.equals(Directories.TRANSACTIONS_SUBDIR))
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:bf917cb
+commit:2445ea7
+commit:47e8ef9
+/////////////////////////////////////////////////////////////////////////
+1:             SigarLibrary.instance.warnIfRunningInDegradedMode();
+author:Carl Yeksigian
+-------------------------------------------------------------------------------
+commit:9dafa43
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.util.FileUtils;
+/////////////////////////////////////////////////////////////////////////
+0:             final Set<String> nonSSTablePaths = new HashSet<>();
+0:             nonSSTablePaths.add(FileUtils.getCanonicalPath(DatabaseDescriptor.getCommitLogLocation()));
+0:             nonSSTablePaths.add(FileUtils.getCanonicalPath(DatabaseDescriptor.getSavedCachesLocation()));
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:                     return (name.equals("snapshots")
+0:                             || name.equals("backups")
+0:                             || nonSSTablePaths.contains(dir.toFile().getCanonicalPath()))
+commit:a3a8dbc
+/////////////////////////////////////////////////////////////////////////
+0:             for (CFMetaData cfm : Schema.instance.getTablesAndViews(SystemKeyspace.NAME))
+author:Marcus Olsson
+-------------------------------------------------------------------------------
+commit:a4da379
+/////////////////////////////////////////////////////////////////////////
+1:                                                                       checkSystemKeyspaceState,
+1:                                                                       checkDatacenter,
+1:                                                                       checkRack);
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     public static final StartupCheck checkDatacenter = new StartupCheck()
+1:     {
+0:         public void execute() throws StartupException
+1:         {
+1:             if (!Boolean.getBoolean("cassandra.ignore_dc"))
+1:             {
+1:                 String storedDc = SystemKeyspace.getDatacenter();
+1:                 if (storedDc != null)
+1:                 {
+1:                     String currentDc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(FBUtilities.getBroadcastAddress());
+1:                     if (!storedDc.equals(currentDc))
+1:                     {
+1:                         String formatMessage = "Cannot start node if snitch's data center (%s) differs from previous data center (%s). " +
+1:                                                "Please fix the snitch configuration, decommission and rebootstrap this node or use the flag -Dcassandra.ignore_dc=true.";
+1: 
+0:                         throw new StartupException(100, String.format(formatMessage, currentDc, storedDc));
+1:                     }
+1:                 }
+1:             }
+1:         }
+1:     };
+1: 
+1:     public static final StartupCheck checkRack = new StartupCheck()
+1:     {
+0:         public void execute() throws StartupException
+1:         {
+1:             if (!Boolean.getBoolean("cassandra.ignore_rack"))
+1:             {
+1:                 String storedRack = SystemKeyspace.getRack();
+1:                 if (storedRack != null)
+1:                 {
+1:                     String currentRack = DatabaseDescriptor.getEndpointSnitch().getRack(FBUtilities.getBroadcastAddress());
+1:                     if (!storedRack.equals(currentRack))
+1:                     {
+1:                         String formatMessage = "Cannot start node if snitch's rack (%s) differs from previous rack (%s). " +
+1:                                                "Please fix the snitch configuration, decommission and rebootstrap this node or use the flag -Dcassandra.ignore_rack=true.";
+1: 
+0:                         throw new StartupException(100, String.format(formatMessage, currentRack, storedRack));
+1:                     }
+1:                 }
+1:             }
+1:         }
+1:     };
+commit:879c49b
+/////////////////////////////////////////////////////////////////////////
+0:                                                                       checkSystemKeyspaceState,
+0:                                                                       checkDatacenter,
+0:                                                                       checkRack);
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:     public static final StartupCheck checkDatacenter = new StartupCheck()
+0:     {
+0:         public void execute() throws StartupException
+0:         {
+0:             if (!Boolean.getBoolean("cassandra.ignore_dc"))
+0:             {
+0:                 String storedDc = SystemKeyspace.getDatacenter();
+0:                 if (storedDc != null)
+0:                 {
+0:                     String currentDc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(FBUtilities.getBroadcastAddress());
+0:                     if (!storedDc.equals(currentDc))
+0:                     {
+0:                         String formatMessage = "Cannot start node if snitch's data center (%s) differs from previous data center (%s). " +
+0:                                                "Please fix the snitch configuration, decommission and rebootstrap this node or use the flag -Dcassandra.ignore_dc=true.";
+0: 
+0:                         throw new StartupException(100, String.format(formatMessage, currentDc, storedDc));
+0:                     }
+0:                 }
+0:             }
+0:         }
+0:     };
+0: 
+0:     public static final StartupCheck checkRack = new StartupCheck()
+0:     {
+0:         public void execute() throws StartupException
+0:         {
+0:             if (!Boolean.getBoolean("cassandra.ignore_rack"))
+0:             {
+0:                 String storedRack = SystemKeyspace.getRack();
+0:                 if (storedRack != null)
+0:                 {
+0:                     String currentRack = DatabaseDescriptor.getEndpointSnitch().getRack(FBUtilities.getBroadcastAddress());
+0:                     if (!storedRack.equals(currentRack))
+0:                     {
+0:                         String formatMessage = "Cannot start node if snitch's rack (%s) differs from previous rack (%s). " +
+0:                                                "Please fix the snitch configuration, decommission and rebootstrap this node or use the flag -Dcassandra.ignore_rack=true.";
+0: 
+0:                         throw new StartupException(100, String.format(formatMessage, currentRack, storedRack));
+0:                     }
+0:                 }
+0:             }
+0:         }
+0:     };
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:4cf97f4
+commit:cd46ca1
+/////////////////////////////////////////////////////////////////////////
+1:                     logger.warn("Directory {} doesn't exist", dataDir);
+commit:96d41f0
+/////////////////////////////////////////////////////////////////////////
+1:     public static final StartupCheck checkDataDirs = () ->
+0:         // check all directories(data, commitlog, saved cache) for existence and permission
+0:         Iterable<String> dirs = Iterables.concat(Arrays.asList(DatabaseDescriptor.getAllDataFileLocations()),
+0:                                                  Arrays.asList(DatabaseDescriptor.getCommitLogLocation(),
+1:                                                                DatabaseDescriptor.getSavedCachesLocation(),
+1:                                                                DatabaseDescriptor.getHintsDirectory().getAbsolutePath()));
+0:         for (String dataDir : dirs)
+0:             logger.debug("Checking directory {}", dataDir);
+0:             File dir = new File(dataDir);
+0: 
+0:             // check that directories exist.
+0:             if (!dir.exists())
+0:                 logger.error("Directory {} doesn't exist", dataDir);
+0:                 // if they don't, failing their creation, stop cassandra.
+0:                 if (!dir.mkdirs())
+0:                     throw new StartupException(3, "Has no permission to create directory "+ dataDir);
+0: 
+0:             // if directories exist verify their permissions
+0:             if (!Directories.verifyFullPermissions(dir, dataDir))
+0:                 throw new StartupException(3, "Insufficient permissions on directory " + dataDir);
+commit:6e1033b
+/////////////////////////////////////////////////////////////////////////
+0:             for (CFMetaData cfm : Schema.instance.getTables(SystemKeyspace.NAME))
+author:Marcus Eriksson
+-------------------------------------------------------------------------------
+commit:aa133b7
+/////////////////////////////////////////////////////////////////////////
+0: 
+============================================================================

@@ -1,0 +1,2215 @@
+1:3bdcaa3: /*
+1:3bdcaa3:  * Licensed to the Apache Software Foundation (ASF) under one
+1:3bdcaa3:  * or more contributor license agreements.  See the NOTICE file
+1:3bdcaa3:  * distributed with this work for additional information
+1:3bdcaa3:  * regarding copyright ownership.  The ASF licenses this file
+1:3bdcaa3:  * to you under the Apache License, Version 2.0 (the
+1:3bdcaa3:  * "License"); you may not use this file except in compliance
+1:3bdcaa3:  * with the License.  You may obtain a copy of the License at
+11:3bdcaa3:  *
+1:3bdcaa3:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:3bdcaa3:  *
+1:3bdcaa3:  * Unless required by applicable law or agreed to in writing, software
+1:3bdcaa3:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:3bdcaa3:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:3bdcaa3:  * See the License for the specific language governing permissions and
+1:3bdcaa3:  * limitations under the License.
+11:3bdcaa3:  */
+1:3bdcaa3: package org.apache.cassandra.db.view;
+68:3bdcaa3: 
+1:5a4253b: import java.util.*;
+1:5a4253b: import java.util.stream.Collectors;
+1:3bdcaa3: 
+1:1a9286c: import javax.annotation.Nullable;
+1:3bdcaa3: 
+1:3bdcaa3: import com.google.common.collect.Iterables;
+1:3bdcaa3: 
+1:5a4253b: import org.apache.cassandra.cql3.*;
+1:5a4253b: import org.apache.cassandra.cql3.statements.ParsedStatement;
+1:5a4253b: import org.apache.cassandra.cql3.statements.SelectStatement;
+1:5a4253b: import org.apache.cassandra.db.*;
+1:5a4253b: import org.apache.cassandra.config.*;
+1:3bdcaa3: import org.apache.cassandra.db.compaction.CompactionManager;
+1:5a4253b: import org.apache.cassandra.db.rows.*;
+1:1a9286c: import org.apache.cassandra.schema.KeyspaceMetadata;
+1:5a4253b: import org.apache.cassandra.service.ClientState;
+1:9f335fe: import org.apache.cassandra.utils.FBUtilities;
+1:83f8ccc: import org.slf4j.Logger;
+1:83f8ccc: import org.slf4j.LoggerFactory;
+1:3bdcaa3: 
+11:3bdcaa3: /**
+1:a3a8dbc:  * A View copies data from a base table into a view table which can be queried independently from the
+1:a3a8dbc:  * base. Every update which targets the base table must be fed through the {@link ViewManager} to ensure
+1:3bdcaa3:  * that if a view needs to be updated, the updates are properly created and fed into the view.
+1:3bdcaa3:  */
+1:a3a8dbc: public class View
+1:9f335fe: {
+1:83f8ccc:     private static final Logger logger = LoggerFactory.getLogger(View.class);
+1:3bdcaa3: 
+1:3bdcaa3:     public final String name;
+1:a3a8dbc:     private volatile ViewDefinition definition;
+1:3bdcaa3: 
+1:3bdcaa3:     private final ColumnFamilyStore baseCfs;
+1:3bdcaa3: 
+1:86ba227:     public volatile List<ColumnDefinition> baseNonPKColumnsInViewPK;
+1:3bdcaa3: 
+1:a3a8dbc:     private final boolean includeAllColumns;
+1:a3a8dbc:     private ViewBuilder builder;
+1:3bdcaa3: 
+1:5a4253b:     // Only the raw statement can be final, because the statement cannot always be prepared when the MV is initialized.
+1:5a4253b:     // For example, during startup, this view will be initialized as part of the Keyspace.open() work; preparing a statement
+1:5a4253b:     // also requires the keyspace to be open, so this results in double-initialization problems.
+1:5a4253b:     private final SelectStatement.RawStatement rawSelect;
+1:5a4253b:     private SelectStatement select;
+1:5a4253b:     private ReadQuery query;
+1:3bdcaa3: 
+1:a3a8dbc:     public View(ViewDefinition definition,
+1:a3a8dbc:                 ColumnFamilyStore baseCfs)
+52:3bdcaa3:     {
+1:3bdcaa3:         this.baseCfs = baseCfs;
+1:86ba227:         this.name = definition.viewName;
+1:86ba227:         this.includeAllColumns = definition.includeAllColumns;
+1:5a4253b:         this.rawSelect = definition.select;
+1:86ba227: 
+1:86ba227:         updateDefinition(definition);
+1:9f335fe:     }
+1:3bdcaa3: 
+1:a3a8dbc:     public ViewDefinition getDefinition()
+1:3bdcaa3:     {
+1:a3a8dbc:         return definition;
+52:3bdcaa3:     }
+1:3bdcaa3: 
+1:3bdcaa3:     /**
+1:3bdcaa3:      * This updates the columns stored which are dependent on the base CFMetaData.
+1:3bdcaa3:      */
+1:86ba227:     public void updateDefinition(ViewDefinition definition)
+1:3bdcaa3:     {
+1:a3a8dbc:         this.definition = definition;
+1:a3a8dbc: 
+1:86ba227:         List<ColumnDefinition> nonPKDefPartOfViewPK = new ArrayList<>();
+1:86ba227:         for (ColumnDefinition baseColumn : baseCfs.metadata.allColumns())
+1:3bdcaa3:         {
+1:86ba227:             ColumnDefinition viewColumn = getViewColumn(baseColumn);
+1:86ba227:             if (viewColumn != null && !baseColumn.isPrimaryKeyColumn() && viewColumn.isPrimaryKeyColumn())
+1:86ba227:                 nonPKDefPartOfViewPK.add(baseColumn);
+1:3bdcaa3:         }
+1:86ba227:         this.baseNonPKColumnsInViewPK = nonPKDefPartOfViewPK;
+1:3bdcaa3:     }
+1:3bdcaa3: 
+1:3bdcaa3:     /**
+1:86ba227:      * The view column corresponding to the provided base column. This <b>can</b>
+1:86ba227:      * return {@code null} if the column is denormalized in the view.
+1:3bdcaa3:      */
+1:86ba227:     public ColumnDefinition getViewColumn(ColumnDefinition baseColumn)
+1:3bdcaa3:     {
+1:86ba227:         return definition.metadata.getColumnDefinition(baseColumn.name);
+1:86ba227:     }
+1:3bdcaa3: 
+1:86ba227:     /**
+1:86ba227:      * The base column corresponding to the provided view column. This should
+1:86ba227:      * never return {@code null} since a view can't have its "own" columns.
+1:86ba227:      */
+1:86ba227:     public ColumnDefinition getBaseColumn(ColumnDefinition viewColumn)
+1:86ba227:     {
+1:86ba227:         ColumnDefinition baseColumn = baseCfs.metadata.getColumnDefinition(viewColumn.name);
+1:86ba227:         assert baseColumn != null;
+1:86ba227:         return baseColumn;
+1:86ba227:     }
+1:86ba227: 
+1:86ba227:     /**
+1:86ba227:      * Whether the view might be affected by the provided update.
+1:86ba227:      * <p>
+1:86ba227:      * Note that having this method return {@code true} is not an absolute guarantee that the view will be
+1:86ba227:      * updated, just that it most likely will, but a {@code false} return guarantees it won't be affected).
+1:86ba227:      *
+1:86ba227:      * @param partitionKey the partition key that is updated.
+1:86ba227:      * @param update the update being applied.
+1:86ba227:      * @return {@code false} if we can guarantee that inserting {@code update} for key {@code partitionKey}
+1:86ba227:      * won't affect the view in any way, {@code true} otherwise.
+1:86ba227:      */
+1:86ba227:     public boolean mayBeAffectedBy(DecoratedKey partitionKey, Row update)
+1:86ba227:     {
+1:86ba227:         // We can guarantee that the view won't be affected if:
+1:86ba227:         //  - the clustering is excluded by the view filter (note that this isn't true of the filter on regular columns:
+1:86ba227:         //    even if an update don't match a view condition on a regular column, that update can still invalidate an pre-existing
+1:86ba227:         //    entry).
+1:86ba227:         //  - or the update don't modify any of the columns impacting the view (where "impacting" the view means that column is
+1:86ba227:         //    neither included in the view, nor used by the view filter).
+1:86ba227:         if (!getReadQuery().selectsClustering(partitionKey, update.clustering()))
+1:5a4253b:             return false;
+1:3bdcaa3: 
+1:86ba227:         // We want to find if the update modify any of the columns that are part of the view (in which case the view is affected).
+1:86ba227:         // But if the view include all the base table columns, or the update has either a row deletion or a row liveness (note
+1:86ba227:         // that for the liveness, it would be more "precise" to check if it's live, but pushing an update that is already expired
+1:86ba227:         // is dump so it's ok not to optimize for it and it saves us from having to pass nowInSec to the method), we know the view
+1:86ba227:         // is affected right away.
+1:86ba227:         if (includeAllColumns || !update.deletion().isLive() || !update.primaryKeyLivenessInfo().isEmpty())
+1:9f335fe:             return true;
+1:9f335fe: 
+1:86ba227:         for (ColumnData data : update)
+1:3bdcaa3:         {
+1:86ba227:             if (definition.metadata.getColumnDefinition(data.column().name) != null)
+2:2fcfc7c:                 return true;
+1:3bdcaa3:         }
+1:3bdcaa3:         return false;
+1:3bdcaa3:     }
+1:2fcfc7c: 
+1:3bdcaa3:     /**
+1:86ba227:      * Whether a given base row matches the view filter (and thus if is should have a corresponding entry).
+1:86ba227:      * <p>
+1:86ba227:      * Note that this differs from {@link #mayBeAffectedBy} in that the provide row <b>must</b> be the current
+1:86ba227:      * state of the base row, not just some updates to it. This method also has no false positive: a base
+1:86ba227:      * row either do or don't match the view filter.
+1:3bdcaa3:      *
+1:86ba227:      * @param partitionKey the partition key that is updated.
+1:86ba227:      * @param baseRow the current state of a particular base row.
+1:86ba227:      * @param nowInSec the current time in seconds (to decide what is live and what isn't).
+1:86ba227:      * @return {@code true} if {@code baseRow} matches the view filters, {@code false} otherwise.
+1:3bdcaa3:      */
+1:86ba227:     public boolean matchesViewFilter(DecoratedKey partitionKey, Row baseRow, int nowInSec)
+1:3bdcaa3:     {
+1:86ba227:         return getReadQuery().selectsClustering(partitionKey, baseRow.clustering())
+1:86ba227:             && getSelectStatement().rowFilterForInternalCalls().isSatisfiedBy(baseCfs.metadata, partitionKey, baseRow, nowInSec);
+1:3bdcaa3:     }
+1:3bdcaa3: 
+1:3bdcaa3:     /**
+1:5a4253b:      * Returns the SelectStatement used to populate and filter this view.  Internal users should access the select
+1:5a4253b:      * statement this way to ensure it has been prepared.
+1:3bdcaa3:      */
+1:5a4253b:     public SelectStatement getSelectStatement()
+1:3bdcaa3:     {
+1:5a4253b:         if (select == null)
+1:3bdcaa3:         {
+1:5a4253b:             ClientState state = ClientState.forInternalCalls();
+1:5a4253b:             state.setKeyspace(baseCfs.keyspace.getName());
+1:5a4253b:             rawSelect.prepareKeyspace(state);
+1:5a4253b:             ParsedStatement.Prepared prepared = rawSelect.prepare(true);
+1:5a4253b:             select = (SelectStatement) prepared.statement;
+1:3bdcaa3:         }
+1:3bdcaa3: 
+1:5a4253b:         return select;
+1:3bdcaa3:     }
+1:3bdcaa3: 
+1:3bdcaa3:     /**
+1:5a4253b:      * Returns the ReadQuery used to filter this view.  Internal users should access the query this way to ensure it
+1:5a4253b:      * has been prepared.
+1:3bdcaa3:      */
+1:5a4253b:     public ReadQuery getReadQuery()
+1:3bdcaa3:     {
+1:5a4253b:         if (query == null)
+1:5a4253b:             query = getSelectStatement().getQuery(QueryOptions.forInternalCalls(Collections.emptyList()), FBUtilities.nowInSeconds());
+1:5a4253b:         return query;
+1:3bdcaa3:     }
+1:3bdcaa3: 
+1:3bdcaa3:     public synchronized void build()
+1:3bdcaa3:     {
+1:3bdcaa3:         if (this.builder != null)
+1:3bdcaa3:         {
+1:3bdcaa3:             this.builder.stop();
+1:3bdcaa3:             this.builder = null;
+1:3bdcaa3:         }
+1:3bdcaa3: 
+1:a3a8dbc:         this.builder = new ViewBuilder(baseCfs, this);
+1:a3a8dbc:         CompactionManager.instance.submitViewBuilder(builder);
+1:3bdcaa3:     }
+1:3bdcaa3: 
+1:1a9286c:     @Nullable
+1:a3a8dbc:     public static CFMetaData findBaseTable(String keyspace, String viewName)
+1:3bdcaa3:     {
+1:a3a8dbc:         ViewDefinition view = Schema.instance.getView(keyspace, viewName);
+1:a3a8dbc:         return (view == null) ? null : Schema.instance.getCFMetaData(view.baseTableId);
+1:3bdcaa3:     }
+1:3bdcaa3: 
+1:a3a8dbc:     public static Iterable<ViewDefinition> findAll(String keyspace, String baseTable)
+1:3bdcaa3:     {
+1:a3a8dbc:         KeyspaceMetadata ksm = Schema.instance.getKSMetaData(keyspace);
+1:a3a8dbc:         final UUID baseId = Schema.instance.getId(keyspace, baseTable);
+1:a3a8dbc:         return Iterables.filter(ksm.views, view -> view.baseTableId.equals(baseId));
+1:3bdcaa3:     }
+1:3bdcaa3: 
+1:3bdcaa3:     /**
+1:5a4253b:      * Builds the string text for a materialized view's SELECT statement.
+1:3bdcaa3:      */
+1:5a4253b:     public static String buildSelectStatement(String cfName, Collection<ColumnDefinition> includedColumns, String whereClause)
+1:3bdcaa3:     {
+1:5a4253b:          StringBuilder rawSelect = new StringBuilder("SELECT ");
+1:5a4253b:         if (includedColumns == null || includedColumns.isEmpty())
+1:5a4253b:             rawSelect.append("*");
+1:9f335fe:         else
+1:5a4253b:             rawSelect.append(includedColumns.stream().map(id -> id.name.toCQLString()).collect(Collectors.joining(", ")));
+1:5a4253b:         rawSelect.append(" FROM \"").append(cfName).append("\" WHERE ") .append(whereClause).append(" ALLOW FILTERING");
+1:5a4253b:         return rawSelect.toString();
+1:3bdcaa3:     }
+1:3bdcaa3: 
+1:5a4253b:     public static String relationsToWhereClause(List<Relation> whereClause)
+1:3bdcaa3:     {
+1:5a4253b:         List<String> expressions = new ArrayList<>(whereClause.size());
+1:5a4253b:         for (Relation rel : whereClause)
+1:3bdcaa3:         {
+1:5a4253b:             StringBuilder sb = new StringBuilder();
+1:3bdcaa3: 
+1:5a4253b:             if (rel.isMultiColumn())
+1:3bdcaa3:             {
+1:5a4253b:                 sb.append(((MultiColumnRelation) rel).getEntities().stream()
+1:4ed0060:                         .map(ColumnDefinition.Raw::toString)
+1:5a4253b:                         .collect(Collectors.joining(", ", "(", ")")));
+1:3bdcaa3:             }
+1:3bdcaa3:             else
+1:3bdcaa3:             {
+1:4ed0060:                 sb.append(((SingleColumnRelation) rel).getEntity());
+1:3bdcaa3:             }
+1:3bdcaa3: 
+1:5a4253b:             sb.append(" ").append(rel.operator()).append(" ");
+1:3bdcaa3: 
+1:5a4253b:             if (rel.isIN())
+1:3bdcaa3:             {
+1:5a4253b:                 sb.append(rel.getInValues().stream()
+1:5a4253b:                         .map(Term.Raw::getText)
+1:5a4253b:                         .collect(Collectors.joining(", ", "(", ")")));
+1:3bdcaa3:             }
+3:5a4253b:             else
+1:3bdcaa3:             {
+1:5a4253b:                 sb.append(rel.getValue().getText());
+1:3bdcaa3:             }
+1:3bdcaa3: 
+1:5a4253b:             expressions.add(sb.toString());
+1:3bdcaa3:         }
+1:3bdcaa3: 
+1:5a4253b:         return expressions.stream().collect(Collectors.joining(" AND "));
+1:3bdcaa3:     }
+1:3bdcaa3: }
+============================================================================
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:79c5bc3
+/////////////////////////////////////////////////////////////////////////
+commit:f2251aa
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:4ed0060
+/////////////////////////////////////////////////////////////////////////
+1:                         .map(ColumnDefinition.Raw::toString)
+1:                 sb.append(((SingleColumnRelation) rel).getEntity());
+commit:86ba227
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.partitions.*;
+0: import org.apache.cassandra.utils.btree.BTreeSet;
+/////////////////////////////////////////////////////////////////////////
+1:     public volatile List<ColumnDefinition> baseNonPKColumnsInViewPK;
+/////////////////////////////////////////////////////////////////////////
+1:         this.name = definition.viewName;
+1:         this.includeAllColumns = definition.includeAllColumns;
+1: 
+1:         updateDefinition(definition);
+/////////////////////////////////////////////////////////////////////////
+1:     public void updateDefinition(ViewDefinition definition)
+1:         List<ColumnDefinition> nonPKDefPartOfViewPK = new ArrayList<>();
+1:         for (ColumnDefinition baseColumn : baseCfs.metadata.allColumns())
+1:             ColumnDefinition viewColumn = getViewColumn(baseColumn);
+1:             if (viewColumn != null && !baseColumn.isPrimaryKeyColumn() && viewColumn.isPrimaryKeyColumn())
+1:                 nonPKDefPartOfViewPK.add(baseColumn);
+1:         this.baseNonPKColumnsInViewPK = nonPKDefPartOfViewPK;
+1:      * The view column corresponding to the provided base column. This <b>can</b>
+1:      * return {@code null} if the column is denormalized in the view.
+1:     public ColumnDefinition getViewColumn(ColumnDefinition baseColumn)
+1:         return definition.metadata.getColumnDefinition(baseColumn.name);
+1:     }
+1:     /**
+1:      * The base column corresponding to the provided view column. This should
+1:      * never return {@code null} since a view can't have its "own" columns.
+1:      */
+1:     public ColumnDefinition getBaseColumn(ColumnDefinition viewColumn)
+1:     {
+1:         ColumnDefinition baseColumn = baseCfs.metadata.getColumnDefinition(viewColumn.name);
+1:         assert baseColumn != null;
+1:         return baseColumn;
+1:     }
+1: 
+1:     /**
+1:      * Whether the view might be affected by the provided update.
+1:      * <p>
+1:      * Note that having this method return {@code true} is not an absolute guarantee that the view will be
+1:      * updated, just that it most likely will, but a {@code false} return guarantees it won't be affected).
+1:      *
+1:      * @param partitionKey the partition key that is updated.
+1:      * @param update the update being applied.
+1:      * @return {@code false} if we can guarantee that inserting {@code update} for key {@code partitionKey}
+1:      * won't affect the view in any way, {@code true} otherwise.
+1:      */
+1:     public boolean mayBeAffectedBy(DecoratedKey partitionKey, Row update)
+1:     {
+1:         // We can guarantee that the view won't be affected if:
+1:         //  - the clustering is excluded by the view filter (note that this isn't true of the filter on regular columns:
+1:         //    even if an update don't match a view condition on a regular column, that update can still invalidate an pre-existing
+1:         //    entry).
+1:         //  - or the update don't modify any of the columns impacting the view (where "impacting" the view means that column is
+1:         //    neither included in the view, nor used by the view filter).
+1:         if (!getReadQuery().selectsClustering(partitionKey, update.clustering()))
+1:         // We want to find if the update modify any of the columns that are part of the view (in which case the view is affected).
+1:         // But if the view include all the base table columns, or the update has either a row deletion or a row liveness (note
+1:         // that for the liveness, it would be more "precise" to check if it's live, but pushing an update that is already expired
+1:         // is dump so it's ok not to optimize for it and it saves us from having to pass nowInSec to the method), we know the view
+1:         // is affected right away.
+1:         if (includeAllColumns || !update.deletion().isLive() || !update.primaryKeyLivenessInfo().isEmpty())
+1:         for (ColumnData data : update)
+1:             if (definition.metadata.getColumnDefinition(data.column().name) != null)
+1:      * Whether a given base row matches the view filter (and thus if is should have a corresponding entry).
+1:      * <p>
+1:      * Note that this differs from {@link #mayBeAffectedBy} in that the provide row <b>must</b> be the current
+1:      * state of the base row, not just some updates to it. This method also has no false positive: a base
+1:      * row either do or don't match the view filter.
+1:      * @param partitionKey the partition key that is updated.
+1:      * @param baseRow the current state of a particular base row.
+1:      * @param nowInSec the current time in seconds (to decide what is live and what isn't).
+1:      * @return {@code true} if {@code baseRow} matches the view filters, {@code false} otherwise.
+1:     public boolean matchesViewFilter(DecoratedKey partitionKey, Row baseRow, int nowInSec)
+1:         return getReadQuery().selectsClustering(partitionKey, baseRow.clustering())
+1:             && getSelectStatement().rowFilterForInternalCalls().isSatisfiedBy(baseCfs.metadata, partitionKey, baseRow, nowInSec);
+/////////////////////////////////////////////////////////////////////////
+commit:b99c863
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.transport.Server;
+/////////////////////////////////////////////////////////////////////////
+0:                 QueryPager pager = command.getPager(null, Server.CURRENT_VERSION);
+/////////////////////////////////////////////////////////////////////////
+0:         QueryPager pager = builder.build().getPager(null, Server.CURRENT_VERSION);
+commit:665f747
+/////////////////////////////////////////////////////////////////////////
+0:                                             Row.Deletion deletion,
+0:         builder.addRowDeletion(deletion);
+/////////////////////////////////////////////////////////////////////////
+0:                                Row.Deletion.shadowable(new DeletionTime(temporalRow.viewClusteringTimestamp(), temporalRow.nowInSec)),
+/////////////////////////////////////////////////////////////////////////
+0:                         PartitionUpdate update = createTombstone(temporalRow, value, Row.Deletion.regular(deletionTime), resolver, temporalRow.nowInSec);
+author:Carl Yeksigian
+-------------------------------------------------------------------------------
+commit:9961b69
+/////////////////////////////////////////////////////////////////////////
+0:             if (cdef.isComplex() && definition.includes(cdef.name))
+commit:9f335fe
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.AbstractReadCommandBuilder;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.FBUtilities;
+/////////////////////////////////////////////////////////////////////////
+0:             if (row.primaryKeyLivenessInfo().isLive(FBUtilities.nowInSeconds()))
+1:                 return true;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:             if (!deletionInfo.getPartitionDeletion().isLive())
+1:             {
+0:                 command = SinglePartitionReadCommand.fullPartitionRead(baseCfs.metadata, rowSet.nowInSec, dk);
+1:             }
+1:             else
+/////////////////////////////////////////////////////////////////////////
+commit:a3a8dbc
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.UUID;
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.config.ViewDefinition;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:  * A View copies data from a base table into a view table which can be queried independently from the
+1:  * base. Every update which targets the base table must be fed through the {@link ViewManager} to ensure
+0:  * {@link View#createMutations(AbstractBTreePartition, TemporalRow.Set, boolean)} is the "main method"
+1: public class View
+0:     private static class Columns
+/////////////////////////////////////////////////////////////////////////
+0:         private Columns(List<ColumnDefinition> partitionDefs, List<ColumnDefinition> primaryKeyDefs, List<ColumnDefinition> baseComplexColumns)
+/////////////////////////////////////////////////////////////////////////
+1:     private volatile ViewDefinition definition;
+0:     private Columns columns;
+1:     private final boolean includeAllColumns;
+1:     private ViewBuilder builder;
+1:     public View(ViewDefinition definition,
+1:                 ColumnFamilyStore baseCfs)
+0:         includeAllColumns = definition.includeAllColumns;
+1:     public ViewDefinition getDefinition()
+1:         return definition;
+/////////////////////////////////////////////////////////////////////////
+0:     public boolean updateDefinition(ViewDefinition definition)
+1:         this.definition = definition;
+1: 
+0:         CFMetaData viewCfm = definition.metadata;
+0:         List<ColumnDefinition> partitionDefs = new ArrayList<>(viewCfm.partitionKeyColumns().size());
+0:         List<ColumnDefinition> primaryKeyDefs = new ArrayList<>(viewCfm.partitionKeyColumns().size()
+0:                                                                 + viewCfm.clusteringColumns().size());
+0:         boolean partitionAllPrimaryKeyColumns = resolveAndAddColumns(Iterables.transform(viewCfm.partitionKeyColumns(), cd -> cd.name), primaryKeyDefs, partitionDefs);
+0:         boolean clusteringAllPrimaryKeyColumns = resolveAndAddColumns(Iterables.transform(viewCfm.clusteringColumns(), cd -> cd.name), primaryKeyDefs);
+/////////////////////////////////////////////////////////////////////////
+0:         this.columns = new Columns(partitionDefs, primaryKeyDefs, baseComplexColumns);
+/////////////////////////////////////////////////////////////////////////
+0:         if (includeAllColumns)
+0:         // If there are range tombstones, tombstones will also need to be generated for the view
+/////////////////////////////////////////////////////////////////////////
+0:                 if (definition.metadata.getColumnDefinition(data.column().name) != null)
+/////////////////////////////////////////////////////////////////////////
+0:         CFMetaData viewCfm = definition.metadata;
+0:         CBuilder clustering = CBuilder.create(viewCfm.comparator);
+/////////////////////////////////////////////////////////////////////////
+0:         CFMetaData viewCfm = definition.metadata;
+/////////////////////////////////////////////////////////////////////////
+0:         CFMetaData viewCfm = definition.metadata;
+/////////////////////////////////////////////////////////////////////////
+0:         CFMetaData metadata = definition.metadata;
+/////////////////////////////////////////////////////////////////////////
+0:      * @return Mutation which is the transformed base table mutation for the view.
+0:         CFMetaData viewCfm = definition.metadata;
+/////////////////////////////////////////////////////////////////////////
+0:         CBuilder clustering = CBuilder.create(viewCfm.comparator);
+0:         for (int i = 0; i < viewCfm.clusteringColumns().size(); i++)
+0:             clustering.add(temporalRow.clusteringValue(viewCfm.clusteringColumns().get(i), resolver));
+0:         regularBuilder.addPrimaryKeyLivenessInfo(LivenessInfo.create(viewCfm,
+0:         for (ColumnDefinition columnDefinition : viewCfm.allColumns())
+/////////////////////////////////////////////////////////////////////////
+0:         return PartitionUpdate.singleRowUpdate(viewCfm, partitionKey, regularBuilder.build());
+/////////////////////////////////////////////////////////////////////////
+0:         TemporalRow.Set rowSet;
+/////////////////////////////////////////////////////////////////////////
+1:         this.builder = new ViewBuilder(baseCfs, this);
+1:         CompactionManager.instance.submitViewBuilder(builder);
+1:     public static CFMetaData findBaseTable(String keyspace, String viewName)
+1:         ViewDefinition view = Schema.instance.getView(keyspace, viewName);
+1:         return (view == null) ? null : Schema.instance.getCFMetaData(view.baseTableId);
+1:     public static Iterable<ViewDefinition> findAll(String keyspace, String baseTable)
+1:         KeyspaceMetadata ksm = Schema.instance.getKSMetaData(keyspace);
+1:         final UUID baseId = Schema.instance.getId(keyspace, baseTable);
+1:         return Iterables.filter(ksm.views, view -> view.baseTableId.equals(baseId));
+commit:2fcfc7c
+/////////////////////////////////////////////////////////////////////////
+0:         // Check each row for deletion or update
+0:             if (row.hasComplexDeletion())
+1:                 return true;
+0:             if (!row.deletion().isLive())
+1:                 return true;
+1: 
+commit:3bdcaa3
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.db.view;
+1: 
+0: import java.nio.ByteBuffer;
+0: import java.util.ArrayList;
+0: import java.util.Collection;
+0: import java.util.HashSet;
+0: import java.util.Iterator;
+0: import java.util.LinkedList;
+0: import java.util.List;
+0: import java.util.Set;
+1: 
+1: import com.google.common.collect.Iterables;
+1: 
+0: import org.apache.cassandra.config.CFMetaData;
+0: import org.apache.cassandra.config.ColumnDefinition;
+0: import org.apache.cassandra.config.MaterializedViewDefinition;
+0: import org.apache.cassandra.config.Schema;
+0: import org.apache.cassandra.cql3.ColumnIdentifier;
+0: import org.apache.cassandra.cql3.statements.CFProperties;
+0: import org.apache.cassandra.db.AbstractReadCommandBuilder.SinglePartitionSliceBuilder;
+0: import org.apache.cassandra.db.CBuilder;
+0: import org.apache.cassandra.db.Clustering;
+0: import org.apache.cassandra.db.ColumnFamilyStore;
+0: import org.apache.cassandra.db.DecoratedKey;
+0: import org.apache.cassandra.db.DeletionInfo;
+0: import org.apache.cassandra.db.DeletionTime;
+0: import org.apache.cassandra.db.Keyspace;
+0: import org.apache.cassandra.db.LivenessInfo;
+0: import org.apache.cassandra.db.Mutation;
+0: import org.apache.cassandra.db.RangeTombstone;
+0: import org.apache.cassandra.db.ReadCommand;
+0: import org.apache.cassandra.db.ReadOrderGroup;
+0: import org.apache.cassandra.db.SinglePartitionReadCommand;
+0: import org.apache.cassandra.db.Slice;
+1: import org.apache.cassandra.db.compaction.CompactionManager;
+0: import org.apache.cassandra.db.partitions.AbstractThreadUnsafePartition;
+0: import org.apache.cassandra.db.partitions.PartitionIterator;
+0: import org.apache.cassandra.db.partitions.PartitionUpdate;
+0: import org.apache.cassandra.db.rows.BTreeBackedRow;
+0: import org.apache.cassandra.db.rows.Cell;
+0: import org.apache.cassandra.db.rows.ColumnData;
+0: import org.apache.cassandra.db.rows.ComplexColumnData;
+0: import org.apache.cassandra.db.rows.Row;
+0: import org.apache.cassandra.db.rows.RowIterator;
+0: import org.apache.cassandra.service.pager.QueryPager;
+1: 
+1: /**
+0:  * A Materialized View copies data from a base table into a view table which can be queried independently from the
+0:  * base. Every update which targets the base table must be fed through the {@link MaterializedViewManager} to ensure
+1:  * that if a view needs to be updated, the updates are properly created and fed into the view.
+1:  *
+0:  * This class does the job of translating the base row to the view row.
+1:  *
+0:  * It handles reading existing state and figuring out what tombstones need to be generated.
+1:  *
+0:  * createMutations below is the "main method"
+1:  *
+1:  */
+0: public class MaterializedView
+1: {
+1:     /**
+0:      * The columns should all be updated together, so we use this object as group.
+1:      */
+0:     private static class MVColumns
+1:     {
+0:         //These are the base column definitions in terms of the *views* partitioning.
+0:         //Meaning we can see (for example) the partition key of the view contains a clustering key
+0:         //from the base table.
+0:         public final List<ColumnDefinition> partitionDefs;
+0:         public final List<ColumnDefinition> primaryKeyDefs;
+0:         public final List<ColumnDefinition> baseComplexColumns;
+1: 
+0:         private MVColumns(List<ColumnDefinition> partitionDefs, List<ColumnDefinition> primaryKeyDefs, List<ColumnDefinition> baseComplexColumns)
+1:         {
+0:             this.partitionDefs = partitionDefs;
+0:             this.primaryKeyDefs = primaryKeyDefs;
+0:             this.baseComplexColumns = baseComplexColumns;
+1:         }
+1:     }
+1: 
+1:     public final String name;
+1: 
+1:     private final ColumnFamilyStore baseCfs;
+0:     private ColumnFamilyStore _viewCfs = null;
+1: 
+0:     private MVColumns columns;
+1: 
+0:     private final boolean viewHasAllPrimaryKeys;
+0:     private final boolean includeAll;
+0:     private MaterializedViewBuilder builder;
+1: 
+0:     public MaterializedView(MaterializedViewDefinition definition,
+0:                             ColumnFamilyStore baseCfs)
+1:     {
+1:         this.baseCfs = baseCfs;
+1: 
+0:         name = definition.viewName;
+0:         includeAll = definition.includeAll;
+1: 
+0:         viewHasAllPrimaryKeys = updateDefinition(definition);
+1:     }
+1: 
+1:     /**
+0:      * Lazily fetch the CFS instance for the view.
+0:      * We do this lazily to avoid initilization issues.
+1:      *
+0:      * @return The views CFS instance
+1:      */
+0:     public ColumnFamilyStore getViewCfs()
+1:     {
+0:         if (_viewCfs == null)
+0:             _viewCfs = Keyspace.openAndGetStore(Schema.instance.getCFMetaData(baseCfs.keyspace.getName(), name));
+1: 
+0:         return _viewCfs;
+1:     }
+1: 
+1: 
+1:     /**
+0:      * Lookup column definitions in the base table that correspond to the view columns (should be 1:1)
+1:      *
+0:      * Notify caller if all primary keys in the view are ALL primary keys in the base. We do this to simplify
+0:      * tombstone checks.
+1:      *
+0:      * @param columns a list of columns to lookup in the base table
+0:      * @param definitions lists to populate for the base table definitions
+0:      * @return true if all view PKs are also Base PKs
+1:      */
+0:     private boolean resolveAndAddColumns(Iterable<ColumnIdentifier> columns, List<ColumnDefinition>... definitions)
+1:     {
+0:         boolean allArePrimaryKeys = true;
+0:         for (ColumnIdentifier identifier : columns)
+1:         {
+0:             ColumnDefinition cdef = baseCfs.metadata.getColumnDefinition(identifier);
+0:             assert cdef != null : "Could not resolve column " + identifier.toString();
+1: 
+0:             for (List<ColumnDefinition> list : definitions)
+1:             {
+0:                 list.add(cdef);
+1:             }
+1: 
+0:             allArePrimaryKeys = allArePrimaryKeys && cdef.isPrimaryKeyColumn();
+1:         }
+1: 
+0:         return allArePrimaryKeys;
+1:     }
+1: 
+1:     /**
+1:      * This updates the columns stored which are dependent on the base CFMetaData.
+1:      *
+0:      * @return true if the view contains only columns which are part of the base's primary key; false if there is at
+0:      *         least one column which is not.
+1:      */
+0:     public boolean updateDefinition(MaterializedViewDefinition definition)
+1:     {
+0:         List<ColumnDefinition> partitionDefs = new ArrayList<>(definition.partitionColumns.size());
+0:         List<ColumnDefinition> primaryKeyDefs = new ArrayList<>(definition.partitionColumns.size()
+0:                                                                 + definition.clusteringColumns.size());
+0:         List<ColumnDefinition> baseComplexColumns = new ArrayList<>();
+1: 
+0:         // We only add the partition columns to the partitions list, but both partition columns and clustering
+0:         // columns are added to the primary keys list
+0:         boolean partitionAllPrimaryKeyColumns = resolveAndAddColumns(definition.partitionColumns, primaryKeyDefs, partitionDefs);
+0:         boolean clusteringAllPrimaryKeyColumns = resolveAndAddColumns(definition.clusteringColumns, primaryKeyDefs);
+1: 
+0:         for (ColumnDefinition cdef : baseCfs.metadata.allColumns())
+1:         {
+0:             if (cdef.isComplex())
+1:             {
+0:                 baseComplexColumns.add(cdef);
+1:             }
+1:         }
+1: 
+0:         this.columns = new MVColumns(partitionDefs, primaryKeyDefs, baseComplexColumns);
+1: 
+0:         return partitionAllPrimaryKeyColumns && clusteringAllPrimaryKeyColumns;
+1:     }
+1: 
+1:     /**
+0:      * Check to see if the update could possibly modify a view. Cases where the view may be updated are:
+0:      * <ul>
+0:      *     <li>View selects all columns</li>
+0:      *     <li>Update contains any range tombstones</li>
+0:      *     <li>Update touches one of the columns included in the view</li>
+0:      * </ul>
+1:      *
+0:      * If the update contains any range tombstones, there is a possibility that it will not touch a range that is
+0:      * currently included in the view.
+1:      *
+0:      * @return true if {@param partition} modifies a column included in the view
+1:      */
+0:     public boolean updateAffectsView(AbstractThreadUnsafePartition partition)
+1:     {
+0:         // If we are including all of the columns, then any update will be included
+0:         if (includeAll)
+0:             return true;
+1: 
+0:         // If there are range tombstones, tombstones will also need to be generated for the materialized view
+0:         // This requires a query of the base rows and generating tombstones for all of those values
+0:         if (!partition.deletionInfo().isLive())
+0:             return true;
+1: 
+0:         // Check whether the update touches any of the columns included in the view
+0:         for (Row row : partition)
+1:         {
+0:             for (ColumnData data : row)
+1:             {
+0:                 if (getViewCfs().metadata.getColumnDefinition(data.column().name) != null)
+0:                     return true;
+1:             }
+1:         }
+1: 
+1:         return false;
+1:     }
+1: 
+1:     /**
+0:      * Creates the clustering columns for the view based on the specified row and resolver policy
+1:      *
+0:      * @param temporalRow The current row
+0:      * @param resolver The policy to use when selecting versions of cells use
+0:      * @return The clustering object to use for the view
+1:      */
+0:     private Clustering viewClustering(TemporalRow temporalRow, TemporalRow.Resolver resolver)
+1:     {
+0:         CFMetaData viewCfm = getViewCfs().metadata;
+0:         int numViewClustering = viewCfm.clusteringColumns().size();
+0:         CBuilder clustering = CBuilder.create(getViewCfs().getComparator());
+0:         for (int i = 0; i < numViewClustering; i++)
+1:         {
+0:             ColumnDefinition definition = viewCfm.clusteringColumns().get(i);
+0:             clustering.add(temporalRow.clusteringValue(definition, resolver));
+1:         }
+1: 
+0:         return clustering.build();
+1:     }
+1: 
+1:     /**
+0:      * @return Mutation containing a range tombstone for a base partition key and TemporalRow.
+1:      */
+0:     private PartitionUpdate createTombstone(TemporalRow temporalRow,
+0:                                             DecoratedKey partitionKey,
+0:                                             DeletionTime deletionTime,
+0:                                             TemporalRow.Resolver resolver,
+0:                                             int nowInSec)
+1:     {
+0:         CFMetaData viewCfm = getViewCfs().metadata;
+0:         Row.Builder builder = BTreeBackedRow.unsortedBuilder(viewCfm.partitionColumns().regulars, nowInSec);
+0:         builder.newRow(viewClustering(temporalRow, resolver));
+0:         builder.addRowDeletion(deletionTime);
+0:         return PartitionUpdate.singleRowUpdate(viewCfm, partitionKey, builder.build());
+1:     }
+1: 
+1:     /**
+0:      * @return PartitionUpdate containing a complex tombstone for a TemporalRow, and the collection's column identifier.
+1:      */
+0:     private PartitionUpdate createComplexTombstone(TemporalRow temporalRow,
+0:                                                    DecoratedKey partitionKey,
+0:                                                    ColumnDefinition deletedColumn,
+0:                                                    DeletionTime deletionTime,
+0:                                                    TemporalRow.Resolver resolver,
+0:                                                    int nowInSec)
+1:     {
+1: 
+0:         CFMetaData viewCfm = getViewCfs().metadata;
+0:         Row.Builder builder = BTreeBackedRow.unsortedBuilder(viewCfm.partitionColumns().regulars, nowInSec);
+0:         builder.newRow(viewClustering(temporalRow, resolver));
+0:         builder.addComplexDeletion(deletedColumn, deletionTime);
+0:         return PartitionUpdate.singleRowUpdate(viewCfm, partitionKey, builder.build());
+1:     }
+1: 
+1:     /**
+0:      * @return View's DecoratedKey or null, if one of the view's primary key components has an invalid resolution from
+0:      *         the TemporalRow and its Resolver
+1:      */
+0:     private DecoratedKey viewPartitionKey(TemporalRow temporalRow, TemporalRow.Resolver resolver)
+1:     {
+0:         List<ColumnDefinition> partitionDefs = this.columns.partitionDefs;
+0:         Object[] partitionKey = new Object[partitionDefs.size()];
+1: 
+0:         for (int i = 0; i < partitionKey.length; i++)
+1:         {
+0:             ByteBuffer value = temporalRow.clusteringValue(partitionDefs.get(i), resolver);
+1: 
+0:             if (value == null)
+0:                 return null;
+1: 
+0:             partitionKey[i] = value;
+1:         }
+1: 
+0:         return getViewCfs().partitioner.decorateKey(CFMetaData.serializePartitionKey(getViewCfs().metadata
+0:                                                                                      .getKeyValidatorAsClusteringComparator()
+0:                                                                                      .make(partitionKey)));
+1:     }
+1: 
+1:     /**
+0:      * @return mutation which contains the tombstone for the referenced TemporalRow, or null if not necessary.
+0:      * TemporalRow's can reference at most one view row; there will be at most one row to be tombstoned, so only one
+0:      * mutation is necessary
+1:      */
+0:     private PartitionUpdate createRangeTombstoneForRow(TemporalRow temporalRow)
+1:     {
+0:         // Primary Key and Clustering columns do not generate tombstones
+0:         if (viewHasAllPrimaryKeys)
+0:             return null;
+1: 
+0:         boolean hasUpdate = false;
+0:         List<ColumnDefinition> primaryKeyDefs = this.columns.primaryKeyDefs;
+0:         for (ColumnDefinition viewPartitionKeys : primaryKeyDefs)
+1:         {
+0:             if (!viewPartitionKeys.isPrimaryKeyColumn() && temporalRow.clusteringValue(viewPartitionKeys, TemporalRow.oldValueIfUpdated) != null)
+0:                 hasUpdate = true;
+1:         }
+1: 
+0:         if (!hasUpdate)
+0:             return null;
+1: 
+0:         TemporalRow.Resolver resolver = TemporalRow.earliest;
+0:         return createTombstone(temporalRow,
+0:                                viewPartitionKey(temporalRow, resolver),
+0:                                new DeletionTime(temporalRow.viewClusteringTimestamp(), temporalRow.nowInSec),
+0:                                resolver,
+0:                                temporalRow.nowInSec);
+1:     }
+1: 
+1:     /**
+0:      * @return Mutation which is the transformed base table mutation for the materialized view.
+1:      */
+0:     private PartitionUpdate createUpdatesForInserts(TemporalRow temporalRow)
+1:     {
+0:         TemporalRow.Resolver resolver = TemporalRow.latest;
+1: 
+0:         DecoratedKey partitionKey = viewPartitionKey(temporalRow, resolver);
+0:         ColumnFamilyStore viewCfs = getViewCfs();
+1: 
+0:         if (partitionKey == null)
+1:         {
+0:             // Not having a partition key means we aren't updating anything
+0:             return null;
+1:         }
+1: 
+0:         Row.Builder regularBuilder = BTreeBackedRow.unsortedBuilder(viewCfs.metadata.partitionColumns().regulars, temporalRow.nowInSec);
+1: 
+0:         CBuilder clustering = CBuilder.create(viewCfs.getComparator());
+0:         for (int i = 0; i < viewCfs.metadata.clusteringColumns().size(); i++)
+1:         {
+0:             clustering.add(temporalRow.clusteringValue(viewCfs.metadata.clusteringColumns().get(i), resolver));
+1:         }
+0:         regularBuilder.newRow(clustering.build());
+0:         regularBuilder.addPrimaryKeyLivenessInfo(LivenessInfo.create(viewCfs.metadata,
+0:                                                                      temporalRow.viewClusteringTimestamp(),
+0:                                                                      temporalRow.viewClusteringTtl(),
+0:                                                                      temporalRow.viewClusteringLocalDeletionTime()));
+1: 
+0:         for (ColumnDefinition columnDefinition : viewCfs.metadata.allColumns())
+1:         {
+0:             if (columnDefinition.isPrimaryKeyColumn())
+0:                 continue;
+1: 
+0:             for (Cell cell : temporalRow.values(columnDefinition, resolver))
+1:             {
+0:                 regularBuilder.addCell(cell);
+1:             }
+1:         }
+1: 
+0:         return PartitionUpdate.singleRowUpdate(viewCfs.metadata, partitionKey, regularBuilder.build());
+1:     }
+1: 
+1:     /**
+0:      * @param partition Update which possibly contains deletion info for which to generate view tombstones.
+0:      * @return    View Tombstones which delete all of the rows which have been removed from the base table with
+0:      *            {@param partition}
+1:      */
+0:     private Collection<Mutation> createForDeletionInfo(TemporalRow.Set rowSet, AbstractThreadUnsafePartition partition)
+1:     {
+0:         final TemporalRow.Resolver resolver = TemporalRow.earliest;
+1: 
+0:         DeletionInfo deletionInfo = partition.deletionInfo();
+1: 
+0:         List<Mutation> mutations = new ArrayList<>();
+1: 
+0:         // Check the complex columns to see if there are any which may have tombstones we need to create for the view
+0:         if (!columns.baseComplexColumns.isEmpty())
+1:         {
+0:             for (Row row : partition)
+1:             {
+0:                 if (!row.hasComplexDeletion())
+0:                     continue;
+1: 
+0:                 TemporalRow temporalRow = rowSet.getClustering(row.clustering());
+1: 
+0:                 assert temporalRow != null;
+1: 
+0:                 for (ColumnDefinition definition : columns.baseComplexColumns)
+1:                 {
+0:                     ComplexColumnData columnData = row.getComplexColumnData(definition);
+1: 
+0:                     if (columnData != null)
+1:                     {
+0:                         DeletionTime time = columnData.complexDeletion();
+0:                         if (!time.isLive())
+1:                         {
+0:                             DecoratedKey targetKey = viewPartitionKey(temporalRow, resolver);
+0:                             if (targetKey != null)
+0:                                 mutations.add(new Mutation(createComplexTombstone(temporalRow, targetKey, definition, time, resolver, temporalRow.nowInSec)));
+1:                         }
+1:                     }
+1:                 }
+1:             }
+1:         }
+1: 
+0:         ReadCommand command = null;
+1: 
+0:         if (!deletionInfo.isLive())
+1:         {
+0:             // We have to generate tombstones for all of the affected rows, but we don't have the information in order
+0:             // to create them. This requires that we perform a read for the entire range that is being tombstoned, and
+0:             // generate a tombstone for each. This may be slow, because a single range tombstone can cover up to an
+0:             // entire partition of data which is not distributed on a single partition node.
+0:             DecoratedKey dk = rowSet.dk;
+1: 
+0:             if (deletionInfo.hasRanges())
+1:             {
+0:                 SinglePartitionSliceBuilder builder = new SinglePartitionSliceBuilder(baseCfs, dk);
+0:                 Iterator<RangeTombstone> tombstones = deletionInfo.rangeIterator(false);
+0:                 while (tombstones.hasNext())
+1:                 {
+0:                     RangeTombstone tombstone = tombstones.next();
+1: 
+0:                     builder.addSlice(tombstone.deletedSlice());
+1:                 }
+1: 
+0:                 command = builder.build();
+1:             }
+1:             else
+1:             {
+0:                 command = SinglePartitionReadCommand.fullPartitionRead(baseCfs.metadata, rowSet.nowInSec, dk);
+1:             }
+1:         }
+1: 
+0:         if (command == null)
+1:         {
+0:             SinglePartitionSliceBuilder builder = null;
+0:             for (Row row : partition)
+1:             {
+0:                 if (!row.deletion().isLive())
+1:                 {
+0:                     if (builder == null)
+0:                         builder = new SinglePartitionSliceBuilder(baseCfs, rowSet.dk);
+0:                     builder.addSlice(Slice.make(row.clustering()));
+1:                 }
+1:             }
+1: 
+0:             if (builder != null)
+0:                 command = builder.build();
+1:         }
+1: 
+0:         if (command != null)
+1:         {
+0:             QueryPager pager = command.getPager(null);
+1: 
+0:             // Add all of the rows which were recovered from the query to the row set
+0:             while (!pager.isExhausted())
+1:             {
+0:                 try (ReadOrderGroup orderGroup = pager.startOrderGroup();
+0:                      PartitionIterator iter = pager.fetchPageInternal(128, orderGroup))
+1:                 {
+0:                     if (!iter.hasNext())
+0:                         break;
+1: 
+0:                     try (RowIterator rowIterator = iter.next())
+1:                     {
+0:                         while (rowIterator.hasNext())
+1:                         {
+0:                             Row row = rowIterator.next();
+0:                             rowSet.addRow(row, false);
+1:                         }
+1:                     }
+1:                 }
+1:             }
+1: 
+0:             // If the temporal row has been deleted by the deletion info, we generate the corresponding range tombstone
+0:             // for the view.
+0:             for (TemporalRow temporalRow : rowSet)
+1:             {
+0:                 DeletionTime deletionTime = temporalRow.deletionTime(partition);
+0:                 if (!deletionTime.isLive())
+1:                 {
+0:                     DecoratedKey value = viewPartitionKey(temporalRow, resolver);
+0:                     if (value != null)
+1:                     {
+0:                         PartitionUpdate update = createTombstone(temporalRow, value, deletionTime, resolver, temporalRow.nowInSec);
+0:                         if (update != null)
+0:                             mutations.add(new Mutation(update));
+1:                     }
+1:                 }
+1:             }
+1:         }
+1: 
+0:         return !mutations.isEmpty() ? mutations : null;
+1:     }
+1: 
+1:     /**
+0:      * Read and update temporal rows in the set which have corresponding values stored on the local node
+1:      */
+0:     private void readLocalRows(TemporalRow.Set rowSet)
+1:     {
+0:         SinglePartitionSliceBuilder builder = new SinglePartitionSliceBuilder(baseCfs, rowSet.dk);
+1: 
+0:         for (TemporalRow temporalRow : rowSet)
+0:             builder.addSlice(temporalRow.baseSlice());
+1: 
+0:         QueryPager pager = builder.build().getPager(null);
+1: 
+0:         while (!pager.isExhausted())
+1:         {
+0:             try (ReadOrderGroup orderGroup = pager.startOrderGroup();
+0:                  PartitionIterator iter = pager.fetchPageInternal(128, orderGroup))
+1:             {
+0:                 while (iter.hasNext())
+1:                 {
+0:                     try (RowIterator rows = iter.next())
+1:                     {
+0:                         while (rows.hasNext())
+1:                         {
+0:                             rowSet.addRow(rows.next(), false);
+1:                         }
+1:                     }
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+0:      * @return Set of rows which are contained in the partition update {@param partition}
+1:      */
+0:     private TemporalRow.Set separateRows(ByteBuffer key, AbstractThreadUnsafePartition partition)
+1:     {
+0:         Set<ColumnIdentifier> columns = new HashSet<>();
+0:         for (ColumnDefinition def : this.columns.primaryKeyDefs)
+0:             columns.add(def.name);
+1: 
+0:         TemporalRow.Set rowSet = new TemporalRow.Set(baseCfs, columns, key);
+0:         for (Row row : partition)
+0:             rowSet.addRow(row, true);
+1: 
+0:         return rowSet;
+1:     }
+1: 
+1:     /**
+0:      * @param isBuilding If the view is currently being built, we do not query the values which are already stored,
+0:      *                   since all of the update will already be present in the base table.
+0:      * @return View mutations which represent the changes necessary as long as previously created mutations for the view
+0:      *         have been applied successfully. This is based solely on the changes that are necessary given the current
+0:      *         state of the base table and the newly applying partition data.
+1:      */
+0:     public Collection<Mutation> createMutations(ByteBuffer key, AbstractThreadUnsafePartition partition, boolean isBuilding)
+1:     {
+0:         if (!updateAffectsView(partition))
+0:             return null;
+1: 
+0:         TemporalRow.Set rowSet = separateRows(key, partition);
+1: 
+0:         // If we are building the view, we do not want to add old values; they will always be the same
+0:         if (!isBuilding)
+0:             readLocalRows(rowSet);
+1: 
+0:         Collection<Mutation> mutations = null;
+0:         for (TemporalRow temporalRow : rowSet)
+1:         {
+0:             // If we are building, there is no need to check for partition tombstones; those values will not be present
+0:             // in the partition data
+0:             if (!isBuilding)
+1:             {
+0:                 PartitionUpdate partitionTombstone = createRangeTombstoneForRow(temporalRow);
+0:                 if (partitionTombstone != null)
+1:                 {
+0:                     if (mutations == null) mutations = new LinkedList<>();
+0:                     mutations.add(new Mutation(partitionTombstone));
+1:                 }
+1:             }
+1: 
+0:             PartitionUpdate insert = createUpdatesForInserts(temporalRow);
+0:             if (insert != null)
+1:             {
+0:                 if (mutations == null) mutations = new LinkedList<>();
+0:                 mutations.add(new Mutation(insert));
+1:             }
+1:         }
+1: 
+0:         if (!isBuilding)
+1:         {
+0:             Collection<Mutation> deletion = createForDeletionInfo(rowSet, partition);
+0:             if (deletion != null && !deletion.isEmpty())
+1:             {
+0:                 if (mutations == null) mutations = new LinkedList<>();
+0:                 mutations.addAll(deletion);
+1:             }
+1:         }
+1: 
+0:         return mutations;
+1:     }
+1: 
+1:     public synchronized void build()
+1:     {
+1:         if (this.builder != null)
+1:         {
+1:             this.builder.stop();
+1:             this.builder = null;
+1:         }
+1: 
+0:         this.builder = new MaterializedViewBuilder(baseCfs, this);
+0:         CompactionManager.instance.submitMaterializedViewBuilder(builder);
+1:     }
+1: 
+1:     /**
+0:      * @return CFMetaData which represents the definition given
+1:      */
+0:     public static CFMetaData getCFMetaData(MaterializedViewDefinition definition,
+0:                                            CFMetaData baseCf,
+0:                                            CFProperties properties)
+1:     {
+0:         CFMetaData.Builder viewBuilder = CFMetaData.Builder
+0:                                          .createView(baseCf.ksName, definition.viewName);
+1: 
+0:         ColumnDefinition nonPkTarget = null;
+1: 
+0:         for (ColumnIdentifier targetIdentifier : definition.partitionColumns)
+1:         {
+0:             ColumnDefinition target = baseCf.getColumnDefinition(targetIdentifier);
+0:             if (!target.isPartitionKey())
+0:                 nonPkTarget = target;
+1: 
+0:             viewBuilder.addPartitionKey(target.name, properties.getReversableType(targetIdentifier, target.type));
+1:         }
+1: 
+0:         Collection<ColumnDefinition> included = new ArrayList<>();
+0:         for(ColumnIdentifier identifier : definition.included)
+1:         {
+0:             ColumnDefinition cfDef = baseCf.getColumnDefinition(identifier);
+0:             assert cfDef != null;
+0:             included.add(cfDef);
+1:         }
+1: 
+0:         boolean includeAll = included.isEmpty();
+1: 
+0:         for (ColumnIdentifier ident : definition.clusteringColumns)
+1:         {
+0:             ColumnDefinition column = baseCf.getColumnDefinition(ident);
+0:             viewBuilder.addClusteringColumn(ident, properties.getReversableType(ident, column.type));
+1:         }
+1: 
+0:         for (ColumnDefinition column : baseCf.partitionColumns().regulars.columns)
+1:         {
+0:             if (column != nonPkTarget && (includeAll || included.contains(column)))
+1:             {
+0:                 viewBuilder.addRegularColumn(column.name, column.type);
+1:             }
+1:         }
+1: 
+0:         //Add any extra clustering columns
+0:         for (ColumnDefinition column : Iterables.concat(baseCf.partitionKeyColumns(), baseCf.clusteringColumns()))
+1:         {
+0:             if ( (!definition.partitionColumns.contains(column.name) && !definition.clusteringColumns.contains(column.name)) &&
+0:                  (includeAll || included.contains(column)) )
+1:             {
+0:                 viewBuilder.addRegularColumn(column.name, column.type);
+1:             }
+1:         }
+1: 
+0:         CFMetaData cfm = viewBuilder.build();
+0:         properties.properties.applyToCFMetadata(cfm);
+1: 
+0:         return cfm;
+1:     }
+1: }
+author:Tyler Hobbs
+-------------------------------------------------------------------------------
+commit:83f8ccc
+/////////////////////////////////////////////////////////////////////////
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+/////////////////////////////////////////////////////////////////////////
+1:     private static final Logger logger = LoggerFactory.getLogger(View.class);
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:             ColumnDefinition column = viewCfm.clusteringColumns().get(i);
+0:             ByteBuffer value = temporalRow.clusteringValue(column, resolver);
+0: 
+0:             // handle single-column deletions correctly to avoid nulls in the view primary key
+0:             if (value == null)
+0:                 return null;
+0: 
+0:             clustering.add(value);
+/////////////////////////////////////////////////////////////////////////
+0:             // individually.
+commit:2998bb3
+/////////////////////////////////////////////////////////////////////////
+0:     private final boolean viewPKIncludesOnlyBasePKColumns;
+/////////////////////////////////////////////////////////////////////////
+0:         viewPKIncludesOnlyBasePKColumns = updateDefinition(definition);
+/////////////////////////////////////////////////////////////////////////
+0:             if (includeAllColumns || !row.deletion().isLive())
+/////////////////////////////////////////////////////////////////////////
+0:         if (viewPKIncludesOnlyBasePKColumns)
+/////////////////////////////////////////////////////////////////////////
+0:         Row row = regularBuilder.build();
+0: 
+0:         // although we check for empty rows in updateAppliesToView(), if there are any good rows in the PartitionUpdate,
+0:         // all rows in the partition will be processed, and we need to handle empty/non-live rows here (CASSANDRA-10614)
+0:         if (row.isEmpty())
+0:             return null;
+0: 
+0:         return PartitionUpdate.singleRowUpdate(viewCfm, partitionKey, row);
+/////////////////////////////////////////////////////////////////////////
+0:         ReadQuery selectQuery = getReadQuery();
+0:             // In updateAffectsView, we check the partition to see if there is at least one row that matches the
+0:             // filters and is live.  If there is more than one row in the partition, we need to re-check each one
+0:             // invididually.
+0:             if (partition.rowCount() != 1 && !selectQuery.selectsClustering(partition.partitionKey(), temporalRow.baseClustering()))
+0:                 continue;
+0: 
+commit:5a4253b
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.*;
+1: import java.util.stream.Collectors;
+1: import org.apache.cassandra.cql3.*;
+1: import org.apache.cassandra.cql3.statements.ParsedStatement;
+1: import org.apache.cassandra.cql3.statements.SelectStatement;
+1: import org.apache.cassandra.db.*;
+1: import org.apache.cassandra.config.*;
+1: import org.apache.cassandra.db.rows.*;
+1: import org.apache.cassandra.service.ClientState;
+0: import org.apache.cassandra.utils.FBUtilities;
+/////////////////////////////////////////////////////////////////////////
+1:     // Only the raw statement can be final, because the statement cannot always be prepared when the MV is initialized.
+1:     // For example, during startup, this view will be initialized as part of the Keyspace.open() work; preparing a statement
+1:     // also requires the keyspace to be open, so this results in double-initialization problems.
+1:     private final SelectStatement.RawStatement rawSelect;
+1:     private SelectStatement select;
+1:     private ReadQuery query;
+0: 
+/////////////////////////////////////////////////////////////////////////
+1:         this.rawSelect = definition.select;
+/////////////////////////////////////////////////////////////////////////
+0:         ReadQuery selectQuery = getReadQuery();
+0:         if (!selectQuery.selectsKey(partition.partitionKey()))
+1:             return false;
+/////////////////////////////////////////////////////////////////////////
+0:             if (!selectQuery.selectsClustering(partition.partitionKey(), row.clustering()))
+0:                 continue;
+0: 
+0:             if (includeAllColumns || viewHasAllPrimaryKeys || !row.deletion().isLive())
+/////////////////////////////////////////////////////////////////////////
+0:                 command = getSelectStatement().internalReadForView(dk, rowSet.nowInSec);
+/////////////////////////////////////////////////////////////////////////
+0:             ReadQuery selectQuery = getReadQuery();
+0:                     if (!selectQuery.selectsClustering(rowSet.dk, row.clustering()))
+0:                         continue;
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:             ReadQuery selectQuery = getReadQuery();
+0:             assert selectQuery.selectsKey(rowSet.dk);
+0:             // We may have already done this work for another MV update so check
+/////////////////////////////////////////////////////////////////////////
+0:                                 if (selectQuery.selectsClustering(rowSet.dk, row.clustering()))
+0:                                     rowSet.addRow(row, false);
+/////////////////////////////////////////////////////////////////////////
+0:     /**
+1:      * Returns the SelectStatement used to populate and filter this view.  Internal users should access the select
+1:      * statement this way to ensure it has been prepared.
+0:      */
+1:     public SelectStatement getSelectStatement()
+0:     {
+1:         if (select == null)
+0:         {
+1:             ClientState state = ClientState.forInternalCalls();
+1:             state.setKeyspace(baseCfs.keyspace.getName());
+1:             rawSelect.prepareKeyspace(state);
+1:             ParsedStatement.Prepared prepared = rawSelect.prepare(true);
+1:             select = (SelectStatement) prepared.statement;
+0:         }
+0: 
+1:         return select;
+0:     }
+0: 
+0:     /**
+1:      * Returns the ReadQuery used to filter this view.  Internal users should access the query this way to ensure it
+1:      * has been prepared.
+0:      */
+1:     public ReadQuery getReadQuery()
+0:     {
+1:         if (query == null)
+1:             query = getSelectStatement().getQuery(QueryOptions.forInternalCalls(Collections.emptyList()), FBUtilities.nowInSeconds());
+1:         return query;
+0:     }
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:     /**
+1:      * Builds the string text for a materialized view's SELECT statement.
+0:      */
+1:     public static String buildSelectStatement(String cfName, Collection<ColumnDefinition> includedColumns, String whereClause)
+0:     {
+1:          StringBuilder rawSelect = new StringBuilder("SELECT ");
+1:         if (includedColumns == null || includedColumns.isEmpty())
+1:             rawSelect.append("*");
+1:         else
+1:             rawSelect.append(includedColumns.stream().map(id -> id.name.toCQLString()).collect(Collectors.joining(", ")));
+1:         rawSelect.append(" FROM \"").append(cfName).append("\" WHERE ") .append(whereClause).append(" ALLOW FILTERING");
+1:         return rawSelect.toString();
+0:     }
+0: 
+1:     public static String relationsToWhereClause(List<Relation> whereClause)
+0:     {
+1:         List<String> expressions = new ArrayList<>(whereClause.size());
+1:         for (Relation rel : whereClause)
+0:         {
+1:             StringBuilder sb = new StringBuilder();
+0: 
+1:             if (rel.isMultiColumn())
+0:             {
+1:                 sb.append(((MultiColumnRelation) rel).getEntities().stream()
+0:                         .map(ColumnIdentifier.Raw::toCQLString)
+1:                         .collect(Collectors.joining(", ", "(", ")")));
+0:             }
+1:             else
+0:             {
+0:                 sb.append(((SingleColumnRelation) rel).getEntity().toCQLString());
+0:             }
+0: 
+1:             sb.append(" ").append(rel.operator()).append(" ");
+0: 
+1:             if (rel.isIN())
+0:             {
+1:                 sb.append(rel.getInValues().stream()
+1:                         .map(Term.Raw::getText)
+1:                         .collect(Collectors.joining(", ", "(", ")")));
+0:             }
+1:             else
+0:             {
+1:                 sb.append(rel.getValue().getText());
+0:             }
+0: 
+1:             expressions.add(sb.toString());
+0:         }
+0: 
+1:         return expressions.stream().collect(Collectors.joining(" AND "));
+0:     }
+author:Jeff Jirsa
+-------------------------------------------------------------------------------
+commit:dc61fa6
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:         if (!partition.metadata().cfId.equals(definition.baseTableId))
+0:             return false;
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:             return existing;
+author:Chris Lohfink
+-------------------------------------------------------------------------------
+commit:62ffa35
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.concurrent.TimeUnit;
+/////////////////////////////////////////////////////////////////////////
+0:         long start = System.currentTimeMillis();
+/////////////////////////////////////////////////////////////////////////
+0:         baseCfs.metric.viewReadTime.update(System.currentTimeMillis() - start, TimeUnit.MILLISECONDS);
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:aa57626
+/////////////////////////////////////////////////////////////////////////
+0:         Row.Builder builder = BTreeRow.unsortedBuilder(nowInSec);
+/////////////////////////////////////////////////////////////////////////
+0:         Row.Builder builder = BTreeRow.unsortedBuilder(nowInSec);
+/////////////////////////////////////////////////////////////////////////
+0:         Row.Builder regularBuilder = BTreeRow.unsortedBuilder(temporalRow.nowInSec);
+commit:e51f83b
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.partitions.AbstractBTreePartition;
+0: import org.apache.cassandra.db.rows.BTreeRow;
+/////////////////////////////////////////////////////////////////////////
+0:     public boolean updateAffectsView(AbstractBTreePartition partition)
+/////////////////////////////////////////////////////////////////////////
+0:         Row.Builder builder = BTreeRow.unsortedBuilder(viewCfm.partitionColumns().regulars, nowInSec);
+/////////////////////////////////////////////////////////////////////////
+0:         Row.Builder builder = BTreeRow.unsortedBuilder(viewCfm.partitionColumns().regulars, nowInSec);
+/////////////////////////////////////////////////////////////////////////
+0:         Row.Builder regularBuilder = BTreeRow.unsortedBuilder(viewCfs.metadata.partitionColumns().regulars, temporalRow.nowInSec);
+/////////////////////////////////////////////////////////////////////////
+0:     private Collection<Mutation> createForDeletionInfo(TemporalRow.Set rowSet, AbstractBTreePartition partition)
+/////////////////////////////////////////////////////////////////////////
+0:     private TemporalRow.Set separateRows(ByteBuffer key, AbstractBTreePartition partition)
+/////////////////////////////////////////////////////////////////////////
+0:     public Collection<Mutation> createMutations(ByteBuffer key, AbstractBTreePartition partition, boolean isBuilding)
+commit:ace28c9
+/////////////////////////////////////////////////////////////////////////
+0:         for (ColumnDefinition column : baseCf.partitionColumns().regulars)
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:1fc3121
+/////////////////////////////////////////////////////////////////////////
+0:             //We may have already done this work for
+0:             //another MV update so check
+0: 
+0:             if (!rowSet.hasTombstonedExisting())
+0:                 QueryPager pager = command.getPager(null);
+0:                 // Add all of the rows which were recovered from the query to the row set
+0:                 while (!pager.isExhausted())
+0:                 {
+0:                     try (ReadOrderGroup orderGroup = pager.startOrderGroup();
+0:                          PartitionIterator iter = pager.fetchPageInternal(128, orderGroup))
+0:                         if (!iter.hasNext())
+0:                             break;
+0: 
+0:                         try (RowIterator rowIterator = iter.next())
+0:                             while (rowIterator.hasNext())
+0:                             {
+0:                                 Row row = rowIterator.next();
+0:                                 rowSet.addRow(row, false);
+0:                             }
+0: 
+0:                 //Incase we fetched nothing, avoid re checking on another MV update
+0:                 rowSet.setTombstonedExisting();
+/////////////////////////////////////////////////////////////////////////
+0:     private TemporalRow.Set separateRows(AbstractBTreePartition partition, Set<ColumnIdentifier> viewPrimaryKeyCols)
+0:         TemporalRow.Set rowSet = new TemporalRow.Set(baseCfs, viewPrimaryKeyCols, partition.partitionKey().getKey());
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:      * Splits the partition update up and adds the existing state to each row.
+0:      * This data can be reused for multiple MV updates on the same base table
+0:      *
+0:      * @param partition the mutation
+0:      * @param isBuilding If the view is currently being built, we do not query the values which are already stored,
+0:      *                   since all of the update will already be present in the base table.
+0:      * @return The set of temoral rows contained in this update
+0:      */
+0:     public TemporalRow.Set getTemporalRowSet(AbstractBTreePartition partition, TemporalRow.Set existing, boolean isBuilding)
+0:     {
+0:         if (!updateAffectsView(partition))
+0:             return null;
+0: 
+0:         Set<ColumnIdentifier> columns = new HashSet<>(this.columns.primaryKeyDefs.size());
+0:         for (ColumnDefinition def : this.columns.primaryKeyDefs)
+0:             columns.add(def.name);
+0: 
+0:         TemporalRow.Set rowSet = null;
+0:         if (existing == null)
+0:         {
+0:             rowSet = separateRows(partition, columns);
+0: 
+0:             // If we are building the view, we do not want to add old values; they will always be the same
+0:             if (!isBuilding)
+0:                 readLocalRows(rowSet);
+0:         }
+0:         else
+0:         {
+0:             rowSet = existing.withNewViewPrimaryKey(columns);
+0:         }
+0: 
+0:         return rowSet;
+0:     }
+0: 
+0: 
+0:     /**
+0:     public Collection<Mutation> createMutations(AbstractBTreePartition partition, TemporalRow.Set rowSet, boolean isBuilding)
+commit:3c43775
+/////////////////////////////////////////////////////////////////////////
+0: /*
+0:  * Licensed to the Apache Software Foundation (ASF) under one
+0:  * or more contributor license agreements.  See the NOTICE file
+0:  * distributed with this work for additional information
+0:  * regarding copyright ownership.  The ASF licenses this file
+0:  * to you under the Apache License, Version 2.0 (the
+0:  * "License"); you may not use this file except in compliance
+0:  * with the License.  You may obtain a copy of the License at
+0:  *
+0:  *     http://www.apache.org/licenses/LICENSE-2.0
+0:  *
+0:  * Unless required by applicable law or agreed to in writing, software
+0:  * distributed under the License is distributed on an "AS IS" BASIS,
+0:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+0:  * See the License for the specific language governing permissions and
+0:  * limitations under the License.
+0:  */
+0: package org.apache.cassandra.db.view;
+0: 
+0: import java.nio.ByteBuffer;
+0: import java.util.ArrayList;
+0: import java.util.Collection;
+0: import java.util.HashSet;
+0: import java.util.Iterator;
+0: import java.util.LinkedList;
+0: import java.util.List;
+0: import java.util.Set;
+0: 
+0: import com.google.common.collect.Iterables;
+0: 
+0: import org.apache.cassandra.config.CFMetaData;
+0: import org.apache.cassandra.config.ColumnDefinition;
+0: import org.apache.cassandra.config.MaterializedViewDefinition;
+0: import org.apache.cassandra.config.Schema;
+0: import org.apache.cassandra.cql3.ColumnIdentifier;
+0: import org.apache.cassandra.cql3.statements.CFProperties;
+0: import org.apache.cassandra.db.AbstractReadCommandBuilder.SinglePartitionSliceBuilder;
+0: import org.apache.cassandra.db.CBuilder;
+0: import org.apache.cassandra.db.Clustering;
+0: import org.apache.cassandra.db.ColumnFamilyStore;
+0: import org.apache.cassandra.db.DecoratedKey;
+0: import org.apache.cassandra.db.DeletionInfo;
+0: import org.apache.cassandra.db.DeletionTime;
+0: import org.apache.cassandra.db.Keyspace;
+0: import org.apache.cassandra.db.LivenessInfo;
+0: import org.apache.cassandra.db.Mutation;
+0: import org.apache.cassandra.db.RangeTombstone;
+0: import org.apache.cassandra.db.ReadCommand;
+0: import org.apache.cassandra.db.ReadOrderGroup;
+0: import org.apache.cassandra.db.SinglePartitionReadCommand;
+0: import org.apache.cassandra.db.Slice;
+0: import org.apache.cassandra.db.compaction.CompactionManager;
+0: import org.apache.cassandra.db.partitions.AbstractThreadUnsafePartition;
+0: import org.apache.cassandra.db.partitions.PartitionIterator;
+0: import org.apache.cassandra.db.partitions.PartitionUpdate;
+0: import org.apache.cassandra.db.rows.BTreeBackedRow;
+0: import org.apache.cassandra.db.rows.Cell;
+0: import org.apache.cassandra.db.rows.ColumnData;
+0: import org.apache.cassandra.db.rows.ComplexColumnData;
+0: import org.apache.cassandra.db.rows.Row;
+0: import org.apache.cassandra.db.rows.RowIterator;
+0: import org.apache.cassandra.service.pager.QueryPager;
+0: 
+0: /**
+0:  * A Materialized View copies data from a base table into a view table which can be queried independently from the
+0:  * base. Every update which targets the base table must be fed through the {@link MaterializedViewManager} to ensure
+0:  * that if a view needs to be updated, the updates are properly created and fed into the view.
+0:  *
+0:  * This class does the job of translating the base row to the view row.
+0:  *
+0:  * It handles reading existing state and figuring out what tombstones need to be generated.
+0:  *
+0:  * createMutations below is the "main method"
+0:  *
+0:  */
+0: public class MaterializedView
+0: {
+0:     /**
+0:      * The columns should all be updated together, so we use this object as group.
+0:      */
+0:     private static class MVColumns
+0:     {
+0:         //These are the base column definitions in terms of the *views* partitioning.
+0:         //Meaning we can see (for example) the partition key of the view contains a clustering key
+0:         //from the base table.
+0:         public final List<ColumnDefinition> partitionDefs;
+0:         public final List<ColumnDefinition> primaryKeyDefs;
+0:         public final List<ColumnDefinition> baseComplexColumns;
+0: 
+0:         private MVColumns(List<ColumnDefinition> partitionDefs, List<ColumnDefinition> primaryKeyDefs, List<ColumnDefinition> baseComplexColumns)
+0:         {
+0:             this.partitionDefs = partitionDefs;
+0:             this.primaryKeyDefs = primaryKeyDefs;
+0:             this.baseComplexColumns = baseComplexColumns;
+0:         }
+0:     }
+0: 
+0:     public final String name;
+0: 
+0:     private final ColumnFamilyStore baseCfs;
+0:     private ColumnFamilyStore _viewCfs = null;
+0: 
+0:     private MVColumns columns;
+0: 
+0:     private final boolean viewHasAllPrimaryKeys;
+0:     private final boolean includeAll;
+0:     private MaterializedViewBuilder builder;
+0: 
+0:     public MaterializedView(MaterializedViewDefinition definition,
+0:                             ColumnFamilyStore baseCfs)
+0:     {
+0:         this.baseCfs = baseCfs;
+0: 
+0:         name = definition.viewName;
+0:         includeAll = definition.includeAll;
+0: 
+0:         viewHasAllPrimaryKeys = updateDefinition(definition);
+0:     }
+0: 
+0:     /**
+0:      * Lazily fetch the CFS instance for the view.
+0:      * We do this lazily to avoid initilization issues.
+0:      *
+0:      * @return The views CFS instance
+0:      */
+0:     public ColumnFamilyStore getViewCfs()
+0:     {
+0:         if (_viewCfs == null)
+0:             _viewCfs = Keyspace.openAndGetStore(Schema.instance.getCFMetaData(baseCfs.keyspace.getName(), name));
+0: 
+0:         return _viewCfs;
+0:     }
+0: 
+0: 
+0:     /**
+0:      * Lookup column definitions in the base table that correspond to the view columns (should be 1:1)
+0:      *
+0:      * Notify caller if all primary keys in the view are ALL primary keys in the base. We do this to simplify
+0:      * tombstone checks.
+0:      *
+0:      * @param columns a list of columns to lookup in the base table
+0:      * @param definitions lists to populate for the base table definitions
+0:      * @return true if all view PKs are also Base PKs
+0:      */
+0:     private boolean resolveAndAddColumns(Iterable<ColumnIdentifier> columns, List<ColumnDefinition>... definitions)
+0:     {
+0:         boolean allArePrimaryKeys = true;
+0:         for (ColumnIdentifier identifier : columns)
+0:         {
+0:             ColumnDefinition cdef = baseCfs.metadata.getColumnDefinition(identifier);
+0:             assert cdef != null : "Could not resolve column " + identifier.toString();
+0: 
+0:             for (List<ColumnDefinition> list : definitions)
+0:             {
+0:                 list.add(cdef);
+0:             }
+0: 
+0:             allArePrimaryKeys = allArePrimaryKeys && cdef.isPrimaryKeyColumn();
+0:         }
+0: 
+0:         return allArePrimaryKeys;
+0:     }
+0: 
+0:     /**
+0:      * This updates the columns stored which are dependent on the base CFMetaData.
+0:      *
+0:      * @return true if the view contains only columns which are part of the base's primary key; false if there is at
+0:      *         least one column which is not.
+0:      */
+0:     public boolean updateDefinition(MaterializedViewDefinition definition)
+0:     {
+0:         List<ColumnDefinition> partitionDefs = new ArrayList<>(definition.partitionColumns.size());
+0:         List<ColumnDefinition> primaryKeyDefs = new ArrayList<>(definition.partitionColumns.size()
+0:                                                                 + definition.clusteringColumns.size());
+0:         List<ColumnDefinition> baseComplexColumns = new ArrayList<>();
+0: 
+0:         // We only add the partition columns to the partitions list, but both partition columns and clustering
+0:         // columns are added to the primary keys list
+0:         boolean partitionAllPrimaryKeyColumns = resolveAndAddColumns(definition.partitionColumns, primaryKeyDefs, partitionDefs);
+0:         boolean clusteringAllPrimaryKeyColumns = resolveAndAddColumns(definition.clusteringColumns, primaryKeyDefs);
+0: 
+0:         for (ColumnDefinition cdef : baseCfs.metadata.allColumns())
+0:         {
+0:             if (cdef.isComplex())
+0:             {
+0:                 baseComplexColumns.add(cdef);
+0:             }
+0:         }
+0: 
+0:         this.columns = new MVColumns(partitionDefs, primaryKeyDefs, baseComplexColumns);
+0: 
+0:         return partitionAllPrimaryKeyColumns && clusteringAllPrimaryKeyColumns;
+0:     }
+0: 
+0:     /**
+0:      * Check to see if the update could possibly modify a view. Cases where the view may be updated are:
+0:      * <ul>
+0:      *     <li>View selects all columns</li>
+0:      *     <li>Update contains any range tombstones</li>
+0:      *     <li>Update touches one of the columns included in the view</li>
+0:      * </ul>
+0:      *
+0:      * If the update contains any range tombstones, there is a possibility that it will not touch a range that is
+0:      * currently included in the view.
+0:      *
+0:      * @return true if {@param partition} modifies a column included in the view
+0:      */
+0:     public boolean updateAffectsView(AbstractThreadUnsafePartition partition)
+0:     {
+0:         // If we are including all of the columns, then any update will be included
+0:         if (includeAll)
+0:             return true;
+0: 
+0:         // If there are range tombstones, tombstones will also need to be generated for the materialized view
+0:         // This requires a query of the base rows and generating tombstones for all of those values
+0:         if (!partition.deletionInfo().isLive())
+0:             return true;
+0: 
+0:         // Check whether the update touches any of the columns included in the view
+0:         for (Row row : partition)
+0:         {
+0:             for (ColumnData data : row)
+0:             {
+0:                 if (getViewCfs().metadata.getColumnDefinition(data.column().name) != null)
+0:                     return true;
+0:             }
+0:         }
+0: 
+0:         return false;
+0:     }
+0: 
+0:     /**
+0:      * Creates the clustering columns for the view based on the specified row and resolver policy
+0:      *
+0:      * @param temporalRow The current row
+0:      * @param resolver The policy to use when selecting versions of cells use
+0:      * @return The clustering object to use for the view
+0:      */
+0:     private Clustering viewClustering(TemporalRow temporalRow, TemporalRow.Resolver resolver)
+0:     {
+0:         CFMetaData viewCfm = getViewCfs().metadata;
+0:         int numViewClustering = viewCfm.clusteringColumns().size();
+0:         CBuilder clustering = CBuilder.create(getViewCfs().getComparator());
+0:         for (int i = 0; i < numViewClustering; i++)
+0:         {
+0:             ColumnDefinition definition = viewCfm.clusteringColumns().get(i);
+0:             clustering.add(temporalRow.clusteringValue(definition, resolver));
+0:         }
+0: 
+0:         return clustering.build();
+0:     }
+0: 
+0:     /**
+0:      * @return Mutation containing a range tombstone for a base partition key and TemporalRow.
+0:      */
+0:     private PartitionUpdate createTombstone(TemporalRow temporalRow,
+0:                                             DecoratedKey partitionKey,
+0:                                             DeletionTime deletionTime,
+0:                                             TemporalRow.Resolver resolver,
+0:                                             int nowInSec)
+0:     {
+0:         CFMetaData viewCfm = getViewCfs().metadata;
+0:         Row.Builder builder = BTreeBackedRow.unsortedBuilder(viewCfm.partitionColumns().regulars, nowInSec);
+0:         builder.newRow(viewClustering(temporalRow, resolver));
+0:         builder.addRowDeletion(deletionTime);
+0:         return PartitionUpdate.singleRowUpdate(viewCfm, partitionKey, builder.build());
+0:     }
+0: 
+0:     /**
+0:      * @return PartitionUpdate containing a complex tombstone for a TemporalRow, and the collection's column identifier.
+0:      */
+0:     private PartitionUpdate createComplexTombstone(TemporalRow temporalRow,
+0:                                                    DecoratedKey partitionKey,
+0:                                                    ColumnDefinition deletedColumn,
+0:                                                    DeletionTime deletionTime,
+0:                                                    TemporalRow.Resolver resolver,
+0:                                                    int nowInSec)
+0:     {
+0: 
+0:         CFMetaData viewCfm = getViewCfs().metadata;
+0:         Row.Builder builder = BTreeBackedRow.unsortedBuilder(viewCfm.partitionColumns().regulars, nowInSec);
+0:         builder.newRow(viewClustering(temporalRow, resolver));
+0:         builder.addComplexDeletion(deletedColumn, deletionTime);
+0:         return PartitionUpdate.singleRowUpdate(viewCfm, partitionKey, builder.build());
+0:     }
+0: 
+0:     /**
+0:      * @return View's DecoratedKey or null, if one of the view's primary key components has an invalid resolution from
+0:      *         the TemporalRow and its Resolver
+0:      */
+0:     private DecoratedKey viewPartitionKey(TemporalRow temporalRow, TemporalRow.Resolver resolver)
+0:     {
+0:         List<ColumnDefinition> partitionDefs = this.columns.partitionDefs;
+0:         Object[] partitionKey = new Object[partitionDefs.size()];
+0: 
+0:         for (int i = 0; i < partitionKey.length; i++)
+0:         {
+0:             ByteBuffer value = temporalRow.clusteringValue(partitionDefs.get(i), resolver);
+0: 
+0:             if (value == null)
+0:                 return null;
+0: 
+0:             partitionKey[i] = value;
+0:         }
+0: 
+0:         return getViewCfs().partitioner.decorateKey(CFMetaData.serializePartitionKey(getViewCfs().metadata
+0:                                                                                      .getKeyValidatorAsClusteringComparator()
+0:                                                                                      .make(partitionKey)));
+0:     }
+0: 
+0:     /**
+0:      * @return mutation which contains the tombstone for the referenced TemporalRow, or null if not necessary.
+0:      * TemporalRow's can reference at most one view row; there will be at most one row to be tombstoned, so only one
+0:      * mutation is necessary
+0:      */
+0:     private PartitionUpdate createRangeTombstoneForRow(TemporalRow temporalRow)
+0:     {
+0:         // Primary Key and Clustering columns do not generate tombstones
+0:         if (viewHasAllPrimaryKeys)
+0:             return null;
+0: 
+0:         boolean hasUpdate = false;
+0:         List<ColumnDefinition> primaryKeyDefs = this.columns.primaryKeyDefs;
+0:         for (ColumnDefinition viewPartitionKeys : primaryKeyDefs)
+0:         {
+0:             if (!viewPartitionKeys.isPrimaryKeyColumn() && temporalRow.clusteringValue(viewPartitionKeys, TemporalRow.oldValueIfUpdated) != null)
+0:                 hasUpdate = true;
+0:         }
+0: 
+0:         if (!hasUpdate)
+0:             return null;
+0: 
+0:         TemporalRow.Resolver resolver = TemporalRow.earliest;
+0:         return createTombstone(temporalRow,
+0:                                viewPartitionKey(temporalRow, resolver),
+0:                                new DeletionTime(temporalRow.viewClusteringTimestamp(), temporalRow.nowInSec),
+0:                                resolver,
+0:                                temporalRow.nowInSec);
+0:     }
+0: 
+0:     /**
+0:      * @return Mutation which is the transformed base table mutation for the materialized view.
+0:      */
+0:     private PartitionUpdate createUpdatesForInserts(TemporalRow temporalRow)
+0:     {
+0:         TemporalRow.Resolver resolver = TemporalRow.latest;
+0: 
+0:         DecoratedKey partitionKey = viewPartitionKey(temporalRow, resolver);
+0:         ColumnFamilyStore viewCfs = getViewCfs();
+0: 
+0:         if (partitionKey == null)
+0:         {
+0:             // Not having a partition key means we aren't updating anything
+0:             return null;
+0:         }
+0: 
+0:         Row.Builder regularBuilder = BTreeBackedRow.unsortedBuilder(viewCfs.metadata.partitionColumns().regulars, temporalRow.nowInSec);
+0: 
+0:         CBuilder clustering = CBuilder.create(viewCfs.getComparator());
+0:         for (int i = 0; i < viewCfs.metadata.clusteringColumns().size(); i++)
+0:         {
+0:             clustering.add(temporalRow.clusteringValue(viewCfs.metadata.clusteringColumns().get(i), resolver));
+0:         }
+0:         regularBuilder.newRow(clustering.build());
+0:         regularBuilder.addPrimaryKeyLivenessInfo(LivenessInfo.create(viewCfs.metadata,
+0:                                                                      temporalRow.viewClusteringTimestamp(),
+0:                                                                      temporalRow.viewClusteringTtl(),
+0:                                                                      temporalRow.viewClusteringLocalDeletionTime()));
+0: 
+0:         for (ColumnDefinition columnDefinition : viewCfs.metadata.allColumns())
+0:         {
+0:             if (columnDefinition.isPrimaryKeyColumn())
+0:                 continue;
+0: 
+0:             for (Cell cell : temporalRow.values(columnDefinition, resolver))
+0:             {
+0:                 regularBuilder.addCell(cell);
+0:             }
+0:         }
+0: 
+0:         return PartitionUpdate.singleRowUpdate(viewCfs.metadata, partitionKey, regularBuilder.build());
+0:     }
+0: 
+0:     /**
+0:      * @param partition Update which possibly contains deletion info for which to generate view tombstones.
+0:      * @return    View Tombstones which delete all of the rows which have been removed from the base table with
+0:      *            {@param partition}
+0:      */
+0:     private Collection<Mutation> createForDeletionInfo(TemporalRow.Set rowSet, AbstractThreadUnsafePartition partition)
+0:     {
+0:         final TemporalRow.Resolver resolver = TemporalRow.earliest;
+0: 
+0:         DeletionInfo deletionInfo = partition.deletionInfo();
+0: 
+0:         List<Mutation> mutations = new ArrayList<>();
+0: 
+0:         // Check the complex columns to see if there are any which may have tombstones we need to create for the view
+0:         if (!columns.baseComplexColumns.isEmpty())
+0:         {
+0:             for (Row row : partition)
+0:             {
+0:                 if (!row.hasComplexDeletion())
+0:                     continue;
+0: 
+0:                 TemporalRow temporalRow = rowSet.getClustering(row.clustering());
+0: 
+0:                 assert temporalRow != null;
+0: 
+0:                 for (ColumnDefinition definition : columns.baseComplexColumns)
+0:                 {
+0:                     ComplexColumnData columnData = row.getComplexColumnData(definition);
+0: 
+0:                     if (columnData != null)
+0:                     {
+0:                         DeletionTime time = columnData.complexDeletion();
+0:                         if (!time.isLive())
+0:                         {
+0:                             DecoratedKey targetKey = viewPartitionKey(temporalRow, resolver);
+0:                             if (targetKey != null)
+0:                                 mutations.add(new Mutation(createComplexTombstone(temporalRow, targetKey, definition, time, resolver, temporalRow.nowInSec)));
+0:                         }
+0:                     }
+0:                 }
+0:             }
+0:         }
+0: 
+0:         ReadCommand command = null;
+0: 
+0:         if (!deletionInfo.isLive())
+0:         {
+0:             // We have to generate tombstones for all of the affected rows, but we don't have the information in order
+0:             // to create them. This requires that we perform a read for the entire range that is being tombstoned, and
+0:             // generate a tombstone for each. This may be slow, because a single range tombstone can cover up to an
+0:             // entire partition of data which is not distributed on a single partition node.
+0:             DecoratedKey dk = rowSet.dk;
+0: 
+0:             if (deletionInfo.hasRanges())
+0:             {
+0:                 SinglePartitionSliceBuilder builder = new SinglePartitionSliceBuilder(baseCfs, dk);
+0:                 Iterator<RangeTombstone> tombstones = deletionInfo.rangeIterator(false);
+0:                 while (tombstones.hasNext())
+0:                 {
+0:                     RangeTombstone tombstone = tombstones.next();
+0: 
+0:                     builder.addSlice(tombstone.deletedSlice());
+0:                 }
+0: 
+0:                 command = builder.build();
+0:             }
+0:             else
+0:             {
+0:                 command = SinglePartitionReadCommand.fullPartitionRead(baseCfs.metadata, rowSet.nowInSec, dk);
+0:             }
+0:         }
+0: 
+0:         if (command == null)
+0:         {
+0:             SinglePartitionSliceBuilder builder = null;
+0:             for (Row row : partition)
+0:             {
+0:                 if (!row.deletion().isLive())
+0:                 {
+0:                     if (builder == null)
+0:                         builder = new SinglePartitionSliceBuilder(baseCfs, rowSet.dk);
+0:                     builder.addSlice(Slice.make(row.clustering()));
+0:                 }
+0:             }
+0: 
+0:             if (builder != null)
+0:                 command = builder.build();
+0:         }
+0: 
+0:         if (command != null)
+0:         {
+0:             QueryPager pager = command.getPager(null);
+0: 
+0:             // Add all of the rows which were recovered from the query to the row set
+0:             while (!pager.isExhausted())
+0:             {
+0:                 try (ReadOrderGroup orderGroup = pager.startOrderGroup();
+0:                      PartitionIterator iter = pager.fetchPageInternal(128, orderGroup))
+0:                 {
+0:                     if (!iter.hasNext())
+0:                         break;
+0: 
+0:                     try (RowIterator rowIterator = iter.next())
+0:                     {
+0:                         while (rowIterator.hasNext())
+0:                         {
+0:                             Row row = rowIterator.next();
+0:                             rowSet.addRow(row, false);
+0:                         }
+0:                     }
+0:                 }
+0:             }
+0: 
+0:             // If the temporal row has been deleted by the deletion info, we generate the corresponding range tombstone
+0:             // for the view.
+0:             for (TemporalRow temporalRow : rowSet)
+0:             {
+0:                 DeletionTime deletionTime = temporalRow.deletionTime(partition);
+0:                 if (!deletionTime.isLive())
+0:                 {
+0:                     DecoratedKey value = viewPartitionKey(temporalRow, resolver);
+0:                     if (value != null)
+0:                     {
+0:                         PartitionUpdate update = createTombstone(temporalRow, value, deletionTime, resolver, temporalRow.nowInSec);
+0:                         if (update != null)
+0:                             mutations.add(new Mutation(update));
+0:                     }
+0:                 }
+0:             }
+0:         }
+0: 
+0:         return !mutations.isEmpty() ? mutations : null;
+0:     }
+0: 
+0:     /**
+0:      * Read and update temporal rows in the set which have corresponding values stored on the local node
+0:      */
+0:     private void readLocalRows(TemporalRow.Set rowSet)
+0:     {
+0:         SinglePartitionSliceBuilder builder = new SinglePartitionSliceBuilder(baseCfs, rowSet.dk);
+0: 
+0:         for (TemporalRow temporalRow : rowSet)
+0:             builder.addSlice(temporalRow.baseSlice());
+0: 
+0:         QueryPager pager = builder.build().getPager(null);
+0: 
+0:         while (!pager.isExhausted())
+0:         {
+0:             try (ReadOrderGroup orderGroup = pager.startOrderGroup();
+0:                  PartitionIterator iter = pager.fetchPageInternal(128, orderGroup))
+0:             {
+0:                 while (iter.hasNext())
+0:                 {
+0:                     try (RowIterator rows = iter.next())
+0:                     {
+0:                         while (rows.hasNext())
+0:                         {
+0:                             rowSet.addRow(rows.next(), false);
+0:                         }
+0:                     }
+0:                 }
+0:             }
+0:         }
+0:     }
+0: 
+0:     /**
+0:      * @return Set of rows which are contained in the partition update {@param partition}
+0:      */
+0:     private TemporalRow.Set separateRows(ByteBuffer key, AbstractThreadUnsafePartition partition)
+0:     {
+0:         Set<ColumnIdentifier> columns = new HashSet<>();
+0:         for (ColumnDefinition def : this.columns.primaryKeyDefs)
+0:             columns.add(def.name);
+0: 
+0:         TemporalRow.Set rowSet = new TemporalRow.Set(baseCfs, columns, key);
+0:         for (Row row : partition)
+0:             rowSet.addRow(row, true);
+0: 
+0:         return rowSet;
+0:     }
+0: 
+0:     /**
+0:      * @param isBuilding If the view is currently being built, we do not query the values which are already stored,
+0:      *                   since all of the update will already be present in the base table.
+0:      * @return View mutations which represent the changes necessary as long as previously created mutations for the view
+0:      *         have been applied successfully. This is based solely on the changes that are necessary given the current
+0:      *         state of the base table and the newly applying partition data.
+0:      */
+0:     public Collection<Mutation> createMutations(ByteBuffer key, AbstractThreadUnsafePartition partition, boolean isBuilding)
+0:     {
+0:         if (!updateAffectsView(partition))
+0:             return null;
+0: 
+0:         TemporalRow.Set rowSet = separateRows(key, partition);
+0: 
+0:         // If we are building the view, we do not want to add old values; they will always be the same
+0:         if (!isBuilding)
+0:             readLocalRows(rowSet);
+0: 
+0:         Collection<Mutation> mutations = null;
+0:         for (TemporalRow temporalRow : rowSet)
+0:         {
+0:             // If we are building, there is no need to check for partition tombstones; those values will not be present
+0:             // in the partition data
+0:             if (!isBuilding)
+0:             {
+0:                 PartitionUpdate partitionTombstone = createRangeTombstoneForRow(temporalRow);
+0:                 if (partitionTombstone != null)
+0:                 {
+0:                     if (mutations == null) mutations = new LinkedList<>();
+0:                     mutations.add(new Mutation(partitionTombstone));
+0:                 }
+0:             }
+0: 
+0:             PartitionUpdate insert = createUpdatesForInserts(temporalRow);
+0:             if (insert != null)
+0:             {
+0:                 if (mutations == null) mutations = new LinkedList<>();
+0:                 mutations.add(new Mutation(insert));
+0:             }
+0:         }
+0: 
+0:         if (!isBuilding)
+0:         {
+0:             Collection<Mutation> deletion = createForDeletionInfo(rowSet, partition);
+0:             if (deletion != null && !deletion.isEmpty())
+0:             {
+0:                 if (mutations == null) mutations = new LinkedList<>();
+0:                 mutations.addAll(deletion);
+0:             }
+0:         }
+0: 
+0:         return mutations;
+0:     }
+0: 
+0:     public synchronized void build()
+0:     {
+0:         if (this.builder != null)
+0:         {
+0:             this.builder.stop();
+0:             this.builder = null;
+0:         }
+0: 
+0:         this.builder = new MaterializedViewBuilder(baseCfs, this);
+0:         CompactionManager.instance.submitMaterializedViewBuilder(builder);
+0:     }
+0: 
+0:     /**
+0:      * @return CFMetaData which represents the definition given
+0:      */
+0:     public static CFMetaData getCFMetaData(MaterializedViewDefinition definition,
+0:                                            CFMetaData baseCf,
+0:                                            CFProperties properties)
+0:     {
+0:         CFMetaData.Builder viewBuilder = CFMetaData.Builder
+0:                                          .createView(baseCf.ksName, definition.viewName);
+0: 
+0:         ColumnDefinition nonPkTarget = null;
+0: 
+0:         for (ColumnIdentifier targetIdentifier : definition.partitionColumns)
+0:         {
+0:             ColumnDefinition target = baseCf.getColumnDefinition(targetIdentifier);
+0:             if (!target.isPartitionKey())
+0:                 nonPkTarget = target;
+0: 
+0:             viewBuilder.addPartitionKey(target.name, properties.getReversableType(targetIdentifier, target.type));
+0:         }
+0: 
+0:         Collection<ColumnDefinition> included = new ArrayList<>();
+0:         for(ColumnIdentifier identifier : definition.included)
+0:         {
+0:             ColumnDefinition cfDef = baseCf.getColumnDefinition(identifier);
+0:             assert cfDef != null;
+0:             included.add(cfDef);
+0:         }
+0: 
+0:         boolean includeAll = included.isEmpty();
+0: 
+0:         for (ColumnIdentifier ident : definition.clusteringColumns)
+0:         {
+0:             ColumnDefinition column = baseCf.getColumnDefinition(ident);
+0:             viewBuilder.addClusteringColumn(ident, properties.getReversableType(ident, column.type));
+0:         }
+0: 
+0:         for (ColumnDefinition column : baseCf.partitionColumns().regulars.columns)
+0:         {
+0:             if (column != nonPkTarget && (includeAll || included.contains(column)))
+0:             {
+0:                 viewBuilder.addRegularColumn(column.name, column.type);
+0:             }
+0:         }
+0: 
+0:         //Add any extra clustering columns
+0:         for (ColumnDefinition column : Iterables.concat(baseCf.partitionKeyColumns(), baseCf.clusteringColumns()))
+0:         {
+0:             if ( (!definition.partitionColumns.contains(column.name) && !definition.clusteringColumns.contains(column.name)) &&
+0:                  (includeAll || included.contains(column)) )
+0:             {
+0:                 viewBuilder.addRegularColumn(column.name, column.type);
+0:             }
+0:         }
+0: 
+0:         CFMetaData cfm = viewBuilder.build();
+0:         properties.properties.applyToCFMetadata(cfm);
+0: 
+0:         return cfm;
+0:     }
+0: }
+author:Paulo Motta
+-------------------------------------------------------------------------------
+commit:1a9286c
+/////////////////////////////////////////////////////////////////////////
+1: import javax.annotation.Nullable;
+0: 
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.schema.KeyspaceMetadata;
+/////////////////////////////////////////////////////////////////////////
+1:     @Nullable
+0:     public static CFMetaData findBaseTable(String keyspace, String view)
+0:     {
+0:         KeyspaceMetadata ksm = Schema.instance.getKSMetaData(keyspace);
+0:         if (ksm == null)
+0:             return null;
+0: 
+0:         for (CFMetaData cfm : ksm.tables)
+0:             if (cfm.getMaterializedViews().get(view).isPresent())
+0:                 return cfm;
+0: 
+0:         return null;
+0:     }
+0: 
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:b31845c
+/////////////////////////////////////////////////////////////////////////
+0:         return viewBuilder.build().params(properties.properties.asNewTableParams());
+commit:0a08525
+/////////////////////////////////////////////////////////////////////////
+0:         CFMetaData metadata = getViewCfs().metadata;
+0:         return metadata.decorateKey(CFMetaData.serializePartitionKey(metadata
+0:                                                                      .getKeyValidatorAsClusteringComparator()
+0:                                                                      .make(partitionKey)));
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:a22ce89
+/////////////////////////////////////////////////////////////////////////
+0:         return getViewCfs().partitioner.decorateKey(CFMetaData.serializePartitionKey(getViewCfs().metadata
+0:                                                                                      .getKeyValidatorAsClusteringComparator()
+0:                                                                                      .make(partitionKey)));
+commit:24d185d
+/////////////////////////////////////////////////////////////////////////
+author:Branimir Lambov
+-------------------------------------------------------------------------------
+commit:69f77cb
+/////////////////////////////////////////////////////////////////////////
+0:         CFMetaData metadata = getViewCfs().metadata;
+0:         return metadata.decorateKey(CFMetaData.serializePartitionKey(metadata
+0:                                                                      .getKeyValidatorAsClusteringComparator()
+0:                                                                      .make(partitionKey)));
+============================================================================

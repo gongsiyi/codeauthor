@@ -1,0 +1,945 @@
+1:2d7909d: /*
+1:2d7909d:  * Licensed to the Apache Software Foundation (ASF) under one
+1:2d7909d:  * or more contributor license agreements.  See the NOTICE file
+1:2d7909d:  * distributed with this work for additional information
+1:2d7909d:  * regarding copyright ownership.  The ASF licenses this file
+1:2d7909d:  * to you under the Apache License, Version 2.0 (the
+1:2d7909d:  * "License"); you may not use this file except in compliance
+1:2d7909d:  * with the License.  You may obtain a copy of the License at
+1:2d7909d:  *
+1:2d7909d:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:2d7909d:  *
+1:2d7909d:  * Unless required by applicable law or agreed to in writing, software
+1:2d7909d:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:2d7909d:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:2d7909d:  * See the License for the specific language governing permissions and
+1:2d7909d:  * limitations under the License.
+1:2d7909d:  */
+1:2d7909d: package org.apache.cassandra.db.compaction;
+1:2d7909d: 
+1:2d7909d: import com.google.common.base.Throwables;
+1:a991b64: 
+1:2d7909d: import org.apache.cassandra.db.*;
+1:a991b64: import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+1:2d7909d: 
+1:2d7909d: import org.apache.cassandra.io.sstable.Component;
+1:2d7909d: import org.apache.cassandra.io.sstable.CorruptSSTableException;
+1:2d7909d: import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
+1:2d7909d: import org.apache.cassandra.io.sstable.format.SSTableReader;
+1:2d7909d: import org.apache.cassandra.io.util.DataIntegrityMetadata;
+1:2d7909d: import org.apache.cassandra.io.util.DataIntegrityMetadata.FileDigestValidator;
+1:2d7909d: import org.apache.cassandra.io.util.FileUtils;
+1:2d7909d: import org.apache.cassandra.io.util.RandomAccessReader;
+1:2d7909d: import org.apache.cassandra.service.ActiveRepairService;
+1:2d7909d: import org.apache.cassandra.utils.ByteBufferUtil;
+1:a991b64: import org.apache.cassandra.utils.FBUtilities;
+1:2d7909d: import org.apache.cassandra.utils.OutputHandler;
+1:e194fe9: import org.apache.cassandra.utils.UUIDGen;
+1:2d7909d: 
+1:2d7909d: import java.io.Closeable;
+1:2d7909d: import java.io.File;
+1:2d7909d: import java.io.IOError;
+1:2d7909d: import java.io.IOException;
+1:2d7909d: import java.nio.ByteBuffer;
+1:2d7909d: import java.util.*;
+1:2d7909d: 
+1:2d7909d: public class Verifier implements Closeable
+1:2d7909d: {
+1:2d7909d:     private final ColumnFamilyStore cfs;
+1:2d7909d:     private final SSTableReader sstable;
+1:2d7909d: 
+1:2d7909d:     private final CompactionController controller;
+1:2d7909d: 
+1:2d7909d: 
+1:2d7909d:     private final RandomAccessReader dataFile;
+1:2d7909d:     private final RandomAccessReader indexFile;
+1:2d7909d:     private final VerifyInfo verifyInfo;
+1:2d7909d:     private final RowIndexEntry.IndexSerializer rowIndexEntrySerializer;
+1:2d7909d: 
+1:2d7909d:     private int goodRows;
+1:2d7909d:     private int badRows;
+1:2d7909d: 
+1:2d7909d:     private final OutputHandler outputHandler;
+1:2d7909d:     private FileDigestValidator validator;
+1:2d7909d: 
+1:fed476f:     public Verifier(ColumnFamilyStore cfs, SSTableReader sstable, boolean isOffline)
+1:2d7909d:     {
+1:2d7909d:         this(cfs, sstable, new OutputHandler.LogOutput(), isOffline);
+1:2d7909d:     }
+1:2d7909d: 
+1:fed476f:     public Verifier(ColumnFamilyStore cfs, SSTableReader sstable, OutputHandler outputHandler, boolean isOffline)
+1:2d7909d:     {
+1:2d7909d:         this.cfs = cfs;
+1:2d7909d:         this.sstable = sstable;
+1:2d7909d:         this.outputHandler = outputHandler;
+1:a991b64:         this.rowIndexEntrySerializer = sstable.descriptor.version.getSSTableFormat().getIndexSerializer(sstable.metadata, sstable.descriptor.version, sstable.header);
+1:2d7909d: 
+1:2d7909d:         this.controller = new VerifyController(cfs);
+1:2d7909d: 
+1:2d7909d:         this.dataFile = isOffline
+1:2d7909d:                         ? sstable.openDataReader()
+1:2d7909d:                         : sstable.openDataReader(CompactionManager.instance.getRateLimiter());
+1:2d7909d:         this.indexFile = RandomAccessReader.open(new File(sstable.descriptor.filenameFor(Component.PRIMARY_INDEX)));
+1:2d7909d:         this.verifyInfo = new VerifyInfo(dataFile, sstable);
+1:2d7909d:     }
+1:2d7909d: 
+1:2d7909d:     public void verify(boolean extended) throws IOException
+1:2d7909d:     {
+1:2d7909d:         long rowStart = 0;
+1:2d7909d: 
+1:db68ac9:         outputHandler.output(String.format("Verifying %s (%s)", sstable, FBUtilities.prettyPrintMemory(dataFile.length())));
+1:2d7909d:         outputHandler.output(String.format("Checking computed hash of %s ", sstable));
+1:2d7909d: 
+1:2d7909d: 
+1:0600d7d:         // Verify will use the Digest files, which works for both compressed and uncompressed sstables
+1:2d7909d:         try
+1:2d7909d:         {
+1:2d7909d:             validator = null;
+1:2d7909d: 
+1:0600d7d:             if (sstable.descriptor.digestComponent != null &&
+1:0600d7d:                 new File(sstable.descriptor.filenameFor(sstable.descriptor.digestComponent)).exists())
+1:2d7909d:             {
+1:2d7909d:                 validator = DataIntegrityMetadata.fileDigestValidator(sstable.descriptor);
+1:2d7909d:                 validator.validate();
+1:2d7909d:             }
+1:2d7909d:             else
+1:2d7909d:             {
+1:a991b64:                 outputHandler.output("Data digest missing, assuming extended verification of disk values");
+1:2d7909d:                 extended = true;
+1:2d7909d:             }
+1:2d7909d:         }
+1:2d7909d:         catch (IOException e)
+1:2d7909d:         {
+1:2d7909d:             outputHandler.debug(e.getMessage());
+1:2d7909d:             markAndThrow();
+1:2d7909d:         }
+1:2d7909d:         finally
+1:2d7909d:         {
+1:2d7909d:             FileUtils.closeQuietly(validator);
+1:2d7909d:         }
+1:2d7909d: 
+1:2d7909d:         if ( !extended )
+1:2d7909d:             return;
+1:2d7909d: 
+1:a991b64:         outputHandler.output("Extended Verify requested, proceeding to inspect values");
+1:2d7909d: 
+1:2d7909d: 
+1:2d7909d:         try
+1:2d7909d:         {
+1:2d7909d:             ByteBuffer nextIndexKey = ByteBufferUtil.readWithShortLength(indexFile);
+1:2d7909d:             {
+1:ef5bbed:                 long firstRowPositionFromIndex = rowIndexEntrySerializer.deserializePositionAndSkip(indexFile);
+1:2d7909d:                 if (firstRowPositionFromIndex != 0)
+1:2d7909d:                     markAndThrow();
+1:2d7909d:             }
+1:2d7909d: 
+1:2d7909d:             DecoratedKey prevKey = null;
+1:2d7909d: 
+1:2d7909d:             while (!dataFile.isEOF())
+1:2d7909d:             {
+1:2d7909d: 
+1:2d7909d:                 if (verifyInfo.isStopRequested())
+1:2d7909d:                     throw new CompactionInterruptedException(verifyInfo.getCompactionInfo());
+1:2d7909d: 
+1:2d7909d:                 rowStart = dataFile.getFilePointer();
+1:2d7909d:                 outputHandler.debug("Reading row at " + rowStart);
+1:2d7909d: 
+1:2d7909d:                 DecoratedKey key = null;
+1:2d7909d:                 try
+1:2d7909d:                 {
+1:69f77cb:                     key = sstable.decorateKey(ByteBufferUtil.readWithShortLength(dataFile));
+1:2d7909d:                 }
+1:2d7909d:                 catch (Throwable th)
+1:2d7909d:                 {
+1:2d7909d:                     throwIfFatal(th);
+1:2d7909d:                     // check for null key below
+1:2d7909d:                 }
+1:2d7909d: 
+1:2d7909d:                 ByteBuffer currentIndexKey = nextIndexKey;
+1:2d7909d:                 long nextRowPositionFromIndex = 0;
+1:2d7909d:                 try
+1:2d7909d:                 {
+1:2d7909d:                     nextIndexKey = indexFile.isEOF() ? null : ByteBufferUtil.readWithShortLength(indexFile);
+1:2d7909d:                     nextRowPositionFromIndex = indexFile.isEOF()
+1:2d7909d:                                              ? dataFile.length()
+1:ef5bbed:                                              : rowIndexEntrySerializer.deserializePositionAndSkip(indexFile);
+1:2d7909d:                 }
+1:2d7909d:                 catch (Throwable th)
+1:2d7909d:                 {
+1:2d7909d:                     markAndThrow();
+1:2d7909d:                 }
+1:2d7909d: 
+1:2d7909d:                 long dataStart = dataFile.getFilePointer();
+1:2d7909d:                 long dataStartFromIndex = currentIndexKey == null
+1:2d7909d:                                         ? -1
+1:2d7909d:                                         : rowStart + 2 + currentIndexKey.remaining();
+1:2d7909d: 
+1:9581667:                 long dataSize = nextRowPositionFromIndex - dataStartFromIndex;
+1:2d7909d:                 // avoid an NPE if key is null
+1:2d7909d:                 String keyName = key == null ? "(unreadable key)" : ByteBufferUtil.bytesToHex(key.getKey());
+1:db68ac9:                 outputHandler.debug(String.format("row %s is %s", keyName, FBUtilities.prettyPrintMemory(dataSize)));
+1:2d7909d: 
+1:2d7909d:                 assert currentIndexKey != null || indexFile.isEOF();
+1:2d7909d: 
+1:2d7909d:                 try
+1:2d7909d:                 {
+1:2d7909d:                     if (key == null || dataSize > dataFile.length())
+1:2d7909d:                         markAndThrow();
+1:2d7909d: 
+1:0655217:                     //mimic the scrub read path
+1:d40ac78:                     try (UnfilteredRowIterator iterator = SSTableIdentityIterator.create(sstable, dataFile, key))
+1:a991b64:                     {
+1:a991b64:                     }
+1:a991b64: 
+1:2d7909d:                     if ( (prevKey != null && prevKey.compareTo(key) > 0) || !key.getKey().equals(currentIndexKey) || dataStart != dataStartFromIndex )
+1:2d7909d:                         markAndThrow();
+1:2d7909d:                     
+1:2d7909d:                     goodRows++;
+1:2d7909d:                     prevKey = key;
+1:2d7909d: 
+1:2d7909d: 
+1:2d7909d:                     outputHandler.debug(String.format("Row %s at %s valid, moving to next row at %s ", goodRows, rowStart, nextRowPositionFromIndex));
+1:2d7909d:                     dataFile.seek(nextRowPositionFromIndex);
+1:2d7909d:                 }
+1:2d7909d:                 catch (Throwable th)
+1:2d7909d:                 {
+1:2d7909d:                     badRows++;
+1:2d7909d:                     markAndThrow();
+1:2d7909d:                 }
+1:2d7909d:             }
+1:2d7909d:         }
+1:2d7909d:         catch (Throwable t)
+1:2d7909d:         {
+1:2d7909d:             throw Throwables.propagate(t);
+1:2d7909d:         }
+1:2d7909d:         finally
+1:2d7909d:         {
+1:2d7909d:             controller.close();
+1:2d7909d:         }
+1:2d7909d: 
+1:2d7909d:         outputHandler.output("Verify of " + sstable + " succeeded. All " + goodRows + " rows read successfully");
+1:2d7909d:     }
+1:2d7909d: 
+1:2d7909d:     public void close()
+1:2d7909d:     {
+1:2d7909d:         FileUtils.closeQuietly(dataFile);
+1:2d7909d:         FileUtils.closeQuietly(indexFile);
+1:2d7909d:     }
+1:2d7909d: 
+1:2d7909d:     private void throwIfFatal(Throwable th)
+1:2d7909d:     {
+1:2d7909d:         if (th instanceof Error && !(th instanceof AssertionError || th instanceof IOError))
+1:2d7909d:             throw (Error) th;
+1:2d7909d:     }
+1:2d7909d: 
+1:2d7909d:     private void markAndThrow() throws IOException
+1:2d7909d:     {
+1:2d7909d:         sstable.descriptor.getMetadataSerializer().mutateRepairedAt(sstable.descriptor, ActiveRepairService.UNREPAIRED_SSTABLE);
+1:2d7909d:         throw new CorruptSSTableException(new Exception(String.format("Invalid SSTable %s, please force repair", sstable.getFilename())), sstable.getFilename());
+1:2d7909d:     }
+1:2d7909d: 
+1:2d7909d:     public CompactionInfo.Holder getVerifyInfo()
+1:2d7909d:     {
+1:2d7909d:         return verifyInfo;
+1:2d7909d:     }
+1:2d7909d: 
+1:2d7909d:     private static class VerifyInfo extends CompactionInfo.Holder
+1:2d7909d:     {
+1:2d7909d:         private final RandomAccessReader dataFile;
+1:2d7909d:         private final SSTableReader sstable;
+1:e194fe9:         private final UUID verificationCompactionId;
+1:2d7909d: 
+1:2d7909d:         public VerifyInfo(RandomAccessReader dataFile, SSTableReader sstable)
+1:2d7909d:         {
+1:2d7909d:             this.dataFile = dataFile;
+1:2d7909d:             this.sstable = sstable;
+1:e194fe9:             verificationCompactionId = UUIDGen.getTimeUUID();
+1:2d7909d:         }
+1:2d7909d: 
+1:2d7909d:         public CompactionInfo getCompactionInfo()
+1:2d7909d:         {
+1:2d7909d:             try
+1:2d7909d:             {
+1:2d7909d:                 return new CompactionInfo(sstable.metadata,
+1:2d7909d:                                           OperationType.VERIFY,
+1:2d7909d:                                           dataFile.getFilePointer(),
+1:e194fe9:                                           dataFile.length(),
+1:e194fe9:                                           verificationCompactionId);
+1:2d7909d:             }
+1:2d7909d:             catch (Exception e)
+1:2d7909d:             {
+1:2d7909d:                 throw new RuntimeException();
+1:2d7909d:             }
+1:2d7909d:         }
+1:2d7909d:     }
+1:2d7909d: 
+1:2d7909d:     private static class VerifyController extends CompactionController
+1:2d7909d:     {
+1:2d7909d:         public VerifyController(ColumnFamilyStore cfs)
+1:2d7909d:         {
+1:2d7909d:             super(cfs, Integer.MAX_VALUE);
+1:2d7909d:         }
+1:2d7909d: 
+1:2d7909d:         @Override
+1:2d7909d:         public long maxPurgeableTimestamp(DecoratedKey key)
+1:2d7909d:         {
+1:2d7909d:             return Long.MIN_VALUE;
+1:2d7909d:         }
+1:2d7909d:     }
+1:2d7909d: }
+============================================================================
+author:Branimir Lambov
+-------------------------------------------------------------------------------
+commit:d40ac78
+/////////////////////////////////////////////////////////////////////////
+1:                     try (UnfilteredRowIterator iterator = SSTableIdentityIterator.create(sstable, dataFile, key))
+commit:69f77cb
+/////////////////////////////////////////////////////////////////////////
+1:                     key = sstable.decorateKey(ByteBufferUtil.readWithShortLength(dataFile));
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:fed476f
+/////////////////////////////////////////////////////////////////////////
+1:     public Verifier(ColumnFamilyStore cfs, SSTableReader sstable, boolean isOffline)
+1:     public Verifier(ColumnFamilyStore cfs, SSTableReader sstable, OutputHandler outputHandler, boolean isOffline)
+commit:9581667
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:                 long dataSize = nextRowPositionFromIndex - dataStartFromIndex;
+commit:0655217
+/////////////////////////////////////////////////////////////////////////
+1:                     //mimic the scrub read path
+0:                     new SSTableIdentityIterator(sstable, dataFile, key, true);
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:ef5bbed
+/////////////////////////////////////////////////////////////////////////
+1:                 long firstRowPositionFromIndex = rowIndexEntrySerializer.deserializePositionAndSkip(indexFile);
+/////////////////////////////////////////////////////////////////////////
+1:                                              : rowIndexEntrySerializer.deserializePositionAndSkip(indexFile);
+commit:0600d7d
+/////////////////////////////////////////////////////////////////////////
+1:         // Verify will use the Digest files, which works for both compressed and uncompressed sstables
+1:             if (sstable.descriptor.digestComponent != null &&
+1:                 new File(sstable.descriptor.filenameFor(sstable.descriptor.digestComponent)).exists())
+author:Giampaolo Trapasso
+-------------------------------------------------------------------------------
+commit:db68ac9
+/////////////////////////////////////////////////////////////////////////
+1:         outputHandler.output(String.format("Verifying %s (%s)", sstable, FBUtilities.prettyPrintMemory(dataFile.length())));
+/////////////////////////////////////////////////////////////////////////
+1:                 outputHandler.debug(String.format("row %s is %s", keyName, FBUtilities.prettyPrintMemory(dataSize)));
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:0a08525
+/////////////////////////////////////////////////////////////////////////
+0:                     key = sstable.decorateKey(ByteBufferUtil.readWithShortLength(dataFile));
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:a22ce89
+/////////////////////////////////////////////////////////////////////////
+0:                     key = sstable.partitioner.decorateKey(ByteBufferUtil.readWithShortLength(dataFile));
+commit:b25adc7
+/////////////////////////////////////////////////////////////////////////
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:a991b64
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.FBUtilities;
+/////////////////////////////////////////////////////////////////////////
+1:         this.rowIndexEntrySerializer = sstable.descriptor.version.getSSTableFormat().getIndexSerializer(sstable.metadata, sstable.descriptor.version, sstable.header);
+/////////////////////////////////////////////////////////////////////////
+1:                 outputHandler.output("Data digest missing, assuming extended verification of disk values");
+/////////////////////////////////////////////////////////////////////////
+1:         outputHandler.output("Extended Verify requested, proceeding to inspect values");
+0:                 long firstRowPositionFromIndex = rowIndexEntrySerializer.deserialize(indexFile).position;
+/////////////////////////////////////////////////////////////////////////
+0:                                              : rowIndexEntrySerializer.deserialize(indexFile).position;
+/////////////////////////////////////////////////////////////////////////
+0:                     try (UnfilteredRowIterator iterator = new SSTableIdentityIterator(sstable, dataFile, key))
+1:                     {
+1:                     }
+1: 
+author:Lyuben Todorov
+-------------------------------------------------------------------------------
+commit:e194fe9
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.UUIDGen;
+/////////////////////////////////////////////////////////////////////////
+1:         private final UUID verificationCompactionId;
+1:             verificationCompactionId = UUIDGen.getTimeUUID();
+/////////////////////////////////////////////////////////////////////////
+1:                                           dataFile.length(),
+1:                                           verificationCompactionId);
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:2d7909d
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.db.compaction;
+1: 
+1: import com.google.common.base.Throwables;
+0: import com.google.common.collect.Sets;
+1: import org.apache.cassandra.db.*;
+1: 
+1: import org.apache.cassandra.io.sstable.Component;
+1: import org.apache.cassandra.io.sstable.CorruptSSTableException;
+1: import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
+1: import org.apache.cassandra.io.sstable.format.SSTableReader;
+1: import org.apache.cassandra.io.util.DataIntegrityMetadata;
+1: import org.apache.cassandra.io.util.DataIntegrityMetadata.FileDigestValidator;
+1: import org.apache.cassandra.io.util.FileUtils;
+1: import org.apache.cassandra.io.util.RandomAccessReader;
+1: import org.apache.cassandra.service.ActiveRepairService;
+1: import org.apache.cassandra.utils.ByteBufferUtil;
+0: import org.apache.cassandra.utils.JVMStabilityInspector;
+1: import org.apache.cassandra.utils.OutputHandler;
+1: 
+1: import java.io.Closeable;
+1: import java.io.File;
+1: import java.io.IOError;
+1: import java.io.IOException;
+1: import java.nio.ByteBuffer;
+1: import java.util.*;
+1: 
+1: public class Verifier implements Closeable
+1: {
+1:     private final ColumnFamilyStore cfs;
+1:     private final SSTableReader sstable;
+1: 
+1:     private final CompactionController controller;
+1: 
+1: 
+1:     private final RandomAccessReader dataFile;
+1:     private final RandomAccessReader indexFile;
+1:     private final VerifyInfo verifyInfo;
+1:     private final RowIndexEntry.IndexSerializer rowIndexEntrySerializer;
+1: 
+1:     private int goodRows;
+1:     private int badRows;
+1: 
+1:     private final OutputHandler outputHandler;
+1:     private FileDigestValidator validator;
+1: 
+0:     public Verifier(ColumnFamilyStore cfs, SSTableReader sstable, boolean isOffline) throws IOException
+1:     {
+1:         this(cfs, sstable, new OutputHandler.LogOutput(), isOffline);
+1:     }
+1: 
+0:     public Verifier(ColumnFamilyStore cfs, SSTableReader sstable, OutputHandler outputHandler, boolean isOffline) throws IOException
+1:     {
+1:         this.cfs = cfs;
+1:         this.sstable = sstable;
+1:         this.outputHandler = outputHandler;
+0:         this.rowIndexEntrySerializer = sstable.descriptor.version.getSSTableFormat().getIndexSerializer(sstable.metadata);
+1: 
+1:         this.controller = new VerifyController(cfs);
+1: 
+1:         this.dataFile = isOffline
+1:                         ? sstable.openDataReader()
+1:                         : sstable.openDataReader(CompactionManager.instance.getRateLimiter());
+1:         this.indexFile = RandomAccessReader.open(new File(sstable.descriptor.filenameFor(Component.PRIMARY_INDEX)));
+1:         this.verifyInfo = new VerifyInfo(dataFile, sstable);
+1:     }
+1: 
+1:     public void verify(boolean extended) throws IOException
+1:     {
+1:         long rowStart = 0;
+1: 
+0:         outputHandler.output(String.format("Verifying %s (%s bytes)", sstable, dataFile.length()));
+1:         outputHandler.output(String.format("Checking computed hash of %s ", sstable));
+1: 
+1: 
+0:         // Verify will use the adler32 Digest files, which works for both compressed and uncompressed sstables
+1:         try
+1:         {
+1:             validator = null;
+1: 
+0:             if (new File(sstable.descriptor.filenameFor(Component.DIGEST)).exists())
+1:             {
+1:                 validator = DataIntegrityMetadata.fileDigestValidator(sstable.descriptor);
+1:                 validator.validate();
+1:             }
+1:             else
+1:             {
+0:                 outputHandler.output("Data digest missing, assuming extended verification of disk atoms");
+1:                 extended = true;
+1:             }
+1:         }
+1:         catch (IOException e)
+1:         {
+1:             outputHandler.debug(e.getMessage());
+1:             markAndThrow();
+1:         }
+1:         finally
+1:         {
+1:             FileUtils.closeQuietly(validator);
+1:         }
+1: 
+1:         if ( !extended )
+1:             return;
+1: 
+0:         outputHandler.output("Extended Verify requested, proceeding to inspect atoms");
+1: 
+1: 
+1:         try
+1:         {
+1:             ByteBuffer nextIndexKey = ByteBufferUtil.readWithShortLength(indexFile);
+1:             {
+0:                 long firstRowPositionFromIndex = rowIndexEntrySerializer.deserialize(indexFile, sstable.descriptor.version).position;
+1:                 if (firstRowPositionFromIndex != 0)
+1:                     markAndThrow();
+1:             }
+1: 
+1:             DecoratedKey prevKey = null;
+1: 
+1:             while (!dataFile.isEOF())
+1:             {
+1: 
+1:                 if (verifyInfo.isStopRequested())
+1:                     throw new CompactionInterruptedException(verifyInfo.getCompactionInfo());
+1: 
+1:                 rowStart = dataFile.getFilePointer();
+1:                 outputHandler.debug("Reading row at " + rowStart);
+1: 
+1:                 DecoratedKey key = null;
+0:                 long dataSize = -1;
+1:                 try
+1:                 {
+0:                     key = sstable.partitioner.decorateKey(ByteBufferUtil.readWithShortLength(dataFile));
+1:                 }
+1:                 catch (Throwable th)
+1:                 {
+1:                     throwIfFatal(th);
+1:                     // check for null key below
+1:                 }
+1: 
+1:                 ByteBuffer currentIndexKey = nextIndexKey;
+1:                 long nextRowPositionFromIndex = 0;
+1:                 try
+1:                 {
+1:                     nextIndexKey = indexFile.isEOF() ? null : ByteBufferUtil.readWithShortLength(indexFile);
+1:                     nextRowPositionFromIndex = indexFile.isEOF()
+1:                                              ? dataFile.length()
+0:                                              : rowIndexEntrySerializer.deserialize(indexFile, sstable.descriptor.version).position;
+1:                 }
+1:                 catch (Throwable th)
+1:                 {
+1:                     markAndThrow();
+1:                 }
+1: 
+1:                 long dataStart = dataFile.getFilePointer();
+1:                 long dataStartFromIndex = currentIndexKey == null
+1:                                         ? -1
+1:                                         : rowStart + 2 + currentIndexKey.remaining();
+1: 
+0:                 dataSize = nextRowPositionFromIndex - dataStartFromIndex;
+1:                 // avoid an NPE if key is null
+1:                 String keyName = key == null ? "(unreadable key)" : ByteBufferUtil.bytesToHex(key.getKey());
+0:                 outputHandler.debug(String.format("row %s is %s bytes", keyName, dataSize));
+1: 
+1:                 assert currentIndexKey != null || indexFile.isEOF();
+1: 
+1:                 try
+1:                 {
+1:                     if (key == null || dataSize > dataFile.length())
+1:                         markAndThrow();
+1: 
+0:                     SSTableIdentityIterator atoms = new SSTableIdentityIterator(sstable, dataFile, key, true);
+1:                     if ( (prevKey != null && prevKey.compareTo(key) > 0) || !key.getKey().equals(currentIndexKey) || dataStart != dataStartFromIndex )
+1:                         markAndThrow();
+1:                     
+1:                     goodRows++;
+1:                     prevKey = key;
+1: 
+1: 
+1:                     outputHandler.debug(String.format("Row %s at %s valid, moving to next row at %s ", goodRows, rowStart, nextRowPositionFromIndex));
+1:                     dataFile.seek(nextRowPositionFromIndex);
+1:                 }
+1:                 catch (Throwable th)
+1:                 {
+1:                     badRows++;
+1:                     markAndThrow();
+1:                 }
+1:             }
+1:         }
+1:         catch (Throwable t)
+1:         {
+1:             throw Throwables.propagate(t);
+1:         }
+1:         finally
+1:         {
+1:             controller.close();
+1:         }
+1: 
+1:         outputHandler.output("Verify of " + sstable + " succeeded. All " + goodRows + " rows read successfully");
+1:     }
+1: 
+1:     public void close()
+1:     {
+1:         FileUtils.closeQuietly(dataFile);
+1:         FileUtils.closeQuietly(indexFile);
+1:     }
+1: 
+1:     private void throwIfFatal(Throwable th)
+1:     {
+1:         if (th instanceof Error && !(th instanceof AssertionError || th instanceof IOError))
+1:             throw (Error) th;
+1:     }
+1: 
+1:     private void markAndThrow() throws IOException
+1:     {
+1:         sstable.descriptor.getMetadataSerializer().mutateRepairedAt(sstable.descriptor, ActiveRepairService.UNREPAIRED_SSTABLE);
+1:         throw new CorruptSSTableException(new Exception(String.format("Invalid SSTable %s, please force repair", sstable.getFilename())), sstable.getFilename());
+1:     }
+1: 
+1:     public CompactionInfo.Holder getVerifyInfo()
+1:     {
+1:         return verifyInfo;
+1:     }
+1: 
+1:     private static class VerifyInfo extends CompactionInfo.Holder
+1:     {
+1:         private final RandomAccessReader dataFile;
+1:         private final SSTableReader sstable;
+1: 
+1:         public VerifyInfo(RandomAccessReader dataFile, SSTableReader sstable)
+1:         {
+1:             this.dataFile = dataFile;
+1:             this.sstable = sstable;
+1:         }
+1: 
+1:         public CompactionInfo getCompactionInfo()
+1:         {
+1:             try
+1:             {
+1:                 return new CompactionInfo(sstable.metadata,
+1:                                           OperationType.VERIFY,
+1:                                           dataFile.getFilePointer(),
+0:                                           dataFile.length());
+1:             }
+1:             catch (Exception e)
+1:             {
+1:                 throw new RuntimeException();
+1:             }
+1:         }
+1:     }
+1: 
+1:     private static class VerifyController extends CompactionController
+1:     {
+1:         public VerifyController(ColumnFamilyStore cfs)
+1:         {
+1:             super(cfs, Integer.MAX_VALUE);
+1:         }
+1: 
+1:         @Override
+1:         public long maxPurgeableTimestamp(DecoratedKey key)
+1:         {
+1:             return Long.MIN_VALUE;
+1:         }
+1:     }
+1: }
+author:Jeff Jirsa
+-------------------------------------------------------------------------------
+commit:21bdf87
+/////////////////////////////////////////////////////////////////////////
+0: /*
+0:  * Licensed to the Apache Software Foundation (ASF) under one
+0:  * or more contributor license agreements.  See the NOTICE file
+0:  * distributed with this work for additional information
+0:  * regarding copyright ownership.  The ASF licenses this file
+0:  * to you under the Apache License, Version 2.0 (the
+0:  * "License"); you may not use this file except in compliance
+0:  * with the License.  You may obtain a copy of the License at
+0:  *
+0:  *     http://www.apache.org/licenses/LICENSE-2.0
+0:  *
+0:  * Unless required by applicable law or agreed to in writing, software
+0:  * distributed under the License is distributed on an "AS IS" BASIS,
+0:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+0:  * See the License for the specific language governing permissions and
+0:  * limitations under the License.
+0:  */
+0: package org.apache.cassandra.db.compaction;
+0: 
+0: import com.google.common.base.Throwables;
+0: import com.google.common.collect.Sets;
+0: import org.apache.cassandra.db.*;
+0: 
+0: import org.apache.cassandra.io.sstable.Component;
+0: import org.apache.cassandra.io.sstable.CorruptSSTableException;
+0: import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
+0: import org.apache.cassandra.io.sstable.format.SSTableReader;
+0: import org.apache.cassandra.io.util.DataIntegrityMetadata;
+0: import org.apache.cassandra.io.util.DataIntegrityMetadata.FileDigestValidator;
+0: import org.apache.cassandra.io.util.FileUtils;
+0: import org.apache.cassandra.io.util.RandomAccessReader;
+0: import org.apache.cassandra.service.ActiveRepairService;
+0: import org.apache.cassandra.utils.ByteBufferUtil;
+0: import org.apache.cassandra.utils.JVMStabilityInspector;
+0: import org.apache.cassandra.utils.OutputHandler;
+0: 
+0: import java.io.Closeable;
+0: import java.io.File;
+0: import java.io.IOError;
+0: import java.io.IOException;
+0: import java.nio.ByteBuffer;
+0: import java.util.*;
+0: 
+0: public class Verifier implements Closeable
+0: {
+0:     private final ColumnFamilyStore cfs;
+0:     private final SSTableReader sstable;
+0: 
+0:     private final CompactionController controller;
+0: 
+0: 
+0:     private final RandomAccessReader dataFile;
+0:     private final RandomAccessReader indexFile;
+0:     private final VerifyInfo verifyInfo;
+0:     private final RowIndexEntry.IndexSerializer rowIndexEntrySerializer;
+0: 
+0:     private int goodRows;
+0:     private int badRows;
+0: 
+0:     private final OutputHandler outputHandler;
+0:     private FileDigestValidator validator;
+0: 
+0:     public Verifier(ColumnFamilyStore cfs, SSTableReader sstable, boolean isOffline) throws IOException
+0:     {
+0:         this(cfs, sstable, new OutputHandler.LogOutput(), isOffline);
+0:     }
+0: 
+0:     public Verifier(ColumnFamilyStore cfs, SSTableReader sstable, OutputHandler outputHandler, boolean isOffline) throws IOException
+0:     {
+0:         this.cfs = cfs;
+0:         this.sstable = sstable;
+0:         this.outputHandler = outputHandler;
+0:         this.rowIndexEntrySerializer = sstable.descriptor.version.getSSTableFormat().getIndexSerializer(sstable.metadata);
+0: 
+0:         this.controller = new VerifyController(cfs);
+0: 
+0:         this.dataFile = isOffline
+0:                         ? sstable.openDataReader()
+0:                         : sstable.openDataReader(CompactionManager.instance.getRateLimiter());
+0:         this.indexFile = RandomAccessReader.open(new File(sstable.descriptor.filenameFor(Component.PRIMARY_INDEX)));
+0:         this.verifyInfo = new VerifyInfo(dataFile, sstable);
+0:     }
+0: 
+0:     public void verify(boolean extended) throws IOException
+0:     {
+0:         long rowStart = 0;
+0: 
+0:         outputHandler.output(String.format("Verifying %s (%s bytes)", sstable, dataFile.length()));
+0:         outputHandler.output(String.format("Checking computed hash of %s ", sstable));
+0: 
+0: 
+0:         // Verify will use the adler32 Digest files, which works for both compressed and uncompressed sstables
+0:         try
+0:         {
+0:             validator = null;
+0: 
+0:             if (new File(sstable.descriptor.filenameFor(Component.DIGEST)).exists())
+0:             {
+0:                 validator = DataIntegrityMetadata.fileDigestValidator(sstable.descriptor);
+0:                 validator.validate();
+0:             }
+0:             else
+0:             {
+0:                 outputHandler.output("Data digest missing, assuming extended verification of disk atoms");
+0:                 extended = true;
+0:             }
+0:         }
+0:         catch (IOException e)
+0:         {
+0:             outputHandler.debug(e.getMessage());
+0:             markAndThrow();
+0:         }
+0:         finally
+0:         {
+0:             FileUtils.closeQuietly(validator);
+0:         }
+0: 
+0:         if ( !extended )
+0:             return;
+0: 
+0:         outputHandler.output("Extended Verify requested, proceeding to inspect atoms");
+0: 
+0: 
+0:         try
+0:         {
+0:             ByteBuffer nextIndexKey = ByteBufferUtil.readWithShortLength(indexFile);
+0:             {
+0:                 long firstRowPositionFromIndex = rowIndexEntrySerializer.deserialize(indexFile, sstable.descriptor.version).position;
+0:                 if (firstRowPositionFromIndex != 0)
+0:                     markAndThrow();
+0:             }
+0: 
+0:             DecoratedKey prevKey = null;
+0: 
+0:             while (!dataFile.isEOF())
+0:             {
+0: 
+0:                 if (verifyInfo.isStopRequested())
+0:                     throw new CompactionInterruptedException(verifyInfo.getCompactionInfo());
+0: 
+0:                 rowStart = dataFile.getFilePointer();
+0:                 outputHandler.debug("Reading row at " + rowStart);
+0: 
+0:                 DecoratedKey key = null;
+0:                 long dataSize = -1;
+0:                 try
+0:                 {
+0:                     key = sstable.partitioner.decorateKey(ByteBufferUtil.readWithShortLength(dataFile));
+0:                 }
+0:                 catch (Throwable th)
+0:                 {
+0:                     throwIfFatal(th);
+0:                     // check for null key below
+0:                 }
+0: 
+0:                 ByteBuffer currentIndexKey = nextIndexKey;
+0:                 long nextRowPositionFromIndex = 0;
+0:                 try
+0:                 {
+0:                     nextIndexKey = indexFile.isEOF() ? null : ByteBufferUtil.readWithShortLength(indexFile);
+0:                     nextRowPositionFromIndex = indexFile.isEOF()
+0:                                              ? dataFile.length()
+0:                                              : rowIndexEntrySerializer.deserialize(indexFile, sstable.descriptor.version).position;
+0:                 }
+0:                 catch (Throwable th)
+0:                 {
+0:                     markAndThrow();
+0:                 }
+0: 
+0:                 long dataStart = dataFile.getFilePointer();
+0:                 long dataStartFromIndex = currentIndexKey == null
+0:                                         ? -1
+0:                                         : rowStart + 2 + currentIndexKey.remaining();
+0: 
+0:                 dataSize = nextRowPositionFromIndex - dataStartFromIndex;
+0:                 // avoid an NPE if key is null
+0:                 String keyName = key == null ? "(unreadable key)" : ByteBufferUtil.bytesToHex(key.getKey());
+0:                 outputHandler.debug(String.format("row %s is %s bytes", keyName, dataSize));
+0: 
+0:                 assert currentIndexKey != null || indexFile.isEOF();
+0: 
+0:                 try
+0:                 {
+0:                     if (key == null || dataSize > dataFile.length())
+0:                         markAndThrow();
+0: 
+0:                     SSTableIdentityIterator atoms = new SSTableIdentityIterator(sstable, dataFile, key, true);
+0:                     if ( (prevKey != null && prevKey.compareTo(key) > 0) || !key.getKey().equals(currentIndexKey) || dataStart != dataStartFromIndex )
+0:                         markAndThrow();
+0:                     
+0:                     goodRows++;
+0:                     prevKey = key;
+0: 
+0: 
+0:                     outputHandler.debug(String.format("Row %s at %s valid, moving to next row at %s ", goodRows, rowStart, nextRowPositionFromIndex));
+0:                     dataFile.seek(nextRowPositionFromIndex);
+0:                 }
+0:                 catch (Throwable th)
+0:                 {
+0:                     badRows++;
+0:                     markAndThrow();
+0:                 }
+0:             }
+0:         }
+0:         catch (Throwable t)
+0:         {
+0:             throw Throwables.propagate(t);
+0:         }
+0:         finally
+0:         {
+0:             controller.close();
+0:         }
+0: 
+0:         outputHandler.output("Verify of " + sstable + " succeeded. All " + goodRows + " rows read successfully");
+0:     }
+0: 
+0:     public void close()
+0:     {
+0:         FileUtils.closeQuietly(dataFile);
+0:         FileUtils.closeQuietly(indexFile);
+0:     }
+0: 
+0:     private void throwIfFatal(Throwable th)
+0:     {
+0:         if (th instanceof Error && !(th instanceof AssertionError || th instanceof IOError))
+0:             throw (Error) th;
+0:     }
+0: 
+0:     private void markAndThrow() throws IOException
+0:     {
+0:         sstable.descriptor.getMetadataSerializer().mutateRepairedAt(sstable.descriptor, ActiveRepairService.UNREPAIRED_SSTABLE);
+0:         throw new CorruptSSTableException(new Exception(String.format("Invalid SSTable %s, please force repair", sstable.getFilename())), sstable.getFilename());
+0:     }
+0: 
+0:     public CompactionInfo.Holder getVerifyInfo()
+0:     {
+0:         return verifyInfo;
+0:     }
+0: 
+0:     private static class VerifyInfo extends CompactionInfo.Holder
+0:     {
+0:         private final RandomAccessReader dataFile;
+0:         private final SSTableReader sstable;
+0: 
+0:         public VerifyInfo(RandomAccessReader dataFile, SSTableReader sstable)
+0:         {
+0:             this.dataFile = dataFile;
+0:             this.sstable = sstable;
+0:         }
+0: 
+0:         public CompactionInfo getCompactionInfo()
+0:         {
+0:             try
+0:             {
+0:                 return new CompactionInfo(sstable.metadata,
+0:                                           OperationType.VERIFY,
+0:                                           dataFile.getFilePointer(),
+0:                                           dataFile.length());
+0:             }
+0:             catch (Exception e)
+0:             {
+0:                 throw new RuntimeException();
+0:             }
+0:         }
+0:     }
+0: 
+0:     private static class VerifyController extends CompactionController
+0:     {
+0:         public VerifyController(ColumnFamilyStore cfs)
+0:         {
+0:             super(cfs, Integer.MAX_VALUE);
+0:         }
+0: 
+0:         @Override
+0:         public long maxPurgeableTimestamp(DecoratedKey key)
+0:         {
+0:             return Long.MIN_VALUE;
+0:         }
+0:     }
+0: }
+============================================================================

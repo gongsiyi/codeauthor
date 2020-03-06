@@ -1,0 +1,774 @@
+1:ce63ccc: /*
+1:ce63ccc:  * Licensed to the Apache Software Foundation (ASF) under one
+1:ce63ccc:  * or more contributor license agreements.  See the NOTICE file
+1:ce63ccc:  * distributed with this work for additional information
+1:ce63ccc:  * regarding copyright ownership.  The ASF licenses this file
+1:ce63ccc:  * to you under the Apache License, Version 2.0 (the
+1:ce63ccc:  * "License"); you may not use this file except in compliance
+1:ce63ccc:  * with the License.  You may obtain a copy of the License at
+1:ce63ccc:  *
+1:ce63ccc:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:ce63ccc:  *
+1:ce63ccc:  * Unless required by applicable law or agreed to in writing, software
+1:ce63ccc:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:ce63ccc:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:ce63ccc:  * See the License for the specific language governing permissions and
+1:ce63ccc:  * limitations under the License.
+1:ce63ccc:  */
+1:ce63ccc: 
+1:ce63ccc: package org.apache.cassandra.io.util;
+1:ce63ccc: 
+1:ce63ccc: import java.nio.ByteBuffer;
+1:ce63ccc: import java.nio.channels.FileChannel;
+1:ce63ccc: import java.util.Arrays;
+1:ce63ccc: 
+1:30bb255: import org.slf4j.LoggerFactory;
+1:30bb255: 
+1:ce63ccc: import org.apache.cassandra.io.FSReadError;
+1:ce63ccc: import org.apache.cassandra.io.compress.CompressionMetadata;
+1:30bb255: import org.apache.cassandra.utils.JVMStabilityInspector;
+1:ce63ccc: import org.apache.cassandra.utils.Throwables;
+1:ce63ccc: import org.apache.cassandra.utils.concurrent.RefCounted;
+1:ce63ccc: import org.apache.cassandra.utils.concurrent.SharedCloseableImpl;
+1:ce63ccc: 
+1:ce63ccc: import static java.util.stream.Stream.of;
+1:ce63ccc: import static org.apache.cassandra.utils.Throwables.perform;
+1:ce63ccc: 
+1:ce63ccc: public class MmappedRegions extends SharedCloseableImpl
+1:ce63ccc: {
+1:ce63ccc:     /** In a perfect world, MAX_SEGMENT_SIZE would be final, but we need to test with a smaller size */
+1:ce63ccc:     public static int MAX_SEGMENT_SIZE = Integer.MAX_VALUE;
+1:ce63ccc: 
+1:ce63ccc:     /** When we need to grow the arrays, we add this number of region slots */
+1:ce63ccc:     static final int REGION_ALLOC_SIZE = 15;
+1:ce63ccc: 
+1:ce63ccc:     /** The original state, which is shared with the tidier and
+1:ce63ccc:      * contains all the regions mapped so far. It also
+1:ce63ccc:      * does the actual mapping. */
+1:ce63ccc:     private final State state;
+1:ce63ccc: 
+1:ce63ccc:     /** A copy of the latest state. We update this each time the original state is
+1:ce63ccc:      * updated and we share this with copies. If we are a copy, then this
+1:ce63ccc:      * is null. Copies can only access existing regions, they cannot create
+1:ce63ccc:      * new ones. This is for thread safety and because MmappedRegions is
+1:ce63ccc:      * reference counted, only the original state will be cleaned-up,
+1:ce63ccc:      * therefore only the original state should create new mapped regions.
+1:ce63ccc:      */
+1:ce63ccc:     private volatile State copy;
+1:ce63ccc: 
+1:ce63ccc:     private MmappedRegions(ChannelProxy channel, CompressionMetadata metadata, long length)
+1:ce63ccc:     {
+1:ce63ccc:         this(new State(channel), metadata, length);
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc:     private MmappedRegions(State state, CompressionMetadata metadata, long length)
+1:ce63ccc:     {
+1:ce63ccc:         super(new Tidier(state));
+1:ce63ccc: 
+1:ce63ccc:         this.state = state;
+1:ce63ccc: 
+1:ce63ccc:         if (metadata != null)
+1:ce63ccc:         {
+1:ce63ccc:             assert length == 0 : "expected no length with metadata";
+1:ce63ccc:             updateState(metadata);
+1:ce63ccc:         }
+1:ce63ccc:         else if (length > 0)
+1:ce63ccc:         {
+1:ce63ccc:             updateState(length);
+1:ce63ccc:         }
+1:ce63ccc: 
+1:ce63ccc:         this.copy = new State(state);
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc:     private MmappedRegions(MmappedRegions original)
+1:ce63ccc:     {
+1:ce63ccc:         super(original);
+1:ce63ccc:         this.state = original.copy;
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc:     public static MmappedRegions empty(ChannelProxy channel)
+1:ce63ccc:     {
+1:ce63ccc:         return new MmappedRegions(channel, null, 0);
+1:ce63ccc:     }
+1:ce63ccc: 
+1:b4133f3:     /**
+1:b4133f3:      * @param channel file to map. the MmappedRegions instance will hold shared copy of given channel.
+1:b4133f3:      * @param metadata
+1:b4133f3:      * @return new instance
+1:b4133f3:      */
+1:ce63ccc:     public static MmappedRegions map(ChannelProxy channel, CompressionMetadata metadata)
+1:ce63ccc:     {
+1:ce63ccc:         if (metadata == null)
+1:ce63ccc:             throw new IllegalArgumentException("metadata cannot be null");
+1:ce63ccc: 
+1:ce63ccc:         return new MmappedRegions(channel, metadata, 0);
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc:     public static MmappedRegions map(ChannelProxy channel, long length)
+1:ce63ccc:     {
+1:ce63ccc:         if (length <= 0)
+1:ce63ccc:             throw new IllegalArgumentException("Length must be positive");
+1:ce63ccc: 
+1:ce63ccc:         return new MmappedRegions(channel, null, length);
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc:     /**
+1:ce63ccc:      * @return a snapshot of the memory mapped regions. The snapshot can
+1:ce63ccc:      * only use existing regions, it cannot create new ones.
+1:ce63ccc:      */
+1:ce63ccc:     public MmappedRegions sharedCopy()
+1:ce63ccc:     {
+1:ce63ccc:         return new MmappedRegions(this);
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc:     private boolean isCopy()
+1:ce63ccc:     {
+1:ce63ccc:         return copy == null;
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc:     public void extend(long length)
+1:ce63ccc:     {
+1:ce63ccc:         if (length < 0)
+1:ce63ccc:             throw new IllegalArgumentException("Length must not be negative");
+1:ce63ccc: 
+1:ce63ccc:         assert !isCopy() : "Copies cannot be extended";
+1:ce63ccc: 
+1:ce63ccc:         if (length <= state.length)
+1:ce63ccc:             return;
+1:ce63ccc: 
+1:ce63ccc:         updateState(length);
+1:ce63ccc:         copy = new State(state);
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc:     private void updateState(long length)
+1:ce63ccc:     {
+1:ce63ccc:         state.length = length;
+1:ce63ccc:         long pos = state.getPosition();
+1:ce63ccc:         while (pos < length)
+1:ce63ccc:         {
+1:ce63ccc:             long size = Math.min(MAX_SEGMENT_SIZE, length - pos);
+1:ce63ccc:             state.add(pos, size);
+1:ce63ccc:             pos += size;
+1:ce63ccc:         }
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc:     private void updateState(CompressionMetadata metadata)
+1:ce63ccc:     {
+1:ce63ccc:         long offset = 0;
+1:ce63ccc:         long lastSegmentOffset = 0;
+1:ce63ccc:         long segmentSize = 0;
+1:ce63ccc: 
+1:ce63ccc:         while (offset < metadata.dataLength)
+1:ce63ccc:         {
+1:ce63ccc:             CompressionMetadata.Chunk chunk = metadata.chunkFor(offset);
+1:ce63ccc: 
+1:ce63ccc:             //Reached a new mmap boundary
+1:ce63ccc:             if (segmentSize + chunk.length + 4 > MAX_SEGMENT_SIZE)
+1:ce63ccc:             {
+1:ce63ccc:                 if (segmentSize > 0)
+1:ce63ccc:                 {
+1:ce63ccc:                     state.add(lastSegmentOffset, segmentSize);
+1:ce63ccc:                     lastSegmentOffset += segmentSize;
+1:ce63ccc:                     segmentSize = 0;
+1:ce63ccc:                 }
+1:ce63ccc:             }
+1:ce63ccc: 
+1:ce63ccc:             segmentSize += chunk.length + 4; //checksum
+1:ce63ccc:             offset += metadata.chunkLength();
+1:ce63ccc:         }
+1:ce63ccc: 
+1:ce63ccc:         if (segmentSize > 0)
+1:ce63ccc:             state.add(lastSegmentOffset, segmentSize);
+1:ce63ccc: 
+1:ce63ccc:         state.length = lastSegmentOffset + segmentSize;
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc:     public boolean isValid(ChannelProxy channel)
+1:ce63ccc:     {
+1:ce63ccc:         return state.isValid(channel);
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc:     public boolean isEmpty()
+1:ce63ccc:     {
+1:ce63ccc:         return state.isEmpty();
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc:     public Region floor(long position)
+1:ce63ccc:     {
+1:ce63ccc:         assert !isCleanedUp() : "Attempted to use closed region";
+1:ce63ccc:         return state.floor(position);
+1:ce63ccc:     }
+1:30bb255:     
+1:30bb255:     public void closeQuietly()
+1:30bb255:     {
+1:30bb255:         Throwable err = close(null);
+1:30bb255:         if (err != null)
+1:30bb255:         {
+1:30bb255:             JVMStabilityInspector.inspectThrowable(err);
+1:ce63ccc: 
+1:30bb255:             // This is not supposed to happen
+1:30bb255:             LoggerFactory.getLogger(getClass()).error("Error while closing mmapped regions", err);
+1:30bb255:         }
+1:30bb255:     }
+1:30bb255: 
+1:30bb255:     public static final class Region implements Rebufferer.BufferHolder
+1:ce63ccc:     {
+1:ce63ccc:         public final long offset;
+1:ce63ccc:         public final ByteBuffer buffer;
+1:ce63ccc: 
+1:ce63ccc:         public Region(long offset, ByteBuffer buffer)
+1:ce63ccc:         {
+1:ce63ccc:             this.offset = offset;
+1:ce63ccc:             this.buffer = buffer;
+1:ce63ccc:         }
+1:ce63ccc: 
+1:30bb255:         public ByteBuffer buffer()
+1:30bb255:         {
+1:30bb255:             return buffer.duplicate();
+1:30bb255:         }
+1:30bb255: 
+1:30bb255:         public long offset()
+1:ce63ccc:         {
+1:ce63ccc:             return offset;
+1:ce63ccc:         }
+1:ce63ccc: 
+1:30bb255:         public long end()
+1:ce63ccc:         {
+1:ce63ccc:             return offset + buffer.capacity();
+1:ce63ccc:         }
+1:30bb255: 
+1:30bb255:         public void release()
+1:30bb255:         {
+1:30bb255:             // only released after no readers are present
+1:30bb255:         }
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc:     private static final class State
+1:ce63ccc:     {
+1:ce63ccc:         /** The file channel */
+1:ce63ccc:         private final ChannelProxy channel;
+1:ce63ccc: 
+1:ce63ccc:         /** An array of region buffers, synchronized with offsets */
+1:ce63ccc:         private ByteBuffer[] buffers;
+1:ce63ccc: 
+1:ce63ccc:         /** An array of region offsets, synchronized with buffers */
+1:ce63ccc:         private long[] offsets;
+1:ce63ccc: 
+1:ce63ccc:         /** The maximum file length we have mapped */
+1:ce63ccc:         private long length;
+1:ce63ccc: 
+1:ce63ccc:         /** The index to the last region added */
+1:ce63ccc:         private int last;
+1:ce63ccc: 
+1:ce63ccc:         private State(ChannelProxy channel)
+1:ce63ccc:         {
+1:ce63ccc:             this.channel = channel.sharedCopy();
+1:ce63ccc:             this.buffers = new ByteBuffer[REGION_ALLOC_SIZE];
+1:ce63ccc:             this.offsets = new long[REGION_ALLOC_SIZE];
+1:ce63ccc:             this.length = 0;
+1:ce63ccc:             this.last = -1;
+1:ce63ccc:         }
+1:ce63ccc: 
+1:ce63ccc:         private State(State original)
+1:ce63ccc:         {
+1:ce63ccc:             this.channel = original.channel;
+1:ce63ccc:             this.buffers = original.buffers;
+1:ce63ccc:             this.offsets = original.offsets;
+1:ce63ccc:             this.length = original.length;
+1:ce63ccc:             this.last = original.last;
+1:ce63ccc:         }
+1:ce63ccc: 
+1:ce63ccc:         private boolean isEmpty()
+1:ce63ccc:         {
+1:ce63ccc:             return last < 0;
+1:ce63ccc:         }
+1:ce63ccc: 
+1:ce63ccc:         private boolean isValid(ChannelProxy channel)
+1:ce63ccc:         {
+1:ce63ccc:             return this.channel.filePath().equals(channel.filePath());
+1:ce63ccc:         }
+1:ce63ccc: 
+1:ce63ccc:         private Region floor(long position)
+1:ce63ccc:         {
+1:30bb255:             assert 0 <= position && position <= length : String.format("%d > %d", position, length);
+1:ce63ccc: 
+1:ce63ccc:             int idx = Arrays.binarySearch(offsets, 0, last +1, position);
+1:ce63ccc:             assert idx != -1 : String.format("Bad position %d for regions %s, last %d in %s", position, Arrays.toString(offsets), last, channel);
+1:ce63ccc:             if (idx < 0)
+1:ce63ccc:                 idx = -(idx + 2); // round down to entry at insertion point
+1:ce63ccc: 
+1:ce63ccc:             return new Region(offsets[idx], buffers[idx]);
+1:ce63ccc:         }
+1:ce63ccc: 
+1:ce63ccc:         private long getPosition()
+1:ce63ccc:         {
+1:ce63ccc:             return last < 0 ? 0 : offsets[last] + buffers[last].capacity();
+1:ce63ccc:         }
+1:ce63ccc: 
+1:ce63ccc:         private void add(long pos, long size)
+1:ce63ccc:         {
+1:ce63ccc:             ByteBuffer buffer = channel.map(FileChannel.MapMode.READ_ONLY, pos, size);
+1:ce63ccc: 
+1:ce63ccc:             ++last;
+1:ce63ccc: 
+1:ce63ccc:             if (last == offsets.length)
+1:ce63ccc:             {
+1:ce63ccc:                 offsets = Arrays.copyOf(offsets, offsets.length + REGION_ALLOC_SIZE);
+1:ce63ccc:                 buffers = Arrays.copyOf(buffers, buffers.length + REGION_ALLOC_SIZE);
+1:ce63ccc:             }
+1:ce63ccc: 
+1:ce63ccc:             offsets[last] = pos;
+1:ce63ccc:             buffers[last] = buffer;
+1:ce63ccc:         }
+1:ce63ccc: 
+1:ce63ccc:         private Throwable close(Throwable accumulate)
+1:ce63ccc:         {
+1:ce63ccc:             accumulate = channel.close(accumulate);
+1:ce63ccc: 
+1:ce63ccc:             /*
+1:ce63ccc:              * Try forcing the unmapping of segments using undocumented unsafe sun APIs.
+1:ce63ccc:              * If this fails (non Sun JVM), we'll have to wait for the GC to finalize the mapping.
+1:ce63ccc:              * If this works and a thread tries to access any segment, hell will unleash on earth.
+1:ce63ccc:              */
+1:54836ec:             if (!FileUtils.isCleanerAvailable)
+1:ce63ccc:                 return accumulate;
+1:ce63ccc: 
+1:ce63ccc:             return perform(accumulate, channel.filePath(), Throwables.FileOpType.READ,
+1:ce63ccc:                            of(buffers)
+1:ce63ccc:                            .map((buffer) ->
+1:ce63ccc:                                 () ->
+1:ce63ccc:                                 {
+1:ce63ccc:                                     if (buffer != null)
+1:ce63ccc:                                         FileUtils.clean(buffer);
+1:ce63ccc:                                 }));
+1:ce63ccc:         }
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc:     public static final class Tidier implements RefCounted.Tidy
+1:ce63ccc:     {
+1:ce63ccc:         final State state;
+1:ce63ccc: 
+1:ce63ccc:         Tidier(State state)
+1:ce63ccc:         {
+1:ce63ccc:             this.state = state;
+1:ce63ccc:         }
+1:ce63ccc: 
+1:ce63ccc:         public String name()
+1:ce63ccc:         {
+1:ce63ccc:             return state.channel.filePath();
+1:ce63ccc:         }
+1:ce63ccc: 
+1:ce63ccc:         public void tidy()
+1:ce63ccc:         {
+1:ce63ccc:             try
+1:ce63ccc:             {
+1:ce63ccc:                 Throwables.maybeFail(state.close(null));
+1:ce63ccc:             }
+1:ce63ccc:             catch (Exception e)
+1:ce63ccc:             {
+1:ce63ccc:                 throw new FSReadError(e, state.channel.filePath());
+1:ce63ccc:             }
+1:ce63ccc:         }
+1:ce63ccc:     }
+1:ce63ccc: 
+1:ce63ccc: }
+============================================================================
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:54836ec
+/////////////////////////////////////////////////////////////////////////
+1:             if (!FileUtils.isCleanerAvailable)
+author:Yuki Morishita
+-------------------------------------------------------------------------------
+commit:b4133f3
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * @param channel file to map. the MmappedRegions instance will hold shared copy of given channel.
+1:      * @param metadata
+1:      * @return new instance
+1:      */
+author:Branimir Lambov
+-------------------------------------------------------------------------------
+commit:30bb255
+/////////////////////////////////////////////////////////////////////////
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import org.apache.cassandra.utils.JVMStabilityInspector;
+/////////////////////////////////////////////////////////////////////////
+1:     
+1:     public void closeQuietly()
+1:     {
+1:         Throwable err = close(null);
+1:         if (err != null)
+1:         {
+1:             JVMStabilityInspector.inspectThrowable(err);
+1:             // This is not supposed to happen
+1:             LoggerFactory.getLogger(getClass()).error("Error while closing mmapped regions", err);
+1:         }
+1:     }
+1: 
+1:     public static final class Region implements Rebufferer.BufferHolder
+/////////////////////////////////////////////////////////////////////////
+1:         public ByteBuffer buffer()
+1:         {
+1:             return buffer.duplicate();
+1:         }
+1: 
+1:         public long offset()
+1:         public long end()
+1: 
+1:         public void release()
+1:         {
+1:             // only released after no readers are present
+1:         }
+/////////////////////////////////////////////////////////////////////////
+1:             assert 0 <= position && position <= length : String.format("%d > %d", position, length);
+author:Stefania Alborghetti
+-------------------------------------------------------------------------------
+commit:ce63ccc
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: 
+1: package org.apache.cassandra.io.util;
+1: 
+1: import java.nio.ByteBuffer;
+1: import java.nio.channels.FileChannel;
+1: import java.util.Arrays;
+1: 
+1: import org.apache.cassandra.io.FSReadError;
+1: import org.apache.cassandra.io.compress.CompressionMetadata;
+1: import org.apache.cassandra.utils.Throwables;
+1: import org.apache.cassandra.utils.concurrent.RefCounted;
+1: import org.apache.cassandra.utils.concurrent.SharedCloseableImpl;
+1: 
+1: import static java.util.stream.Stream.of;
+1: import static org.apache.cassandra.utils.Throwables.perform;
+1: 
+1: public class MmappedRegions extends SharedCloseableImpl
+1: {
+1:     /** In a perfect world, MAX_SEGMENT_SIZE would be final, but we need to test with a smaller size */
+1:     public static int MAX_SEGMENT_SIZE = Integer.MAX_VALUE;
+1: 
+1:     /** When we need to grow the arrays, we add this number of region slots */
+1:     static final int REGION_ALLOC_SIZE = 15;
+1: 
+1:     /** The original state, which is shared with the tidier and
+1:      * contains all the regions mapped so far. It also
+1:      * does the actual mapping. */
+1:     private final State state;
+1: 
+1:     /** A copy of the latest state. We update this each time the original state is
+1:      * updated and we share this with copies. If we are a copy, then this
+1:      * is null. Copies can only access existing regions, they cannot create
+1:      * new ones. This is for thread safety and because MmappedRegions is
+1:      * reference counted, only the original state will be cleaned-up,
+1:      * therefore only the original state should create new mapped regions.
+1:      */
+1:     private volatile State copy;
+1: 
+1:     private MmappedRegions(ChannelProxy channel, CompressionMetadata metadata, long length)
+1:     {
+1:         this(new State(channel), metadata, length);
+1:     }
+1: 
+1:     private MmappedRegions(State state, CompressionMetadata metadata, long length)
+1:     {
+1:         super(new Tidier(state));
+1: 
+1:         this.state = state;
+1: 
+1:         if (metadata != null)
+1:         {
+1:             assert length == 0 : "expected no length with metadata";
+1:             updateState(metadata);
+1:         }
+1:         else if (length > 0)
+1:         {
+1:             updateState(length);
+1:         }
+1: 
+1:         this.copy = new State(state);
+1:     }
+1: 
+1:     private MmappedRegions(MmappedRegions original)
+1:     {
+1:         super(original);
+1:         this.state = original.copy;
+1:     }
+1: 
+1:     public static MmappedRegions empty(ChannelProxy channel)
+1:     {
+1:         return new MmappedRegions(channel, null, 0);
+1:     }
+1: 
+1:     public static MmappedRegions map(ChannelProxy channel, CompressionMetadata metadata)
+1:     {
+1:         if (metadata == null)
+1:             throw new IllegalArgumentException("metadata cannot be null");
+1: 
+1:         return new MmappedRegions(channel, metadata, 0);
+1:     }
+1: 
+1:     public static MmappedRegions map(ChannelProxy channel, long length)
+1:     {
+1:         if (length <= 0)
+1:             throw new IllegalArgumentException("Length must be positive");
+1: 
+1:         return new MmappedRegions(channel, null, length);
+1:     }
+1: 
+1:     /**
+1:      * @return a snapshot of the memory mapped regions. The snapshot can
+1:      * only use existing regions, it cannot create new ones.
+1:      */
+1:     public MmappedRegions sharedCopy()
+1:     {
+1:         return new MmappedRegions(this);
+1:     }
+1: 
+1:     private boolean isCopy()
+1:     {
+1:         return copy == null;
+1:     }
+1: 
+1:     public void extend(long length)
+1:     {
+1:         if (length < 0)
+1:             throw new IllegalArgumentException("Length must not be negative");
+1: 
+1:         assert !isCopy() : "Copies cannot be extended";
+1: 
+1:         if (length <= state.length)
+1:             return;
+1: 
+1:         updateState(length);
+1:         copy = new State(state);
+1:     }
+1: 
+1:     private void updateState(long length)
+1:     {
+1:         state.length = length;
+1:         long pos = state.getPosition();
+1:         while (pos < length)
+1:         {
+1:             long size = Math.min(MAX_SEGMENT_SIZE, length - pos);
+1:             state.add(pos, size);
+1:             pos += size;
+1:         }
+1:     }
+1: 
+1:     private void updateState(CompressionMetadata metadata)
+1:     {
+1:         long offset = 0;
+1:         long lastSegmentOffset = 0;
+1:         long segmentSize = 0;
+1: 
+1:         while (offset < metadata.dataLength)
+1:         {
+1:             CompressionMetadata.Chunk chunk = metadata.chunkFor(offset);
+1: 
+1:             //Reached a new mmap boundary
+1:             if (segmentSize + chunk.length + 4 > MAX_SEGMENT_SIZE)
+1:             {
+1:                 if (segmentSize > 0)
+1:                 {
+1:                     state.add(lastSegmentOffset, segmentSize);
+1:                     lastSegmentOffset += segmentSize;
+1:                     segmentSize = 0;
+1:                 }
+1:             }
+1: 
+1:             segmentSize += chunk.length + 4; //checksum
+1:             offset += metadata.chunkLength();
+1:         }
+1: 
+1:         if (segmentSize > 0)
+1:             state.add(lastSegmentOffset, segmentSize);
+1: 
+1:         state.length = lastSegmentOffset + segmentSize;
+1:     }
+1: 
+1:     public boolean isValid(ChannelProxy channel)
+1:     {
+1:         return state.isValid(channel);
+1:     }
+1: 
+1:     public boolean isEmpty()
+1:     {
+1:         return state.isEmpty();
+1:     }
+1: 
+1:     public Region floor(long position)
+1:     {
+1:         assert !isCleanedUp() : "Attempted to use closed region";
+1:         return state.floor(position);
+1:     }
+1: 
+0:     public static final class Region
+1:     {
+1:         public final long offset;
+1:         public final ByteBuffer buffer;
+1: 
+1:         public Region(long offset, ByteBuffer buffer)
+1:         {
+1:             this.offset = offset;
+1:             this.buffer = buffer;
+1:         }
+1: 
+0:         public long bottom()
+1:         {
+1:             return offset;
+1:         }
+1: 
+0:         public long top()
+1:         {
+1:             return offset + buffer.capacity();
+1:         }
+1:     }
+1: 
+1:     private static final class State
+1:     {
+1:         /** The file channel */
+1:         private final ChannelProxy channel;
+1: 
+1:         /** An array of region buffers, synchronized with offsets */
+1:         private ByteBuffer[] buffers;
+1: 
+1:         /** An array of region offsets, synchronized with buffers */
+1:         private long[] offsets;
+1: 
+1:         /** The maximum file length we have mapped */
+1:         private long length;
+1: 
+1:         /** The index to the last region added */
+1:         private int last;
+1: 
+1:         private State(ChannelProxy channel)
+1:         {
+1:             this.channel = channel.sharedCopy();
+1:             this.buffers = new ByteBuffer[REGION_ALLOC_SIZE];
+1:             this.offsets = new long[REGION_ALLOC_SIZE];
+1:             this.length = 0;
+1:             this.last = -1;
+1:         }
+1: 
+1:         private State(State original)
+1:         {
+1:             this.channel = original.channel;
+1:             this.buffers = original.buffers;
+1:             this.offsets = original.offsets;
+1:             this.length = original.length;
+1:             this.last = original.last;
+1:         }
+1: 
+1:         private boolean isEmpty()
+1:         {
+1:             return last < 0;
+1:         }
+1: 
+1:         private boolean isValid(ChannelProxy channel)
+1:         {
+1:             return this.channel.filePath().equals(channel.filePath());
+1:         }
+1: 
+1:         private Region floor(long position)
+1:         {
+0:             assert 0 <= position && position < length : String.format("%d >= %d", position, length);
+1: 
+1:             int idx = Arrays.binarySearch(offsets, 0, last +1, position);
+1:             assert idx != -1 : String.format("Bad position %d for regions %s, last %d in %s", position, Arrays.toString(offsets), last, channel);
+1:             if (idx < 0)
+1:                 idx = -(idx + 2); // round down to entry at insertion point
+1: 
+1:             return new Region(offsets[idx], buffers[idx]);
+1:         }
+1: 
+1:         private long getPosition()
+1:         {
+1:             return last < 0 ? 0 : offsets[last] + buffers[last].capacity();
+1:         }
+1: 
+1:         private void add(long pos, long size)
+1:         {
+1:             ByteBuffer buffer = channel.map(FileChannel.MapMode.READ_ONLY, pos, size);
+1: 
+1:             ++last;
+1: 
+1:             if (last == offsets.length)
+1:             {
+1:                 offsets = Arrays.copyOf(offsets, offsets.length + REGION_ALLOC_SIZE);
+1:                 buffers = Arrays.copyOf(buffers, buffers.length + REGION_ALLOC_SIZE);
+1:             }
+1: 
+1:             offsets[last] = pos;
+1:             buffers[last] = buffer;
+1:         }
+1: 
+1:         private Throwable close(Throwable accumulate)
+1:         {
+1:             accumulate = channel.close(accumulate);
+1: 
+1:             /*
+1:              * Try forcing the unmapping of segments using undocumented unsafe sun APIs.
+1:              * If this fails (non Sun JVM), we'll have to wait for the GC to finalize the mapping.
+1:              * If this works and a thread tries to access any segment, hell will unleash on earth.
+1:              */
+0:             if (!FileUtils.isCleanerAvailable())
+1:                 return accumulate;
+1: 
+1:             return perform(accumulate, channel.filePath(), Throwables.FileOpType.READ,
+1:                            of(buffers)
+1:                            .map((buffer) ->
+1:                                 () ->
+1:                                 {
+1:                                     if (buffer != null)
+1:                                         FileUtils.clean(buffer);
+1:                                 }));
+1:         }
+1:     }
+1: 
+1:     public static final class Tidier implements RefCounted.Tidy
+1:     {
+1:         final State state;
+1: 
+1:         Tidier(State state)
+1:         {
+1:             this.state = state;
+1:         }
+1: 
+1:         public String name()
+1:         {
+1:             return state.channel.filePath();
+1:         }
+1: 
+1:         public void tidy()
+1:         {
+1:             try
+1:             {
+1:                 Throwables.maybeFail(state.close(null));
+1:             }
+1:             catch (Exception e)
+1:             {
+1:                 throw new FSReadError(e, state.channel.filePath());
+1:             }
+1:         }
+1:     }
+1: 
+1: }
+============================================================================

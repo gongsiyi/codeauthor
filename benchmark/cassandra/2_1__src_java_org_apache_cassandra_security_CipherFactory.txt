@@ -1,0 +1,548 @@
+1:765ab3f: /*
+1:765ab3f:  * Licensed to the Apache Software Foundation (ASF) under one
+1:765ab3f:  * or more contributor license agreements.  See the NOTICE file
+1:765ab3f:  * distributed with this work for additional information
+1:765ab3f:  * regarding copyright ownership.  The ASF licenses this file
+1:765ab3f:  * to you under the Apache License, Version 2.0 (the
+1:765ab3f:  * "License"); you may not use this file except in compliance
+1:765ab3f:  * with the License.  You may obtain a copy of the License at
+1:765ab3f:  *
+1:765ab3f:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:765ab3f:  *
+1:765ab3f:  * Unless required by applicable law or agreed to in writing, software
+1:765ab3f:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:765ab3f:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:765ab3f:  * See the License for the specific language governing permissions and
+1:765ab3f:  * limitations under the License.
+1:765ab3f:  */
+1:765ab3f: package org.apache.cassandra.security;
+1:765ab3f: 
+1:765ab3f: import java.io.IOException;
+1:765ab3f: import java.lang.reflect.Constructor;
+1:765ab3f: import java.security.InvalidAlgorithmParameterException;
+1:765ab3f: import java.security.InvalidKeyException;
+1:765ab3f: import java.security.Key;
+1:765ab3f: import java.security.NoSuchAlgorithmException;
+1:765ab3f: import java.security.SecureRandom;
+1:765ab3f: import java.util.Arrays;
+1:765ab3f: import java.util.concurrent.ExecutionException;
+1:765ab3f: import javax.crypto.Cipher;
+1:765ab3f: import javax.crypto.NoSuchPaddingException;
+1:765ab3f: import javax.crypto.spec.IvParameterSpec;
+1:765ab3f: 
+1:765ab3f: import com.google.common.annotations.VisibleForTesting;
+1:765ab3f: import com.google.common.cache.CacheBuilder;
+1:765ab3f: import com.google.common.cache.CacheLoader;
+1:765ab3f: import com.google.common.cache.LoadingCache;
+1:765ab3f: import com.google.common.cache.RemovalListener;
+1:765ab3f: import com.google.common.cache.RemovalNotification;
+1:765ab3f: import org.slf4j.Logger;
+1:765ab3f: import org.slf4j.LoggerFactory;
+1:765ab3f: 
+1:765ab3f: import org.apache.cassandra.config.TransparentDataEncryptionOptions;
+1:765ab3f: 
+1:765ab3f: /**
+1:765ab3f:  * A factory for loading encryption keys from {@link KeyProvider} instances.
+1:765ab3f:  * Maintains a cache of loaded keys to avoid invoking the key provider on every call.
+1:765ab3f:  */
+1:765ab3f: public class CipherFactory
+1:765ab3f: {
+1:765ab3f:     private final Logger logger = LoggerFactory.getLogger(CipherFactory.class);
+1:765ab3f: 
+1:765ab3f:     /**
+1:765ab3f:      * Keep around thread local instances of Cipher as they are quite expensive to instantiate (@code Cipher#getInstance).
+1:765ab3f:      * Bonus points if you can avoid calling (@code Cipher#init); hence, the point of the supporting struct
+1:765ab3f:      * for caching Cipher instances.
+1:765ab3f:      */
+1:765ab3f:     private static final ThreadLocal<CachedCipher> cipherThreadLocal = new ThreadLocal<>();
+1:765ab3f: 
+1:765ab3f:     private final SecureRandom secureRandom;
+1:765ab3f:     private final LoadingCache<String, Key> cache;
+1:765ab3f:     private final int ivLength;
+1:765ab3f:     private final KeyProvider keyProvider;
+1:765ab3f: 
+1:765ab3f:     public CipherFactory(TransparentDataEncryptionOptions options)
+1:765ab3f:     {
+1:765ab3f:         logger.info("initializing CipherFactory");
+1:765ab3f:         ivLength = options.iv_length;
+1:765ab3f: 
+1:765ab3f:         try
+1:765ab3f:         {
+1:765ab3f:             secureRandom = SecureRandom.getInstance("SHA1PRNG");
+1:765ab3f:             Class<KeyProvider> keyProviderClass = (Class<KeyProvider>)Class.forName(options.key_provider.class_name);
+1:765ab3f:             Constructor ctor = keyProviderClass.getConstructor(TransparentDataEncryptionOptions.class);
+1:765ab3f:             keyProvider = (KeyProvider)ctor.newInstance(options);
+1:765ab3f:         }
+1:765ab3f:         catch (Exception e)
+1:765ab3f:         {
+1:765ab3f:             throw new RuntimeException("couldn't load cipher factory", e);
+1:765ab3f:         }
+1:765ab3f: 
+1:765ab3f:         cache = CacheBuilder.newBuilder() // by default cache is unbounded
+1:765ab3f:                 .maximumSize(64) // a value large enough that we should never even get close (so nothing gets evicted)
+1:765ab3f:                 .concurrencyLevel(Runtime.getRuntime().availableProcessors())
+1:765ab3f:                 .removalListener(new RemovalListener<String, Key>()
+1:765ab3f:                 {
+1:765ab3f:                     public void onRemoval(RemovalNotification<String, Key> notice)
+1:765ab3f:                     {
+1:765ab3f:                         // maybe reload the key? (to avoid the reload being on the user's dime)
+1:765ab3f:                         logger.info("key {} removed from cipher key cache", notice.getKey());
+1:765ab3f:                     }
+1:765ab3f:                 })
+1:765ab3f:                 .build(new CacheLoader<String, Key>()
+1:765ab3f:                 {
+1:765ab3f:                     @Override
+1:765ab3f:                     public Key load(String alias) throws Exception
+1:765ab3f:                     {
+1:765ab3f:                         logger.info("loading secret key for alias {}", alias);
+1:765ab3f:                         return keyProvider.getSecretKey(alias);
+1:765ab3f:                     }
+1:765ab3f:                 });
+1:765ab3f:     }
+1:765ab3f: 
+1:765ab3f:     public Cipher getEncryptor(String transformation, String keyAlias) throws IOException
+1:765ab3f:     {
+1:765ab3f:         byte[] iv = new byte[ivLength];
+1:765ab3f:         secureRandom.nextBytes(iv);
+1:765ab3f:         return buildCipher(transformation, keyAlias, iv, Cipher.ENCRYPT_MODE);
+1:765ab3f:     }
+1:765ab3f: 
+1:765ab3f:     public Cipher getDecryptor(String transformation, String keyAlias, byte[] iv) throws IOException
+1:765ab3f:     {
+1:f54580d:         assert iv != null && iv.length > 0 : "trying to decrypt, but the initialization vector is empty";
+1:765ab3f:         return buildCipher(transformation, keyAlias, iv, Cipher.DECRYPT_MODE);
+1:765ab3f:     }
+1:765ab3f: 
+1:765ab3f:     @VisibleForTesting
+1:765ab3f:     Cipher buildCipher(String transformation, String keyAlias, byte[] iv, int cipherMode) throws IOException
+1:765ab3f:     {
+1:765ab3f:         try
+1:765ab3f:         {
+1:765ab3f:             CachedCipher cachedCipher = cipherThreadLocal.get();
+1:765ab3f:             if (cachedCipher != null)
+1:765ab3f:             {
+1:765ab3f:                 Cipher cipher = cachedCipher.cipher;
+1:765ab3f:                 // rigorous checks to make sure we've absolutely got the correct instance (with correct alg/key/iv/...)
+1:765ab3f:                 if (cachedCipher.mode == cipherMode && cipher.getAlgorithm().equals(transformation)
+1:765ab3f:                     && cachedCipher.keyAlias.equals(keyAlias) && Arrays.equals(cipher.getIV(), iv))
+1:765ab3f:                     return cipher;
+1:765ab3f:             }
+1:765ab3f: 
+1:765ab3f:             Key key = retrieveKey(keyAlias);
+1:765ab3f:             Cipher cipher = Cipher.getInstance(transformation);
+1:765ab3f:             cipher.init(cipherMode, key, new IvParameterSpec(iv));
+1:765ab3f:             cipherThreadLocal.set(new CachedCipher(cipherMode, keyAlias, cipher));
+1:765ab3f:             return cipher;
+1:765ab3f:         }
+1:765ab3f:         catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidAlgorithmParameterException | InvalidKeyException e)
+1:765ab3f:         {
+1:765ab3f:             logger.error("could not build cipher", e);
+1:765ab3f:             throw new IOException("cannot load cipher", e);
+1:765ab3f:         }
+1:765ab3f:     }
+1:765ab3f: 
+1:765ab3f:     private Key retrieveKey(String keyAlias) throws IOException
+1:765ab3f:     {
+1:765ab3f:         try
+1:765ab3f:         {
+1:765ab3f:             return cache.get(keyAlias);
+1:765ab3f:         }
+1:765ab3f:         catch (ExecutionException e)
+1:765ab3f:         {
+1:765ab3f:             if (e.getCause() instanceof IOException)
+1:765ab3f:                 throw (IOException)e.getCause();
+1:765ab3f:             throw new IOException("failed to load key from cache: " + keyAlias, e);
+1:765ab3f:         }
+1:765ab3f:     }
+1:765ab3f: 
+1:765ab3f:     /**
+1:765ab3f:      * A simple struct to use with the thread local caching of Cipher as we can't get the mode (encrypt/decrypt) nor
+1:765ab3f:      * key_alias (or key!) from the Cipher itself to use for comparisons
+1:765ab3f:      */
+1:765ab3f:     private static class CachedCipher
+1:765ab3f:     {
+1:765ab3f:         public final int mode;
+1:765ab3f:         public final String keyAlias;
+1:765ab3f:         public final Cipher cipher;
+1:765ab3f: 
+1:765ab3f:         private CachedCipher(int mode, String keyAlias, Cipher cipher)
+1:765ab3f:         {
+1:765ab3f:             this.mode = mode;
+1:765ab3f:             this.keyAlias = keyAlias;
+1:765ab3f:             this.cipher = cipher;
+1:765ab3f:         }
+1:765ab3f:     }
+1:765ab3f: }
+============================================================================
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:ef59624
+/////////////////////////////////////////////////////////////////////////
+commit:f8ccb39
+/////////////////////////////////////////////////////////////////////////
+0:         assert iv != null || iv.length > 0 : "trying to decrypt, but the initialization vector is empty";
+author:Jason Brown
+-------------------------------------------------------------------------------
+commit:f54580d
+/////////////////////////////////////////////////////////////////////////
+1:         assert iv != null && iv.length > 0 : "trying to decrypt, but the initialization vector is empty";
+commit:765ab3f
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.security;
+1: 
+1: import java.io.IOException;
+1: import java.lang.reflect.Constructor;
+1: import java.security.InvalidAlgorithmParameterException;
+1: import java.security.InvalidKeyException;
+1: import java.security.Key;
+1: import java.security.NoSuchAlgorithmException;
+1: import java.security.SecureRandom;
+1: import java.util.Arrays;
+1: import java.util.concurrent.ExecutionException;
+1: import javax.crypto.Cipher;
+1: import javax.crypto.NoSuchPaddingException;
+1: import javax.crypto.spec.IvParameterSpec;
+1: 
+1: import com.google.common.annotations.VisibleForTesting;
+1: import com.google.common.cache.CacheBuilder;
+1: import com.google.common.cache.CacheLoader;
+1: import com.google.common.cache.LoadingCache;
+1: import com.google.common.cache.RemovalListener;
+1: import com.google.common.cache.RemovalNotification;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import org.apache.cassandra.config.TransparentDataEncryptionOptions;
+1: 
+1: /**
+1:  * A factory for loading encryption keys from {@link KeyProvider} instances.
+1:  * Maintains a cache of loaded keys to avoid invoking the key provider on every call.
+1:  */
+1: public class CipherFactory
+1: {
+1:     private final Logger logger = LoggerFactory.getLogger(CipherFactory.class);
+1: 
+1:     /**
+1:      * Keep around thread local instances of Cipher as they are quite expensive to instantiate (@code Cipher#getInstance).
+1:      * Bonus points if you can avoid calling (@code Cipher#init); hence, the point of the supporting struct
+1:      * for caching Cipher instances.
+1:      */
+1:     private static final ThreadLocal<CachedCipher> cipherThreadLocal = new ThreadLocal<>();
+1: 
+1:     private final SecureRandom secureRandom;
+1:     private final LoadingCache<String, Key> cache;
+1:     private final int ivLength;
+1:     private final KeyProvider keyProvider;
+1: 
+1:     public CipherFactory(TransparentDataEncryptionOptions options)
+1:     {
+1:         logger.info("initializing CipherFactory");
+1:         ivLength = options.iv_length;
+1: 
+1:         try
+1:         {
+1:             secureRandom = SecureRandom.getInstance("SHA1PRNG");
+1:             Class<KeyProvider> keyProviderClass = (Class<KeyProvider>)Class.forName(options.key_provider.class_name);
+1:             Constructor ctor = keyProviderClass.getConstructor(TransparentDataEncryptionOptions.class);
+1:             keyProvider = (KeyProvider)ctor.newInstance(options);
+1:         }
+1:         catch (Exception e)
+1:         {
+1:             throw new RuntimeException("couldn't load cipher factory", e);
+1:         }
+1: 
+1:         cache = CacheBuilder.newBuilder() // by default cache is unbounded
+1:                 .maximumSize(64) // a value large enough that we should never even get close (so nothing gets evicted)
+1:                 .concurrencyLevel(Runtime.getRuntime().availableProcessors())
+1:                 .removalListener(new RemovalListener<String, Key>()
+1:                 {
+1:                     public void onRemoval(RemovalNotification<String, Key> notice)
+1:                     {
+1:                         // maybe reload the key? (to avoid the reload being on the user's dime)
+1:                         logger.info("key {} removed from cipher key cache", notice.getKey());
+1:                     }
+1:                 })
+1:                 .build(new CacheLoader<String, Key>()
+1:                 {
+1:                     @Override
+1:                     public Key load(String alias) throws Exception
+1:                     {
+1:                         logger.info("loading secret key for alias {}", alias);
+1:                         return keyProvider.getSecretKey(alias);
+1:                     }
+1:                 });
+1:     }
+1: 
+1:     public Cipher getEncryptor(String transformation, String keyAlias) throws IOException
+1:     {
+1:         byte[] iv = new byte[ivLength];
+1:         secureRandom.nextBytes(iv);
+1:         return buildCipher(transformation, keyAlias, iv, Cipher.ENCRYPT_MODE);
+1:     }
+1: 
+1:     public Cipher getDecryptor(String transformation, String keyAlias, byte[] iv) throws IOException
+1:     {
+0:         assert iv != null || iv.length > 0 : "trying to decrypt, but the initialization vector is empty";
+1:         return buildCipher(transformation, keyAlias, iv, Cipher.DECRYPT_MODE);
+1:     }
+1: 
+1:     @VisibleForTesting
+1:     Cipher buildCipher(String transformation, String keyAlias, byte[] iv, int cipherMode) throws IOException
+1:     {
+1:         try
+1:         {
+1:             CachedCipher cachedCipher = cipherThreadLocal.get();
+1:             if (cachedCipher != null)
+1:             {
+1:                 Cipher cipher = cachedCipher.cipher;
+1:                 // rigorous checks to make sure we've absolutely got the correct instance (with correct alg/key/iv/...)
+1:                 if (cachedCipher.mode == cipherMode && cipher.getAlgorithm().equals(transformation)
+1:                     && cachedCipher.keyAlias.equals(keyAlias) && Arrays.equals(cipher.getIV(), iv))
+1:                     return cipher;
+1:             }
+1: 
+1:             Key key = retrieveKey(keyAlias);
+1:             Cipher cipher = Cipher.getInstance(transformation);
+1:             cipher.init(cipherMode, key, new IvParameterSpec(iv));
+1:             cipherThreadLocal.set(new CachedCipher(cipherMode, keyAlias, cipher));
+1:             return cipher;
+1:         }
+1:         catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidAlgorithmParameterException | InvalidKeyException e)
+1:         {
+1:             logger.error("could not build cipher", e);
+1:             throw new IOException("cannot load cipher", e);
+1:         }
+1:     }
+1: 
+1:     private Key retrieveKey(String keyAlias) throws IOException
+1:     {
+1:         try
+1:         {
+1:             return cache.get(keyAlias);
+1:         }
+1:         catch (ExecutionException e)
+1:         {
+1:             if (e.getCause() instanceof IOException)
+1:                 throw (IOException)e.getCause();
+1:             throw new IOException("failed to load key from cache: " + keyAlias, e);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * A simple struct to use with the thread local caching of Cipher as we can't get the mode (encrypt/decrypt) nor
+1:      * key_alias (or key!) from the Cipher itself to use for comparisons
+1:      */
+1:     private static class CachedCipher
+1:     {
+1:         public final int mode;
+1:         public final String keyAlias;
+1:         public final Cipher cipher;
+1: 
+1:         private CachedCipher(int mode, String keyAlias, Cipher cipher)
+1:         {
+1:             this.mode = mode;
+1:             this.keyAlias = keyAlias;
+1:             this.cipher = cipher;
+1:         }
+1:     }
+1: }
+commit:f512995
+/////////////////////////////////////////////////////////////////////////
+0:         assert iv != null && iv.length > 0 : "trying to decrypt, but the initialization vector is empty";
+commit:72f5fbd
+/////////////////////////////////////////////////////////////////////////
+commit:37160e1
+/////////////////////////////////////////////////////////////////////////
+0: /*
+0:  * Licensed to the Apache Software Foundation (ASF) under one
+0:  * or more contributor license agreements.  See the NOTICE file
+0:  * distributed with this work for additional information
+0:  * regarding copyright ownership.  The ASF licenses this file
+0:  * to you under the Apache License, Version 2.0 (the
+0:  * "License"); you may not use this file except in compliance
+0:  * with the License.  You may obtain a copy of the License at
+0:  *
+0:  *     http://www.apache.org/licenses/LICENSE-2.0
+0:  *
+0:  * Unless required by applicable law or agreed to in writing, software
+0:  * distributed under the License is distributed on an "AS IS" BASIS,
+0:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+0:  * See the License for the specific language governing permissions and
+0:  * limitations under the License.
+0:  */
+0: package org.apache.cassandra.security;
+0: 
+0: import java.io.IOException;
+0: import java.lang.reflect.Constructor;
+0: import java.security.InvalidAlgorithmParameterException;
+0: import java.security.InvalidKeyException;
+0: import java.security.Key;
+0: import java.security.NoSuchAlgorithmException;
+0: import java.security.SecureRandom;
+0: import java.util.Arrays;
+0: import java.util.concurrent.ExecutionException;
+0: import javax.crypto.Cipher;
+0: import javax.crypto.NoSuchPaddingException;
+0: import javax.crypto.spec.IvParameterSpec;
+0: 
+0: import com.google.common.annotations.VisibleForTesting;
+0: import com.google.common.cache.CacheBuilder;
+0: import com.google.common.cache.CacheLoader;
+0: import com.google.common.cache.LoadingCache;
+0: import com.google.common.cache.RemovalListener;
+0: import com.google.common.cache.RemovalNotification;
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+0: 
+0: import org.apache.cassandra.config.TransparentDataEncryptionOptions;
+0: 
+0: /**
+0:  * A factory for loading encryption keys from {@link KeyProvider} instances.
+0:  * Maintains a cache of loaded keys to avoid invoking the key provider on every call.
+0:  */
+0: public class CipherFactory
+0: {
+0:     private final Logger logger = LoggerFactory.getLogger(CipherFactory.class);
+0: 
+0:     /**
+0:      * Keep around thread local instances of Cipher as they are quite expensive to instantiate (@code Cipher#getInstance).
+0:      * Bonus points if you can avoid calling (@code Cipher#init); hence, the point of the supporting struct
+0:      * for caching Cipher instances.
+0:      */
+0:     private static final ThreadLocal<CachedCipher> cipherThreadLocal = new ThreadLocal<>();
+0: 
+0:     private final SecureRandom secureRandom;
+0:     private final LoadingCache<String, Key> cache;
+0:     private final int ivLength;
+0:     private final KeyProvider keyProvider;
+0: 
+0:     public CipherFactory(TransparentDataEncryptionOptions options)
+0:     {
+0:         logger.info("initializing CipherFactory");
+0:         ivLength = options.iv_length;
+0: 
+0:         try
+0:         {
+0:             secureRandom = SecureRandom.getInstance("SHA1PRNG");
+0:             Class<KeyProvider> keyProviderClass = (Class<KeyProvider>)Class.forName(options.key_provider.class_name);
+0:             Constructor ctor = keyProviderClass.getConstructor(TransparentDataEncryptionOptions.class);
+0:             keyProvider = (KeyProvider)ctor.newInstance(options);
+0:         }
+0:         catch (Exception e)
+0:         {
+0:             throw new RuntimeException("couldn't load cipher factory", e);
+0:         }
+0: 
+0:         cache = CacheBuilder.newBuilder() // by default cache is unbounded
+0:                 .maximumSize(64) // a value large enough that we should never even get close (so nothing gets evicted)
+0:                 .concurrencyLevel(Runtime.getRuntime().availableProcessors())
+0:                 .removalListener(new RemovalListener<String, Key>()
+0:                 {
+0:                     public void onRemoval(RemovalNotification<String, Key> notice)
+0:                     {
+0:                         // maybe reload the key? (to avoid the reload being on the user's dime)
+0:                         logger.info("key {} removed from cipher key cache", notice.getKey());
+0:                     }
+0:                 })
+0:                 .build(new CacheLoader<String, Key>()
+0:                 {
+0:                     @Override
+0:                     public Key load(String alias) throws Exception
+0:                     {
+0:                         logger.info("loading secret key for alias {}", alias);
+0:                         return keyProvider.getSecretKey(alias);
+0:                     }
+0:                 });
+0:     }
+0: 
+0:     public Cipher getEncryptor(String transformation, String keyAlias) throws IOException
+0:     {
+0:         byte[] iv = new byte[ivLength];
+0:         secureRandom.nextBytes(iv);
+0:         return buildCipher(transformation, keyAlias, iv, Cipher.ENCRYPT_MODE);
+0:     }
+0: 
+0:     public Cipher getDecryptor(String transformation, String keyAlias, byte[] iv) throws IOException
+0:     {
+0:         assert iv != null || iv.length > 0 : "trying to decrypt, but the initialization vector is empty";
+0:         return buildCipher(transformation, keyAlias, iv, Cipher.DECRYPT_MODE);
+0:     }
+0: 
+0:     @VisibleForTesting
+0:     Cipher buildCipher(String transformation, String keyAlias, byte[] iv, int cipherMode) throws IOException
+0:     {
+0:         try
+0:         {
+0:             CachedCipher cachedCipher = cipherThreadLocal.get();
+0:             if (cachedCipher != null)
+0:             {
+0:                 Cipher cipher = cachedCipher.cipher;
+0:                 // rigorous checks to make sure we've absolutely got the correct instance (with correct alg/key/iv/...)
+0:                 if (cachedCipher.mode == cipherMode && cipher.getAlgorithm().equals(transformation)
+0:                     && cachedCipher.keyAlias.equals(keyAlias) && Arrays.equals(cipher.getIV(), iv))
+0:                     return cipher;
+0:             }
+0: 
+0:             Key key = retrieveKey(keyAlias);
+0:             Cipher cipher = Cipher.getInstance(transformation);
+0:             cipher.init(cipherMode, key, new IvParameterSpec(iv));
+0:             cipherThreadLocal.set(new CachedCipher(cipherMode, keyAlias, cipher));
+0:             return cipher;
+0:         }
+0:         catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidAlgorithmParameterException | InvalidKeyException e)
+0:         {
+0:             logger.error("could not build cipher", e);
+0:             throw new IOException("cannot load cipher", e);
+0:         }
+0:     }
+0: 
+0:     private Key retrieveKey(String keyAlias) throws IOException
+0:     {
+0:         try
+0:         {
+0:             return cache.get(keyAlias);
+0:         }
+0:         catch (ExecutionException e)
+0:         {
+0:             if (e.getCause() instanceof IOException)
+0:                 throw (IOException)e.getCause();
+0:             throw new IOException("failed to load key from cache: " + keyAlias, e);
+0:         }
+0:     }
+0: 
+0:     /**
+0:      * A simple struct to use with the thread local caching of Cipher as we can't get the mode (encrypt/decrypt) nor
+0:      * key_alias (or key!) from the Cipher itself to use for comparisons
+0:      */
+0:     private static class CachedCipher
+0:     {
+0:         public final int mode;
+0:         public final String keyAlias;
+0:         public final Cipher cipher;
+0: 
+0:         private CachedCipher(int mode, String keyAlias, Cipher cipher)
+0:         {
+0:             this.mode = mode;
+0:             this.keyAlias = keyAlias;
+0:             this.cipher = cipher;
+0:         }
+0:     }
+0: }
+============================================================================

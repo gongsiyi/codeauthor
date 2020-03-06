@@ -1,0 +1,1266 @@
+1:131eb4a: /**
+1:131eb4a:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:131eb4a:  * contributor license agreements.  See the NOTICE file distributed with
+1:131eb4a:  * this work for additional information regarding copyright ownership.
+1:131eb4a:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:131eb4a:  * (the "License"); you may not use this file except in compliance with
+1:131eb4a:  * the License.  You may obtain a copy of the License at
+1:131eb4a:  *
+1:131eb4a:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:131eb4a:  *
+1:131eb4a:  * Unless required by applicable law or agreed to in writing, software
+1:131eb4a:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:131eb4a:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:131eb4a:  * See the License for the specific language governing permissions and
+1:131eb4a:  * limitations under the License.
+1:131eb4a:  */
+1:131eb4a: package org.apache.mahout.clustering.lda.cvb;
+1:131eb4a: 
+1:85f9ece: import java.io.IOException;
+1:85f9ece: import java.util.ArrayList;
+1:85f9ece: import java.util.Arrays;
+1:85f9ece: import java.util.Collections;
+1:85f9ece: import java.util.Comparator;
+1:85f9ece: import java.util.Iterator;
+1:85f9ece: import java.util.List;
+1:85f9ece: import java.util.Random;
+1:85f9ece: import java.util.concurrent.ArrayBlockingQueue;
+1:85f9ece: import java.util.concurrent.ThreadPoolExecutor;
+1:85f9ece: import java.util.concurrent.TimeUnit;
+1:85f9ece: 
+1:131eb4a: import org.apache.hadoop.conf.Configurable;
+1:131eb4a: import org.apache.hadoop.conf.Configuration;
+1:131eb4a: import org.apache.hadoop.fs.FileSystem;
+1:131eb4a: import org.apache.hadoop.fs.Path;
+1:131eb4a: import org.apache.hadoop.io.IntWritable;
+1:131eb4a: import org.apache.mahout.common.Pair;
+1:4fbfbc6: import org.apache.mahout.common.RandomUtils;
+1:131eb4a: import org.apache.mahout.common.iterator.sequencefile.SequenceFileIterable;
+1:131eb4a: import org.apache.mahout.math.DenseMatrix;
+1:131eb4a: import org.apache.mahout.math.DenseVector;
+1:131eb4a: import org.apache.mahout.math.DistributedRowMatrixWriter;
+1:131eb4a: import org.apache.mahout.math.Matrix;
+1:131eb4a: import org.apache.mahout.math.MatrixSlice;
+1:131eb4a: import org.apache.mahout.math.SequentialAccessSparseVector;
+1:131eb4a: import org.apache.mahout.math.Vector;
+1:dc62944: import org.apache.mahout.math.Vector.Element;
+1:131eb4a: import org.apache.mahout.math.VectorWritable;
+1:131eb4a: import org.apache.mahout.math.function.Functions;
+1:131eb4a: import org.apache.mahout.math.stats.Sampler;
+1:131eb4a: import org.slf4j.Logger;
+1:131eb4a: import org.slf4j.LoggerFactory;
+1:131eb4a: 
+1:131eb4a: /**
+1:131eb4a:  * Thin wrapper around a {@link Matrix} of counts of occurrences of (topic, term) pairs.  Dividing
+1:131eb4a:  * {code topicTermCount.viewRow(topic).get(term)} by the sum over the values for all terms in that
+1:131eb4a:  * row yields p(term | topic).  Instead dividing it by all topic columns for that term yields
+1:131eb4a:  * p(topic | term).
+1:131eb4a:  *
+1:131eb4a:  * Multithreading is enabled for the {@code update(Matrix)} method: this method is async, and
+1:131eb4a:  * merely submits the matrix to a work queue.  When all work has been submitted,
+1:131eb4a:  * {@code awaitTermination()} should be called, which will block until updates have been
+1:131eb4a:  * accumulated.
+1:131eb4a:  */
+1:131eb4a: public class TopicModel implements Configurable, Iterable<MatrixSlice> {
+1:131eb4a:   
+1:131eb4a:   private static final Logger log = LoggerFactory.getLogger(TopicModel.class);
+2:4fbfbc6:   
+1:131eb4a:   private final String[] dictionary;
+1:131eb4a:   private final Matrix topicTermCounts;
+1:131eb4a:   private final Vector topicSums;
+1:131eb4a:   private final int numTopics;
+1:131eb4a:   private final int numTerms;
+1:131eb4a:   private final double eta;
+1:131eb4a:   private final double alpha;
+1:131eb4a: 
+1:131eb4a:   private Configuration conf;
+1:131eb4a: 
+1:564c3e1:   private final Sampler sampler;
+1:131eb4a:   private final int numThreads;
+1:67d1490:   private ThreadPoolExecutor threadPool;
+1:131eb4a:   private Updater[] updaters;
+1:131eb4a: 
+1:131eb4a:   public int getNumTerms() {
+1:131eb4a:     return numTerms;
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public int getNumTopics() {
+1:131eb4a:     return numTopics;
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public TopicModel(int numTopics, int numTerms, double eta, double alpha, String[] dictionary,
+1:131eb4a:       double modelWeight) {
+1:131eb4a:     this(numTopics, numTerms, eta, alpha, null, dictionary, 1, modelWeight);
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public TopicModel(Configuration conf, double eta, double alpha,
+1:131eb4a:       String[] dictionary, int numThreads, double modelWeight, Path... modelpath) throws IOException {
+1:131eb4a:     this(loadModel(conf, modelpath), eta, alpha, dictionary, numThreads, modelWeight);
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public TopicModel(int numTopics, int numTerms, double eta, double alpha, String[] dictionary,
+1:131eb4a:       int numThreads, double modelWeight) {
+1:131eb4a:     this(new DenseMatrix(numTopics, numTerms), new DenseVector(numTopics), eta, alpha, dictionary,
+1:131eb4a:         numThreads, modelWeight);
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public TopicModel(int numTopics, int numTerms, double eta, double alpha, Random random,
+1:131eb4a:       String[] dictionary, int numThreads, double modelWeight) {
+1:131eb4a:     this(randomMatrix(numTopics, numTerms, random), eta, alpha, dictionary, numThreads, modelWeight);
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   private TopicModel(Pair<Matrix, Vector> model, double eta, double alpha, String[] dict,
+1:131eb4a:       int numThreads, double modelWeight) {
+1:131eb4a:     this(model.getFirst(), model.getSecond(), eta, alpha, dict, numThreads, modelWeight);
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public TopicModel(Matrix topicTermCounts, Vector topicSums, double eta, double alpha,
+1:131eb4a:     String[] dictionary, double modelWeight) {
+1:131eb4a:     this(topicTermCounts, topicSums, eta, alpha, dictionary, 1, modelWeight);
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public TopicModel(Matrix topicTermCounts, double eta, double alpha, String[] dictionary,
+1:131eb4a:       int numThreads, double modelWeight) {
+1:131eb4a:     this(topicTermCounts, viewRowSums(topicTermCounts),
+1:131eb4a:         eta, alpha, dictionary, numThreads, modelWeight);
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public TopicModel(Matrix topicTermCounts, Vector topicSums, double eta, double alpha,
+1:131eb4a:     String[] dictionary, int numThreads, double modelWeight) {
+1:131eb4a:     this.dictionary = dictionary;
+1:131eb4a:     this.topicTermCounts = topicTermCounts;
+1:131eb4a:     this.topicSums = topicSums;
+1:131eb4a:     this.numTopics = topicSums.size();
+1:131eb4a:     this.numTerms = topicTermCounts.numCols();
+1:131eb4a:     this.eta = eta;
+1:131eb4a:     this.alpha = alpha;
+1:4fbfbc6:     this.sampler = new Sampler(RandomUtils.getRandom());
+1:131eb4a:     this.numThreads = numThreads;
+1:e64dd36:     if (modelWeight != 1) {
+1:131eb4a:       topicSums.assign(Functions.mult(modelWeight));
+1:e64dd36:       for (int x = 0; x < numTopics; x++) {
+1:131eb4a:         topicTermCounts.viewRow(x).assign(Functions.mult(modelWeight));
+1:131eb4a:       }
+1:131eb4a:     }
+2:131eb4a:     initializeThreadPool();
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   private static Vector viewRowSums(Matrix m) {
+1:131eb4a:     Vector v = new DenseVector(m.numRows());
+1:e64dd36:     for (MatrixSlice slice : m) {
+1:131eb4a:       v.set(slice.index(), slice.vector().norm(1));
+1:131eb4a:     }
+1:131eb4a:     return v;
+1:131eb4a:   }
+1:131eb4a: 
+1:c88c240:   private synchronized void initializeThreadPool() {
+1:c88c240:     if (threadPool != null) {
+1:c88c240:       threadPool.shutdown();
+1:c88c240:       try {
+1:c88c240:         threadPool.awaitTermination(100, TimeUnit.SECONDS);
+1:c88c240:       } catch (InterruptedException e) {
+1:c88c240:         log.error("Could not terminate all threads for TopicModel in time.", e);
+1:c88c240:       }
+1:c88c240:     }
+1:67d1490:     threadPool = new ThreadPoolExecutor(numThreads, numThreads, 0, TimeUnit.SECONDS,
+1:131eb4a:                                                            new ArrayBlockingQueue<Runnable>(numThreads * 10));
+1:131eb4a:     threadPool.allowCoreThreadTimeOut(false);
+1:131eb4a:     updaters = new Updater[numThreads];
+1:e64dd36:     for (int i = 0; i < numThreads; i++) {
+1:131eb4a:       updaters[i] = new Updater();
+1:131eb4a:       threadPool.submit(updaters[i]);
+1:131eb4a:     }
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   Matrix topicTermCounts() {
+1:131eb4a:     return topicTermCounts;
+1:131eb4a:   }
+1:131eb4a: 
+1:229aeff:   @Override
+1:131eb4a:   public Iterator<MatrixSlice> iterator() {
+1:131eb4a:     return topicTermCounts.iterateAll();
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public Vector topicSums() {
+1:131eb4a:     return topicSums;
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   private static Pair<Matrix,Vector> randomMatrix(int numTopics, int numTerms, Random random) {
+1:131eb4a:     Matrix topicTermCounts = new DenseMatrix(numTopics, numTerms);
+1:131eb4a:     Vector topicSums = new DenseVector(numTopics);
+1:e64dd36:     if (random != null) {
+1:e64dd36:       for (int x = 0; x < numTopics; x++) {
+1:e64dd36:         for (int term = 0; term < numTerms; term++) {
+1:131eb4a:           topicTermCounts.viewRow(x).set(term, random.nextDouble());
+1:131eb4a:         }
+1:131eb4a:       }
+1:131eb4a:     }
+1:e64dd36:     for (int x = 0; x < numTopics; x++) {
+1:4fbfbc6:       topicSums.set(x, random == null ? 1.0 : topicTermCounts.viewRow(x).norm(1));
+1:131eb4a:     }
+1:131eb4a:     return Pair.of(topicTermCounts, topicSums);
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public static Pair<Matrix, Vector> loadModel(Configuration conf, Path... modelPaths)
+1:6d16230:     throws IOException {
+1:131eb4a:     int numTopics = -1;
+1:131eb4a:     int numTerms = -1;
+1:85f9ece:     List<Pair<Integer, Vector>> rows = new ArrayList<>();
+1:e64dd36:     for (Path modelPath : modelPaths) {
+1:6d16230:       for (Pair<IntWritable, VectorWritable> row
+1:6d16230:           : new SequenceFileIterable<IntWritable, VectorWritable>(modelPath, true, conf)) {
+1:131eb4a:         rows.add(Pair.of(row.getFirst().get(), row.getSecond().get()));
+1:131eb4a:         numTopics = Math.max(numTopics, row.getFirst().get());
+1:e64dd36:         if (numTerms < 0) {
+1:131eb4a:           numTerms = row.getSecond().get().size();
+1:131eb4a:         }
+1:131eb4a:       }
+1:131eb4a:     }
+1:e64dd36:     if (rows.isEmpty()) {
+1:e5ad032:       throw new IOException(Arrays.toString(modelPaths) + " have no vectors in it");
+1:131eb4a:     }
+1:131eb4a:     numTopics++;
+1:131eb4a:     Matrix model = new DenseMatrix(numTopics, numTerms);
+1:131eb4a:     Vector topicSums = new DenseVector(numTopics);
+1:e64dd36:     for (Pair<Integer, Vector> pair : rows) {
+1:131eb4a:       model.viewRow(pair.getFirst()).assign(pair.getSecond());
+1:131eb4a:       topicSums.set(pair.getFirst(), pair.getSecond().norm(1));
+1:131eb4a:     }
+1:131eb4a:     return Pair.of(model, topicSums);
+1:131eb4a:   }
+1:131eb4a: 
+1:e5ad032:   // NOTE: this is purely for debug purposes.  It is not performant to "toString()" a real model
+1:e5ad032:   @Override
+1:131eb4a:   public String toString() {
+1:4fbfbc6:     StringBuilder buf = new StringBuilder();
+1:e64dd36:     for (int x = 0; x < numTopics; x++) {
+1:131eb4a:       String v = dictionary != null
+1:131eb4a:           ? vectorToSortedString(topicTermCounts.viewRow(x).normalize(1), dictionary)
+1:131eb4a:           : topicTermCounts.viewRow(x).asFormatString();
+1:4fbfbc6:       buf.append(v).append('\n');
+1:131eb4a:     }
+1:4fbfbc6:     return buf.toString();
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public int sampleTerm(Vector topicDistribution) {
+1:131eb4a:     return sampler.sample(topicTermCounts.viewRow(sampler.sample(topicDistribution)));
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public int sampleTerm(int topic) {
+1:131eb4a:     return sampler.sample(topicTermCounts.viewRow(topic));
+1:131eb4a:   }
+1:131eb4a: 
+1:c88c240:   public synchronized void reset() {
+1:e64dd36:     for (int x = 0; x < numTopics; x++) {
+1:131eb4a:       topicTermCounts.assignRow(x, new SequentialAccessSparseVector(numTerms));
+1:131eb4a:     }
+1:564c3e1:     topicSums.assign(1.0);
+1:58cc1ae:     if (threadPool.isTerminated()) {
+1:67d1490:       initializeThreadPool();
+1:67d1490:     }
+1:131eb4a:   }
+1:131eb4a: 
+1:c88c240:   public synchronized void stop() {
+1:e64dd36:     for (Updater updater : updaters) {
+1:131eb4a:       updater.shutdown();
+1:131eb4a:     }
+1:67d1490:     threadPool.shutdown();
+1:67d1490:     try {
+1:67d1490:       if (!threadPool.awaitTermination(60, TimeUnit.SECONDS)) {
+1:67d1490:         log.warn("Threadpool timed out on await termination - jobs still running!");
+1:67d1490:       }
+1:67d1490:     } catch (InterruptedException e) {
+1:67d1490:       log.error("Interrupted shutting down!", e);
+1:67d1490:     }
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public void renormalize() {
+1:e64dd36:     for (int x = 0; x < numTopics; x++) {
+1:131eb4a:       topicTermCounts.assignRow(x, topicTermCounts.viewRow(x).normalize(1));
+1:564c3e1:       topicSums.assign(1.0);
+1:131eb4a:     }
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public void trainDocTopicModel(Vector original, Vector topics, Matrix docTopicModel) {
+1:131eb4a:     // first calculate p(topic|term,document) for all terms in original, and all topics,
+1:131eb4a:     // using p(term|topic) and p(topic|doc)
+1:131eb4a:     pTopicGivenTerm(original, topics, docTopicModel);
+1:131eb4a:     normalizeByTopic(docTopicModel);
+1:131eb4a:     // now multiply, term-by-term, by the document, to get the weighted distribution of
+1:131eb4a:     // term-topic pairs from this document.
+1:dc62944:     for (Element e : original.nonZeroes()) {
+1:e64dd36:       for (int x = 0; x < numTopics; x++) {
+1:131eb4a:         Vector docTopicModelRow = docTopicModel.viewRow(x);
+1:131eb4a:         docTopicModelRow.setQuick(e.index(), docTopicModelRow.getQuick(e.index()) * e.get());
+1:131eb4a:       }
+1:131eb4a:     }
+1:67d1490:     // now recalculate \(p(topic|doc)\) by summing contributions from all of pTopicGivenTerm
+1:564c3e1:     topics.assign(0.0);
+1:e64dd36:     for (int x = 0; x < numTopics; x++) {
+1:131eb4a:       topics.set(x, docTopicModel.viewRow(x).norm(1));
+1:131eb4a:     }
+1:67d1490:     // now renormalize so that \(sum_x(p(x|doc))\) = 1
+1:4841efb:     topics.assign(Functions.mult(1 / topics.norm(1)));
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public Vector infer(Vector original, Vector docTopics) {
+1:131eb4a:     Vector pTerm = original.like();
+1:dc62944:     for (Element e : original.nonZeroes()) {
+1:131eb4a:       int term = e.index();
+1:131eb4a:       // p(a) = sum_x (p(a|x) * p(x|i))
+1:131eb4a:       double pA = 0;
+1:e64dd36:       for (int x = 0; x < numTopics; x++) {
+1:131eb4a:         pA += (topicTermCounts.viewRow(x).get(term) / topicSums.get(x)) * docTopics.get(x);
+1:131eb4a:       }
+1:131eb4a:       pTerm.set(term, pA);
+1:131eb4a:     }
+1:131eb4a:     return pTerm;
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public void update(Matrix docTopicCounts) {
+1:e64dd36:     for (int x = 0; x < numTopics; x++) {
+1:131eb4a:       updaters[x % updaters.length].update(x, docTopicCounts.viewRow(x));
+1:131eb4a:     }
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public void updateTopic(int topic, Vector docTopicCounts) {
+1:131eb4a:     topicTermCounts.viewRow(topic).assign(docTopicCounts, Functions.PLUS);
+1:131eb4a:     topicSums.set(topic, topicSums.get(topic) + docTopicCounts.norm(1));
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public void update(int termId, Vector topicCounts) {
+1:e64dd36:     for (int x = 0; x < numTopics; x++) {
+1:131eb4a:       Vector v = topicTermCounts.viewRow(x);
+1:131eb4a:       v.set(termId, v.get(termId) + topicCounts.get(x));
+1:131eb4a:     }
+1:131eb4a:     topicSums.assign(topicCounts, Functions.PLUS);
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public void persist(Path outputDir, boolean overwrite) throws IOException {
+1:131eb4a:     FileSystem fs = outputDir.getFileSystem(conf);
+1:e64dd36:     if (overwrite) {
+1:131eb4a:       fs.delete(outputDir, true); // CHECK second arg
+1:131eb4a:     }
+1:131eb4a:     DistributedRowMatrixWriter.write(outputDir, conf, topicTermCounts);
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   /**
+1:67d1490:    * Computes {@code \(p(topic x | term a, document i)\)} distributions given input document {@code i}.
+1:67d1490:    * {@code \(pTGT[x][a]\)} is the (un-normalized) {@code \(p(x|a,i)\)}, or if docTopics is {@code null},
+1:67d1490:    * {@code \(p(a|x)\)} (also un-normalized).
+1:131eb4a:    *
+1:67d1490:    * @param document doc-term vector encoding {@code \(w(term a|document i)\)}.
+1:131eb4a:    * @param docTopics {@code docTopics[x]} is the overall weight of topic {@code x} in given
+1:131eb4a:    *          document. If {@code null}, a topic weight of {@code 1.0} is used for all topics.
+1:67d1490:    * @param termTopicDist storage for output {@code \(p(x|a,i)\)} distributions.
+1:131eb4a:    */
+1:131eb4a:   private void pTopicGivenTerm(Vector document, Vector docTopics, Matrix termTopicDist) {
+1:131eb4a:     // for each topic x
+1:e64dd36:     for (int x = 0; x < numTopics; x++) {
+1:131eb4a:       // get p(topic x | document i), or 1.0 if docTopics is null
+1:4fbfbc6:       double topicWeight = docTopics == null ? 1.0 : docTopics.get(x);
+1:131eb4a:       // get w(term a | topic x)
+1:131eb4a:       Vector topicTermRow = topicTermCounts.viewRow(x);
+1:131eb4a:       // get \sum_a w(term a | topic x)
+1:131eb4a:       double topicSum = topicSums.get(x);
+1:131eb4a:       // get p(topic x | term a) distribution to update
+1:131eb4a:       Vector termTopicRow = termTopicDist.viewRow(x);
+1:131eb4a: 
+1:131eb4a:       // for each term a in document i with non-zero weight
+1:dc62944:       for (Element e : document.nonZeroes()) {
+1:131eb4a:         int termIndex = e.index();
+1:131eb4a: 
+1:131eb4a:         // calc un-normalized p(topic x | term a, document i)
+1:6d16230:         double termTopicLikelihood = (topicTermRow.get(termIndex) + eta) * (topicWeight + alpha)
+1:6d16230:             / (topicSum + eta * numTerms);
+1:131eb4a:         termTopicRow.set(termIndex, termTopicLikelihood);
+1:131eb4a:       }
+1:131eb4a:     }
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   /**
+1:67d1490:    * \(sum_x sum_a (c_ai * log(p(x|i) * p(a|x)))\)
+1:131eb4a:    */
+1:131eb4a:   public double perplexity(Vector document, Vector docTopics) {
+1:131eb4a:     double perplexity = 0;
+1:131eb4a:     double norm = docTopics.norm(1) + (docTopics.size() * alpha);
+1:dc62944:     for (Element e : document.nonZeroes()) {
+1:131eb4a:       int term = e.index();
+1:131eb4a:       double prob = 0;
+1:e64dd36:       for (int x = 0; x < numTopics; x++) {
+1:131eb4a:         double d = (docTopics.get(x) + alpha) / norm;
+1:131eb4a:         double p = d * (topicTermCounts.viewRow(x).get(term) + eta)
+1:131eb4a:                    / (topicSums.get(x) + eta * numTerms);
+1:131eb4a:         prob += p;
+1:131eb4a:       }
+1:131eb4a:       perplexity += e.get() * Math.log(prob);
+1:131eb4a:     }
+1:131eb4a:     return -perplexity;
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   private void normalizeByTopic(Matrix perTopicSparseDistributions) {
+1:131eb4a:     // then make sure that each of these is properly normalized by topic: sum_x(p(x|t,d)) = 1
+1:dc62944:     for (Element e : perTopicSparseDistributions.viewRow(0).nonZeroes()) {
+1:131eb4a:       int a = e.index();
+1:131eb4a:       double sum = 0;
+1:e64dd36:       for (int x = 0; x < numTopics; x++) {
+1:131eb4a:         sum += perTopicSparseDistributions.viewRow(x).get(a);
+1:131eb4a:       }
+1:e64dd36:       for (int x = 0; x < numTopics; x++) {
+1:131eb4a:         perTopicSparseDistributions.viewRow(x).set(a,
+1:131eb4a:             perTopicSparseDistributions.viewRow(x).get(a) / sum);
+1:131eb4a:       }
+1:131eb4a:     }
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public static String vectorToSortedString(Vector vector, String[] dictionary) {
+1:85f9ece:     List<Pair<String,Double>> vectorValues = new ArrayList<>(vector.getNumNondefaultElements());
+1:dc62944:     for (Element e : vector.nonZeroes()) {
+1:131eb4a:       vectorValues.add(Pair.of(dictionary != null ? dictionary[e.index()] : String.valueOf(e.index()),
+1:131eb4a:                                e.get()));
+1:131eb4a:     }
+1:131eb4a:     Collections.sort(vectorValues, new Comparator<Pair<String, Double>>() {
+1:131eb4a:       @Override public int compare(Pair<String, Double> x, Pair<String, Double> y) {
+1:131eb4a:         return y.getSecond().compareTo(x.getSecond());
+1:131eb4a:       }
+1:131eb4a:     });
+1:131eb4a:     Iterator<Pair<String,Double>> listIt = vectorValues.iterator();
+1:131eb4a:     StringBuilder bldr = new StringBuilder(2048);
+1:4fbfbc6:     bldr.append('{');
+1:131eb4a:     int i = 0;
+1:e64dd36:     while (listIt.hasNext() && i < 25) {
+1:131eb4a:       i++;
+1:131eb4a:       Pair<String,Double> p = listIt.next();
+1:131eb4a:       bldr.append(p.getFirst());
+1:4fbfbc6:       bldr.append(':');
+1:131eb4a:       bldr.append(p.getSecond());
+1:4fbfbc6:       bldr.append(',');
+1:131eb4a:     }
+1:e64dd36:     if (bldr.length() > 1) {
+1:131eb4a:       bldr.setCharAt(bldr.length() - 1, '}');
+1:131eb4a:     }
+1:131eb4a:     return bldr.toString();
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   @Override
+1:131eb4a:   public void setConf(Configuration configuration) {
+1:131eb4a:     this.conf = configuration;
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   @Override
+1:131eb4a:   public Configuration getConf() {
+1:131eb4a:     return conf;
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   private final class Updater implements Runnable {
+1:564c3e1:     private final ArrayBlockingQueue<Pair<Integer, Vector>> queue =
+1:87c15be:         new ArrayBlockingQueue<>(100);
+1:131eb4a:     private boolean shutdown = false;
+1:131eb4a:     private boolean shutdownComplete = false;
+1:131eb4a: 
+1:131eb4a:     public void shutdown() {
+1:131eb4a:       try {
+1:131eb4a:         synchronized (this) {
+1:e64dd36:           while (!shutdownComplete) {
+1:131eb4a:             shutdown = true;
+1:051cbcf:             wait(10000L); // Arbitrarily, wait 10 seconds rather than forever for this
+1:131eb4a:           }
+1:131eb4a:         }
+1:131eb4a:       } catch (InterruptedException e) {
+1:131eb4a:         log.warn("Interrupted waiting to shutdown() : ", e);
+1:131eb4a:       }
+1:131eb4a:     }
+1:131eb4a: 
+1:131eb4a:     public boolean update(int topic, Vector v) {
+1:e64dd36:       if (shutdown) { // maybe don't do this?
+1:131eb4a:         throw new IllegalStateException("In SHUTDOWN state: cannot submit tasks");
+1:131eb4a:       }
+1:e64dd36:       while (true) { // keep trying if interrupted
+1:131eb4a:         try {
+1:131eb4a:           // start async operation by submitting to the queue
+1:131eb4a:           queue.put(Pair.of(topic, v));
+1:131eb4a:           // return once you got access to the queue
+1:131eb4a:           return true;
+1:131eb4a:         } catch (InterruptedException e) {
+1:131eb4a:           log.warn("Interrupted trying to queue update:", e);
+1:131eb4a:         }
+1:131eb4a:       }
+1:131eb4a:     }
+1:131eb4a: 
+1:4fbfbc6:     @Override
+1:229aeff:     public void run() {
+1:e64dd36:       while (!shutdown) {
+1:131eb4a:         try {
+1:131eb4a:           Pair<Integer, Vector> pair = queue.poll(1, TimeUnit.SECONDS);
+1:e64dd36:           if (pair != null) {
+1:131eb4a:             updateTopic(pair.getFirst(), pair.getSecond());
+1:131eb4a:           }
+1:131eb4a:         } catch (InterruptedException e) {
+1:131eb4a:           log.warn("Interrupted waiting to poll for update", e);
+1:131eb4a:         }
+1:131eb4a:       }
+1:131eb4a:       // in shutdown mode, finish remaining tasks!
+1:e64dd36:       for (Pair<Integer, Vector> pair : queue) {
+1:131eb4a:         updateTopic(pair.getFirst(), pair.getSecond());
+1:131eb4a:       }
+1:131eb4a:       synchronized (this) {
+1:131eb4a:         shutdownComplete = true;
+1:131eb4a:         notifyAll();
+1:131eb4a:       }
+1:131eb4a:     }
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a: }
+============================================================================
+author:Suneel Marthi
+-------------------------------------------------------------------------------
+commit:85f9ece
+/////////////////////////////////////////////////////////////////////////
+1: import java.io.IOException;
+1: import java.util.ArrayList;
+1: import java.util.Arrays;
+1: import java.util.Collections;
+1: import java.util.Comparator;
+1: import java.util.Iterator;
+1: import java.util.List;
+1: import java.util.Random;
+1: import java.util.concurrent.ArrayBlockingQueue;
+1: import java.util.concurrent.ThreadPoolExecutor;
+1: import java.util.concurrent.TimeUnit;
+1: 
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     List<Pair<Integer, Vector>> rows = new ArrayList<>();
+/////////////////////////////////////////////////////////////////////////
+1:     List<Pair<String,Double>> vectorValues = new ArrayList<>(vector.getNumNondefaultElements());
+commit:87c15be
+/////////////////////////////////////////////////////////////////////////
+1:         new ArrayBlockingQueue<>(100);
+author:pferrel
+-------------------------------------------------------------------------------
+commit:b988c49
+author:frankscholten
+-------------------------------------------------------------------------------
+commit:1a42d85
+author:smarthi
+-------------------------------------------------------------------------------
+commit:c88c240
+/////////////////////////////////////////////////////////////////////////
+1:   private synchronized void initializeThreadPool() {
+1:     if (threadPool != null) {
+1:       threadPool.shutdown();
+1:       try {
+1:         threadPool.awaitTermination(100, TimeUnit.SECONDS);
+1:       } catch (InterruptedException e) {
+1:         log.error("Could not terminate all threads for TopicModel in time.", e);
+1:       }
+1:     }
+/////////////////////////////////////////////////////////////////////////
+1:   public synchronized void reset() {
+/////////////////////////////////////////////////////////////////////////
+1:   public synchronized void stop() {
+commit:67d1490
+/////////////////////////////////////////////////////////////////////////
+1:   private ThreadPoolExecutor threadPool;
+/////////////////////////////////////////////////////////////////////////
+1:     threadPool = new ThreadPoolExecutor(numThreads, numThreads, 0, TimeUnit.SECONDS,
+/////////////////////////////////////////////////////////////////////////
+0:     if(threadPool.isTerminated()) {
+1:       initializeThreadPool();
+1:     }
+0:   public void stop() {
+1:     threadPool.shutdown();
+1:     try {
+1:       if (!threadPool.awaitTermination(60, TimeUnit.SECONDS)) {
+1:         log.warn("Threadpool timed out on await termination - jobs still running!");
+1:       }
+1:     } catch (InterruptedException e) {
+1:         log.error("Interrupted shutting down!", e);
+1:     }
+/////////////////////////////////////////////////////////////////////////
+1:     // now recalculate \(p(topic|doc)\) by summing contributions from all of pTopicGivenTerm
+1:     // now renormalize so that \(sum_x(p(x|doc))\) = 1
+/////////////////////////////////////////////////////////////////////////
+1:    * Computes {@code \(p(topic x | term a, document i)\)} distributions given input document {@code i}.
+1:    * {@code \(pTGT[x][a]\)} is the (un-normalized) {@code \(p(x|a,i)\)}, or if docTopics is {@code null},
+1:    * {@code \(p(a|x)\)} (also un-normalized).
+1:    * @param document doc-term vector encoding {@code \(w(term a|document i)\)}.
+1:    * @param termTopicDist storage for output {@code \(p(x|a,i)\)} distributions.
+/////////////////////////////////////////////////////////////////////////
+1:    * \(sum_x sum_a (c_ai * log(p(x|i) * p(a|x)))\)
+author:Sebastian Schelter
+-------------------------------------------------------------------------------
+commit:58cc1ae
+/////////////////////////////////////////////////////////////////////////
+1:     if (threadPool.isTerminated()) {
+/////////////////////////////////////////////////////////////////////////
+0:       log.error("Interrupted shutting down!", e);
+commit:6d16230
+/////////////////////////////////////////////////////////////////////////
+1:     throws IOException {
+1:       for (Pair<IntWritable, VectorWritable> row
+1:           : new SequenceFileIterable<IntWritable, VectorWritable>(modelPath, true, conf)) {
+/////////////////////////////////////////////////////////////////////////
+1:         double termTopicLikelihood = (topicTermRow.get(termIndex) + eta) * (topicWeight + alpha)
+1:             / (topicSum + eta * numTerms);
+commit:4841efb
+/////////////////////////////////////////////////////////////////////////
+1:     topics.assign(Functions.mult(1 / topics.norm(1)));
+/////////////////////////////////////////////////////////////////////////
+0:         double termTopicLikelihood = (topicTermRow.get(termIndex) + eta) * (topicWeight + alpha) /
+0:             (topicSum + eta * numTerms);
+commit:210b265
+/////////////////////////////////////////////////////////////////////////
+0:     List<Pair<String,Double>> vectorValues = Lists.newArrayListWithCapacity(vector.getNumNondefaultElements());
+author:Jacob Alexander Mannix
+-------------------------------------------------------------------------------
+commit:dc62944
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.mahout.math.Vector.Element;
+/////////////////////////////////////////////////////////////////////////
+1:     for (Element e : original.nonZeroes()) {
+/////////////////////////////////////////////////////////////////////////
+1:     for (Element e : original.nonZeroes()) {
+/////////////////////////////////////////////////////////////////////////
+1:       for (Element e : document.nonZeroes()) {
+/////////////////////////////////////////////////////////////////////////
+1:     for (Element e : document.nonZeroes()) {
+/////////////////////////////////////////////////////////////////////////
+1:     for (Element e : perTopicSparseDistributions.viewRow(0).nonZeroes()) {
+/////////////////////////////////////////////////////////////////////////
+1:     for (Element e : vector.nonZeroes()) {
+commit:e5ad032
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.Arrays;
+/////////////////////////////////////////////////////////////////////////
+1:       throw new IOException(Arrays.toString(modelPaths) + " have no vectors in it");
+/////////////////////////////////////////////////////////////////////////
+1:   // NOTE: this is purely for debug purposes.  It is not performant to "toString()" a real model
+1:   @Override
+commit:131eb4a
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.mahout.clustering.lda.cvb;
+1: 
+0: import com.google.common.collect.Lists;
+1: import org.apache.hadoop.conf.Configurable;
+1: import org.apache.hadoop.conf.Configuration;
+1: import org.apache.hadoop.fs.FileSystem;
+1: import org.apache.hadoop.fs.Path;
+1: import org.apache.hadoop.io.IntWritable;
+1: import org.apache.mahout.common.Pair;
+1: import org.apache.mahout.common.iterator.sequencefile.SequenceFileIterable;
+1: import org.apache.mahout.math.DenseMatrix;
+1: import org.apache.mahout.math.DenseVector;
+1: import org.apache.mahout.math.DistributedRowMatrixWriter;
+1: import org.apache.mahout.math.Matrix;
+1: import org.apache.mahout.math.MatrixSlice;
+1: import org.apache.mahout.math.SequentialAccessSparseVector;
+1: import org.apache.mahout.math.Vector;
+1: import org.apache.mahout.math.VectorWritable;
+1: import org.apache.mahout.math.function.Functions;
+1: import org.apache.mahout.math.stats.Sampler;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+0: import java.io.IOException;
+0: import java.util.ArrayList;
+0: import java.util.Collections;
+0: import java.util.Comparator;
+0: import java.util.Iterator;
+0: import java.util.List;
+0: import java.util.Random;
+0: import java.util.concurrent.ArrayBlockingQueue;
+0: import java.util.concurrent.ThreadPoolExecutor;
+0: import java.util.concurrent.TimeUnit;
+1: 
+1: /**
+1:  * Thin wrapper around a {@link Matrix} of counts of occurrences of (topic, term) pairs.  Dividing
+1:  * {code topicTermCount.viewRow(topic).get(term)} by the sum over the values for all terms in that
+1:  * row yields p(term | topic).  Instead dividing it by all topic columns for that term yields
+1:  * p(topic | term).
+1:  *
+1:  * Multithreading is enabled for the {@code update(Matrix)} method: this method is async, and
+1:  * merely submits the matrix to a work queue.  When all work has been submitted,
+1:  * {@code awaitTermination()} should be called, which will block until updates have been
+1:  * accumulated.
+1:  */
+1: public class TopicModel implements Configurable, Iterable<MatrixSlice> {
+1:   private static final Logger log = LoggerFactory.getLogger(TopicModel.class);
+1:   private final String[] dictionary;
+1:   private final Matrix topicTermCounts;
+1:   private final Vector topicSums;
+1:   private final int numTopics;
+1:   private final int numTerms;
+1:   private final double eta;
+1:   private final double alpha;
+1: 
+1:   private Configuration conf;
+1: 
+0:   private Sampler sampler;
+1:   private final int numThreads;
+0:   private ThreadPoolExecutor threadPool;
+1:   private Updater[] updaters;
+1: 
+1:   public int getNumTerms() {
+1:     return numTerms;
+1:   }
+1: 
+1:   public int getNumTopics() {
+1:     return numTopics;
+1:   }
+1: 
+1:   public TopicModel(int numTopics, int numTerms, double eta, double alpha, String[] dictionary,
+1:       double modelWeight) {
+1:     this(numTopics, numTerms, eta, alpha, null, dictionary, 1, modelWeight);
+1:   }
+1: 
+1:   public TopicModel(Configuration conf, double eta, double alpha,
+1:       String[] dictionary, int numThreads, double modelWeight, Path... modelpath) throws IOException {
+1:     this(loadModel(conf, modelpath), eta, alpha, dictionary, numThreads, modelWeight);
+1:   }
+1: 
+1:   public TopicModel(int numTopics, int numTerms, double eta, double alpha, String[] dictionary,
+1:       int numThreads, double modelWeight) {
+1:     this(new DenseMatrix(numTopics, numTerms), new DenseVector(numTopics), eta, alpha, dictionary,
+1:         numThreads, modelWeight);
+1:   }
+1: 
+1:   public TopicModel(int numTopics, int numTerms, double eta, double alpha, Random random,
+1:       String[] dictionary, int numThreads, double modelWeight) {
+1:     this(randomMatrix(numTopics, numTerms, random), eta, alpha, dictionary, numThreads, modelWeight);
+1:   }
+1: 
+1:   private TopicModel(Pair<Matrix, Vector> model, double eta, double alpha, String[] dict,
+1:       int numThreads, double modelWeight) {
+1:     this(model.getFirst(), model.getSecond(), eta, alpha, dict, numThreads, modelWeight);
+1:   }
+1: 
+1:   public TopicModel(Matrix topicTermCounts, Vector topicSums, double eta, double alpha,
+1:     String[] dictionary, double modelWeight) {
+1:     this(topicTermCounts, topicSums, eta, alpha, dictionary, 1, modelWeight);
+1:   }
+1: 
+1:   public TopicModel(Matrix topicTermCounts, double eta, double alpha, String[] dictionary,
+1:       int numThreads, double modelWeight) {
+1:     this(topicTermCounts, viewRowSums(topicTermCounts),
+1:         eta, alpha, dictionary, numThreads, modelWeight);
+1:   }
+1: 
+1:   public TopicModel(Matrix topicTermCounts, Vector topicSums, double eta, double alpha,
+1:     String[] dictionary, int numThreads, double modelWeight) {
+1:     this.dictionary = dictionary;
+1:     this.topicTermCounts = topicTermCounts;
+1:     this.topicSums = topicSums;
+1:     this.numTopics = topicSums.size();
+1:     this.numTerms = topicTermCounts.numCols();
+1:     this.eta = eta;
+1:     this.alpha = alpha;
+0:     this.sampler = new Sampler(new Random(1234));
+1:     this.numThreads = numThreads;
+0:     if(modelWeight != 1) {
+1:       topicSums.assign(Functions.mult(modelWeight));
+0:       for(int x = 0; x < numTopics; x++) {
+1:         topicTermCounts.viewRow(x).assign(Functions.mult(modelWeight));
+1:       }
+1:     }
+1:     initializeThreadPool();
+1:   }
+1: 
+1:   private static Vector viewRowSums(Matrix m) {
+1:     Vector v = new DenseVector(m.numRows());
+0:     for(MatrixSlice slice : m) {
+1:       v.set(slice.index(), slice.vector().norm(1));
+1:     }
+1:     return v;
+1:   }
+1: 
+0:   private void initializeThreadPool() {
+0:     threadPool = new ThreadPoolExecutor(numThreads, numThreads, 0, TimeUnit.SECONDS,
+1:         new ArrayBlockingQueue<Runnable>(numThreads * 10));
+1:     threadPool.allowCoreThreadTimeOut(false);
+1:     updaters = new Updater[numThreads];
+0:     for(int i = 0; i < numThreads; i++) {
+1:       updaters[i] = new Updater();
+1:       threadPool.submit(updaters[i]);
+1:     }
+1:   }
+1: 
+1:   Matrix topicTermCounts() {
+1:     return topicTermCounts;
+1:   }
+1: 
+1:   public Iterator<MatrixSlice> iterator() {
+1:     return topicTermCounts.iterateAll();
+1:   }
+1: 
+1:   public Vector topicSums() {
+1:     return topicSums;
+1:   }
+1: 
+1:   private static Pair<Matrix,Vector> randomMatrix(int numTopics, int numTerms, Random random) {
+1:     Matrix topicTermCounts = new DenseMatrix(numTopics, numTerms);
+1:     Vector topicSums = new DenseVector(numTopics);
+0:     if(random != null) {
+0:       for(int x = 0; x < numTopics; x++) {
+0:         for(int term = 0; term < numTerms; term++) {
+1:           topicTermCounts.viewRow(x).set(term, random.nextDouble());
+1:         }
+1:       }
+1:     }
+0:     for(int x = 0; x < numTopics; x++) {
+0:       topicSums.set(x, random == null ? 1d : topicTermCounts.viewRow(x).norm(1));
+1:     }
+1:     return Pair.of(topicTermCounts, topicSums);
+1:   }
+1: 
+1:   public static Pair<Matrix, Vector> loadModel(Configuration conf, Path... modelPaths)
+0:       throws IOException {
+1:     int numTopics = -1;
+1:     int numTerms = -1;
+0:     List<Pair<Integer, Vector>> rows = Lists.newArrayList();
+0:     for(Path modelPath : modelPaths) {
+0:       for(Pair<IntWritable, VectorWritable> row :
+0:           new SequenceFileIterable<IntWritable, VectorWritable>(modelPath, true, conf)) {
+1:         rows.add(Pair.of(row.getFirst().get(), row.getSecond().get()));
+1:         numTopics = Math.max(numTopics, row.getFirst().get());
+0:         if(numTerms < 0) {
+1:           numTerms = row.getSecond().get().size();
+1:         }
+1:       }
+1:     }
+0:     if(rows.isEmpty()) {
+0:       throw new IOException(modelPaths + " have no vectors in it");
+1:     }
+1:     numTopics++;
+1:     Matrix model = new DenseMatrix(numTopics, numTerms);
+1:     Vector topicSums = new DenseVector(numTopics);
+0:     for(Pair<Integer, Vector> pair : rows) {
+1:       model.viewRow(pair.getFirst()).assign(pair.getSecond());
+1:       topicSums.set(pair.getFirst(), pair.getSecond().norm(1));
+1:     }
+1:     return Pair.of(model, topicSums);
+1:   }
+1: 
+1:   public String toString() {
+0:     String buf = "";
+0:     for(int x = 0; x < numTopics; x++) {
+1:       String v = dictionary != null
+1:           ? vectorToSortedString(topicTermCounts.viewRow(x).normalize(1), dictionary)
+1:           : topicTermCounts.viewRow(x).asFormatString();
+0:       buf += v + "\n";
+1:     }
+0:     return buf;
+1:   }
+1: 
+1:   public int sampleTerm(Vector topicDistribution) {
+1:     return sampler.sample(topicTermCounts.viewRow(sampler.sample(topicDistribution)));
+1:   }
+1: 
+1:   public int sampleTerm(int topic) {
+1:     return sampler.sample(topicTermCounts.viewRow(topic));
+1:   }
+1: 
+0:   public void reset() {
+0:     for(int x = 0; x < numTopics; x++) {
+1:       topicTermCounts.assignRow(x, new SequentialAccessSparseVector(numTerms));
+1:     }
+0:     topicSums.assign(1d);
+1:     initializeThreadPool();
+1:   }
+1: 
+0:   public void awaitTermination() {
+0:     for(Updater updater : updaters) {
+1:       updater.shutdown();
+1:     }
+1:   }
+1: 
+1:   public void renormalize() {
+0:     for(int x = 0; x < numTopics; x++) {
+1:       topicTermCounts.assignRow(x, topicTermCounts.viewRow(x).normalize(1));
+0:       topicSums.assign(1d);
+1:     }
+1:   }
+1: 
+1:   public void trainDocTopicModel(Vector original, Vector topics, Matrix docTopicModel) {
+1:     // first calculate p(topic|term,document) for all terms in original, and all topics,
+1:     // using p(term|topic) and p(topic|doc)
+1:     pTopicGivenTerm(original, topics, docTopicModel);
+1:     normalizeByTopic(docTopicModel);
+1:     // now multiply, term-by-term, by the document, to get the weighted distribution of
+1:     // term-topic pairs from this document.
+0:     Iterator<Vector.Element> it = original.iterateNonZero();
+0:     while(it.hasNext()) {
+0:       Vector.Element e = it.next();
+0:       for(int x = 0; x < numTopics; x++) {
+1:         Vector docTopicModelRow = docTopicModel.viewRow(x);
+1:         docTopicModelRow.setQuick(e.index(), docTopicModelRow.getQuick(e.index()) * e.get());
+1:       }
+1:     }
+0:     // now recalculate p(topic|doc) by summing contributions from all of pTopicGivenTerm
+0:     topics.assign(0d);
+0:     for(int x = 0; x < numTopics; x++) {
+1:       topics.set(x, docTopicModel.viewRow(x).norm(1));
+1:     }
+0:     // now renormalize so that sum_x(p(x|doc)) = 1
+0:     topics.assign(Functions.mult(1/topics.norm(1)));
+1:   }
+1: 
+1:   public Vector infer(Vector original, Vector docTopics) {
+1:     Vector pTerm = original.like();
+0:     Iterator<Vector.Element> it = original.iterateNonZero();
+0:     while(it.hasNext()) {
+0:       Vector.Element e = it.next();
+1:       int term = e.index();
+1:       // p(a) = sum_x (p(a|x) * p(x|i))
+1:       double pA = 0;
+0:       for(int x = 0; x < numTopics; x++) {
+1:         pA += (topicTermCounts.viewRow(x).get(term) / topicSums.get(x)) * docTopics.get(x);
+1:       }
+1:       pTerm.set(term, pA);
+1:     }
+1:     return pTerm;
+1:   }
+1: 
+1:   public void update(Matrix docTopicCounts) {
+0:     for(int x = 0; x < numTopics; x++) {
+1:       updaters[x % updaters.length].update(x, docTopicCounts.viewRow(x));
+1:     }
+1:   }
+1: 
+1:   public void updateTopic(int topic, Vector docTopicCounts) {
+1:     topicTermCounts.viewRow(topic).assign(docTopicCounts, Functions.PLUS);
+1:     topicSums.set(topic, topicSums.get(topic) + docTopicCounts.norm(1));
+1:   }
+1: 
+1:   public void update(int termId, Vector topicCounts) {
+0:     for(int x = 0; x < numTopics; x++) {
+1:       Vector v = topicTermCounts.viewRow(x);
+1:       v.set(termId, v.get(termId) + topicCounts.get(x));
+1:     }
+1:     topicSums.assign(topicCounts, Functions.PLUS);
+1:   }
+1: 
+1:   public void persist(Path outputDir, boolean overwrite) throws IOException {
+1:     FileSystem fs = outputDir.getFileSystem(conf);
+0:     if(overwrite) {
+1:       fs.delete(outputDir, true); // CHECK second arg
+1:     }
+1:     DistributedRowMatrixWriter.write(outputDir, conf, topicTermCounts);
+1:   }
+1: 
+1:   /**
+0:    * Computes {@code p(topic x|term a, document i)} distributions given input document {@code i}.
+0:    * {@code pTGT[x][a]} is the (un-normalized) {@code p(x|a,i)}, or if docTopics is {@code null},
+0:    * {@code p(a|x)} (also un-normalized).
+1:    *
+0:    * @param document doc-term vector encoding {@code w(term a|document i)}.
+1:    * @param docTopics {@code docTopics[x]} is the overall weight of topic {@code x} in given
+1:    *          document. If {@code null}, a topic weight of {@code 1.0} is used for all topics.
+0:    * @param termTopicDist storage for output {@code p(x|a,i)} distributions.
+1:    */
+1:   private void pTopicGivenTerm(Vector document, Vector docTopics, Matrix termTopicDist) {
+1:     // for each topic x
+0:     for(int x = 0; x < numTopics; x++) {
+1:       // get p(topic x | document i), or 1.0 if docTopics is null
+0:       double topicWeight = docTopics == null ? 1d : docTopics.get(x);
+1:       // get w(term a | topic x)
+1:       Vector topicTermRow = topicTermCounts.viewRow(x);
+1:       // get \sum_a w(term a | topic x)
+1:       double topicSum = topicSums.get(x);
+1:       // get p(topic x | term a) distribution to update
+1:       Vector termTopicRow = termTopicDist.viewRow(x);
+1: 
+1:       // for each term a in document i with non-zero weight
+0:       Iterator<Vector.Element> it = document.iterateNonZero();
+0:       while(it.hasNext()) {
+0:         Vector.Element e = it.next();
+1:         int termIndex = e.index();
+1: 
+1:         // calc un-normalized p(topic x | term a, document i)
+0:         double termTopicLikelihood = (topicTermRow.get(termIndex) + eta) * (topicWeight + alpha) / (topicSum + eta * numTerms);
+1:         termTopicRow.set(termIndex, termTopicLikelihood);
+1:       }
+1:     }
+1:   }
+1: 
+1:   /**
+0:    * sum_x sum_a (c_ai * log(p(x|i) * p(a|x)))
+0:    * @param document
+0:    * @param docTopics
+0:    * @return
+1:    */
+1:   public double perplexity(Vector document, Vector docTopics) {
+1:     double perplexity = 0;
+1:     double norm = docTopics.norm(1) + (docTopics.size() * alpha);
+0:     Iterator<Vector.Element> it = document.iterateNonZero();
+0:     while(it.hasNext()) {
+0:       Vector.Element e = it.next();
+1:       int term = e.index();
+1:       double prob = 0;
+0:       for(int x = 0; x < numTopics; x++) {
+1:         double d = (docTopics.get(x) + alpha) / norm;
+1:         double p = d * (topicTermCounts.viewRow(x).get(term) + eta)
+1:                    / (topicSums.get(x) + eta * numTerms);
+1:         prob += p;
+1:       }
+1:       perplexity += e.get() * Math.log(prob);
+1:     }
+1:     return -perplexity;
+1:   }
+1: 
+1:   private void normalizeByTopic(Matrix perTopicSparseDistributions) {
+0:     Iterator<Vector.Element> it = perTopicSparseDistributions.viewRow(0).iterateNonZero();
+1:     // then make sure that each of these is properly normalized by topic: sum_x(p(x|t,d)) = 1
+0:     while(it.hasNext()) {
+0:       Vector.Element e = it.next();
+1:       int a = e.index();
+1:       double sum = 0;
+0:       for(int x = 0; x < numTopics; x++) {
+1:         sum += perTopicSparseDistributions.viewRow(x).get(a);
+1:       }
+0:       for(int x = 0; x < numTopics; x++) {
+1:         perTopicSparseDistributions.viewRow(x).set(a,
+1:             perTopicSparseDistributions.viewRow(x).get(a) / sum);
+1:       }
+1:     }
+1:   }
+1: 
+1:   public static String vectorToSortedString(Vector vector, String[] dictionary) {
+0:     List<Pair<String,Double>> vectorValues =
+0:         new ArrayList<Pair<String, Double>>(vector.getNumNondefaultElements());
+0:     Iterator<Vector.Element> it = vector.iterateNonZero();
+0:     while(it.hasNext()) {
+0:       Vector.Element e = it.next();
+1:       vectorValues.add(Pair.of(dictionary != null ? dictionary[e.index()] : String.valueOf(e.index()),
+1:                                e.get()));
+1:     }
+1:     Collections.sort(vectorValues, new Comparator<Pair<String, Double>>() {
+1:       @Override public int compare(Pair<String, Double> x, Pair<String, Double> y) {
+1:         return y.getSecond().compareTo(x.getSecond());
+1:       }
+1:     });
+1:     Iterator<Pair<String,Double>> listIt = vectorValues.iterator();
+1:     StringBuilder bldr = new StringBuilder(2048);
+0:     bldr.append("{");
+1:     int i = 0;
+0:     while(listIt.hasNext() && i < 25) {
+1:       i++;
+1:       Pair<String,Double> p = listIt.next();
+1:       bldr.append(p.getFirst());
+0:       bldr.append(":");
+1:       bldr.append(p.getSecond());
+0:       bldr.append(",");
+1:     }
+0:     if(bldr.length() > 1) {
+1:       bldr.setCharAt(bldr.length() - 1, '}');
+1:     }
+1:     return bldr.toString();
+1:   }
+1: 
+1:   @Override
+1:   public void setConf(Configuration configuration) {
+1:     this.conf = configuration;
+1:   }
+1: 
+1:   @Override
+1:   public Configuration getConf() {
+1:     return conf;
+1:   }
+1: 
+1:   private final class Updater implements Runnable {
+0:     private ArrayBlockingQueue<Pair<Integer, Vector>> queue =
+0:         new ArrayBlockingQueue<Pair<Integer, Vector>>(100);
+1:     private boolean shutdown = false;
+1:     private boolean shutdownComplete = false;
+1: 
+1:     public void shutdown() {
+1:       try {
+1:         synchronized (this) {
+0:           while(!shutdownComplete) {
+1:             shutdown = true;
+0:             wait();
+1:           }
+1:         }
+1:       } catch (InterruptedException e) {
+1:         log.warn("Interrupted waiting to shutdown() : ", e);
+1:       }
+1:     }
+1: 
+1:     public boolean update(int topic, Vector v) {
+0:       if(shutdown) { // maybe don't do this?
+1:         throw new IllegalStateException("In SHUTDOWN state: cannot submit tasks");
+1:       }
+0:       while(true) { // keep trying if interrupted
+1:         try {
+1:           // start async operation by submitting to the queue
+1:           queue.put(Pair.of(topic, v));
+1:           // return once you got access to the queue
+1:           return true;
+1:         } catch (InterruptedException e) {
+1:           log.warn("Interrupted trying to queue update:", e);
+1:         }
+1:       }
+1:     }
+1: 
+0:     @Override public void run() {
+0:       while(!shutdown) {
+1:         try {
+1:           Pair<Integer, Vector> pair = queue.poll(1, TimeUnit.SECONDS);
+0:           if(pair != null) {
+1:             updateTopic(pair.getFirst(), pair.getSecond());
+1:           }
+1:         } catch (InterruptedException e) {
+1:           log.warn("Interrupted waiting to poll for update", e);
+1:         }
+1:       }
+1:       // in shutdown mode, finish remaining tasks!
+0:       for(Pair<Integer, Vector> pair : queue) {
+1:         updateTopic(pair.getFirst(), pair.getSecond());
+1:       }
+1:       synchronized (this) {
+1:         shutdownComplete = true;
+1:         notifyAll();
+1:       }
+1:     }
+1:   }
+1: 
+1: }
+author:Ted Dunning
+-------------------------------------------------------------------------------
+commit:402e296
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:    * Computes {@code p(topic x | term a, document i)} distributions given input document {@code i}.
+author:Sean R. Owen
+-------------------------------------------------------------------------------
+commit:229aeff
+/////////////////////////////////////////////////////////////////////////
+1:     @Override
+1:     public void run() {
+commit:051cbcf
+/////////////////////////////////////////////////////////////////////////
+1:             wait(10000L); // Arbitrarily, wait 10 seconds rather than forever for this
+commit:15925a5
+/////////////////////////////////////////////////////////////////////////
+commit:564c3e1
+/////////////////////////////////////////////////////////////////////////
+1:   private final Sampler sampler;
+/////////////////////////////////////////////////////////////////////////
+1:     topicSums.assign(1.0);
+/////////////////////////////////////////////////////////////////////////
+1:       topicSums.assign(1.0);
+/////////////////////////////////////////////////////////////////////////
+1:     topics.assign(0.0);
+/////////////////////////////////////////////////////////////////////////
+1:     private final ArrayBlockingQueue<Pair<Integer, Vector>> queue =
+commit:4fbfbc6
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.mahout.common.RandomUtils;
+/////////////////////////////////////////////////////////////////////////
+1:   
+1:   
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     this.sampler = new Sampler(RandomUtils.getRandom());
+/////////////////////////////////////////////////////////////////////////
+0:     ThreadPoolExecutor threadPool = new ThreadPoolExecutor(numThreads, numThreads, 0, TimeUnit.SECONDS,
+0:                                                            new ArrayBlockingQueue<Runnable>(numThreads * 10));
+/////////////////////////////////////////////////////////////////////////
+1:   @Override
+/////////////////////////////////////////////////////////////////////////
+1:       topicSums.set(x, random == null ? 1.0 : topicTermCounts.viewRow(x).norm(1));
+/////////////////////////////////////////////////////////////////////////
+1:     StringBuilder buf = new StringBuilder();
+1:       buf.append(v).append('\n');
+1:     return buf.toString();
+/////////////////////////////////////////////////////////////////////////
+1:       double topicWeight = docTopics == null ? 1.0 : docTopics.get(x);
+/////////////////////////////////////////////////////////////////////////
+1:     bldr.append('{');
+1:       bldr.append(':');
+1:       bldr.append(',');
+author:tcp
+-------------------------------------------------------------------------------
+commit:e64dd36
+/////////////////////////////////////////////////////////////////////////
+1:     if (modelWeight != 1) {
+1:       for (int x = 0; x < numTopics; x++) {
+/////////////////////////////////////////////////////////////////////////
+1:     for (MatrixSlice slice : m) {
+/////////////////////////////////////////////////////////////////////////
+1:     for (int i = 0; i < numThreads; i++) {
+/////////////////////////////////////////////////////////////////////////
+1:     if (random != null) {
+1:       for (int x = 0; x < numTopics; x++) {
+1:         for (int term = 0; term < numTerms; term++) {
+1:     for (int x = 0; x < numTopics; x++) {
+/////////////////////////////////////////////////////////////////////////
+1:     for (Path modelPath : modelPaths) {
+0:       for (Pair<IntWritable, VectorWritable> row :
+1:         if (numTerms < 0) {
+1:     if (rows.isEmpty()) {
+1:     for (Pair<Integer, Vector> pair : rows) {
+/////////////////////////////////////////////////////////////////////////
+1:     for (int x = 0; x < numTopics; x++) {
+/////////////////////////////////////////////////////////////////////////
+1:     for (int x = 0; x < numTopics; x++) {
+/////////////////////////////////////////////////////////////////////////
+1:     for (Updater updater : updaters) {
+1:     for (int x = 0; x < numTopics; x++) {
+/////////////////////////////////////////////////////////////////////////
+0:     while (it.hasNext()) {
+1:       for (int x = 0; x < numTopics; x++) {
+1:     for (int x = 0; x < numTopics; x++) {
+/////////////////////////////////////////////////////////////////////////
+0:     while (it.hasNext()) {
+1:       for (int x = 0; x < numTopics; x++) {
+/////////////////////////////////////////////////////////////////////////
+1:     for (int x = 0; x < numTopics; x++) {
+/////////////////////////////////////////////////////////////////////////
+1:     for (int x = 0; x < numTopics; x++) {
+/////////////////////////////////////////////////////////////////////////
+1:     if (overwrite) {
+/////////////////////////////////////////////////////////////////////////
+1:     for (int x = 0; x < numTopics; x++) {
+/////////////////////////////////////////////////////////////////////////
+0:       while (it.hasNext()) {
+/////////////////////////////////////////////////////////////////////////
+0:     while (it.hasNext()) {
+1:       for (int x = 0; x < numTopics; x++) {
+/////////////////////////////////////////////////////////////////////////
+0:     while (it.hasNext()) {
+1:       for (int x = 0; x < numTopics; x++) {
+1:       for (int x = 0; x < numTopics; x++) {
+/////////////////////////////////////////////////////////////////////////
+0:     while (it.hasNext()) {
+/////////////////////////////////////////////////////////////////////////
+1:     while (listIt.hasNext() && i < 25) {
+/////////////////////////////////////////////////////////////////////////
+1:     if (bldr.length() > 1) {
+/////////////////////////////////////////////////////////////////////////
+1:           while (!shutdownComplete) {
+/////////////////////////////////////////////////////////////////////////
+1:       if (shutdown) { // maybe don't do this?
+1:       while (true) { // keep trying if interrupted
+/////////////////////////////////////////////////////////////////////////
+1:       while (!shutdown) {
+1:           if (pair != null) {
+/////////////////////////////////////////////////////////////////////////
+1:       for (Pair<Integer, Vector> pair : queue) {
+============================================================================

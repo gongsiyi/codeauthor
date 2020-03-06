@@ -1,0 +1,914 @@
+1:17dd4cc: /*
+1:17dd4cc:  * Licensed to the Apache Software Foundation (ASF) under one
+1:17dd4cc:  * or more contributor license agreements.  See the NOTICE file
+1:17dd4cc:  * distributed with this work for additional information
+1:17dd4cc:  * regarding copyright ownership.  The ASF licenses this file
+1:17dd4cc:  * to you under the Apache License, Version 2.0 (the
+1:17dd4cc:  * "License"); you may not use this file except in compliance
+1:17dd4cc:  * with the License.  You may obtain a copy of the License at
+1:17dd4cc:  *
+1:17dd4cc:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:17dd4cc:  *
+1:17dd4cc:  * Unless required by applicable law or agreed to in writing, software
+1:17dd4cc:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:17dd4cc:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:17dd4cc:  * See the License for the specific language governing permissions and
+1:17dd4cc:  * limitations under the License.
+1:17dd4cc:  */
+1:17dd4cc: package org.apache.cassandra.utils.memory;
+1:17dd4cc: 
+1:17dd4cc: import java.nio.ByteBuffer;
+1:17dd4cc: import java.text.DateFormat;
+1:17dd4cc: import java.text.SimpleDateFormat;
+1:17dd4cc: import java.util.ArrayList;
+1:17dd4cc: import java.util.Date;
+1:17dd4cc: import java.util.List;
+1:17dd4cc: import java.util.concurrent.*;
+1:17dd4cc: import java.util.concurrent.atomic.AtomicBoolean;
+1:17dd4cc: 
+1:17dd4cc: import com.google.common.util.concurrent.Uninterruptibles;
+1:17dd4cc: import org.junit.Test;
+1:17dd4cc: 
+1:17dd4cc: import org.slf4j.Logger;
+1:17dd4cc: import org.slf4j.LoggerFactory;
+1:17dd4cc: 
+1:17dd4cc: import org.apache.cassandra.utils.DynamicList;
+1:17dd4cc: 
+1:17dd4cc: import static org.junit.Assert.*;
+1:17dd4cc: 
+1:17dd4cc: public class LongBufferPoolTest
+1:17dd4cc: {
+1:17dd4cc:     private static final Logger logger = LoggerFactory.getLogger(LongBufferPoolTest.class);
+1:17dd4cc: 
+1:17dd4cc:     @Test
+1:17dd4cc:     public void testAllocate() throws InterruptedException, ExecutionException
+1:17dd4cc:     {
+1:17dd4cc:         testAllocate(Runtime.getRuntime().availableProcessors() * 2, TimeUnit.MINUTES.toNanos(2L), 16 << 20);
+1:17dd4cc:     }
+1:17dd4cc: 
+1:17dd4cc:     private static final class BufferCheck
+1:17dd4cc:     {
+1:17dd4cc:         final ByteBuffer buffer;
+1:17dd4cc:         final long val;
+1:17dd4cc:         DynamicList.Node<BufferCheck> listnode;
+1:17dd4cc: 
+1:17dd4cc:         private BufferCheck(ByteBuffer buffer, long val)
+1:17dd4cc:         {
+1:17dd4cc:             this.buffer = buffer;
+1:17dd4cc:             this.val = val;
+1:17dd4cc:         }
+1:17dd4cc: 
+1:17dd4cc:         void validate()
+1:17dd4cc:         {
+1:17dd4cc:             ByteBuffer read = buffer.duplicate();
+1:17dd4cc:             while (read.remaining() > 8)
+1:17dd4cc:                 assert read.getLong() == val;
+1:17dd4cc:         }
+1:17dd4cc: 
+1:17dd4cc:         void init()
+1:17dd4cc:         {
+1:17dd4cc:             ByteBuffer write = buffer.duplicate();
+1:17dd4cc:             while (write.remaining() > 8)
+1:17dd4cc:                 write.putLong(val);
+1:17dd4cc:         }
+1:17dd4cc:     }
+1:17dd4cc: 
+1:17dd4cc:     public void testAllocate(int threadCount, long duration, int poolSize) throws InterruptedException, ExecutionException
+1:17dd4cc:     {
+1:17dd4cc:         final int avgBufferSize = 16 << 10;
+1:17dd4cc:         final int stdevBufferSize = 10 << 10; // picked to ensure exceeding buffer size is rare, but occurs
+1:17dd4cc:         final DateFormat dateFormat = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss");
+1:17dd4cc: 
+1:17dd4cc:         System.out.println(String.format("%s - testing %d threads for %dm",
+1:17dd4cc:                                          dateFormat.format(new Date()),
+1:17dd4cc:                                          threadCount,
+1:17dd4cc:                                          TimeUnit.NANOSECONDS.toMinutes(duration)));
+1:17dd4cc: 
+1:17dd4cc:         final long until = System.nanoTime() + duration;
+1:17dd4cc:         final CountDownLatch latch = new CountDownLatch(threadCount);
+1:17dd4cc:         final SPSCQueue<BufferCheck>[] sharedRecycle = new SPSCQueue[threadCount];
+1:17dd4cc:         final AtomicBoolean[] makingProgress = new AtomicBoolean[threadCount];
+1:17dd4cc:         for (int i = 0 ; i < sharedRecycle.length ; i++)
+1:17dd4cc:         {
+1:17dd4cc:             sharedRecycle[i] = new SPSCQueue<>();
+1:17dd4cc:             makingProgress[i] = new AtomicBoolean(true);
+1:17dd4cc:         }
+1:17dd4cc: 
+1:17dd4cc:         ExecutorService executorService = Executors.newFixedThreadPool(threadCount + 2);
+1:17dd4cc:         List<Future<Boolean>> ret = new ArrayList<>(threadCount);
+1:17dd4cc:         long prevPoolSize = BufferPool.MEMORY_USAGE_THRESHOLD;
+1:17dd4cc:         BufferPool.MEMORY_USAGE_THRESHOLD = poolSize;
+1:17dd4cc:         BufferPool.DEBUG = true;
+1:17dd4cc:         // sum(1..n) = n/2 * (n + 1); we set zero to CHUNK_SIZE, so have n=threadCount-1
+1:17dd4cc:         int targetSizeQuanta = ((threadCount) * (threadCount - 1)) / 2;
+1:17dd4cc:         // fix targetSizeQuanta at 1/64th our poolSize, so that we only consciously exceed our pool size limit
+1:17dd4cc:         targetSizeQuanta = (targetSizeQuanta * poolSize) / 64;
+1:17dd4cc: 
+1:17dd4cc:         {
+1:17dd4cc:             // setup some high churn allocate/deallocate, without any checking
+1:17dd4cc:             final SPSCQueue<ByteBuffer> burn = new SPSCQueue<>();
+1:17dd4cc:             final CountDownLatch doneAdd = new CountDownLatch(1);
+1:17dd4cc:             executorService.submit(new TestUntil(until)
+1:17dd4cc:             {
+1:17dd4cc:                 int count = 0;
+1:17dd4cc:                 void testOne() throws Exception
+1:17dd4cc:                 {
+1:17dd4cc:                     if (count * BufferPool.CHUNK_SIZE >= poolSize / 10)
+1:17dd4cc:                     {
+1:17dd4cc:                         if (burn.exhausted)
+1:17dd4cc:                             count = 0;
+1:17dd4cc:                         else
+1:17dd4cc:                             Thread.yield();
+1:17dd4cc:                         return;
+1:17dd4cc:                     }
+1:17dd4cc: 
+1:17dd4cc:                     ByteBuffer buffer = BufferPool.tryGet(BufferPool.CHUNK_SIZE);
+1:17dd4cc:                     if (buffer == null)
+1:17dd4cc:                     {
+1:17dd4cc:                         Thread.yield();
+1:17dd4cc:                         return;
+1:17dd4cc:                     }
+1:17dd4cc: 
+1:17dd4cc:                     BufferPool.put(buffer);
+1:17dd4cc:                     burn.add(buffer);
+1:17dd4cc:                     count++;
+1:17dd4cc:                 }
+1:17dd4cc:                 void cleanup()
+1:17dd4cc:                 {
+1:17dd4cc:                     doneAdd.countDown();
+1:17dd4cc:                 }
+1:17dd4cc:             });
+1:17dd4cc:             executorService.submit(new TestUntil(until)
+1:17dd4cc:             {
+1:17dd4cc:                 void testOne() throws Exception
+1:17dd4cc:                 {
+1:17dd4cc:                     ByteBuffer buffer = burn.poll();
+1:17dd4cc:                     if (buffer == null)
+1:17dd4cc:                     {
+1:17dd4cc:                         Thread.yield();
+1:17dd4cc:                         return;
+1:17dd4cc:                     }
+1:17dd4cc:                     BufferPool.put(buffer);
+1:17dd4cc:                 }
+1:17dd4cc:                 void cleanup()
+1:17dd4cc:                 {
+1:17dd4cc:                     Uninterruptibles.awaitUninterruptibly(doneAdd);
+1:17dd4cc:                 }
+1:17dd4cc:             });
+1:17dd4cc:         }
+1:17dd4cc: 
+1:17dd4cc:         for (int t = 0; t < threadCount; t++)
+1:17dd4cc:         {
+1:17dd4cc:             final int threadIdx = t;
+1:17dd4cc:             final int targetSize = t == 0 ? BufferPool.CHUNK_SIZE : targetSizeQuanta * t;
+1:17dd4cc: 
+1:17dd4cc:             ret.add(executorService.submit(new TestUntil(until)
+1:17dd4cc:             {
+1:17dd4cc:                 final SPSCQueue<BufferCheck> shareFrom = sharedRecycle[threadIdx];
+1:17dd4cc:                 final DynamicList<BufferCheck> checks = new DynamicList<>((int) Math.max(1, targetSize / (1 << 10)));
+1:17dd4cc:                 final SPSCQueue<BufferCheck> shareTo = sharedRecycle[(threadIdx + 1) % threadCount];
+1:17dd4cc:                 final ThreadLocalRandom rand = ThreadLocalRandom.current();
+1:17dd4cc:                 int totalSize = 0;
+1:17dd4cc:                 int freeingSize = 0;
+1:17dd4cc:                 int size = 0;
+1:17dd4cc: 
+1:17dd4cc:                 void checkpoint()
+1:17dd4cc:                 {
+1:17dd4cc:                     if (!makingProgress[threadIdx].get())
+1:17dd4cc:                         makingProgress[threadIdx].set(true);
+1:17dd4cc:                 }
+1:17dd4cc: 
+1:17dd4cc:                 void testOne() throws Exception
+1:17dd4cc:                 {
+1:17dd4cc: 
+1:17dd4cc:                     long currentTargetSize = rand.nextInt(poolSize / 1024) == 0 ? 0 : targetSize;
+1:17dd4cc:                     int spinCount = 0;
+1:17dd4cc:                     while (totalSize > currentTargetSize - freeingSize)
+1:17dd4cc:                     {
+1:17dd4cc:                         // free buffers until we're below our target size
+1:17dd4cc:                         if (checks.size() == 0)
+1:17dd4cc:                         {
+1:17dd4cc:                             // if we're out of buffers to free, we're waiting on our neighbour to free them;
+1:17dd4cc:                             // first check if the consuming neighbour has caught up, and if so mark that free
+1:17dd4cc:                             if (shareTo.exhausted)
+1:17dd4cc:                             {
+1:17dd4cc:                                 totalSize -= freeingSize;
+1:17dd4cc:                                 freeingSize = 0;
+1:17dd4cc:                             }
+1:17dd4cc:                             else if (!recycleFromNeighbour())
+1:17dd4cc:                             {
+1:17dd4cc:                                 if (++spinCount > 1000 && System.nanoTime() > until)
+1:17dd4cc:                                     return;
+1:17dd4cc:                                 // otherwise, free one of our other neighbour's buffers if can; and otherwise yield
+1:17dd4cc:                                 Thread.yield();
+1:17dd4cc:                             }
+1:17dd4cc:                             continue;
+1:17dd4cc:                         }
+1:17dd4cc: 
+1:17dd4cc:                         // pick a random buffer, with preference going to earlier ones
+1:17dd4cc:                         BufferCheck check = sample();
+1:17dd4cc:                         checks.remove(check.listnode);
+1:17dd4cc:                         check.validate();
+1:17dd4cc: 
+1:17dd4cc:                         size = BufferPool.roundUpNormal(check.buffer.capacity());
+1:17dd4cc:                         if (size > BufferPool.CHUNK_SIZE)
+1:17dd4cc:                             size = 0;
+1:17dd4cc: 
+1:17dd4cc:                         // either share to free, or free immediately
+1:17dd4cc:                         if (rand.nextBoolean())
+1:17dd4cc:                         {
+1:17dd4cc:                             shareTo.add(check);
+1:17dd4cc:                             freeingSize += size;
+1:17dd4cc:                             // interleave this with potentially messing with the other neighbour's stuff
+1:17dd4cc:                             recycleFromNeighbour();
+1:17dd4cc:                         }
+1:17dd4cc:                         else
+1:17dd4cc:                         {
+1:17dd4cc:                             check.validate();
+1:17dd4cc:                             BufferPool.put(check.buffer);
+1:17dd4cc:                             totalSize -= size;
+1:17dd4cc:                         }
+1:17dd4cc:                     }
+1:17dd4cc: 
+1:17dd4cc:                     // allocate a new buffer
+1:17dd4cc:                     size = (int) Math.max(1, avgBufferSize + (stdevBufferSize * rand.nextGaussian()));
+1:17dd4cc:                     if (size <= BufferPool.CHUNK_SIZE)
+1:17dd4cc:                     {
+1:17dd4cc:                         totalSize += BufferPool.roundUpNormal(size);
+1:17dd4cc:                         allocate(size);
+1:17dd4cc:                     }
+1:17dd4cc:                     else if (rand.nextBoolean())
+1:17dd4cc:                     {
+1:17dd4cc:                         allocate(size);
+1:17dd4cc:                     }
+1:17dd4cc:                     else
+1:17dd4cc:                     {
+1:17dd4cc:                         // perform a burst allocation to exhaust all available memory
+1:17dd4cc:                         while (totalSize < poolSize)
+1:17dd4cc:                         {
+1:17dd4cc:                             size = (int) Math.max(1, avgBufferSize + (stdevBufferSize * rand.nextGaussian()));
+1:17dd4cc:                             if (size <= BufferPool.CHUNK_SIZE)
+1:17dd4cc:                             {
+1:17dd4cc:                                 allocate(size);
+1:17dd4cc:                                 totalSize += BufferPool.roundUpNormal(size);
+1:17dd4cc:                             }
+1:17dd4cc:                         }
+1:17dd4cc:                     }
+1:17dd4cc: 
+1:17dd4cc:                     // validate a random buffer we have stashed
+1:17dd4cc:                     checks.get(rand.nextInt(checks.size())).validate();
+1:17dd4cc: 
+1:17dd4cc:                     // free all of our neighbour's remaining shared buffers
+1:17dd4cc:                     while (recycleFromNeighbour());
+1:17dd4cc:                 }
+1:17dd4cc: 
+1:17dd4cc:                 void cleanup()
+1:17dd4cc:                 {
+1:17dd4cc:                     while (checks.size() > 0)
+1:17dd4cc:                     {
+1:17dd4cc:                         BufferCheck check = checks.get(0);
+1:17dd4cc:                         BufferPool.put(check.buffer);
+1:17dd4cc:                         checks.remove(check.listnode);
+1:17dd4cc:                     }
+1:17dd4cc:                     latch.countDown();
+1:17dd4cc:                 }
+1:17dd4cc: 
+1:17dd4cc:                 boolean recycleFromNeighbour()
+1:17dd4cc:                 {
+1:17dd4cc:                     BufferCheck check = shareFrom.poll();
+1:17dd4cc:                     if (check == null)
+1:17dd4cc:                         return false;
+1:17dd4cc:                     check.validate();
+1:17dd4cc:                     BufferPool.put(check.buffer);
+1:17dd4cc:                     return true;
+1:17dd4cc:                 }
+1:17dd4cc: 
+1:17dd4cc:                 BufferCheck allocate(int size)
+1:17dd4cc:                 {
+1:17dd4cc:                     ByteBuffer buffer = BufferPool.get(size);
+1:17dd4cc:                     assertNotNull(buffer);
+1:17dd4cc:                     BufferCheck check = new BufferCheck(buffer, rand.nextLong());
+1:17dd4cc:                     assertEquals(size, buffer.capacity());
+1:17dd4cc:                     assertEquals(0, buffer.position());
+1:17dd4cc:                     check.init();
+1:17dd4cc:                     check.listnode = checks.append(check);
+1:17dd4cc:                     return check;
+1:17dd4cc:                 }
+1:17dd4cc: 
+1:17dd4cc:                 BufferCheck sample()
+1:17dd4cc:                 {
+1:17dd4cc:                     // sample with preference to first elements:
+1:17dd4cc:                     // element at index n will be selected with likelihood (size - n) / sum1ToN(size)
+1:17dd4cc:                     int size = checks.size();
+1:17dd4cc: 
+1:17dd4cc:                     // pick a random number between 1 and sum1toN(size)
+1:17dd4cc:                     int sampleRange = sum1toN(size);
+1:17dd4cc:                     int sampleIndex = rand.nextInt(sampleRange);
+1:17dd4cc: 
+1:17dd4cc:                     // then binary search for the N, such that [sum1ToN(N), sum1ToN(N+1)) contains this random number
+1:17dd4cc:                     int moveBy = Math.max(size / 4, 1);
+1:17dd4cc:                     int index = size / 2;
+1:17dd4cc:                     while (true)
+1:17dd4cc:                     {
+1:17dd4cc:                         int baseSampleIndex = sum1toN(index);
+1:17dd4cc:                         int endOfSampleIndex = sum1toN(index + 1);
+1:17dd4cc:                         if (sampleIndex >= baseSampleIndex)
+1:17dd4cc:                         {
+1:17dd4cc:                             if (sampleIndex < endOfSampleIndex)
+1:17dd4cc:                                 break;
+1:17dd4cc:                             index += moveBy;
+1:17dd4cc:                         }
+1:17dd4cc:                         else index -= moveBy;
+1:17dd4cc:                         moveBy = Math.max(moveBy / 2, 1);
+1:17dd4cc:                     }
+1:17dd4cc: 
+1:17dd4cc:                     // this gives us the inverse of our desired value, so just subtract it from the last index
+1:17dd4cc:                     index = size - (index + 1);
+1:17dd4cc: 
+1:17dd4cc:                     return checks.get(index);
+1:17dd4cc:                 }
+1:17dd4cc: 
+1:17dd4cc:                 private int sum1toN(int n)
+1:17dd4cc:                 {
+1:17dd4cc:                     return (n * (n + 1)) / 2;
+1:17dd4cc:                 }
+1:17dd4cc:             }));
+1:17dd4cc:         }
+1:17dd4cc: 
+1:17dd4cc:         boolean first = true;
+1:17dd4cc:         while (!latch.await(10L, TimeUnit.SECONDS))
+1:17dd4cc:         {
+1:17dd4cc:             if (!first)
+1:17dd4cc:                 BufferPool.assertAllRecycled();
+1:17dd4cc:             first = false;
+1:17dd4cc:             for (AtomicBoolean progress : makingProgress)
+1:17dd4cc:             {
+1:17dd4cc:                 assert progress.get();
+1:17dd4cc:                 progress.set(false);
+1:17dd4cc:             }
+1:17dd4cc:         }
+1:17dd4cc: 
+1:17dd4cc:         for (SPSCQueue<BufferCheck> queue : sharedRecycle)
+1:17dd4cc:         {
+1:17dd4cc:             BufferCheck check;
+1:17dd4cc:             while ( null != (check = queue.poll()) )
+1:17dd4cc:             {
+1:17dd4cc:                 check.validate();
+1:17dd4cc:                 BufferPool.put(check.buffer);
+1:17dd4cc:             }
+1:17dd4cc:         }
+1:17dd4cc: 
+1:17dd4cc:         assertEquals(0, executorService.shutdownNow().size());
+1:17dd4cc: 
+1:17dd4cc:         BufferPool.MEMORY_USAGE_THRESHOLD = prevPoolSize;
+1:17dd4cc:         for (Future<Boolean> r : ret)
+1:17dd4cc:             assertTrue(r.get());
+1:17dd4cc: 
+1:17dd4cc:         System.out.println(String.format("%s - finished.",
+1:17dd4cc:                                          dateFormat.format(new Date())));
+1:17dd4cc:     }
+1:17dd4cc: 
+1:17dd4cc:     static abstract class TestUntil implements Callable<Boolean>
+1:17dd4cc:     {
+1:17dd4cc:         final long until;
+1:17dd4cc:         protected TestUntil(long until)
+1:17dd4cc:         {
+1:17dd4cc:             this.until = until;
+1:17dd4cc:         }
+1:17dd4cc: 
+1:17dd4cc:         abstract void testOne() throws Exception;
+1:17dd4cc:         void checkpoint() {}
+1:17dd4cc:         void cleanup() {}
+1:17dd4cc: 
+1:17dd4cc:         public Boolean call() throws Exception
+1:17dd4cc:         {
+1:17dd4cc:             try
+1:17dd4cc:             {
+1:17dd4cc:                 while (System.nanoTime() < until)
+1:17dd4cc:                 {
+1:17dd4cc:                     checkpoint();
+1:17dd4cc:                     for (int i = 0 ; i < 100 ; i++)
+1:17dd4cc:                         testOne();
+1:17dd4cc:                 }
+1:17dd4cc:             }
+1:17dd4cc:             catch (Exception ex)
+1:17dd4cc:             {
+1:17dd4cc:                 logger.error("Got exception {}, current chunk {}",
+1:17dd4cc:                              ex.getMessage(),
+1:17dd4cc:                              BufferPool.currentChunk());
+1:17dd4cc:                 ex.printStackTrace();
+1:17dd4cc:                 return false;
+1:17dd4cc:             }
+1:17dd4cc:             finally
+1:17dd4cc:             {
+1:17dd4cc:                 cleanup();
+1:17dd4cc:             }
+1:17dd4cc:             return true;
+1:17dd4cc:         }
+1:17dd4cc:     }
+1:17dd4cc: 
+1:17dd4cc:     public static void main(String[] args) throws InterruptedException, ExecutionException
+1:17dd4cc:     {
+1:17dd4cc:         new LongBufferPoolTest().testAllocate(Runtime.getRuntime().availableProcessors(), TimeUnit.HOURS.toNanos(2L), 16 << 20);
+1:17dd4cc:     }
+1:17dd4cc: 
+1:17dd4cc:     /**
+1:17dd4cc:      * A single producer, single consumer queue.
+1:17dd4cc:      */
+1:17dd4cc:     private static final class SPSCQueue<V>
+1:17dd4cc:     {
+1:17dd4cc:         static final class Node<V>
+1:17dd4cc:         {
+1:17dd4cc:             volatile Node<V> next;
+1:17dd4cc:             final V value;
+1:17dd4cc:             Node(V value)
+1:17dd4cc:             {
+1:17dd4cc:                 this.value = value;
+1:17dd4cc:             }
+1:17dd4cc:         }
+1:17dd4cc: 
+1:17dd4cc:         private volatile boolean exhausted = true;
+1:17dd4cc:         Node<V> head = new Node<>(null);
+1:17dd4cc:         Node<V> tail = head;
+1:17dd4cc: 
+1:17dd4cc:         void add(V value)
+1:17dd4cc:         {
+1:17dd4cc:             exhausted = false;
+1:17dd4cc:             tail = tail.next = new Node<>(value);
+1:17dd4cc:         }
+1:17dd4cc: 
+1:17dd4cc:         V poll()
+1:17dd4cc:         {
+1:17dd4cc:             Node<V> next = head.next;
+1:17dd4cc:             if (next == null)
+1:17dd4cc:             {
+1:17dd4cc:                 // this is racey, but good enough for our purposes
+1:17dd4cc:                 exhausted = true;
+1:17dd4cc:                 return null;
+1:17dd4cc:             }
+1:17dd4cc:             head = next;
+1:17dd4cc:             return next.value;
+1:17dd4cc:         }
+1:17dd4cc:     }
+1:17dd4cc: 
+1:17dd4cc: }
+============================================================================
+author:stefania
+-------------------------------------------------------------------------------
+commit:17dd4cc
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.utils.memory;
+1: 
+1: import java.nio.ByteBuffer;
+1: import java.text.DateFormat;
+1: import java.text.SimpleDateFormat;
+1: import java.util.ArrayList;
+1: import java.util.Date;
+1: import java.util.List;
+1: import java.util.concurrent.*;
+1: import java.util.concurrent.atomic.AtomicBoolean;
+1: 
+1: import com.google.common.util.concurrent.Uninterruptibles;
+1: import org.junit.Test;
+1: 
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import org.apache.cassandra.utils.DynamicList;
+1: 
+1: import static org.junit.Assert.*;
+1: 
+1: public class LongBufferPoolTest
+1: {
+1:     private static final Logger logger = LoggerFactory.getLogger(LongBufferPoolTest.class);
+1: 
+1:     @Test
+1:     public void testAllocate() throws InterruptedException, ExecutionException
+1:     {
+1:         testAllocate(Runtime.getRuntime().availableProcessors() * 2, TimeUnit.MINUTES.toNanos(2L), 16 << 20);
+1:     }
+1: 
+1:     private static final class BufferCheck
+1:     {
+1:         final ByteBuffer buffer;
+1:         final long val;
+1:         DynamicList.Node<BufferCheck> listnode;
+1: 
+1:         private BufferCheck(ByteBuffer buffer, long val)
+1:         {
+1:             this.buffer = buffer;
+1:             this.val = val;
+1:         }
+1: 
+1:         void validate()
+1:         {
+1:             ByteBuffer read = buffer.duplicate();
+1:             while (read.remaining() > 8)
+1:                 assert read.getLong() == val;
+1:         }
+1: 
+1:         void init()
+1:         {
+1:             ByteBuffer write = buffer.duplicate();
+1:             while (write.remaining() > 8)
+1:                 write.putLong(val);
+1:         }
+1:     }
+1: 
+1:     public void testAllocate(int threadCount, long duration, int poolSize) throws InterruptedException, ExecutionException
+1:     {
+1:         final int avgBufferSize = 16 << 10;
+1:         final int stdevBufferSize = 10 << 10; // picked to ensure exceeding buffer size is rare, but occurs
+1:         final DateFormat dateFormat = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss");
+1: 
+1:         System.out.println(String.format("%s - testing %d threads for %dm",
+1:                                          dateFormat.format(new Date()),
+1:                                          threadCount,
+1:                                          TimeUnit.NANOSECONDS.toMinutes(duration)));
+1: 
+1:         final long until = System.nanoTime() + duration;
+1:         final CountDownLatch latch = new CountDownLatch(threadCount);
+1:         final SPSCQueue<BufferCheck>[] sharedRecycle = new SPSCQueue[threadCount];
+1:         final AtomicBoolean[] makingProgress = new AtomicBoolean[threadCount];
+1:         for (int i = 0 ; i < sharedRecycle.length ; i++)
+1:         {
+1:             sharedRecycle[i] = new SPSCQueue<>();
+1:             makingProgress[i] = new AtomicBoolean(true);
+1:         }
+1: 
+1:         ExecutorService executorService = Executors.newFixedThreadPool(threadCount + 2);
+1:         List<Future<Boolean>> ret = new ArrayList<>(threadCount);
+1:         long prevPoolSize = BufferPool.MEMORY_USAGE_THRESHOLD;
+1:         BufferPool.MEMORY_USAGE_THRESHOLD = poolSize;
+1:         BufferPool.DEBUG = true;
+1:         // sum(1..n) = n/2 * (n + 1); we set zero to CHUNK_SIZE, so have n=threadCount-1
+1:         int targetSizeQuanta = ((threadCount) * (threadCount - 1)) / 2;
+1:         // fix targetSizeQuanta at 1/64th our poolSize, so that we only consciously exceed our pool size limit
+1:         targetSizeQuanta = (targetSizeQuanta * poolSize) / 64;
+1: 
+1:         {
+1:             // setup some high churn allocate/deallocate, without any checking
+1:             final SPSCQueue<ByteBuffer> burn = new SPSCQueue<>();
+1:             final CountDownLatch doneAdd = new CountDownLatch(1);
+1:             executorService.submit(new TestUntil(until)
+1:             {
+1:                 int count = 0;
+1:                 void testOne() throws Exception
+1:                 {
+1:                     if (count * BufferPool.CHUNK_SIZE >= poolSize / 10)
+1:                     {
+1:                         if (burn.exhausted)
+1:                             count = 0;
+1:                         else
+1:                             Thread.yield();
+1:                         return;
+1:                     }
+1: 
+1:                     ByteBuffer buffer = BufferPool.tryGet(BufferPool.CHUNK_SIZE);
+1:                     if (buffer == null)
+1:                     {
+1:                         Thread.yield();
+1:                         return;
+1:                     }
+1: 
+1:                     BufferPool.put(buffer);
+1:                     burn.add(buffer);
+1:                     count++;
+1:                 }
+1:                 void cleanup()
+1:                 {
+1:                     doneAdd.countDown();
+1:                 }
+1:             });
+1:             executorService.submit(new TestUntil(until)
+1:             {
+1:                 void testOne() throws Exception
+1:                 {
+1:                     ByteBuffer buffer = burn.poll();
+1:                     if (buffer == null)
+1:                     {
+1:                         Thread.yield();
+1:                         return;
+1:                     }
+1:                     BufferPool.put(buffer);
+1:                 }
+1:                 void cleanup()
+1:                 {
+1:                     Uninterruptibles.awaitUninterruptibly(doneAdd);
+1:                 }
+1:             });
+1:         }
+1: 
+1:         for (int t = 0; t < threadCount; t++)
+1:         {
+1:             final int threadIdx = t;
+1:             final int targetSize = t == 0 ? BufferPool.CHUNK_SIZE : targetSizeQuanta * t;
+1: 
+1:             ret.add(executorService.submit(new TestUntil(until)
+1:             {
+1:                 final SPSCQueue<BufferCheck> shareFrom = sharedRecycle[threadIdx];
+1:                 final DynamicList<BufferCheck> checks = new DynamicList<>((int) Math.max(1, targetSize / (1 << 10)));
+1:                 final SPSCQueue<BufferCheck> shareTo = sharedRecycle[(threadIdx + 1) % threadCount];
+1:                 final ThreadLocalRandom rand = ThreadLocalRandom.current();
+1:                 int totalSize = 0;
+1:                 int freeingSize = 0;
+1:                 int size = 0;
+1: 
+1:                 void checkpoint()
+1:                 {
+1:                     if (!makingProgress[threadIdx].get())
+1:                         makingProgress[threadIdx].set(true);
+1:                 }
+1: 
+1:                 void testOne() throws Exception
+1:                 {
+1: 
+1:                     long currentTargetSize = rand.nextInt(poolSize / 1024) == 0 ? 0 : targetSize;
+1:                     int spinCount = 0;
+1:                     while (totalSize > currentTargetSize - freeingSize)
+1:                     {
+1:                         // free buffers until we're below our target size
+1:                         if (checks.size() == 0)
+1:                         {
+1:                             // if we're out of buffers to free, we're waiting on our neighbour to free them;
+1:                             // first check if the consuming neighbour has caught up, and if so mark that free
+1:                             if (shareTo.exhausted)
+1:                             {
+1:                                 totalSize -= freeingSize;
+1:                                 freeingSize = 0;
+1:                             }
+1:                             else if (!recycleFromNeighbour())
+1:                             {
+1:                                 if (++spinCount > 1000 && System.nanoTime() > until)
+1:                                     return;
+1:                                 // otherwise, free one of our other neighbour's buffers if can; and otherwise yield
+1:                                 Thread.yield();
+1:                             }
+1:                             continue;
+1:                         }
+1: 
+1:                         // pick a random buffer, with preference going to earlier ones
+1:                         BufferCheck check = sample();
+1:                         checks.remove(check.listnode);
+1:                         check.validate();
+1: 
+1:                         size = BufferPool.roundUpNormal(check.buffer.capacity());
+1:                         if (size > BufferPool.CHUNK_SIZE)
+1:                             size = 0;
+1: 
+1:                         // either share to free, or free immediately
+1:                         if (rand.nextBoolean())
+1:                         {
+1:                             shareTo.add(check);
+1:                             freeingSize += size;
+1:                             // interleave this with potentially messing with the other neighbour's stuff
+1:                             recycleFromNeighbour();
+1:                         }
+1:                         else
+1:                         {
+1:                             check.validate();
+1:                             BufferPool.put(check.buffer);
+1:                             totalSize -= size;
+1:                         }
+1:                     }
+1: 
+1:                     // allocate a new buffer
+1:                     size = (int) Math.max(1, avgBufferSize + (stdevBufferSize * rand.nextGaussian()));
+1:                     if (size <= BufferPool.CHUNK_SIZE)
+1:                     {
+1:                         totalSize += BufferPool.roundUpNormal(size);
+1:                         allocate(size);
+1:                     }
+1:                     else if (rand.nextBoolean())
+1:                     {
+1:                         allocate(size);
+1:                     }
+1:                     else
+1:                     {
+1:                         // perform a burst allocation to exhaust all available memory
+1:                         while (totalSize < poolSize)
+1:                         {
+1:                             size = (int) Math.max(1, avgBufferSize + (stdevBufferSize * rand.nextGaussian()));
+1:                             if (size <= BufferPool.CHUNK_SIZE)
+1:                             {
+1:                                 allocate(size);
+1:                                 totalSize += BufferPool.roundUpNormal(size);
+1:                             }
+1:                         }
+1:                     }
+1: 
+1:                     // validate a random buffer we have stashed
+1:                     checks.get(rand.nextInt(checks.size())).validate();
+1: 
+1:                     // free all of our neighbour's remaining shared buffers
+1:                     while (recycleFromNeighbour());
+1:                 }
+1: 
+1:                 void cleanup()
+1:                 {
+1:                     while (checks.size() > 0)
+1:                     {
+1:                         BufferCheck check = checks.get(0);
+1:                         BufferPool.put(check.buffer);
+1:                         checks.remove(check.listnode);
+1:                     }
+1:                     latch.countDown();
+1:                 }
+1: 
+1:                 boolean recycleFromNeighbour()
+1:                 {
+1:                     BufferCheck check = shareFrom.poll();
+1:                     if (check == null)
+1:                         return false;
+1:                     check.validate();
+1:                     BufferPool.put(check.buffer);
+1:                     return true;
+1:                 }
+1: 
+1:                 BufferCheck allocate(int size)
+1:                 {
+1:                     ByteBuffer buffer = BufferPool.get(size);
+1:                     assertNotNull(buffer);
+1:                     BufferCheck check = new BufferCheck(buffer, rand.nextLong());
+1:                     assertEquals(size, buffer.capacity());
+1:                     assertEquals(0, buffer.position());
+1:                     check.init();
+1:                     check.listnode = checks.append(check);
+1:                     return check;
+1:                 }
+1: 
+1:                 BufferCheck sample()
+1:                 {
+1:                     // sample with preference to first elements:
+1:                     // element at index n will be selected with likelihood (size - n) / sum1ToN(size)
+1:                     int size = checks.size();
+1: 
+1:                     // pick a random number between 1 and sum1toN(size)
+1:                     int sampleRange = sum1toN(size);
+1:                     int sampleIndex = rand.nextInt(sampleRange);
+1: 
+1:                     // then binary search for the N, such that [sum1ToN(N), sum1ToN(N+1)) contains this random number
+1:                     int moveBy = Math.max(size / 4, 1);
+1:                     int index = size / 2;
+1:                     while (true)
+1:                     {
+1:                         int baseSampleIndex = sum1toN(index);
+1:                         int endOfSampleIndex = sum1toN(index + 1);
+1:                         if (sampleIndex >= baseSampleIndex)
+1:                         {
+1:                             if (sampleIndex < endOfSampleIndex)
+1:                                 break;
+1:                             index += moveBy;
+1:                         }
+1:                         else index -= moveBy;
+1:                         moveBy = Math.max(moveBy / 2, 1);
+1:                     }
+1: 
+1:                     // this gives us the inverse of our desired value, so just subtract it from the last index
+1:                     index = size - (index + 1);
+1: 
+1:                     return checks.get(index);
+1:                 }
+1: 
+1:                 private int sum1toN(int n)
+1:                 {
+1:                     return (n * (n + 1)) / 2;
+1:                 }
+1:             }));
+1:         }
+1: 
+1:         boolean first = true;
+1:         while (!latch.await(10L, TimeUnit.SECONDS))
+1:         {
+1:             if (!first)
+1:                 BufferPool.assertAllRecycled();
+1:             first = false;
+1:             for (AtomicBoolean progress : makingProgress)
+1:             {
+1:                 assert progress.get();
+1:                 progress.set(false);
+1:             }
+1:         }
+1: 
+1:         for (SPSCQueue<BufferCheck> queue : sharedRecycle)
+1:         {
+1:             BufferCheck check;
+1:             while ( null != (check = queue.poll()) )
+1:             {
+1:                 check.validate();
+1:                 BufferPool.put(check.buffer);
+1:             }
+1:         }
+1: 
+1:         assertEquals(0, executorService.shutdownNow().size());
+1: 
+1:         BufferPool.MEMORY_USAGE_THRESHOLD = prevPoolSize;
+1:         for (Future<Boolean> r : ret)
+1:             assertTrue(r.get());
+1: 
+1:         System.out.println(String.format("%s - finished.",
+1:                                          dateFormat.format(new Date())));
+1:     }
+1: 
+1:     static abstract class TestUntil implements Callable<Boolean>
+1:     {
+1:         final long until;
+1:         protected TestUntil(long until)
+1:         {
+1:             this.until = until;
+1:         }
+1: 
+1:         abstract void testOne() throws Exception;
+1:         void checkpoint() {}
+1:         void cleanup() {}
+1: 
+1:         public Boolean call() throws Exception
+1:         {
+1:             try
+1:             {
+1:                 while (System.nanoTime() < until)
+1:                 {
+1:                     checkpoint();
+1:                     for (int i = 0 ; i < 100 ; i++)
+1:                         testOne();
+1:                 }
+1:             }
+1:             catch (Exception ex)
+1:             {
+1:                 logger.error("Got exception {}, current chunk {}",
+1:                              ex.getMessage(),
+1:                              BufferPool.currentChunk());
+1:                 ex.printStackTrace();
+1:                 return false;
+1:             }
+1:             finally
+1:             {
+1:                 cleanup();
+1:             }
+1:             return true;
+1:         }
+1:     }
+1: 
+1:     public static void main(String[] args) throws InterruptedException, ExecutionException
+1:     {
+1:         new LongBufferPoolTest().testAllocate(Runtime.getRuntime().availableProcessors(), TimeUnit.HOURS.toNanos(2L), 16 << 20);
+1:     }
+1: 
+1:     /**
+1:      * A single producer, single consumer queue.
+1:      */
+1:     private static final class SPSCQueue<V>
+1:     {
+1:         static final class Node<V>
+1:         {
+1:             volatile Node<V> next;
+1:             final V value;
+1:             Node(V value)
+1:             {
+1:                 this.value = value;
+1:             }
+1:         }
+1: 
+1:         private volatile boolean exhausted = true;
+1:         Node<V> head = new Node<>(null);
+1:         Node<V> tail = head;
+1: 
+1:         void add(V value)
+1:         {
+1:             exhausted = false;
+1:             tail = tail.next = new Node<>(value);
+1:         }
+1: 
+1:         V poll()
+1:         {
+1:             Node<V> next = head.next;
+1:             if (next == null)
+1:             {
+1:                 // this is racey, but good enough for our purposes
+1:                 exhausted = true;
+1:                 return null;
+1:             }
+1:             head = next;
+1:             return next.value;
+1:         }
+1:     }
+1: 
+1: }
+============================================================================

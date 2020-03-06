@@ -1,0 +1,537 @@
+1:96d41f0: /*
+1:96d41f0:  * Licensed to the Apache Software Foundation (ASF) under one
+1:96d41f0:  * or more contributor license agreements.  See the NOTICE file
+1:96d41f0:  * distributed with this work for additional information
+1:96d41f0:  * regarding copyright ownership.  The ASF licenses this file
+1:96d41f0:  * to you under the Apache License, Version 2.0 (the
+1:96d41f0:  * "License"); you may not use this file except in compliance
+1:96d41f0:  * with the License.  You may obtain a copy of the License at
+1:96d41f0:  *
+1:96d41f0:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:96d41f0:  *
+1:96d41f0:  * Unless required by applicable law or agreed to in writing, software
+1:96d41f0:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:96d41f0:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:96d41f0:  * See the License for the specific language governing permissions and
+1:96d41f0:  * limitations under the License.
+1:96d41f0:  */
+1:96d41f0: package org.apache.cassandra.hints;
+1:96d41f0: 
+1:96d41f0: import java.io.File;
+1:96d41f0: import java.io.IOException;
+1:96d41f0: import java.nio.ByteBuffer;
+1:96d41f0: import java.util.*;
+1:96d41f0: import java.util.concurrent.ExecutionException;
+1:96d41f0: import java.util.concurrent.TimeUnit;
+1:96d41f0: 
+1:96d41f0: import org.slf4j.Logger;
+1:96d41f0: import org.slf4j.LoggerFactory;
+1:96d41f0: 
+1:9797511: import org.apache.cassandra.config.SchemaConstants;
+1:96d41f0: import org.apache.cassandra.cql3.QueryProcessor;
+1:96d41f0: import org.apache.cassandra.cql3.UntypedResultSet;
+1:96d41f0: import org.apache.cassandra.db.*;
+1:96d41f0: import org.apache.cassandra.db.compaction.CompactionManager;
+1:96d41f0: import org.apache.cassandra.db.marshal.UUIDType;
+1:96d41f0: import org.apache.cassandra.db.partitions.PartitionUpdate;
+1:96d41f0: import org.apache.cassandra.io.FSWriteError;
+1:96d41f0: import org.apache.cassandra.io.sstable.Descriptor;
+1:96d41f0: import org.apache.cassandra.io.util.DataInputBuffer;
+1:96d41f0: import org.apache.cassandra.io.util.FileUtils;
+1:96d41f0: import org.apache.cassandra.serializers.MarshalException;
+1:96d41f0: import org.apache.cassandra.utils.FBUtilities;
+1:96d41f0: 
+1:96d41f0: /**
+1:96d41f0:  * A migrator that goes through the legacy system.hints table and writes all the hints to the new hints storage format.
+1:96d41f0:  */
+1:96d41f0: @SuppressWarnings("deprecation")
+1:96d41f0: public final class LegacyHintsMigrator
+1:96d41f0: {
+1:96d41f0:     private static final Logger logger = LoggerFactory.getLogger(LegacyHintsMigrator.class);
+1:96d41f0: 
+1:96d41f0:     private final File hintsDirectory;
+1:96d41f0:     private final long maxHintsFileSize;
+1:96d41f0: 
+1:96d41f0:     private final ColumnFamilyStore legacyHintsTable;
+1:96d41f0:     private final int pageSize;
+1:96d41f0: 
+1:96d41f0:     public LegacyHintsMigrator(File hintsDirectory, long maxHintsFileSize)
+1:96d41f0:     {
+1:96d41f0:         this.hintsDirectory = hintsDirectory;
+1:96d41f0:         this.maxHintsFileSize = maxHintsFileSize;
+1:96d41f0: 
+1:9797511:         legacyHintsTable = Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(SystemKeyspace.LEGACY_HINTS);
+1:96d41f0:         pageSize = calculatePageSize(legacyHintsTable);
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     // read fewer columns (mutations) per page if they are very large
+1:96d41f0:     private static int calculatePageSize(ColumnFamilyStore legacyHintsTable)
+1:96d41f0:     {
+1:96d41f0:         int size = 128;
+1:96d41f0: 
+1:96d41f0:         int meanCellCount = legacyHintsTable.getMeanColumns();
+1:96d41f0:         double meanPartitionSize = legacyHintsTable.getMeanPartitionSize();
+1:96d41f0: 
+1:4cc2b67:         if (meanCellCount != 0 && meanPartitionSize != 0)
+1:96d41f0:         {
+1:96d41f0:             int avgHintSize = (int) meanPartitionSize / meanCellCount;
+1:96d41f0:             size = Math.max(2, Math.min(size, (512 << 10) / avgHintSize));
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         return size;
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     public void migrate()
+1:96d41f0:     {
+1:96d41f0:         // nothing to migrate
+1:96d41f0:         if (legacyHintsTable.isEmpty())
+1:96d41f0:             return;
+1:96d41f0:         logger.info("Migrating legacy hints to new storage");
+1:96d41f0: 
+1:96d41f0:         // major-compact all of the existing sstables to get rid of the tombstones + expired hints
+1:9797511:         logger.info("Forcing a major compaction of {}.{} table", SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.LEGACY_HINTS);
+1:96d41f0:         compactLegacyHints();
+1:96d41f0: 
+1:96d41f0:         // paginate over legacy hints and write them to the new storage
+1:53a177a:         logger.info("Writing legacy hints to the new storage");
+1:96d41f0:         migrateLegacyHints();
+1:96d41f0: 
+1:96d41f0:         // truncate the legacy hints table
+1:9797511:         logger.info("Truncating {}.{} table", SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.LEGACY_HINTS);
+1:96d41f0:         legacyHintsTable.truncateBlocking();
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private void compactLegacyHints()
+1:96d41f0:     {
+1:96d41f0:         Collection<Descriptor> descriptors = new ArrayList<>();
+1:96d41f0:         legacyHintsTable.getTracker().getUncompacting().forEach(sstable -> descriptors.add(sstable.descriptor));
+1:96d41f0:         if (!descriptors.isEmpty())
+1:96d41f0:             forceCompaction(descriptors);
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private void forceCompaction(Collection<Descriptor> descriptors)
+1:96d41f0:     {
+2:96d41f0:         try
+1:96d41f0:         {
+1:96d41f0:             CompactionManager.instance.submitUserDefined(legacyHintsTable, descriptors, FBUtilities.nowInSeconds()).get();
+1:96d41f0:         }
+1:96d41f0:         catch (InterruptedException | ExecutionException e)
+1:96d41f0:         {
+1:96d41f0:             throw new RuntimeException(e);
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private void migrateLegacyHints()
+1:96d41f0:     {
+1:96d41f0:         ByteBuffer buffer = ByteBuffer.allocateDirect(256 * 1024);
+1:9797511:         String query = String.format("SELECT DISTINCT target_id FROM %s.%s", SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.LEGACY_HINTS);
+1:96d41f0:         //noinspection ConstantConditions
+1:96d41f0:         QueryProcessor.executeInternal(query).forEach(row -> migrateLegacyHints(row.getUUID("target_id"), buffer));
+1:96d41f0:         FileUtils.clean(buffer);
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private void migrateLegacyHints(UUID hostId, ByteBuffer buffer)
+1:96d41f0:     {
+1:96d41f0:         String query = String.format("SELECT target_id, hint_id, message_version, mutation, ttl(mutation) AS ttl, writeTime(mutation) AS write_time " +
+1:96d41f0:                                      "FROM %s.%s " +
+1:96d41f0:                                      "WHERE target_id = ?",
+1:9797511:                                      SchemaConstants.SYSTEM_KEYSPACE_NAME,
+1:96d41f0:                                      SystemKeyspace.LEGACY_HINTS);
+1:96d41f0: 
+1:96d41f0:         // read all the old hints (paged iterator), write them in the new format
+1:96d41f0:         UntypedResultSet rows = QueryProcessor.executeInternalWithPaging(query, pageSize, hostId);
+1:96d41f0:         migrateLegacyHints(hostId, rows, buffer);
+1:96d41f0: 
+1:96d41f0:         // delete the whole partition in the legacy table; we would truncate the whole table afterwards, but this allows
+1:96d41f0:         // to not lose progress in case of a terminated conversion
+1:96d41f0:         deleteLegacyHintsPartition(hostId);
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private void migrateLegacyHints(UUID hostId, UntypedResultSet rows, ByteBuffer buffer)
+1:96d41f0:     {
+1:96d41f0:         migrateLegacyHints(hostId, rows.iterator(), buffer);
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private void migrateLegacyHints(UUID hostId, Iterator<UntypedResultSet.Row> iterator, ByteBuffer buffer)
+1:96d41f0:     {
+1:96d41f0:         do
+1:96d41f0:         {
+1:96d41f0:             migrateLegacyHintsInternal(hostId, iterator, buffer);
+1:96d41f0:             // if there are hints that didn't fit in the previous file, keep calling the method to write to a new
+1:96d41f0:             // file until we get everything written.
+1:96d41f0:         }
+1:96d41f0:         while (iterator.hasNext());
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private void migrateLegacyHintsInternal(UUID hostId, Iterator<UntypedResultSet.Row> iterator, ByteBuffer buffer)
+1:96d41f0:     {
+1:96d41f0:         HintsDescriptor descriptor = new HintsDescriptor(hostId, System.currentTimeMillis());
+1:96d41f0: 
+1:96d41f0:         try (HintsWriter writer = HintsWriter.create(hintsDirectory, descriptor))
+1:96d41f0:         {
+1:96d41f0:             try (HintsWriter.Session session = writer.newSession(buffer))
+1:96d41f0:             {
+1:96d41f0:                 while (iterator.hasNext())
+1:96d41f0:                 {
+1:96d41f0:                     Hint hint = convertLegacyHint(iterator.next());
+1:96d41f0:                     if (hint != null)
+1:96d41f0:                         session.append(hint);
+1:96d41f0: 
+1:96d41f0:                     if (session.position() >= maxHintsFileSize)
+1:96d41f0:                         break;
+1:96d41f0:                 }
+1:96d41f0:             }
+1:96d41f0:         }
+1:96d41f0:         catch (IOException e)
+1:96d41f0:         {
+1:96d41f0:             throw new FSWriteError(e, descriptor.fileName());
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private static Hint convertLegacyHint(UntypedResultSet.Row row)
+1:96d41f0:     {
+1:96d41f0:         Mutation mutation = deserializeLegacyMutation(row);
+1:96d41f0:         if (mutation == null)
+1:96d41f0:             return null;
+1:96d41f0: 
+1:96d41f0:         long creationTime = row.getLong("write_time"); // milliseconds, not micros, for the hints table
+1:96d41f0:         int expirationTime = FBUtilities.nowInSeconds() + row.getInt("ttl");
+1:96d41f0:         int originalGCGS = expirationTime - (int) TimeUnit.MILLISECONDS.toSeconds(creationTime);
+1:96d41f0: 
+1:96d41f0:         int gcgs = Math.min(originalGCGS, mutation.smallestGCGS());
+1:96d41f0: 
+1:96d41f0:         return Hint.create(mutation, creationTime, gcgs);
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private static Mutation deserializeLegacyMutation(UntypedResultSet.Row row)
+1:96d41f0:     {
+1:127f7c5:         try (DataInputBuffer dib = new DataInputBuffer(row.getBlob("mutation"), true))
+1:96d41f0:         {
+1:127f7c5:             Mutation mutation = Mutation.serializer.deserialize(dib,
+1:96d41f0:                                                                 row.getInt("message_version"));
+1:96d41f0:             mutation.getPartitionUpdates().forEach(PartitionUpdate::validate);
+1:96d41f0:             return mutation;
+1:96d41f0:         }
+1:96d41f0:         catch (IOException e)
+1:96d41f0:         {
+1:2188bec:             logger.error("Failed to migrate a hint for {} from legacy {}.{} table",
+1:96d41f0:                          row.getUUID("target_id"),
+1:9797511:                          SchemaConstants.SYSTEM_KEYSPACE_NAME,
+1:96d41f0:                          SystemKeyspace.LEGACY_HINTS,
+1:96d41f0:                          e);
+1:96d41f0:             return null;
+1:96d41f0:         }
+1:96d41f0:         catch (MarshalException e)
+1:96d41f0:         {
+1:2188bec:             logger.warn("Failed to validate a hint for {} from legacy {}.{} table - skipping",
+1:96d41f0:                         row.getUUID("target_id"),
+1:9797511:                         SchemaConstants.SYSTEM_KEYSPACE_NAME,
+1:96d41f0:                         SystemKeyspace.LEGACY_HINTS,
+1:96d41f0:                         e);
+1:96d41f0:             return null;
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private static void deleteLegacyHintsPartition(UUID hostId)
+1:96d41f0:     {
+1:96d41f0:         // intentionally use millis, like the rest of the legacy implementation did, just in case
+1:96d41f0:         Mutation mutation = new Mutation(PartitionUpdate.fullPartitionDelete(SystemKeyspace.LegacyHints,
+1:96d41f0:                                                                              UUIDType.instance.decompose(hostId),
+1:96d41f0:                                                                              System.currentTimeMillis(),
+1:96d41f0:                                                                              FBUtilities.nowInSeconds()));
+1:96d41f0:         mutation.applyUnsafe();
+1:96d41f0:     }
+1:96d41f0: }
+============================================================================
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:9797511
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.config.SchemaConstants;
+/////////////////////////////////////////////////////////////////////////
+1:         legacyHintsTable = Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(SystemKeyspace.LEGACY_HINTS);
+/////////////////////////////////////////////////////////////////////////
+1:         logger.info("Forcing a major compaction of {}.{} table", SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.LEGACY_HINTS);
+/////////////////////////////////////////////////////////////////////////
+1:         logger.info("Truncating {}.{} table", SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.LEGACY_HINTS);
+/////////////////////////////////////////////////////////////////////////
+1:         String query = String.format("SELECT DISTINCT target_id FROM %s.%s", SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.LEGACY_HINTS);
+/////////////////////////////////////////////////////////////////////////
+1:                                      SchemaConstants.SYSTEM_KEYSPACE_NAME,
+/////////////////////////////////////////////////////////////////////////
+1:                          SchemaConstants.SYSTEM_KEYSPACE_NAME,
+/////////////////////////////////////////////////////////////////////////
+1:                         SchemaConstants.SYSTEM_KEYSPACE_NAME,
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:2188bec
+/////////////////////////////////////////////////////////////////////////
+1:             logger.error("Failed to migrate a hint for {} from legacy {}.{} table",
+/////////////////////////////////////////////////////////////////////////
+1:             logger.warn("Failed to validate a hint for {} from legacy {}.{} table - skipping",
+author:Branimir Lambov
+-------------------------------------------------------------------------------
+commit:127f7c5
+/////////////////////////////////////////////////////////////////////////
+1:         try (DataInputBuffer dib = new DataInputBuffer(row.getBlob("mutation"), true))
+1:             Mutation mutation = Mutation.serializer.deserialize(dib,
+commit:e777301
+/////////////////////////////////////////////////////////////////////////
+0:         try (DataInputBuffer dib = new DataInputBuffer(row.getBlob("mutation"), true))
+0:             Mutation mutation = Mutation.serializer.deserialize(dib,
+author:Stefania Alborghetti
+-------------------------------------------------------------------------------
+commit:53a177a
+/////////////////////////////////////////////////////////////////////////
+1:         logger.info("Writing legacy hints to the new storage");
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:4cc2b67
+/////////////////////////////////////////////////////////////////////////
+1:         if (meanCellCount != 0 && meanPartitionSize != 0)
+commit:96d41f0
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.hints;
+1: 
+1: import java.io.File;
+1: import java.io.IOException;
+1: import java.nio.ByteBuffer;
+1: import java.util.*;
+1: import java.util.concurrent.ExecutionException;
+1: import java.util.concurrent.TimeUnit;
+1: 
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import org.apache.cassandra.cql3.QueryProcessor;
+1: import org.apache.cassandra.cql3.UntypedResultSet;
+1: import org.apache.cassandra.db.*;
+1: import org.apache.cassandra.db.compaction.CompactionManager;
+1: import org.apache.cassandra.db.marshal.UUIDType;
+1: import org.apache.cassandra.db.partitions.PartitionUpdate;
+1: import org.apache.cassandra.io.FSWriteError;
+1: import org.apache.cassandra.io.sstable.Descriptor;
+1: import org.apache.cassandra.io.util.DataInputBuffer;
+1: import org.apache.cassandra.io.util.FileUtils;
+1: import org.apache.cassandra.serializers.MarshalException;
+1: import org.apache.cassandra.utils.FBUtilities;
+1: 
+1: /**
+1:  * A migrator that goes through the legacy system.hints table and writes all the hints to the new hints storage format.
+1:  */
+1: @SuppressWarnings("deprecation")
+1: public final class LegacyHintsMigrator
+1: {
+1:     private static final Logger logger = LoggerFactory.getLogger(LegacyHintsMigrator.class);
+1: 
+1:     private final File hintsDirectory;
+1:     private final long maxHintsFileSize;
+1: 
+1:     private final ColumnFamilyStore legacyHintsTable;
+1:     private final int pageSize;
+1: 
+1:     public LegacyHintsMigrator(File hintsDirectory, long maxHintsFileSize)
+1:     {
+1:         this.hintsDirectory = hintsDirectory;
+1:         this.maxHintsFileSize = maxHintsFileSize;
+1: 
+0:         legacyHintsTable = Keyspace.open(SystemKeyspace.NAME).getColumnFamilyStore(SystemKeyspace.LEGACY_HINTS);
+1:         pageSize = calculatePageSize(legacyHintsTable);
+1:     }
+1: 
+1:     // read fewer columns (mutations) per page if they are very large
+1:     private static int calculatePageSize(ColumnFamilyStore legacyHintsTable)
+1:     {
+1:         int size = 128;
+1: 
+1:         int meanCellCount = legacyHintsTable.getMeanColumns();
+1:         double meanPartitionSize = legacyHintsTable.getMeanPartitionSize();
+1: 
+0:         if (meanCellCount != 0 || meanPartitionSize != 0)
+1:         {
+1:             int avgHintSize = (int) meanPartitionSize / meanCellCount;
+1:             size = Math.max(2, Math.min(size, (512 << 10) / avgHintSize));
+1:         }
+1: 
+1:         return size;
+1:     }
+1: 
+1:     public void migrate()
+1:     {
+1:         // nothing to migrate
+1:         if (legacyHintsTable.isEmpty())
+1:             return;
+1:         logger.info("Migrating legacy hints to new storage");
+1: 
+1:         // major-compact all of the existing sstables to get rid of the tombstones + expired hints
+0:         logger.info("Forcing a major compaction of {}.{} table", SystemKeyspace.NAME, SystemKeyspace.LEGACY_HINTS);
+1:         compactLegacyHints();
+1: 
+1:         // paginate over legacy hints and write them to the new storage
+0:         logger.info("Migrating legacy hints to the new storage");
+1:         migrateLegacyHints();
+1: 
+1:         // truncate the legacy hints table
+0:         logger.info("Truncating {}.{} table", SystemKeyspace.NAME, SystemKeyspace.LEGACY_HINTS);
+1:         legacyHintsTable.truncateBlocking();
+1:     }
+1: 
+1:     private void compactLegacyHints()
+1:     {
+1:         Collection<Descriptor> descriptors = new ArrayList<>();
+1:         legacyHintsTable.getTracker().getUncompacting().forEach(sstable -> descriptors.add(sstable.descriptor));
+1:         if (!descriptors.isEmpty())
+1:             forceCompaction(descriptors);
+1:     }
+1: 
+1:     private void forceCompaction(Collection<Descriptor> descriptors)
+1:     {
+1:         try
+1:         {
+1:             CompactionManager.instance.submitUserDefined(legacyHintsTable, descriptors, FBUtilities.nowInSeconds()).get();
+1:         }
+1:         catch (InterruptedException | ExecutionException e)
+1:         {
+1:             throw new RuntimeException(e);
+1:         }
+1:     }
+1: 
+1:     private void migrateLegacyHints()
+1:     {
+1:         ByteBuffer buffer = ByteBuffer.allocateDirect(256 * 1024);
+0:         String query = String.format("SELECT DISTINCT target_id FROM %s.%s", SystemKeyspace.NAME, SystemKeyspace.LEGACY_HINTS);
+1:         //noinspection ConstantConditions
+1:         QueryProcessor.executeInternal(query).forEach(row -> migrateLegacyHints(row.getUUID("target_id"), buffer));
+1:         FileUtils.clean(buffer);
+1:     }
+1: 
+1:     private void migrateLegacyHints(UUID hostId, ByteBuffer buffer)
+1:     {
+1:         String query = String.format("SELECT target_id, hint_id, message_version, mutation, ttl(mutation) AS ttl, writeTime(mutation) AS write_time " +
+1:                                      "FROM %s.%s " +
+1:                                      "WHERE target_id = ?",
+0:                                      SystemKeyspace.NAME,
+1:                                      SystemKeyspace.LEGACY_HINTS);
+1: 
+1:         // read all the old hints (paged iterator), write them in the new format
+1:         UntypedResultSet rows = QueryProcessor.executeInternalWithPaging(query, pageSize, hostId);
+1:         migrateLegacyHints(hostId, rows, buffer);
+1: 
+1:         // delete the whole partition in the legacy table; we would truncate the whole table afterwards, but this allows
+1:         // to not lose progress in case of a terminated conversion
+1:         deleteLegacyHintsPartition(hostId);
+1:     }
+1: 
+1:     private void migrateLegacyHints(UUID hostId, UntypedResultSet rows, ByteBuffer buffer)
+1:     {
+1:         migrateLegacyHints(hostId, rows.iterator(), buffer);
+1:     }
+1: 
+1:     private void migrateLegacyHints(UUID hostId, Iterator<UntypedResultSet.Row> iterator, ByteBuffer buffer)
+1:     {
+1:         do
+1:         {
+1:             migrateLegacyHintsInternal(hostId, iterator, buffer);
+1:             // if there are hints that didn't fit in the previous file, keep calling the method to write to a new
+1:             // file until we get everything written.
+1:         }
+1:         while (iterator.hasNext());
+1:     }
+1: 
+1:     private void migrateLegacyHintsInternal(UUID hostId, Iterator<UntypedResultSet.Row> iterator, ByteBuffer buffer)
+1:     {
+1:         HintsDescriptor descriptor = new HintsDescriptor(hostId, System.currentTimeMillis());
+1: 
+1:         try (HintsWriter writer = HintsWriter.create(hintsDirectory, descriptor))
+1:         {
+1:             try (HintsWriter.Session session = writer.newSession(buffer))
+1:             {
+1:                 while (iterator.hasNext())
+1:                 {
+1:                     Hint hint = convertLegacyHint(iterator.next());
+1:                     if (hint != null)
+1:                         session.append(hint);
+1: 
+1:                     if (session.position() >= maxHintsFileSize)
+1:                         break;
+1:                 }
+1:             }
+1:         }
+1:         catch (IOException e)
+1:         {
+1:             throw new FSWriteError(e, descriptor.fileName());
+1:         }
+1:     }
+1: 
+1:     private static Hint convertLegacyHint(UntypedResultSet.Row row)
+1:     {
+1:         Mutation mutation = deserializeLegacyMutation(row);
+1:         if (mutation == null)
+1:             return null;
+1: 
+1:         long creationTime = row.getLong("write_time"); // milliseconds, not micros, for the hints table
+1:         int expirationTime = FBUtilities.nowInSeconds() + row.getInt("ttl");
+1:         int originalGCGS = expirationTime - (int) TimeUnit.MILLISECONDS.toSeconds(creationTime);
+1: 
+1:         int gcgs = Math.min(originalGCGS, mutation.smallestGCGS());
+1: 
+1:         return Hint.create(mutation, creationTime, gcgs);
+1:     }
+1: 
+1:     private static Mutation deserializeLegacyMutation(UntypedResultSet.Row row)
+1:     {
+1:         try
+1:         {
+0:             Mutation mutation = Mutation.serializer.deserialize(new DataInputBuffer(row.getBlob("mutation"), true),
+1:                                                                 row.getInt("message_version"));
+1:             mutation.getPartitionUpdates().forEach(PartitionUpdate::validate);
+1:             return mutation;
+1:         }
+1:         catch (IOException e)
+1:         {
+0:             logger.error("Failed to migrate a hint for {} from legacy {}.{} table: {}",
+1:                          row.getUUID("target_id"),
+0:                          SystemKeyspace.NAME,
+1:                          SystemKeyspace.LEGACY_HINTS,
+1:                          e);
+1:             return null;
+1:         }
+1:         catch (MarshalException e)
+1:         {
+0:             logger.warn("Failed to validate a hint for {} (table id {}) from legacy {}.{} table - skipping: {})",
+1:                         row.getUUID("target_id"),
+0:                         SystemKeyspace.NAME,
+1:                         SystemKeyspace.LEGACY_HINTS,
+1:                         e);
+1:             return null;
+1:         }
+1:     }
+1: 
+1:     private static void deleteLegacyHintsPartition(UUID hostId)
+1:     {
+1:         // intentionally use millis, like the rest of the legacy implementation did, just in case
+1:         Mutation mutation = new Mutation(PartitionUpdate.fullPartitionDelete(SystemKeyspace.LegacyHints,
+1:                                                                              UUIDType.instance.decompose(hostId),
+1:                                                                              System.currentTimeMillis(),
+1:                                                                              FBUtilities.nowInSeconds()));
+1:         mutation.applyUnsafe();
+1:     }
+1: }
+============================================================================

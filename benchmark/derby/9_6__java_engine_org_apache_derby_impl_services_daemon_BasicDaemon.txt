@@ -1,0 +1,2393 @@
+1:eac0369: /*
+1:345de35: 
+1:345de35:    Derby - Class org.apache.derby.impl.services.daemon.BasicDaemon
+1:345de35: 
+1:93fea34:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:93fea34:    contributor license agreements.  See the NOTICE file distributed with
+1:93fea34:    this work for additional information regarding copyright ownership.
+1:93fea34:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:93fea34:    (the "License"); you may not use this file except in compliance with
+1:93fea34:    the License.  You may obtain a copy of the License at
+1:345de35: 
+1:345de35:       http://www.apache.org/licenses/LICENSE-2.0
+1:345de35: 
+1:345de35:    Unless required by applicable law or agreed to in writing, software
+1:345de35:    distributed under the License is distributed on an "AS IS" BASIS,
+1:345de35:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:345de35:    See the License for the specific language governing permissions and
+1:345de35:    limitations under the License.
+12:eac0369: 
+2:eac0369:  */
+1:eac0369: 
+1:eac0369: package org.apache.derby.impl.services.daemon;
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.services.context.ContextService;
+1:eac0369: import org.apache.derby.iapi.services.context.ContextManager;
+1:eac0369: import org.apache.derby.iapi.services.daemon.DaemonService;
+1:eac0369: import org.apache.derby.iapi.services.daemon.Serviceable;
+1:eac0369: import org.apache.derby.iapi.services.monitor.Monitor;
+1:eac0369: import org.apache.derby.iapi.services.monitor.ModuleFactory;
+1:7e51e9d: import org.apache.derby.shared.common.sanity.SanityManager;
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.error.StandardException;
+1:eac0369: 
+1:e7deac4: import java.security.AccessController;
+1:e7deac4: import java.security.PrivilegedAction;
+1:eac0369: import java.util.Vector;
+1:eac0369: import java.util.List;
+1:c851d84: import org.apache.derby.iapi.util.InterruptStatus;
+1:eac0369: 
+2:eac0369: /**
+1:eac0369: 	A BasicDaemon is a background worker thread which does asynchronous I/O and
+1:eac0369: 	general clean up.  It should not be used as a general worker thread for
+1:eac0369: 	parallel execution. 
+1:eac0369: 
+1:eac0369: 	One cannot count on the order of request or count on when the daemon will
+1:eac0369: 	wake up, even with serviceNow requests.  Request are not persistent and not
+1:eac0369: 	recoverable, they are all lost when the system crashes or is shutdown.
+1:eac0369: 	System shutdown, even orderly ones, do not wait for daemons to finish its
+1:eac0369: 	work or empty its queue.  Furthermore, any Serviceable subscriptions,
+1:591cc35: 	including onDemandOnly, must tolerate spurious services.  The BasicDaemon
+1:eac0369: 	will setup a context manager with no context on it.  The Serviceable
+1:eac0369: 	object's performWork must provide useful context on the context manager to
+1:eac0369: 	do its work.  The BasicDaemon will wrap performWork call with try / catch
+1:eac0369: 	block and will use the ContextManager's error handling to clean up any
+1:eac0369: 	error.  The BasicDaemon will guarentee serviceNow request will not be lost
+1:eac0369: 	as long as the jbms does not crash - however, if N serviceNow requests are
+1:eac0369: 	made by the same client, it may only be serviced once, not N times.
+1:eac0369: 
+1:eac0369: 	Many Serviceable object will subscribe to the same BasicDaemon.  Their
+1:eac0369: 	performWork method should be well behaved - in other words, it should not
+1:eac0369: 	take too long or hog too many resources or deadlock with anyone else.  And
+1:eac0369: 	it cannot (should not) error out.
+1:eac0369: 
+1:eac0369: 	The BasicDaemon implementation manages the DaemonService's data structure,
+1:eac0369: 	handles subscriptions and enqueues requests, and determine the service
+1:eac0369: 	schedule for its Serviceable objects.  The BasicDaemon keeps an array
+1:eac0369: 	(Vector) of Serviceable subscriptions it also keeps 2 queues for clients
+1:eac0369: 	that uses it for one time service - the 1st queue is for a serviceNow
+1:eac0369: 	enqueue request, the 2nd queue is for non serviceNow enqueue request.
+1:eac0369: 
+1:eac0369: 	This BasicDaemon services its clients in the following order:
+1:eac0369: 	1. any subscribed client that have made a serviceNow request that has not
+1:eac0369: 				been fulfilled 
+1:eac0369: 	2. serviceable clients on the 1st queue
+1:eac0369: 	3. all subscribed clients that are not onDemandOnly
+1:eac0369: 	4. serviceable clients 2nd queue
+1:eac0369: 
+1:eac0369: */
+1:eac0369: public class BasicDaemon implements DaemonService, Runnable
+1:eac0369: {
+1:eac0369: 	private int numClients;		// number of clients that needs services
+1:eac0369: 
+1:eac0369: 	private static final int OPTIMAL_QUEUE_SIZE = 100;
+1:eac0369: 
+1:a15a470: 	private final Vector<ServiceRecord> subscription;
+1:eac0369: 
+1:eac0369: 	// the context this daemon should run with
+1:eac0369: 	protected final ContextService contextService;
+1:eac0369: 	protected final ContextManager contextMgr;
+1:eac0369: 
+1:eac0369: 	/**
+1:eac0369: 		Queues for the work to be done.
+1:eac0369: 		These are synchronized by this object.
+1:eac0369: 	*/
+1:a15a470: 	private final List<ServiceRecord> highPQ;		// high priority queue
+1:a15a470: 	private final List<ServiceRecord> normPQ;		// normal priority queue
+1:eac0369: 
+1:eac0369: 	/**
+1:eac0369: 		which subscribed clients to service next?
+1:eac0369: 		only accessed by daemon thread
+1:eac0369: 	*/
+1:eac0369: 	private int nextService;
+1:eac0369: 
+1:eac0369: 	/*
+1:eac0369: 	** State for the sleep/wakeup routines.
+1:eac0369: 	*/
+1:eac0369: 
+1:eac0369: 	private boolean awakened;			// a wake up call has been issued 
+1:eac0369: 								// MT - synchronized on this
+1:eac0369: 
+1:eac0369: 	/**
+1:eac0369: 		true if I'm waiting, if this is false then I am running and a notify is not required.
+1:eac0369: 	*/
+1:eac0369: 	private boolean waiting;
+1:eac0369: 
+1:eac0369: 	private boolean inPause;			// if true, don't do anything
+1:eac0369: 	private boolean running;			// I am running now
+1:eac0369: 	private boolean stopRequested;		// thread is requested to die
+1:eac0369: 	private boolean stopped;			// we have stopped
+1:eac0369: 
+1:eac0369: 	private long lastServiceTime; // when did I last wake up on a timer
+1:eac0369: 	private int earlyWakeupCount;		// if I am waken up a couple of times, check
+1:eac0369: 								// that lastServiceTime to make sure work
+1:eac0369: 								// scheduled on a timer gets done once in a
+1:eac0369: 								// while
+1:eac0369: 
+1:eac0369: 	/**
+1:eac0369: 		make a BasicDaemon
+1:eac0369: 	*/
+1:eac0369: 	public BasicDaemon(ContextService contextService)
+1:eac0369: 	{
+1:eac0369: 		this.contextService = contextService;
+1:eac0369: 		this.contextMgr = contextService.newContextManager();
+1:eac0369: 
+1:a15a470: 		subscription = new Vector<ServiceRecord>(1, 1);
+1:a15a470: 		highPQ = new java.util.LinkedList<ServiceRecord>();
+1:a15a470: 		normPQ = new java.util.LinkedList<ServiceRecord>();
+1:eac0369: 		
+1:eac0369: 		lastServiceTime = System.currentTimeMillis();
+2:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	public int subscribe(Serviceable newClient, boolean onDemandOnly)
+1:eac0369: 	{
+1:eac0369: 		int clientNumber;
+1:eac0369: 
+1:eac0369: 		ServiceRecord clientRecord;
+1:eac0369: 
+1:eac0369: 		synchronized(this)
+1:eac0369: 		{
+1:eac0369: 			clientNumber = numClients++;
+1:eac0369: 
+1:eac0369: 			clientRecord = new ServiceRecord(newClient, onDemandOnly, true);
+1:a32eb9f: 			subscription.add(clientNumber, clientRecord);
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 		if (SanityManager.DEBUG)
+1:eac0369: 		{
+1:eac0369: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1:eac0369: 								"subscribed client # " + clientNumber + " : " +
+1:eac0369: 								clientRecord);
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		return clientNumber;
+1:eac0369: 	}
+1:eac0369: 
+1:591cc35: 	/**
+1:591cc35: 	 * Removes a client from the list of subscribed clients. The call does not
+1:591cc35: 	 * wait for the daemon to finish the work it is currently performing.
+1:591cc35: 	 * Therefore, the client must tolerate that its <code>performWork()</code>
+1:591cc35: 	 * method could be invoked even after the call to
+1:591cc35: 	 * <code>unsubscribe()</code> has returned (but not more than once).
+1:591cc35: 	 *
+1:591cc35: 	 * @param clientNumber client identifier
+1:591cc35: 	 */
+1:eac0369: 	public void unsubscribe(int clientNumber)
+1:eac0369: 	{
+1:eac0369: 		if (clientNumber < 0 || clientNumber > subscription.size())
+1:eac0369: 			return;
+1:eac0369: 
+1:eac0369: 		// client number is never reused.  Just null out the vector entry.
+1:a32eb9f: 		subscription.set(clientNumber, null);
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	public void serviceNow(int clientNumber)
+1:eac0369: 	{
+1:eac0369: 		if (clientNumber < 0 || clientNumber > subscription.size())
+1:eac0369: 			return;
+1:eac0369: 
+1:a32eb9f: 		ServiceRecord clientRecord = (ServiceRecord)subscription.get(clientNumber);
+1:eac0369: 		if (clientRecord == null)
+1:eac0369: 			return;
+1:eac0369: 
+1:eac0369: 		clientRecord.called();
+1:eac0369: 		wakeUp();
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	public boolean enqueue(Serviceable newClient, boolean serviceNow)
+1:eac0369: 	{
+1:eac0369: 		ServiceRecord clientRecord = new ServiceRecord(newClient, false, false);
+1:eac0369: 
+1:eac0369: 		if (SanityManager.DEBUG)
+1:eac0369: 		{
+1:eac0369: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 				SanityManager.DEBUG(DaemonService.DaemonTrace,
+1:eac0369: 									"enqueing work, urgent = " + serviceNow + ":" + newClient );
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 
+1:a15a470: 		List<ServiceRecord> queue = serviceNow ? highPQ : normPQ;
+1:eac0369: 
+1:eac0369: 		int highPQsize;
+1:eac0369: 		synchronized (this) {
+1:eac0369: 			queue.add(clientRecord);
+1:eac0369: 			highPQsize = highPQ.size();
+1:eac0369: 
+1:eac0369: 			if (SanityManager.DEBUG) {
+1:eac0369: 
+1:eac0369: 				if (SanityManager.DEBUG_ON("memoryLeakTrace")) {
+1:eac0369: 
+1:eac0369: 					if (highPQsize > (OPTIMAL_QUEUE_SIZE * 2))
+1:eac0369: 						System.out.println("memoryLeakTrace:BasicDaemon " + highPQsize);
+1:eac0369: 				}
+1:eac0369: 			}
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		if (serviceNow && !awakened)
+1:eac0369: 			wakeUp();
+1:eac0369: 
+1:eac0369: 		if (serviceNow) {
+1:eac0369: 			return highPQsize > OPTIMAL_QUEUE_SIZE;
+1:eac0369: 		}
+1:eac0369: 		return false;
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	/**
+1:eac0369: 		Get rid of all queued up Serviceable tasks.
+1:eac0369: 	 */
+1:eac0369: 	public synchronized void clear()
+1:eac0369: 	{
+1:eac0369: 		normPQ.clear();
+1:eac0369: 		highPQ.clear();
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	/*
+1:eac0369: 	 * class specific methods
+1:eac0369: 	 */
+1:eac0369: 
+1:eac0369: 	protected ServiceRecord nextAssignment(boolean urgent)
+1:eac0369: 	{
+1:eac0369: 		// first goes thru the subscription list, then goes thru highPQ;
+1:eac0369: 		ServiceRecord clientRecord;
+1:eac0369: 
+1:eac0369: 		while (nextService < subscription.size())
+1:eac0369: 		{
+1:a32eb9f: 			clientRecord = (ServiceRecord)subscription.get(nextService++);
+1:eac0369: 			if (clientRecord != null && (clientRecord.needImmediateService() || (!urgent && clientRecord.needService())))
+1:eac0369: 				return clientRecord;
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		clientRecord = null;
+1:eac0369: 
+1:eac0369: 		synchronized(this)
+1:eac0369: 		{
+1:eac0369: 			if (!highPQ.isEmpty())
+1:eac0369: 				clientRecord = (ServiceRecord) highPQ.remove(0);
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		if (urgent || clientRecord != null)
+1:eac0369: 		{
+1:eac0369: 			if (SanityManager.DEBUG)
+1:eac0369: 			{
+1:eac0369: 				if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 					SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1:eac0369: 									clientRecord == null ? 
+1:eac0369: 									"No more urgent assignment " : 
+1:eac0369: 									"Next urgent assignment : " + clientRecord);
+1:eac0369: 			}
+1:eac0369: 			
+1:eac0369: 			return clientRecord;
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		clientRecord = null;
+1:eac0369: 		synchronized(this)
+1:eac0369: 		{
+1:eac0369: 			if (!normPQ.isEmpty())
+1:eac0369: 			{
+1:eac0369: 				clientRecord = (ServiceRecord)normPQ.remove(0);
+1:eac0369: 
+1:eac0369: 				if (SanityManager.DEBUG)
+1:eac0369: 				{
+1:eac0369: 					if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 						SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1:eac0369: 										"Next normal enqueued : " + clientRecord);
+1:eac0369: 				}
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369: 			// else no more work 
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		if (SanityManager.DEBUG)
+1:eac0369: 		{
+1:eac0369: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 			{
+1:eac0369: 				if (clientRecord == null)
+1:eac0369: 					SanityManager.DEBUG(DaemonService.DaemonTrace, "No more assignment");
+1:eac0369: 			}
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		return clientRecord;
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	protected void serviceClient(ServiceRecord clientRecord) 
+1:eac0369: 	{
+1:eac0369: 		clientRecord.serviced();
+1:eac0369: 
+1:eac0369: 		Serviceable client = clientRecord.client;
+1:eac0369: 
+1:eac0369: 		// client may have unsubscribed while it had items queued
+1:eac0369: 		if (client == null)
+1:eac0369: 			return;
+1:eac0369: 
+1:eac0369: 		ContextManager cm = contextMgr;
+1:eac0369: 
+1:eac0369: 		if (SanityManager.DEBUG)
+1:eac0369: 		{
+1:eac0369: 			SanityManager.ASSERT(cm != null, "Context manager is null");
+1:eac0369: 			SanityManager.ASSERT(client != null, "client is null");
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		try
+1:eac0369: 		{
+1:eac0369: 			int status = client.performWork(cm);
+1:eac0369: 
+1:eac0369: 			if (clientRecord.subscriber)
+1:eac0369: 				return;
+1:eac0369: 
+1:eac0369: 			if (status == Serviceable.REQUEUE)
+1:eac0369: 			{
+1:a15a470: 				List<ServiceRecord> queue = client.serviceASAP() ? highPQ : normPQ;
+1:eac0369: 				synchronized (this) {
+1:eac0369: 					queue.add(clientRecord);
+1:eac0369: 
+1:eac0369: 					if (SanityManager.DEBUG) {
+1:eac0369: 
+1:eac0369: 						if (SanityManager.DEBUG_ON("memoryLeakTrace")) {
+1:eac0369: 
+1:eac0369: 							if (queue.size() > (OPTIMAL_QUEUE_SIZE * 2))
+1:eac0369: 								System.out.println("memoryLeakTrace:BasicDaemon " + queue.size());
+1:eac0369: 						}
+1:eac0369: 					}
+1:eac0369: 				}
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369: 			return;
+1:eac0369: 		}
+1:eac0369: 		catch (Throwable e)
+1:eac0369: 		{
+1:eac0369: 			if (SanityManager.DEBUG)
+1:eac0369: 				SanityManager.showTrace(e);
+1:4c5c16b: 
+1:4c5c16b:             //Assume database is not active. DERBY-4856 thread dump
+1:4c5c16b:             cm.cleanupOnError(e, false);
+1:eac0369: 		}
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	/*
+1:eac0369: 	 * Runnable methods
+1:eac0369: 	 */
+1:eac0369: 	public void run()
+1:eac0369: 	{
+1:eac0369: 		contextService.setCurrentContextManager(contextMgr);
+1:eac0369: 
+1:eac0369: 		if (SanityManager.DEBUG)
+1:eac0369: 		{
+1:eac0369: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonOff))
+1:eac0369: 			{
+1:eac0369: 				SanityManager.DEBUG(DaemonService.DaemonTrace, "DaemonOff is set in properties, background Daemon not run");
+1:eac0369: 				return;
+1:eac0369: 			}
+1:eac0369: 			SanityManager.DEBUG(DaemonService.DaemonTrace, "running");
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		// infinite loop of rest and work
+1:eac0369: 		while(true)
+1:eac0369: 		{
+1:eac0369: 			if (stopRequested())
+1:eac0369: 				break;
+1:eac0369: 
+1:eac0369: 			// if someone wake me up, only service the urgent requests.
+1:eac0369: 			// if I wake up by my regular schedule, service all clients
+1:eac0369: 			boolean urgentOnly = rest();
+1:eac0369: 
+1:eac0369: 			if (stopRequested())
+1:eac0369: 				break;
+1:eac0369: 
+1:eac0369: 			if (!inPause())
+1:eac0369: 				work(urgentOnly);
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		synchronized(this)
+1:eac0369: 		{
+1:eac0369: 			running = false;
+1:eac0369: 			stopped = true;
+1:eac0369: 		}
+1:4c5c16b:         
+1:4c5c16b:         //Assume database is not active. DERBY-4856 thread dump 
+1:4c5c16b:         contextMgr.cleanupOnError(StandardException.normalClose(), false);
+1:4c5c16b: 
+1:eac0369: 		contextService.resetCurrentContextManager(contextMgr);
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	/*
+1:eac0369: 	 * Daemon Service method
+1:eac0369: 	 */
+1:eac0369: 
+1:eac0369: 	/*
+1:eac0369: 	 * pause the daemon.  Wait till it is no running before it returns
+1:eac0369: 	 */
+1:eac0369: 	public void pause()
+1:eac0369: 	{
+1:eac0369: 		if (SanityManager.DEBUG)
+1:eac0369: 		{
+1:eac0369: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 				SanityManager.DEBUG(DaemonService.DaemonTrace, "pausing daemon");
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		synchronized(this)
+1:eac0369: 		{
+1:eac0369: 			inPause = true;
+1:eac0369: 			while(running)
+1:eac0369: 			{
+1:eac0369: 				if (SanityManager.DEBUG)
+1:eac0369: 				{
+1:eac0369: 					if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 						SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1:eac0369: 										"waiting for daemon run to finish");
+1:eac0369: 				}
+1:eac0369: 
+1:eac0369: 				try
+1:eac0369: 				{
+1:eac0369: 					wait();
+1:eac0369: 				}
+1:eac0369: 				catch (InterruptedException ie)				
+1:eac0369: 				{
+1:c851d84:                     InterruptStatus.setInterrupted();
+1:eac0369: 				}
+1:eac0369: 			}
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		if (SanityManager.DEBUG)
+1:eac0369: 		{
+1:eac0369: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1:eac0369: 								"daemon paused");
+1:eac0369: 		}
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	public void resume()
+1:eac0369: 	{
+1:eac0369: 		synchronized(this)
+1:eac0369: 		{
+1:eac0369: 			inPause = false;
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		if (SanityManager.DEBUG) 
+1:eac0369: 		{
+1:eac0369: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1:eac0369: 								"daemon resumed");
+1:eac0369: 		}
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	/**
+1:eac0369: 		Finish what we are doing and at the next convenient moment, get rid of
+1:eac0369: 		the thread and make the daemon object goes away if possible.
+1:eac0369: 
+1:eac0369: 		remember we are calling from another thread
+1:eac0369: 	 */
+1:eac0369: 	public void stop()
+1:eac0369: 	{
+1:eac0369: 		if (stopped)			// already stopped
+1:eac0369: 			return;
+1:eac0369: 
+1:eac0369: 		synchronized(this)
+1:eac0369: 		{
+1:eac0369: 			stopRequested = true;
+1:eac0369: 			notifyAll(); // get sleeper to wake up and stop ASAP
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		pause(); // finish doing what we are doing first
+1:eac0369: 
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	/*
+1:eac0369: 	**Wait until the work in the high priority queue is done.
+1:eac0369: 	**Note: Used by tests only to make sure all the work 
+1:eac0369: 	**assigned to the daemon is completed.
+1:eac0369: 	**/
+1:eac0369: 	public void waitUntilQueueIsEmpty()
+1:eac0369: 	{
+1:eac0369: 		while(true){
+1:eac0369: 			synchronized(this)
+1:eac0369: 			{
+1:eac0369: 				boolean noSubscriptionRequests = true; 
+1:eac0369: 				for (int urgentServiced = 0; urgentServiced < subscription.size(); urgentServiced++)
+1:eac0369: 				{
+1:a32eb9f: 					ServiceRecord clientRecord = (ServiceRecord)subscription.get(urgentServiced);
+1:eac0369: 					if (clientRecord != null &&	clientRecord.needService())
+1:eac0369: 					{
+1:eac0369: 						noSubscriptionRequests = false;
+1:eac0369: 						break;
+1:eac0369: 					}
+1:eac0369: 				}
+1:eac0369: 
+1:eac0369: 				if (highPQ.isEmpty() && noSubscriptionRequests &&!running){
+1:eac0369: 					return;
+1:eac0369: 				}else{
+1:eac0369: 
+1:eac0369: 					notifyAll(); //wake up the the daemon thread
+1:eac0369: 					//wait for the raw store daemon to wakeus up   
+1:eac0369: 					//when it finihes work.
+1:eac0369: 					try{
+1:eac0369: 						wait();
+1:eac0369: 					}catch (InterruptedException ie)
+1:eac0369: 					{
+1:c851d84:                         InterruptStatus.setInterrupted();
+1:c851d84:                     }
+1:eac0369: 				}
+1:eac0369: 			}
+1:eac0369: 		}
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	private synchronized boolean stopRequested()
+1:eac0369: 	{
+1:eac0369: 		return stopRequested;
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	private synchronized boolean inPause()
+1:eac0369: 	{
+1:eac0369: 		return inPause;
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	/*
+1:eac0369: 	 * BasicDaemon method
+1:eac0369: 	 */
+1:eac0369: 	protected synchronized void wakeUp()
+1:eac0369: 	{
+1:eac0369: 		if (!awakened) {
+1:eac0369: 			awakened = true;	// I am being awakened for urgent work.
+1:eac0369: 
+1:eac0369: 			if (waiting) {
+1:eac0369: 				notifyAll();
+1:eac0369: 			}
+1:eac0369: 		}
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	/**
+1:eac0369: 		Returns true if awakened by some notification, false if wake up by timer
+1:eac0369: 	*/
+1:eac0369: 	private boolean rest()
+1:eac0369: 	{
+1:eac0369: 		if (SanityManager.DEBUG)
+1:eac0369: 		{
+1:eac0369: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1:eac0369: 								"going back to rest");
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		boolean urgentOnly;
+1:eac0369: 		boolean checkWallClock = false;
+1:eac0369: 		synchronized(this)
+1:eac0369: 		{
+1:eac0369: 			try
+1:eac0369: 			{	
+1:eac0369: 				if (!awakened) {
+1:eac0369: 					waiting = true;
+1:eac0369: 					wait(DaemonService.TIMER_DELAY);
+1:eac0369: 					waiting = false;
+1:eac0369: 				}
+1:eac0369: 			}
+1:eac0369: 			catch (InterruptedException ie)
+1:eac0369: 			{
+2:eac0369: 				// someone interrupt us, see what's going on
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369: 			nextService = 0;
+1:eac0369: 
+1:eac0369: 			urgentOnly = awakened;
+1:eac0369: 			if (urgentOnly)	// check wall clock
+1:eac0369: 			{
+1:eac0369: 				// take a guess that each early request is services every 500ms.
+1:eac0369: 				if (earlyWakeupCount++ > (DaemonService.TIMER_DELAY / 500)) {
+1:eac0369: 					earlyWakeupCount = 0;
+1:eac0369: 					checkWallClock = true;
+1:eac0369: 				}
+1:eac0369: 			}
+1:eac0369: 			awakened = false;			// reset this for next time
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		if (SanityManager.DEBUG)
+1:eac0369: 		{
+1:eac0369: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace)) 
+1:eac0369: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1:eac0369: 								urgentOnly ?
+1:eac0369: 								"someone wakes me up" : 
+1:eac0369: 								"wakes up by myself");
+1:eac0369: 		}	
+1:eac0369: 
+1:eac0369: 		if (checkWallClock)
+1:eac0369: 		{
+1:eac0369: 			long currenttime = System.currentTimeMillis();
+1:eac0369: 			if ((currenttime - lastServiceTime) > DaemonService.TIMER_DELAY)
+1:eac0369: 			{
+1:eac0369: 				lastServiceTime = currenttime;
+1:eac0369: 				urgentOnly = false;
+1:eac0369: 
+1:eac0369: 				if (SanityManager.DEBUG)
+1:eac0369: 				{
+1:eac0369: 					if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 						SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1:eac0369: 										"wall clock check says service all");
+1:eac0369: 				}
+1:eac0369: 			}
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		return urgentOnly;
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	private void work(boolean urgentOnly)
+1:eac0369: 	{
+1:eac0369: 		if (SanityManager.DEBUG)
+1:eac0369: 		{
+1:eac0369: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1:eac0369: 								"going back to work");
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		ServiceRecord work;
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 		// while I am working, all serviceNow requests that comes in now will
+1:eac0369: 		// be taken care of when we get the next Assignment.
+1:eac0369: 		int serviceCount = 0;
+1:eac0369: 
+1:eac0369: 		int yieldFactor = 10;
+1:eac0369: 		if (urgentOnly && (highPQ.size() > OPTIMAL_QUEUE_SIZE))
+1:eac0369: 			yieldFactor = 2;
+1:eac0369: 
+1:eac0369: 		int yieldCount = OPTIMAL_QUEUE_SIZE / yieldFactor;
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 		for (work = nextAssignment(urgentOnly);
+1:eac0369: 			 work != null;
+1:eac0369: 			 work = nextAssignment(urgentOnly))
+1:eac0369: 		{
+1:eac0369: 			if (SanityManager.DEBUG)
+1:eac0369: 			{
+1:eac0369: 				if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 					SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1:eac0369: 										"servicing " + work);
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 			synchronized(this)
+1:eac0369: 			{
+1:eac0369: 				if (inPause || stopRequested)
+1:eac0369: 					break;			// don't do anything more
+1:eac0369: 				running = true;
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369: 			// do work
+1:eac0369: 			try
+1:eac0369: 			{
+1:eac0369: 				serviceClient(work);
+1:eac0369: 				serviceCount++;
+1:eac0369: 			}
+1:eac0369: 			finally	
+1:eac0369: 			{
+1:eac0369: 				// catch run time exceptions
+1:eac0369: 				synchronized(this)
+1:eac0369: 				{
+1:eac0369: 					running = false;
+1:eac0369: 					notifyAll();
+1:eac0369: 					if (inPause || stopRequested)
+1:eac0369: 						break;	// don't do anything more
+1:eac0369: 				}
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369: 			if (SanityManager.DEBUG)
+1:eac0369: 			{
+1:eac0369: 				if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 					SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1:eac0369: 										"done " + work);
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369: 			// ensure the subscribed clients get a look in once in a while
+1:eac0369: 			// when the queues are large.
+1:eac0369: 			if ((serviceCount % (OPTIMAL_QUEUE_SIZE / 2)) == 0) {
+1:eac0369: 				nextService = 0;
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369: 			if ((serviceCount % yieldCount) == 0) {
+1:eac0369: 
+1:eac0369: 				yield();
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369: 			if (SanityManager.DEBUG)
+1:eac0369: 			{
+1:eac0369: 				if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369: 					SanityManager.DEBUG(DaemonService.DaemonTrace,
+1:eac0369: 										"come back from yield");
+1:eac0369: 			}
+1:eac0369: 		}
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 	/* let everybody else run first */
+1:eac0369: 	private void yield()
+1:eac0369: 	{
+1:eac0369: 		Thread currentThread = Thread.currentThread();
+1:eac0369: 		int oldPriority = currentThread.getPriority();
+1:eac0369: 
+1:eac0369: 		if (oldPriority <= Thread.MIN_PRIORITY)
+1:eac0369: 		{
+1:56a7b39: 			Thread.yield();
+1:eac0369: 		}
+1:eac0369: 		else
+1:eac0369: 		{
+1:56c1dc2: 			ModuleFactory mf = getMonitor();
+1:e7deac4:             setThreadPriority(mf, Thread.MIN_PRIORITY);
+1:56a7b39: 			Thread.yield();
+1:e7deac4:             setThreadPriority(mf, oldPriority);
+1:eac0369: 		}
+1:eac0369: 	}
+1:e7deac4: 
+1:e7deac4:     /**
+1:e7deac4:      * Change the priority of the current thread, but only if it was created
+1:e7deac4:      * by {@link ModuleFactory#getDaemonThread}.
+1:e7deac4:      */
+1:e7deac4:     private static void setThreadPriority(
+1:e7deac4:             ModuleFactory mf, final int priority) {
+1:e7deac4:         final Thread t = Thread.currentThread();
+1:e7deac4:         if (mf != null && mf.isDaemonThread(t)) {
+1:e7deac4:             AccessController.doPrivileged(new PrivilegedAction<Void>() {
+1:e7deac4:                 @Override
+1:e7deac4:                 public Void run() {
+1:e7deac4:                     t.setPriority(priority);
+1:e7deac4:                     return null;
+1:e7deac4:                 }
+1:e7deac4:             });
+1:e7deac4:         }
+1:e7deac4:     }
+1:56c1dc2:     
+1:56c1dc2:     /**
+1:56c1dc2:      * Privileged Monitor lookup. Must be package private so that user code
+1:56c1dc2:      * can't call this entry point.
+1:56c1dc2:      */
+1:56c1dc2:     static  ModuleFactory  getMonitor()
+1:56c1dc2:     {
+1:56c1dc2:         return AccessController.doPrivileged
+1:56c1dc2:             (
+1:56c1dc2:              new PrivilegedAction<ModuleFactory>()
+1:56c1dc2:              {
+1:56c1dc2:                  public ModuleFactory run()
+1:56c1dc2:                  {
+1:56c1dc2:                      return Monitor.getMonitor();
+1:56c1dc2:                  }
+1:56c1dc2:              }
+1:56c1dc2:              );
+1:56c1dc2:     }
+1:56c1dc2: 
+1:eac0369: }
+============================================================================
+author:Richard N. Hillegas
+-------------------------------------------------------------------------------
+commit:56c1dc2
+/////////////////////////////////////////////////////////////////////////
+1: 			ModuleFactory mf = getMonitor();
+/////////////////////////////////////////////////////////////////////////
+1:     
+1:     /**
+1:      * Privileged Monitor lookup. Must be package private so that user code
+1:      * can't call this entry point.
+1:      */
+1:     static  ModuleFactory  getMonitor()
+1:     {
+1:         return AccessController.doPrivileged
+1:             (
+1:              new PrivilegedAction<ModuleFactory>()
+1:              {
+1:                  public ModuleFactory run()
+1:                  {
+1:                      return Monitor.getMonitor();
+1:                  }
+1:              }
+1:              );
+1:     }
+1: 
+commit:a15a470
+/////////////////////////////////////////////////////////////////////////
+1: 	private final Vector<ServiceRecord> subscription;
+/////////////////////////////////////////////////////////////////////////
+1: 	private final List<ServiceRecord> highPQ;		// high priority queue
+1: 	private final List<ServiceRecord> normPQ;		// normal priority queue
+/////////////////////////////////////////////////////////////////////////
+1: 		subscription = new Vector<ServiceRecord>(1, 1);
+1: 		highPQ = new java.util.LinkedList<ServiceRecord>();
+1: 		normPQ = new java.util.LinkedList<ServiceRecord>();
+/////////////////////////////////////////////////////////////////////////
+1: 		List<ServiceRecord> queue = serviceNow ? highPQ : normPQ;
+/////////////////////////////////////////////////////////////////////////
+1: 				List<ServiceRecord> queue = client.serviceASAP() ? highPQ : normPQ;
+commit:93fea34
+/////////////////////////////////////////////////////////////////////////
+1:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:    contributor license agreements.  See the NOTICE file distributed with
+1:    this work for additional information regarding copyright ownership.
+1:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:    (the "License"); you may not use this file except in compliance with
+1:    the License.  You may obtain a copy of the License at
+author:Knut Anders Hatlen
+-------------------------------------------------------------------------------
+commit:e7deac4
+/////////////////////////////////////////////////////////////////////////
+1: import java.security.AccessController;
+1: import java.security.PrivilegedAction;
+/////////////////////////////////////////////////////////////////////////
+1:             setThreadPriority(mf, Thread.MIN_PRIORITY);
+1:             setThreadPriority(mf, oldPriority);
+1: 
+1:     /**
+1:      * Change the priority of the current thread, but only if it was created
+1:      * by {@link ModuleFactory#getDaemonThread}.
+1:      */
+1:     private static void setThreadPriority(
+1:             ModuleFactory mf, final int priority) {
+1:         final Thread t = Thread.currentThread();
+1:         if (mf != null && mf.isDaemonThread(t)) {
+1:             AccessController.doPrivileged(new PrivilegedAction<Void>() {
+1:                 @Override
+1:                 public Void run() {
+1:                     t.setPriority(priority);
+1:                     return null;
+1:                 }
+1:             });
+1:         }
+1:     }
+commit:a32eb9f
+/////////////////////////////////////////////////////////////////////////
+1: 			subscription.add(clientNumber, clientRecord);
+/////////////////////////////////////////////////////////////////////////
+1: 		subscription.set(clientNumber, null);
+/////////////////////////////////////////////////////////////////////////
+1: 		ServiceRecord clientRecord = (ServiceRecord)subscription.get(clientNumber);
+/////////////////////////////////////////////////////////////////////////
+1: 			clientRecord = (ServiceRecord)subscription.get(nextService++);
+/////////////////////////////////////////////////////////////////////////
+1: 					ServiceRecord clientRecord = (ServiceRecord)subscription.get(urgentServiced);
+commit:591cc35
+/////////////////////////////////////////////////////////////////////////
+1: 	including onDemandOnly, must tolerate spurious services.  The BasicDaemon
+/////////////////////////////////////////////////////////////////////////
+1: 	/**
+1: 	 * Removes a client from the list of subscribed clients. The call does not
+1: 	 * wait for the daemon to finish the work it is currently performing.
+1: 	 * Therefore, the client must tolerate that its <code>performWork()</code>
+1: 	 * method could be invoked even after the call to
+1: 	 * <code>unsubscribe()</code> has returned (but not more than once).
+1: 	 *
+1: 	 * @param clientNumber client identifier
+1: 	 */
+author:Bryan Pendleton
+-------------------------------------------------------------------------------
+commit:7e51e9d
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.shared.common.sanity.SanityManager;
+author:Dag H. Wanvik
+-------------------------------------------------------------------------------
+commit:c851d84
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.util.InterruptStatus;
+/////////////////////////////////////////////////////////////////////////
+1:                     InterruptStatus.setInterrupted();
+/////////////////////////////////////////////////////////////////////////
+1:                         InterruptStatus.setInterrupted();
+1:                     }
+author:Lily Wei
+-------------------------------------------------------------------------------
+commit:56a7b39
+/////////////////////////////////////////////////////////////////////////
+1: 			Thread.yield();
+1: 			Thread.yield();
+commit:4c5c16b
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:             //Assume database is not active. DERBY-4856 thread dump
+1:             cm.cleanupOnError(e, false);
+/////////////////////////////////////////////////////////////////////////
+1:         
+1:         //Assume database is not active. DERBY-4856 thread dump 
+1:         contextMgr.cleanupOnError(StandardException.normalClose(), false);
+1: 
+author:David Van Couvering
+-------------------------------------------------------------------------------
+commit:6b50965
+/////////////////////////////////////////////////////////////////////////
+author:Oyvind Bakksjo
+-------------------------------------------------------------------------------
+commit:aaea357
+author:Daniel John Debrunner
+-------------------------------------------------------------------------------
+commit:345de35
+/////////////////////////////////////////////////////////////////////////
+1:    Derby - Class org.apache.derby.impl.services.daemon.BasicDaemon
+1: 
+0:    Copyright 1997, 2004 The Apache Software Foundation or its licensors, as applicable.
+1: 
+0:    Licensed under the Apache License, Version 2.0 (the "License");
+0:    you may not use this file except in compliance with the License.
+0:    You may obtain a copy of the License at
+1: 
+1:       http://www.apache.org/licenses/LICENSE-2.0
+1: 
+1:    Unless required by applicable law or agreed to in writing, software
+1:    distributed under the License is distributed on an "AS IS" BASIS,
+1:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:    See the License for the specific language governing permissions and
+1:    limitations under the License.
+commit:1f9b9c4
+/////////////////////////////////////////////////////////////////////////
+commit:eac0369
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1: 
+0:    Licensed Materials - Property of IBM
+0:    Cloudscape - Package org.apache.derby.impl.services.daemon
+0:    (C) Copyright IBM Corp. 1997, 2004. All Rights Reserved.
+0:    US Government Users Restricted Rights - Use, duplication or
+0:    disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+1: 
+1:  */
+1: 
+1: package org.apache.derby.impl.services.daemon;
+1: 
+1: import org.apache.derby.iapi.services.context.ContextService;
+1: import org.apache.derby.iapi.services.context.ContextManager;
+1: import org.apache.derby.iapi.services.daemon.DaemonService;
+1: import org.apache.derby.iapi.services.daemon.Serviceable;
+1: import org.apache.derby.iapi.services.monitor.Monitor;
+1: import org.apache.derby.iapi.services.monitor.ModuleFactory;
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+1: 
+1: import org.apache.derby.iapi.error.StandardException;
+1: 
+1: import java.util.Vector;
+1: import java.util.List;
+1: 
+1: /**
+1: 	A BasicDaemon is a background worker thread which does asynchronous I/O and
+1: 	general clean up.  It should not be used as a general worker thread for
+1: 	parallel execution. 
+1: 
+1: 	One cannot count on the order of request or count on when the daemon will
+1: 	wake up, even with serviceNow requests.  Request are not persistent and not
+1: 	recoverable, they are all lost when the system crashes or is shutdown.
+1: 	System shutdown, even orderly ones, do not wait for daemons to finish its
+1: 	work or empty its queue.  Furthermore, any Serviceable subscriptions,
+0: 	including onDemandOnly, must tolerate spurrious services.  The BasicDaemon
+1: 	will setup a context manager with no context on it.  The Serviceable
+1: 	object's performWork must provide useful context on the context manager to
+1: 	do its work.  The BasicDaemon will wrap performWork call with try / catch
+1: 	block and will use the ContextManager's error handling to clean up any
+1: 	error.  The BasicDaemon will guarentee serviceNow request will not be lost
+1: 	as long as the jbms does not crash - however, if N serviceNow requests are
+1: 	made by the same client, it may only be serviced once, not N times.
+1: 
+1: 	Many Serviceable object will subscribe to the same BasicDaemon.  Their
+1: 	performWork method should be well behaved - in other words, it should not
+1: 	take too long or hog too many resources or deadlock with anyone else.  And
+1: 	it cannot (should not) error out.
+1: 
+1: 	The BasicDaemon implementation manages the DaemonService's data structure,
+1: 	handles subscriptions and enqueues requests, and determine the service
+1: 	schedule for its Serviceable objects.  The BasicDaemon keeps an array
+1: 	(Vector) of Serviceable subscriptions it also keeps 2 queues for clients
+1: 	that uses it for one time service - the 1st queue is for a serviceNow
+1: 	enqueue request, the 2nd queue is for non serviceNow enqueue request.
+1: 
+1: 	This BasicDaemon services its clients in the following order:
+1: 	1. any subscribed client that have made a serviceNow request that has not
+1: 				been fulfilled 
+1: 	2. serviceable clients on the 1st queue
+1: 	3. all subscribed clients that are not onDemandOnly
+1: 	4. serviceable clients 2nd queue
+1: 
+1: */
+1: public class BasicDaemon implements DaemonService, Runnable
+1: {
+1: 	/**
+0: 		IBM Copyright &copy notice.
+1: 	*/
+0: 	public static final String copyrightNotice = org.apache.derby.iapi.reference.Copyright.SHORT_1997_2004;
+1: 	private int numClients;		// number of clients that needs services
+1: 
+1: 	private static final int OPTIMAL_QUEUE_SIZE = 100;
+1: 
+0: 	private final Vector subscription;
+1: 
+1: 	// the context this daemon should run with
+1: 	protected final ContextService contextService;
+1: 	protected final ContextManager contextMgr;
+1: 
+1: 	/**
+1: 		Queues for the work to be done.
+1: 		These are synchronized by this object.
+1: 	*/
+0: 	private final List highPQ;		// high priority queue
+0: 	private final List normPQ;		// normal priority queue
+1: 
+1: 	/**
+1: 		which subscribed clients to service next?
+1: 		only accessed by daemon thread
+1: 	*/
+1: 	private int nextService;
+1: 
+1: 	/*
+1: 	** State for the sleep/wakeup routines.
+1: 	*/
+1: 
+1: 	private boolean awakened;			// a wake up call has been issued 
+1: 								// MT - synchronized on this
+1: 
+1: 	/**
+1: 		true if I'm waiting, if this is false then I am running and a notify is not required.
+1: 	*/
+1: 	private boolean waiting;
+1: 
+1: 	private boolean inPause;			// if true, don't do anything
+1: 	private boolean running;			// I am running now
+1: 	private boolean stopRequested;		// thread is requested to die
+1: 	private boolean stopped;			// we have stopped
+1: 
+1: 	private long lastServiceTime; // when did I last wake up on a timer
+1: 	private int earlyWakeupCount;		// if I am waken up a couple of times, check
+1: 								// that lastServiceTime to make sure work
+1: 								// scheduled on a timer gets done once in a
+1: 								// while
+1: 
+1: 	/**
+1: 		make a BasicDaemon
+1: 
+0: 		@param priority the priority of the daemon thread
+0: 		@param delay the number of milliseconds between servcies to its clients
+1: 	*/
+1: 	public BasicDaemon(ContextService contextService)
+1: 	{
+1: 		this.contextService = contextService;
+1: 		this.contextMgr = contextService.newContextManager();
+1: 
+0: 		subscription = new Vector(1, 1);
+0: 		highPQ = new java.util.LinkedList();
+0: 		normPQ = new java.util.LinkedList();
+1: 		
+1: 		lastServiceTime = System.currentTimeMillis();
+1: 	}
+1: 
+1: 	public int subscribe(Serviceable newClient, boolean onDemandOnly)
+1: 	{
+1: 		int clientNumber;
+1: 
+1: 		ServiceRecord clientRecord;
+1: 
+1: 		synchronized(this)
+1: 		{
+1: 			clientNumber = numClients++;
+1: 
+1: 			clientRecord = new ServiceRecord(newClient, onDemandOnly, true);
+0: 			subscription.insertElementAt(clientRecord, clientNumber);
+1: 		}
+1: 
+1: 
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1: 								"subscribed client # " + clientNumber + " : " +
+1: 								clientRecord);
+1: 		}
+1: 
+1: 		return clientNumber;
+1: 	}
+1: 
+1: 	public void unsubscribe(int clientNumber)
+1: 	{
+1: 		if (clientNumber < 0 || clientNumber > subscription.size())
+1: 			return;
+1: 
+1: 		// client number is never reused.  Just null out the vector entry.
+0: 		subscription.setElementAt(null, clientNumber);
+1: 	}
+1: 
+1: 	public void serviceNow(int clientNumber)
+1: 	{
+1: 		if (clientNumber < 0 || clientNumber > subscription.size())
+1: 			return;
+1: 
+0: 		ServiceRecord clientRecord = (ServiceRecord)subscription.elementAt(clientNumber);
+1: 		if (clientRecord == null)
+1: 			return;
+1: 
+1: 		clientRecord.called();
+1: 		wakeUp();
+1: 	}
+1: 
+1: 	public boolean enqueue(Serviceable newClient, boolean serviceNow)
+1: 	{
+1: 		ServiceRecord clientRecord = new ServiceRecord(newClient, false, false);
+1: 
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 				SanityManager.DEBUG(DaemonService.DaemonTrace,
+1: 									"enqueing work, urgent = " + serviceNow + ":" + newClient );
+1: 		}
+1: 
+1: 
+0: 		List queue = serviceNow ? highPQ : normPQ;
+1: 
+1: 		int highPQsize;
+1: 		synchronized (this) {
+1: 			queue.add(clientRecord);
+1: 			highPQsize = highPQ.size();
+1: 
+1: 			if (SanityManager.DEBUG) {
+1: 
+1: 				if (SanityManager.DEBUG_ON("memoryLeakTrace")) {
+1: 
+1: 					if (highPQsize > (OPTIMAL_QUEUE_SIZE * 2))
+1: 						System.out.println("memoryLeakTrace:BasicDaemon " + highPQsize);
+1: 				}
+1: 			}
+1: 		}
+1: 
+1: 		if (serviceNow && !awakened)
+1: 			wakeUp();
+1: 
+1: 		if (serviceNow) {
+1: 			return highPQsize > OPTIMAL_QUEUE_SIZE;
+1: 		}
+1: 		return false;
+1: 	}
+1: 
+1: 	/**
+1: 		Get rid of all queued up Serviceable tasks.
+1: 	 */
+1: 	public synchronized void clear()
+1: 	{
+1: 		normPQ.clear();
+1: 		highPQ.clear();
+1: 	}
+1: 
+1: 	/*
+1: 	 * class specific methods
+1: 	 */
+1: 
+1: 	protected ServiceRecord nextAssignment(boolean urgent)
+1: 	{
+1: 		// first goes thru the subscription list, then goes thru highPQ;
+1: 		ServiceRecord clientRecord;
+1: 
+1: 		while (nextService < subscription.size())
+1: 		{
+0: 			clientRecord = (ServiceRecord)subscription.elementAt(nextService++);
+1: 			if (clientRecord != null && (clientRecord.needImmediateService() || (!urgent && clientRecord.needService())))
+1: 				return clientRecord;
+1: 		}
+1: 
+1: 		clientRecord = null;
+1: 
+1: 		synchronized(this)
+1: 		{
+1: 			if (!highPQ.isEmpty())
+1: 				clientRecord = (ServiceRecord) highPQ.remove(0);
+1: 		}
+1: 
+1: 		if (urgent || clientRecord != null)
+1: 		{
+1: 			if (SanityManager.DEBUG)
+1: 			{
+1: 				if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 					SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1: 									clientRecord == null ? 
+1: 									"No more urgent assignment " : 
+1: 									"Next urgent assignment : " + clientRecord);
+1: 			}
+1: 			
+1: 			return clientRecord;
+1: 		}
+1: 
+1: 		clientRecord = null;
+1: 		synchronized(this)
+1: 		{
+1: 			if (!normPQ.isEmpty())
+1: 			{
+1: 				clientRecord = (ServiceRecord)normPQ.remove(0);
+1: 
+1: 				if (SanityManager.DEBUG)
+1: 				{
+1: 					if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 						SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1: 										"Next normal enqueued : " + clientRecord);
+1: 				}
+1: 			}
+1: 
+1: 			// else no more work 
+1: 		}
+1: 
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 			{
+1: 				if (clientRecord == null)
+1: 					SanityManager.DEBUG(DaemonService.DaemonTrace, "No more assignment");
+1: 			}
+1: 		}
+1: 
+1: 		return clientRecord;
+1: 	}
+1: 
+1: 	protected void serviceClient(ServiceRecord clientRecord) 
+1: 	{
+1: 		clientRecord.serviced();
+1: 
+1: 		Serviceable client = clientRecord.client;
+1: 
+1: 		// client may have unsubscribed while it had items queued
+1: 		if (client == null)
+1: 			return;
+1: 
+1: 		ContextManager cm = contextMgr;
+1: 
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			SanityManager.ASSERT(cm != null, "Context manager is null");
+1: 			SanityManager.ASSERT(client != null, "client is null");
+1: 		}
+1: 
+1: 		try
+1: 		{
+1: 			int status = client.performWork(cm);
+1: 
+1: 			if (clientRecord.subscriber)
+1: 				return;
+1: 
+1: 			if (status == Serviceable.REQUEUE)
+1: 			{
+0: 				List queue = client.serviceASAP() ? highPQ : normPQ;
+1: 				synchronized (this) {
+1: 					queue.add(clientRecord);
+1: 
+1: 					if (SanityManager.DEBUG) {
+1: 
+1: 						if (SanityManager.DEBUG_ON("memoryLeakTrace")) {
+1: 
+1: 							if (queue.size() > (OPTIMAL_QUEUE_SIZE * 2))
+1: 								System.out.println("memoryLeakTrace:BasicDaemon " + queue.size());
+1: 						}
+1: 					}
+1: 				}
+1: 			}
+1: 
+1: 			return;
+1: 		}
+1: 		catch (Throwable e)
+1: 		{
+1: 			if (SanityManager.DEBUG)
+1: 				SanityManager.showTrace(e);
+0: 			cm.cleanupOnError(e);
+1: 		}
+1: 	}
+1: 
+1: 	/*
+1: 	 * Runnable methods
+1: 	 */
+1: 	public void run()
+1: 	{
+1: 		contextService.setCurrentContextManager(contextMgr);
+1: 
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonOff))
+1: 			{
+1: 				SanityManager.DEBUG(DaemonService.DaemonTrace, "DaemonOff is set in properties, background Daemon not run");
+1: 				return;
+1: 			}
+1: 			SanityManager.DEBUG(DaemonService.DaemonTrace, "running");
+1: 		}
+1: 
+1: 		// infinite loop of rest and work
+1: 		while(true)
+1: 		{
+1: 			if (stopRequested())
+1: 				break;
+1: 
+1: 			// if someone wake me up, only service the urgent requests.
+1: 			// if I wake up by my regular schedule, service all clients
+1: 			boolean urgentOnly = rest();
+1: 
+1: 			if (stopRequested())
+1: 				break;
+1: 
+1: 			if (!inPause())
+1: 				work(urgentOnly);
+1: 		}
+1: 
+1: 		synchronized(this)
+1: 		{
+1: 			running = false;
+1: 			stopped = true;
+1: 		}
+0: 		contextMgr.cleanupOnError(StandardException.normalClose());
+1: 		contextService.resetCurrentContextManager(contextMgr);
+1: 	}
+1: 
+1: 	/*
+1: 	 * Daemon Service method
+1: 	 */
+1: 
+1: 	/*
+1: 	 * pause the daemon.  Wait till it is no running before it returns
+1: 	 */
+1: 	public void pause()
+1: 	{
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 				SanityManager.DEBUG(DaemonService.DaemonTrace, "pausing daemon");
+1: 		}
+1: 
+1: 		synchronized(this)
+1: 		{
+1: 			inPause = true;
+1: 			while(running)
+1: 			{
+1: 				if (SanityManager.DEBUG)
+1: 				{
+1: 					if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 						SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1: 										"waiting for daemon run to finish");
+1: 				}
+1: 
+1: 				try
+1: 				{
+1: 					wait();
+1: 				}
+1: 				catch (InterruptedException ie)				
+1: 				{
+0: 					// someone interrrupt us, done running
+1: 				}
+1: 			}
+1: 		}
+1: 
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1: 								"daemon paused");
+1: 		}
+1: 	}
+1: 
+1: 	public void resume()
+1: 	{
+1: 		synchronized(this)
+1: 		{
+1: 			inPause = false;
+1: 		}
+1: 
+1: 		if (SanityManager.DEBUG) 
+1: 		{
+1: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1: 								"daemon resumed");
+1: 		}
+1: 	}
+1: 
+1: 	/**
+1: 		Finish what we are doing and at the next convenient moment, get rid of
+1: 		the thread and make the daemon object goes away if possible.
+1: 
+1: 		remember we are calling from another thread
+1: 	 */
+1: 	public void stop()
+1: 	{
+1: 		if (stopped)			// already stopped
+1: 			return;
+1: 
+1: 		synchronized(this)
+1: 		{
+1: 			stopRequested = true;
+1: 			notifyAll(); // get sleeper to wake up and stop ASAP
+1: 		}
+1: 
+1: 		pause(); // finish doing what we are doing first
+1: 
+1: 	}
+1: 
+1: 	/*
+1: 	**Wait until the work in the high priority queue is done.
+1: 	**Note: Used by tests only to make sure all the work 
+1: 	**assigned to the daemon is completed.
+1: 	**/
+1: 	public void waitUntilQueueIsEmpty()
+1: 	{
+1: 		while(true){
+1: 			synchronized(this)
+1: 			{
+1: 				boolean noSubscriptionRequests = true; 
+1: 				for (int urgentServiced = 0; urgentServiced < subscription.size(); urgentServiced++)
+1: 				{
+0: 					ServiceRecord clientRecord = (ServiceRecord)subscription.elementAt(urgentServiced);
+1: 					if (clientRecord != null &&	clientRecord.needService())
+1: 					{
+1: 						noSubscriptionRequests = false;
+1: 						break;
+1: 					}
+1: 				}
+1: 
+1: 				if (highPQ.isEmpty() && noSubscriptionRequests &&!running){
+1: 					return;
+1: 				}else{
+1: 
+1: 					notifyAll(); //wake up the the daemon thread
+1: 					//wait for the raw store daemon to wakeus up   
+1: 					//when it finihes work.
+1: 					try{
+1: 						wait();
+1: 					}catch (InterruptedException ie)
+1: 					{
+1: 						// someone interrupt us, see what's going on
+1: 					}
+1: 				}
+1: 			}
+1: 		}
+1: 	}
+1: 
+1: 	private synchronized boolean stopRequested()
+1: 	{
+1: 		return stopRequested;
+1: 	}
+1: 
+1: 	private synchronized boolean inPause()
+1: 	{
+1: 		return inPause;
+1: 	}
+1: 
+1: 	/*
+1: 	 * BasicDaemon method
+1: 	 */
+1: 	protected synchronized void wakeUp()
+1: 	{
+1: 		if (!awakened) {
+1: 			awakened = true;	// I am being awakened for urgent work.
+1: 
+1: 			if (waiting) {
+1: 				notifyAll();
+1: 			}
+1: 		}
+1: 	}
+1: 
+1: 	/**
+1: 		Returns true if awakened by some notification, false if wake up by timer
+1: 	*/
+1: 	private boolean rest()
+1: 	{
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1: 								"going back to rest");
+1: 		}
+1: 
+1: 		boolean urgentOnly;
+1: 		boolean checkWallClock = false;
+1: 		synchronized(this)
+1: 		{
+1: 			try
+1: 			{	
+1: 				if (!awakened) {
+1: 					waiting = true;
+1: 					wait(DaemonService.TIMER_DELAY);
+1: 					waiting = false;
+1: 				}
+1: 			}
+1: 			catch (InterruptedException ie)
+1: 			{
+1: 				// someone interrupt us, see what's going on
+1: 			}
+1: 
+1: 			nextService = 0;
+1: 
+1: 			urgentOnly = awakened;
+1: 			if (urgentOnly)	// check wall clock
+1: 			{
+1: 				// take a guess that each early request is services every 500ms.
+1: 				if (earlyWakeupCount++ > (DaemonService.TIMER_DELAY / 500)) {
+1: 					earlyWakeupCount = 0;
+1: 					checkWallClock = true;
+1: 				}
+1: 			}
+1: 			awakened = false;			// reset this for next time
+1: 		}
+1: 
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace)) 
+1: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1: 								urgentOnly ?
+1: 								"someone wakes me up" : 
+1: 								"wakes up by myself");
+1: 		}	
+1: 
+1: 		if (checkWallClock)
+1: 		{
+1: 			long currenttime = System.currentTimeMillis();
+1: 			if ((currenttime - lastServiceTime) > DaemonService.TIMER_DELAY)
+1: 			{
+1: 				lastServiceTime = currenttime;
+1: 				urgentOnly = false;
+1: 
+1: 				if (SanityManager.DEBUG)
+1: 				{
+1: 					if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 						SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1: 										"wall clock check says service all");
+1: 				}
+1: 			}
+1: 		}
+1: 
+1: 		return urgentOnly;
+1: 	}
+1: 
+1: 	private void work(boolean urgentOnly)
+1: 	{
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1: 								"going back to work");
+1: 		}
+1: 
+1: 		ServiceRecord work;
+1: 
+1: 
+1: 		// while I am working, all serviceNow requests that comes in now will
+1: 		// be taken care of when we get the next Assignment.
+1: 		int serviceCount = 0;
+1: 
+1: 		int yieldFactor = 10;
+1: 		if (urgentOnly && (highPQ.size() > OPTIMAL_QUEUE_SIZE))
+1: 			yieldFactor = 2;
+1: 
+1: 		int yieldCount = OPTIMAL_QUEUE_SIZE / yieldFactor;
+1: 
+1: 
+1: 		for (work = nextAssignment(urgentOnly);
+1: 			 work != null;
+1: 			 work = nextAssignment(urgentOnly))
+1: 		{
+1: 			if (SanityManager.DEBUG)
+1: 			{
+1: 				if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 					SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1: 										"servicing " + work);
+1: 			}
+1: 
+1: 
+1: 			synchronized(this)
+1: 			{
+1: 				if (inPause || stopRequested)
+1: 					break;			// don't do anything more
+1: 				running = true;
+1: 			}
+1: 
+1: 			// do work
+1: 			try
+1: 			{
+1: 				serviceClient(work);
+1: 				serviceCount++;
+1: 			}
+1: 			finally	
+1: 			{
+1: 				// catch run time exceptions
+1: 				synchronized(this)
+1: 				{
+1: 					running = false;
+1: 					notifyAll();
+1: 					if (inPause || stopRequested)
+1: 						break;	// don't do anything more
+1: 				}
+1: 			}
+1: 
+1: 			if (SanityManager.DEBUG)
+1: 			{
+1: 				if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 					SanityManager.DEBUG(DaemonService.DaemonTrace, 
+1: 										"done " + work);
+1: 			}
+1: 
+1: 			// ensure the subscribed clients get a look in once in a while
+1: 			// when the queues are large.
+1: 			if ((serviceCount % (OPTIMAL_QUEUE_SIZE / 2)) == 0) {
+1: 				nextService = 0;
+1: 			}
+1: 
+1: 			if ((serviceCount % yieldCount) == 0) {
+1: 
+1: 				yield();
+1: 			}
+1: 
+1: 			if (SanityManager.DEBUG)
+1: 			{
+1: 				if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 					SanityManager.DEBUG(DaemonService.DaemonTrace,
+1: 										"come back from yield");
+1: 			}
+1: 		}
+1: 	}
+1: 
+1: 
+1: 	/* let everybody else run first */
+1: 	private void yield()
+1: 	{
+1: 		Thread currentThread = Thread.currentThread();
+1: 		int oldPriority = currentThread.getPriority();
+1: 
+1: 		if (oldPriority <= Thread.MIN_PRIORITY)
+1: 		{
+0: 			currentThread.yield();
+1: 		}
+1: 		else
+1: 		{
+0: 			ModuleFactory mf = Monitor.getMonitor();
+0: 			if (mf != null)
+0: 				mf.setThreadPriority(Thread.MIN_PRIORITY);
+0: 			currentThread.yield();
+0: 			if (mf != null)
+0: 				mf.setThreadPriority(oldPriority);
+1: 		}
+1: 	}
+1: }
+1: 
+1: 
+1: 
+1: 
+1: 
+1: 
+1: 
+1: 
+1: 
+author:Ken Coar
+-------------------------------------------------------------------------------
+commit:95e7b46
+/////////////////////////////////////////////////////////////////////////
+0: /*
+0: 
+0:    Licensed Materials - Property of IBM
+0:    Cloudscape - Package org.apache.derby.impl.services.daemon
+0:    (C) Copyright IBM Corp. 1997, 2004. All Rights Reserved.
+0:    US Government Users Restricted Rights - Use, duplication or
+0:    disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+0: 
+0:  */
+0: 
+0: package org.apache.derby.impl.services.daemon;
+0: 
+0: import org.apache.derby.iapi.services.context.ContextService;
+0: import org.apache.derby.iapi.services.context.ContextManager;
+0: import org.apache.derby.iapi.services.daemon.DaemonService;
+0: import org.apache.derby.iapi.services.daemon.Serviceable;
+0: import org.apache.derby.iapi.services.monitor.Monitor;
+0: import org.apache.derby.iapi.services.monitor.ModuleFactory;
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+0: 
+0: import org.apache.derby.iapi.error.StandardException;
+0: 
+0: import java.util.Vector;
+0: import java.util.List;
+0: 
+0: /**
+0: 	A BasicDaemon is a background worker thread which does asynchronous I/O and
+0: 	general clean up.  It should not be used as a general worker thread for
+0: 	parallel execution. 
+0: 
+0: 	One cannot count on the order of request or count on when the daemon will
+0: 	wake up, even with serviceNow requests.  Request are not persistent and not
+0: 	recoverable, they are all lost when the system crashes or is shutdown.
+0: 	System shutdown, even orderly ones, do not wait for daemons to finish its
+0: 	work or empty its queue.  Furthermore, any Serviceable subscriptions,
+0: 	including onDemandOnly, must tolerate spurrious services.  The BasicDaemon
+0: 	will setup a context manager with no context on it.  The Serviceable
+0: 	object's performWork must provide useful context on the context manager to
+0: 	do its work.  The BasicDaemon will wrap performWork call with try / catch
+0: 	block and will use the ContextManager's error handling to clean up any
+0: 	error.  The BasicDaemon will guarentee serviceNow request will not be lost
+0: 	as long as the jbms does not crash - however, if N serviceNow requests are
+0: 	made by the same client, it may only be serviced once, not N times.
+0: 
+0: 	Many Serviceable object will subscribe to the same BasicDaemon.  Their
+0: 	performWork method should be well behaved - in other words, it should not
+0: 	take too long or hog too many resources or deadlock with anyone else.  And
+0: 	it cannot (should not) error out.
+0: 
+0: 	The BasicDaemon implementation manages the DaemonService's data structure,
+0: 	handles subscriptions and enqueues requests, and determine the service
+0: 	schedule for its Serviceable objects.  The BasicDaemon keeps an array
+0: 	(Vector) of Serviceable subscriptions it also keeps 2 queues for clients
+0: 	that uses it for one time service - the 1st queue is for a serviceNow
+0: 	enqueue request, the 2nd queue is for non serviceNow enqueue request.
+0: 
+0: 	This BasicDaemon services its clients in the following order:
+0: 	1. any subscribed client that have made a serviceNow request that has not
+0: 				been fulfilled 
+0: 	2. serviceable clients on the 1st queue
+0: 	3. all subscribed clients that are not onDemandOnly
+0: 	4. serviceable clients 2nd queue
+0: 
+0: */
+0: public class BasicDaemon implements DaemonService, Runnable
+0: {
+0: 	/**
+0: 		IBM Copyright &copy notice.
+0: 	*/
+0: 	public static final String copyrightNotice = org.apache.derby.iapi.reference.Copyright.SHORT_1997_2004;
+0: 	private int numClients;		// number of clients that needs services
+0: 
+0: 	private static final int OPTIMAL_QUEUE_SIZE = 100;
+0: 
+0: 	private final Vector subscription;
+0: 
+0: 	// the context this daemon should run with
+0: 	protected final ContextService contextService;
+0: 	protected final ContextManager contextMgr;
+0: 
+0: 	/**
+0: 		Queues for the work to be done.
+0: 		These are synchronized by this object.
+0: 	*/
+0: 	private final List highPQ;		// high priority queue
+0: 	private final List normPQ;		// normal priority queue
+0: 
+0: 	/**
+0: 		which subscribed clients to service next?
+0: 		only accessed by daemon thread
+0: 	*/
+0: 	private int nextService;
+0: 
+0: 	/*
+0: 	** State for the sleep/wakeup routines.
+0: 	*/
+0: 
+0: 	private boolean awakened;			// a wake up call has been issued 
+0: 								// MT - synchronized on this
+0: 
+0: 	/**
+0: 		true if I'm waiting, if this is false then I am running and a notify is not required.
+0: 	*/
+0: 	private boolean waiting;
+0: 
+0: 	private boolean inPause;			// if true, don't do anything
+0: 	private boolean running;			// I am running now
+0: 	private boolean stopRequested;		// thread is requested to die
+0: 	private boolean stopped;			// we have stopped
+0: 
+0: 	private long lastServiceTime; // when did I last wake up on a timer
+0: 	private int earlyWakeupCount;		// if I am waken up a couple of times, check
+0: 								// that lastServiceTime to make sure work
+0: 								// scheduled on a timer gets done once in a
+0: 								// while
+0: 
+0: 	/**
+0: 		make a BasicDaemon
+0: 
+0: 		@param priority the priority of the daemon thread
+0: 		@param delay the number of milliseconds between servcies to its clients
+0: 	*/
+0: 	public BasicDaemon(ContextService contextService)
+0: 	{
+0: 		this.contextService = contextService;
+0: 		this.contextMgr = contextService.newContextManager();
+0: 
+0: 		subscription = new Vector(1, 1);
+0: 		highPQ = new java.util.LinkedList();
+0: 		normPQ = new java.util.LinkedList();
+0: 		
+0: 		lastServiceTime = System.currentTimeMillis();
+0: 	}
+0: 
+0: 	public int subscribe(Serviceable newClient, boolean onDemandOnly)
+0: 	{
+0: 		int clientNumber;
+0: 
+0: 		ServiceRecord clientRecord;
+0: 
+0: 		synchronized(this)
+0: 		{
+0: 			clientNumber = numClients++;
+0: 
+0: 			clientRecord = new ServiceRecord(newClient, onDemandOnly, true);
+0: 			subscription.insertElementAt(clientRecord, clientNumber);
+0: 		}
+0: 
+0: 
+0: 		if (SanityManager.DEBUG)
+0: 		{
+0: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+0: 								"subscribed client # " + clientNumber + " : " +
+0: 								clientRecord);
+0: 		}
+0: 
+0: 		return clientNumber;
+0: 	}
+0: 
+0: 	public void unsubscribe(int clientNumber)
+0: 	{
+0: 		if (clientNumber < 0 || clientNumber > subscription.size())
+0: 			return;
+0: 
+0: 		// client number is never reused.  Just null out the vector entry.
+0: 		subscription.setElementAt(null, clientNumber);
+0: 	}
+0: 
+0: 	public void serviceNow(int clientNumber)
+0: 	{
+0: 		if (clientNumber < 0 || clientNumber > subscription.size())
+0: 			return;
+0: 
+0: 		ServiceRecord clientRecord = (ServiceRecord)subscription.elementAt(clientNumber);
+0: 		if (clientRecord == null)
+0: 			return;
+0: 
+0: 		clientRecord.called();
+0: 		wakeUp();
+0: 	}
+0: 
+0: 	public boolean enqueue(Serviceable newClient, boolean serviceNow)
+0: 	{
+0: 		ServiceRecord clientRecord = new ServiceRecord(newClient, false, false);
+0: 
+0: 		if (SanityManager.DEBUG)
+0: 		{
+0: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 				SanityManager.DEBUG(DaemonService.DaemonTrace,
+0: 									"enqueing work, urgent = " + serviceNow + ":" + newClient );
+0: 		}
+0: 
+0: 
+0: 		List queue = serviceNow ? highPQ : normPQ;
+0: 
+0: 		int highPQsize;
+0: 		synchronized (this) {
+0: 			queue.add(clientRecord);
+0: 			highPQsize = highPQ.size();
+0: 
+0: 			if (SanityManager.DEBUG) {
+0: 
+0: 				if (SanityManager.DEBUG_ON("memoryLeakTrace")) {
+0: 
+0: 					if (highPQsize > (OPTIMAL_QUEUE_SIZE * 2))
+0: 						System.out.println("memoryLeakTrace:BasicDaemon " + highPQsize);
+0: 				}
+0: 			}
+0: 		}
+0: 
+0: 		if (serviceNow && !awakened)
+0: 			wakeUp();
+0: 
+0: 		if (serviceNow) {
+0: 			return highPQsize > OPTIMAL_QUEUE_SIZE;
+0: 		}
+0: 		return false;
+0: 	}
+0: 
+0: 	/**
+0: 		Get rid of all queued up Serviceable tasks.
+0: 	 */
+0: 	public synchronized void clear()
+0: 	{
+0: 		normPQ.clear();
+0: 		highPQ.clear();
+0: 	}
+0: 
+0: 	/*
+0: 	 * class specific methods
+0: 	 */
+0: 
+0: 	protected ServiceRecord nextAssignment(boolean urgent)
+0: 	{
+0: 		// first goes thru the subscription list, then goes thru highPQ;
+0: 		ServiceRecord clientRecord;
+0: 
+0: 		while (nextService < subscription.size())
+0: 		{
+0: 			clientRecord = (ServiceRecord)subscription.elementAt(nextService++);
+0: 			if (clientRecord != null && (clientRecord.needImmediateService() || (!urgent && clientRecord.needService())))
+0: 				return clientRecord;
+0: 		}
+0: 
+0: 		clientRecord = null;
+0: 
+0: 		synchronized(this)
+0: 		{
+0: 			if (!highPQ.isEmpty())
+0: 				clientRecord = (ServiceRecord) highPQ.remove(0);
+0: 		}
+0: 
+0: 		if (urgent || clientRecord != null)
+0: 		{
+0: 			if (SanityManager.DEBUG)
+0: 			{
+0: 				if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 					SanityManager.DEBUG(DaemonService.DaemonTrace, 
+0: 									clientRecord == null ? 
+0: 									"No more urgent assignment " : 
+0: 									"Next urgent assignment : " + clientRecord);
+0: 			}
+0: 			
+0: 			return clientRecord;
+0: 		}
+0: 
+0: 		clientRecord = null;
+0: 		synchronized(this)
+0: 		{
+0: 			if (!normPQ.isEmpty())
+0: 			{
+0: 				clientRecord = (ServiceRecord)normPQ.remove(0);
+0: 
+0: 				if (SanityManager.DEBUG)
+0: 				{
+0: 					if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 						SanityManager.DEBUG(DaemonService.DaemonTrace, 
+0: 										"Next normal enqueued : " + clientRecord);
+0: 				}
+0: 			}
+0: 
+0: 			// else no more work 
+0: 		}
+0: 
+0: 		if (SanityManager.DEBUG)
+0: 		{
+0: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 			{
+0: 				if (clientRecord == null)
+0: 					SanityManager.DEBUG(DaemonService.DaemonTrace, "No more assignment");
+0: 			}
+0: 		}
+0: 
+0: 		return clientRecord;
+0: 	}
+0: 
+0: 	protected void serviceClient(ServiceRecord clientRecord) 
+0: 	{
+0: 		clientRecord.serviced();
+0: 
+0: 		Serviceable client = clientRecord.client;
+0: 
+0: 		// client may have unsubscribed while it had items queued
+0: 		if (client == null)
+0: 			return;
+0: 
+0: 		ContextManager cm = contextMgr;
+0: 
+0: 		if (SanityManager.DEBUG)
+0: 		{
+0: 			SanityManager.ASSERT(cm != null, "Context manager is null");
+0: 			SanityManager.ASSERT(client != null, "client is null");
+0: 		}
+0: 
+0: 		try
+0: 		{
+0: 			int status = client.performWork(cm);
+0: 
+0: 			if (clientRecord.subscriber)
+0: 				return;
+0: 
+0: 			if (status == Serviceable.REQUEUE)
+0: 			{
+0: 				List queue = client.serviceASAP() ? highPQ : normPQ;
+0: 				synchronized (this) {
+0: 					queue.add(clientRecord);
+0: 
+0: 					if (SanityManager.DEBUG) {
+0: 
+0: 						if (SanityManager.DEBUG_ON("memoryLeakTrace")) {
+0: 
+0: 							if (queue.size() > (OPTIMAL_QUEUE_SIZE * 2))
+0: 								System.out.println("memoryLeakTrace:BasicDaemon " + queue.size());
+0: 						}
+0: 					}
+0: 				}
+0: 			}
+0: 
+0: 			return;
+0: 		}
+0: 		catch (Throwable e)
+0: 		{
+0: 			if (SanityManager.DEBUG)
+0: 				SanityManager.showTrace(e);
+0: 			cm.cleanupOnError(e);
+0: 		}
+0: 	}
+0: 
+0: 	/*
+0: 	 * Runnable methods
+0: 	 */
+0: 	public void run()
+0: 	{
+0: 		contextService.setCurrentContextManager(contextMgr);
+0: 
+0: 		if (SanityManager.DEBUG)
+0: 		{
+0: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonOff))
+0: 			{
+0: 				SanityManager.DEBUG(DaemonService.DaemonTrace, "DaemonOff is set in properties, background Daemon not run");
+0: 				return;
+0: 			}
+0: 			SanityManager.DEBUG(DaemonService.DaemonTrace, "running");
+0: 		}
+0: 
+0: 		// infinite loop of rest and work
+0: 		while(true)
+0: 		{
+0: 			if (stopRequested())
+0: 				break;
+0: 
+0: 			// if someone wake me up, only service the urgent requests.
+0: 			// if I wake up by my regular schedule, service all clients
+0: 			boolean urgentOnly = rest();
+0: 
+0: 			if (stopRequested())
+0: 				break;
+0: 
+0: 			if (!inPause())
+0: 				work(urgentOnly);
+0: 		}
+0: 
+0: 		synchronized(this)
+0: 		{
+0: 			running = false;
+0: 			stopped = true;
+0: 		}
+0: 		contextMgr.cleanupOnError(StandardException.normalClose());
+0: 		contextService.resetCurrentContextManager(contextMgr);
+0: 	}
+0: 
+0: 	/*
+0: 	 * Daemon Service method
+0: 	 */
+0: 
+0: 	/*
+0: 	 * pause the daemon.  Wait till it is no running before it returns
+0: 	 */
+0: 	public void pause()
+0: 	{
+0: 		if (SanityManager.DEBUG)
+0: 		{
+0: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 				SanityManager.DEBUG(DaemonService.DaemonTrace, "pausing daemon");
+0: 		}
+0: 
+0: 		synchronized(this)
+0: 		{
+0: 			inPause = true;
+0: 			while(running)
+0: 			{
+0: 				if (SanityManager.DEBUG)
+0: 				{
+0: 					if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 						SanityManager.DEBUG(DaemonService.DaemonTrace, 
+0: 										"waiting for daemon run to finish");
+0: 				}
+0: 
+0: 				try
+0: 				{
+0: 					wait();
+0: 				}
+0: 				catch (InterruptedException ie)				
+0: 				{
+0: 					// someone interrrupt us, done running
+0: 				}
+0: 			}
+0: 		}
+0: 
+0: 		if (SanityManager.DEBUG)
+0: 		{
+0: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+0: 								"daemon paused");
+0: 		}
+0: 	}
+0: 
+0: 	public void resume()
+0: 	{
+0: 		synchronized(this)
+0: 		{
+0: 			inPause = false;
+0: 		}
+0: 
+0: 		if (SanityManager.DEBUG) 
+0: 		{
+0: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+0: 								"daemon resumed");
+0: 		}
+0: 	}
+0: 
+0: 	/**
+0: 		Finish what we are doing and at the next convenient moment, get rid of
+0: 		the thread and make the daemon object goes away if possible.
+0: 
+0: 		remember we are calling from another thread
+0: 	 */
+0: 	public void stop()
+0: 	{
+0: 		if (stopped)			// already stopped
+0: 			return;
+0: 
+0: 		synchronized(this)
+0: 		{
+0: 			stopRequested = true;
+0: 			notifyAll(); // get sleeper to wake up and stop ASAP
+0: 		}
+0: 
+0: 		pause(); // finish doing what we are doing first
+0: 
+0: 	}
+0: 
+0: 	/*
+0: 	**Wait until the work in the high priority queue is done.
+0: 	**Note: Used by tests only to make sure all the work 
+0: 	**assigned to the daemon is completed.
+0: 	**/
+0: 	public void waitUntilQueueIsEmpty()
+0: 	{
+0: 		while(true){
+0: 			synchronized(this)
+0: 			{
+0: 				boolean noSubscriptionRequests = true; 
+0: 				for (int urgentServiced = 0; urgentServiced < subscription.size(); urgentServiced++)
+0: 				{
+0: 					ServiceRecord clientRecord = (ServiceRecord)subscription.elementAt(urgentServiced);
+0: 					if (clientRecord != null &&	clientRecord.needService())
+0: 					{
+0: 						noSubscriptionRequests = false;
+0: 						break;
+0: 					}
+0: 				}
+0: 
+0: 				if (highPQ.isEmpty() && noSubscriptionRequests &&!running){
+0: 					return;
+0: 				}else{
+0: 
+0: 					notifyAll(); //wake up the the daemon thread
+0: 					//wait for the raw store daemon to wakeus up   
+0: 					//when it finihes work.
+0: 					try{
+0: 						wait();
+0: 					}catch (InterruptedException ie)
+0: 					{
+0: 						// someone interrupt us, see what's going on
+0: 					}
+0: 				}
+0: 			}
+0: 		}
+0: 	}
+0: 
+0: 	private synchronized boolean stopRequested()
+0: 	{
+0: 		return stopRequested;
+0: 	}
+0: 
+0: 	private synchronized boolean inPause()
+0: 	{
+0: 		return inPause;
+0: 	}
+0: 
+0: 	/*
+0: 	 * BasicDaemon method
+0: 	 */
+0: 	protected synchronized void wakeUp()
+0: 	{
+0: 		if (!awakened) {
+0: 			awakened = true;	// I am being awakened for urgent work.
+0: 
+0: 			if (waiting) {
+0: 				notifyAll();
+0: 			}
+0: 		}
+0: 	}
+0: 
+0: 	/**
+0: 		Returns true if awakened by some notification, false if wake up by timer
+0: 	*/
+0: 	private boolean rest()
+0: 	{
+0: 		if (SanityManager.DEBUG)
+0: 		{
+0: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+0: 								"going back to rest");
+0: 		}
+0: 
+0: 		boolean urgentOnly;
+0: 		boolean checkWallClock = false;
+0: 		synchronized(this)
+0: 		{
+0: 			try
+0: 			{	
+0: 				if (!awakened) {
+0: 					waiting = true;
+0: 					wait(DaemonService.TIMER_DELAY);
+0: 					waiting = false;
+0: 				}
+0: 			}
+0: 			catch (InterruptedException ie)
+0: 			{
+0: 				// someone interrupt us, see what's going on
+0: 			}
+0: 
+0: 			nextService = 0;
+0: 
+0: 			urgentOnly = awakened;
+0: 			if (urgentOnly)	// check wall clock
+0: 			{
+0: 				// take a guess that each early request is services every 500ms.
+0: 				if (earlyWakeupCount++ > (DaemonService.TIMER_DELAY / 500)) {
+0: 					earlyWakeupCount = 0;
+0: 					checkWallClock = true;
+0: 				}
+0: 			}
+0: 			awakened = false;			// reset this for next time
+0: 		}
+0: 
+0: 		if (SanityManager.DEBUG)
+0: 		{
+0: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace)) 
+0: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+0: 								urgentOnly ?
+0: 								"someone wakes me up" : 
+0: 								"wakes up by myself");
+0: 		}	
+0: 
+0: 		if (checkWallClock)
+0: 		{
+0: 			long currenttime = System.currentTimeMillis();
+0: 			if ((currenttime - lastServiceTime) > DaemonService.TIMER_DELAY)
+0: 			{
+0: 				lastServiceTime = currenttime;
+0: 				urgentOnly = false;
+0: 
+0: 				if (SanityManager.DEBUG)
+0: 				{
+0: 					if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 						SanityManager.DEBUG(DaemonService.DaemonTrace, 
+0: 										"wall clock check says service all");
+0: 				}
+0: 			}
+0: 		}
+0: 
+0: 		return urgentOnly;
+0: 	}
+0: 
+0: 	private void work(boolean urgentOnly)
+0: 	{
+0: 		if (SanityManager.DEBUG)
+0: 		{
+0: 			if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 				SanityManager.DEBUG(DaemonService.DaemonTrace, 
+0: 								"going back to work");
+0: 		}
+0: 
+0: 		ServiceRecord work;
+0: 
+0: 
+0: 		// while I am working, all serviceNow requests that comes in now will
+0: 		// be taken care of when we get the next Assignment.
+0: 		int serviceCount = 0;
+0: 
+0: 		int yieldFactor = 10;
+0: 		if (urgentOnly && (highPQ.size() > OPTIMAL_QUEUE_SIZE))
+0: 			yieldFactor = 2;
+0: 
+0: 		int yieldCount = OPTIMAL_QUEUE_SIZE / yieldFactor;
+0: 
+0: 
+0: 		for (work = nextAssignment(urgentOnly);
+0: 			 work != null;
+0: 			 work = nextAssignment(urgentOnly))
+0: 		{
+0: 			if (SanityManager.DEBUG)
+0: 			{
+0: 				if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 					SanityManager.DEBUG(DaemonService.DaemonTrace, 
+0: 										"servicing " + work);
+0: 			}
+0: 
+0: 
+0: 			synchronized(this)
+0: 			{
+0: 				if (inPause || stopRequested)
+0: 					break;			// don't do anything more
+0: 				running = true;
+0: 			}
+0: 
+0: 			// do work
+0: 			try
+0: 			{
+0: 				serviceClient(work);
+0: 				serviceCount++;
+0: 			}
+0: 			finally	
+0: 			{
+0: 				// catch run time exceptions
+0: 				synchronized(this)
+0: 				{
+0: 					running = false;
+0: 					notifyAll();
+0: 					if (inPause || stopRequested)
+0: 						break;	// don't do anything more
+0: 				}
+0: 			}
+0: 
+0: 			if (SanityManager.DEBUG)
+0: 			{
+0: 				if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 					SanityManager.DEBUG(DaemonService.DaemonTrace, 
+0: 										"done " + work);
+0: 			}
+0: 
+0: 			// ensure the subscribed clients get a look in once in a while
+0: 			// when the queues are large.
+0: 			if ((serviceCount % (OPTIMAL_QUEUE_SIZE / 2)) == 0) {
+0: 				nextService = 0;
+0: 			}
+0: 
+0: 			if ((serviceCount % yieldCount) == 0) {
+0: 
+0: 				yield();
+0: 			}
+0: 
+0: 			if (SanityManager.DEBUG)
+0: 			{
+0: 				if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0: 					SanityManager.DEBUG(DaemonService.DaemonTrace,
+0: 										"come back from yield");
+0: 			}
+0: 		}
+0: 	}
+0: 
+0: 
+0: 	/* let everybody else run first */
+0: 	private void yield()
+0: 	{
+0: 		Thread currentThread = Thread.currentThread();
+0: 		int oldPriority = currentThread.getPriority();
+0: 
+0: 		if (oldPriority <= Thread.MIN_PRIORITY)
+0: 		{
+0: 			currentThread.yield();
+0: 		}
+0: 		else
+0: 		{
+0: 			ModuleFactory mf = Monitor.getMonitor();
+0: 			if (mf != null)
+0: 				mf.setThreadPriority(Thread.MIN_PRIORITY);
+0: 			currentThread.yield();
+0: 			if (mf != null)
+0: 				mf.setThreadPriority(oldPriority);
+0: 		}
+0: 	}
+0: }
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+============================================================================

@@ -1,0 +1,692 @@
+1:07cf56f: /*
+1:b95a49c:  * Licensed to the Apache Software Foundation (ASF) under one
+1:b95a49c:  * or more contributor license agreements.  See the NOTICE file
+1:b95a49c:  * distributed with this work for additional information
+1:b95a49c:  * regarding copyright ownership.  The ASF licenses this file
+1:b95a49c:  * to you under the Apache License, Version 2.0 (the
+1:b95a49c:  * "License"); you may not use this file except in compliance
+1:b95a49c:  * with the License.  You may obtain a copy of the License at
+2:b95a49c:  *
+1:b95a49c:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:b95a49c:  *
+1:b95a49c:  * Unless required by applicable law or agreed to in writing, software
+1:b95a49c:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:b95a49c:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:b95a49c:  * See the License for the specific language governing permissions and
+1:b95a49c:  * limitations under the License.
+6:b95a49c:  */
+1:4b54b8a: package org.apache.cassandra.utils.memory;
+9:b95a49c: 
+1:b95a49c: import java.nio.ByteBuffer;
+1:4b54b8a: import java.util.concurrent.ConcurrentLinkedQueue;
+1:b95a49c: import java.util.concurrent.atomic.AtomicInteger;
+1:7d36c1e: import java.util.concurrent.atomic.AtomicLong;
+1:b95a49c: import java.util.concurrent.atomic.AtomicReference;
+1:4b54b8a: 
+1:58a2427: import org.slf4j.Logger;
+1:58a2427: import org.slf4j.LoggerFactory;
+1:b95a49c: 
+1:1a3b5db: import org.apache.cassandra.utils.ByteBufferUtil;
+1:1a3b5db: import org.apache.cassandra.utils.concurrent.OpOrder;
+1:1a3b5db: import sun.nio.ch.DirectBuffer;
+1:1a3b5db: 
+7:b95a49c: /**
+1:ac9844b: + * The SlabAllocator is a bump-the-pointer allocator that allocates
+1:ac9844b: + * large (1MB) global regions and then doles them out to threads that
+1:ac9844b: + * request smaller sized (up to 128kb) slices into the array.
+1:f44110c:  * <p></p>
+1:b95a49c:  * The purpose of this class is to combat heap fragmentation in long lived
+1:b95a49c:  * objects: by ensuring that all allocations with similar lifetimes
+1:b95a49c:  * only to large regions of contiguous memory, we ensure that large blocks
+1:b95a49c:  * get freed up at the same time.
+1:f44110c:  * <p></p>
+1:b95a49c:  * Otherwise, variable length byte arrays allocated end up
+1:b95a49c:  * interleaved throughout the heap, and the old generation gets progressively
+1:b95a49c:  * more fragmented until a stop-the-world compacting collection occurs.
+1:b95a49c:  */
+1:8541cca: public class SlabAllocator extends MemtableBufferAllocator
+8:b95a49c: {
+1:1a3b5db:     private static final Logger logger = LoggerFactory.getLogger(SlabAllocator.class);
+1:58a2427: 
+1:680798e:     private final static int REGION_SIZE = 1024 * 1024;
+1:680798e:     private final static int MAX_CLONED_SIZE = 128 * 1024; // bigger than this don't go in the region
+1:b95a49c: 
+1:4b54b8a:     // globally stash any Regions we allocate but are beaten to using, and use these up before allocating any more
+1:4b54b8a:     private static final ConcurrentLinkedQueue<Region> RACE_ALLOCATED = new ConcurrentLinkedQueue<>();
+1:4b54b8a: 
+1:8541cca:     private final AtomicReference<Region> currentRegion = new AtomicReference<>();
+1:f022354:     private final AtomicInteger regionCount = new AtomicInteger(0);
+1:b95a49c: 
+1:1a3b5db:     // this queue is used to keep references to off-heap allocated regions so that we can free them when we are discarded
+1:1a3b5db:     private final ConcurrentLinkedQueue<Region> offHeapRegions = new ConcurrentLinkedQueue<>();
+1:2f41243:     private final AtomicLong unslabbedSize = new AtomicLong(0);
+1:1a3b5db:     private final boolean allocateOnHeapOnly;
+1:2f41243:     private final EnsureOnHeap ensureOnHeap;
+1:1a3b5db: 
+1:1a3b5db:     SlabAllocator(SubAllocator onHeap, SubAllocator offHeap, boolean allocateOnHeapOnly)
+1:4b54b8a:     {
+1:1a3b5db:         super(onHeap, offHeap);
+1:1a3b5db:         this.allocateOnHeapOnly = allocateOnHeapOnly;
+1:2f41243:         this.ensureOnHeap = allocateOnHeapOnly ? new EnsureOnHeap.NoOp() : new EnsureOnHeap.CloneToHeap();
+1:2f41243:     }
+1:2f41243: 
+1:2f41243:     public EnsureOnHeap ensureOnHeap()
+1:2f41243:     {
+1:2f41243:         return ensureOnHeap;
+1:4b54b8a:     }
+1:4b54b8a: 
+1:b95a49c:     public ByteBuffer allocate(int size)
+1:4b54b8a:     {
+1:4b54b8a:         return allocate(size, null);
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     public ByteBuffer allocate(int size, OpOrder.Group opGroup)
+1:4b54b8a:     {
+1:b95a49c:         assert size >= 0;
+1:b95a49c:         if (size == 0)
+1:b95a49c:             return ByteBufferUtil.EMPTY_BYTE_BUFFER;
+1:4b54b8a: 
+1:1a3b5db:         (allocateOnHeapOnly ? onHeap() : offHeap()).allocate(size, opGroup);
+1:b95a49c:         // satisfy large allocations directly from JVM since they don't cause fragmentation
+1:b95a49c:         // as badly, and fill up our regions quickly
+1:b95a49c:         if (size > MAX_CLONED_SIZE)
+1:7d36c1e:         {
+1:1a3b5db:             unslabbedSize.addAndGet(size);
+1:1a3b5db:             if (allocateOnHeapOnly)
+1:1a3b5db:                 return ByteBuffer.allocate(size);
+1:1a3b5db:             Region region = new Region(ByteBuffer.allocateDirect(size));
+1:1a3b5db:             offHeapRegions.add(region);
+1:1a3b5db:             return region.allocate(size);
+1:4b54b8a:         }
+1:7d36c1e: 
+1:b95a49c:         while (true)
+1:7d36c1e:         {
+1:b95a49c:             Region region = getRegion();
+1:7d36c1e: 
+1:b95a49c:             // Try to allocate from this region
+1:b95a49c:             ByteBuffer cloned = region.allocate(size);
+1:b95a49c:             if (cloned != null)
+1:b95a49c:                 return cloned;
+1:b95a49c: 
+1:b95a49c:             // not enough space!
+1:58a2427:             currentRegion.compareAndSet(region, null);
+1:7d36c1e:         }
+1:7d36c1e:     }
+1:b95a49c: 
+1:8541cca:     public DataReclaimer reclaimer()
+1:7d36c1e:     {
+1:8541cca:         return NO_OP;
+1:7d36c1e:     }
+1:b95a49c: 
+1:1a3b5db:     public void setDiscarded()
+1:1a3b5db:     {
+1:1a3b5db:         for (Region region : offHeapRegions)
+1:1a3b5db:             ((DirectBuffer) region.data).cleaner().clean();
+1:1a3b5db:         super.setDiscarded();
+1:1a3b5db:     }
+1:1a3b5db: 
+1:7d36c1e:     /**
+1:b95a49c:      * Get the current region, or, if there is no current region, allocate a new one
+1:7d36c1e:      */
+1:b95a49c:     private Region getRegion()
+1:b95a49c:     {
+1:b95a49c:         while (true)
+1:b95a49c:         {
+1:b95a49c:             // Try to get the region
+1:b95a49c:             Region region = currentRegion.get();
+1:b95a49c:             if (region != null)
+1:b95a49c:                 return region;
+1:b95a49c: 
+1:b95a49c:             // No current region, so we want to allocate one. We race
+1:4b54b8a:             // against other allocators to CAS in a Region, and if we fail we stash the region for re-use
+1:4b54b8a:             region = RACE_ALLOCATED.poll();
+1:4b54b8a:             if (region == null)
+1:1a3b5db:                 region = new Region(allocateOnHeapOnly ? ByteBuffer.allocate(REGION_SIZE) : ByteBuffer.allocateDirect(REGION_SIZE));
+1:b95a49c:             if (currentRegion.compareAndSet(null, region))
+1:b95a49c:             {
+1:1a3b5db:                 if (!allocateOnHeapOnly)
+1:1a3b5db:                     offHeapRegions.add(region);
+1:f022354:                 regionCount.incrementAndGet();
+1:36b40be:                 logger.trace("{} regions now allocated in {}", regionCount, this);
+1:b95a49c:                 return region;
+8:b95a49c:             }
+1:4b54b8a: 
+1:b95a49c:             // someone else won race - that's fine, we'll try to grab theirs
+1:b95a49c:             // in the next iteration of the loop.
+1:4b54b8a:             RACE_ALLOCATED.add(region);
+1:b95a49c:         }
+1:b95a49c:     }
+1:b95a49c: 
+1:8541cca:     protected AbstractAllocator allocator(OpOrder.Group writeOp)
+1:8541cca:     {
+1:8541cca:         return new ContextAllocator(writeOp, this);
+1:8541cca:     }
+1:8541cca: 
+1:7d36c1e:     /**
+1:b95a49c:      * A region of memory out of which allocations are sliced.
+1:b95a49c:      *
+1:b95a49c:      * This serves two purposes:
+1:b95a49c:      *  - to provide a step between initialization and allocation, so that racing to CAS a
+1:b95a49c:      *    new region in is harmless
+1:b95a49c:      *  - encapsulates the allocation offset
+1:7d36c1e:      */
+1:b95a49c:     private static class Region
+1:b95a49c:     {
+1:b95a49c:         /**
+1:b95a49c:          * Actual underlying data
+1:b95a49c:          */
+1:2f41243:         private final ByteBuffer data;
+1:b95a49c: 
+1:b95a49c:         /**
+1:b95a49c:          * Offset for the next allocation, or the sentinel value -1
+1:b95a49c:          * which implies that the region is still uninitialized.
+1:b95a49c:          */
+1:2f41243:         private final AtomicInteger nextFreeOffset = new AtomicInteger(0);
+1:b95a49c: 
+1:b95a49c:         /**
+1:b95a49c:          * Total number of allocations satisfied from this buffer
+1:b95a49c:          */
+1:2f41243:         private final AtomicInteger allocCount = new AtomicInteger();
+1:b95a49c: 
+1:b95a49c:         /**
+1:b95a49c:          * Create an uninitialized region. Note that memory is not allocated yet, so
+1:b95a49c:          * this is cheap.
+1:b95a49c:          *
+1:1a3b5db:          * @param buffer bytes
+1:b95a49c:          */
+1:1a3b5db:         private Region(ByteBuffer buffer)
+1:b95a49c:         {
+1:1a3b5db:             data = buffer;
+1:b95a49c:         }
+1:b95a49c: 
+1:b95a49c:         /**
+1:b95a49c:          * Try to allocate <code>size</code> bytes from the region.
+1:b95a49c:          *
+1:b95a49c:          * @return the successful allocation, or null to indicate not-enough-space
+1:b95a49c:          */
+1:b95a49c:         public ByteBuffer allocate(int size)
+1:b95a49c:         {
+1:b95a49c:             while (true)
+1:b95a49c:             {
+1:b95a49c:                 int oldOffset = nextFreeOffset.get();
+1:b95a49c: 
+1:b95a49c:                 if (oldOffset + size > data.capacity()) // capacity == remaining
+1:b95a49c:                     return null;
+1:b95a49c: 
+1:b95a49c:                 // Try to atomically claim this region
+1:b95a49c:                 if (nextFreeOffset.compareAndSet(oldOffset, oldOffset + size))
+1:b95a49c:                 {
+1:b95a49c:                     // we got the alloc
+1:b95a49c:                     allocCount.incrementAndGet();
+1:b95a49c:                     return (ByteBuffer) data.duplicate().position(oldOffset).limit(oldOffset + size);
+1:b95a49c:                 }
+1:b95a49c:                 // we raced and lost alloc, try again
+1:b95a49c:             }
+1:b95a49c:         }
+1:b95a49c: 
+1:b95a49c:         @Override
+1:b95a49c:         public String toString()
+1:b95a49c:         {
+1:b95a49c:             return "Region@" + System.identityHashCode(this) +
+1:b95a49c:                    " allocs=" + allocCount.get() + "waste=" +
+1:b95a49c:                    (data.capacity() - nextFreeOffset.get());
+1:b95a49c:         }
+1:b95a49c:     }
+1:b95a49c: }
+============================================================================
+author:Josh McKenzie
+-------------------------------------------------------------------------------
+commit:a8a3a73
+author:Zhao Yang
+-------------------------------------------------------------------------------
+commit:ac9844b
+/////////////////////////////////////////////////////////////////////////
+1: + * The SlabAllocator is a bump-the-pointer allocator that allocates
+1: + * large (1MB) global regions and then doles them out to threads that
+1: + * request smaller sized (up to 128kb) slices into the array.
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:2f41243
+/////////////////////////////////////////////////////////////////////////
+1:     private final AtomicLong unslabbedSize = new AtomicLong(0);
+1:     private final EnsureOnHeap ensureOnHeap;
+1:         this.ensureOnHeap = allocateOnHeapOnly ? new EnsureOnHeap.NoOp() : new EnsureOnHeap.CloneToHeap();
+1:     }
+1: 
+1:     public EnsureOnHeap ensureOnHeap()
+1:     {
+1:         return ensureOnHeap;
+/////////////////////////////////////////////////////////////////////////
+1:         private final ByteBuffer data;
+1:         private final AtomicInteger nextFreeOffset = new AtomicInteger(0);
+1:         private final AtomicInteger allocCount = new AtomicInteger();
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:f44110c
+/////////////////////////////////////////////////////////////////////////
+1:  * <p></p>
+1:  * <p></p>
+commit:c5f4cdd
+commit:8bb5487
+/////////////////////////////////////////////////////////////////////////
+0:         return unslabbed.get() + (regionCount - 1) * (long)REGION_SIZE;
+/////////////////////////////////////////////////////////////////////////
+0:         return unslabbed.get() + regionCount * (long)REGION_SIZE;
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:8541cca
+/////////////////////////////////////////////////////////////////////////
+1: public class SlabAllocator extends MemtableBufferAllocator
+/////////////////////////////////////////////////////////////////////////
+1:     private final AtomicReference<Region> currentRegion = new AtomicReference<>();
+/////////////////////////////////////////////////////////////////////////
+1:     public DataReclaimer reclaimer()
+1:         return NO_OP;
+/////////////////////////////////////////////////////////////////////////
+1:     protected AbstractAllocator allocator(OpOrder.Group writeOp)
+1:     {
+1:         return new ContextAllocator(writeOp, this);
+1:     }
+1: 
+commit:1a3b5db
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.ByteBufferUtil;
+1: import org.apache.cassandra.utils.concurrent.OpOrder;
+1: import sun.nio.ch.DirectBuffer;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0: public class SlabAllocator extends PoolAllocator
+1:     private static final Logger logger = LoggerFactory.getLogger(SlabAllocator.class);
+/////////////////////////////////////////////////////////////////////////
+1:     // this queue is used to keep references to off-heap allocated regions so that we can free them when we are discarded
+1:     private final ConcurrentLinkedQueue<Region> offHeapRegions = new ConcurrentLinkedQueue<>();
+0:     private AtomicLong unslabbedSize = new AtomicLong(0);
+1:     private final boolean allocateOnHeapOnly;
+1: 
+1:     SlabAllocator(SubAllocator onHeap, SubAllocator offHeap, boolean allocateOnHeapOnly)
+1:         super(onHeap, offHeap);
+1:         this.allocateOnHeapOnly = allocateOnHeapOnly;
+/////////////////////////////////////////////////////////////////////////
+1:         (allocateOnHeapOnly ? onHeap() : offHeap()).allocate(size, opGroup);
+1:             unslabbedSize.addAndGet(size);
+1:             if (allocateOnHeapOnly)
+1:                 return ByteBuffer.allocate(size);
+1:             Region region = new Region(ByteBuffer.allocateDirect(size));
+1:             offHeapRegions.add(region);
+1:             return region.allocate(size);
+/////////////////////////////////////////////////////////////////////////
+1:     public void setDiscarded()
+1:     {
+1:         for (Region region : offHeapRegions)
+1:             ((DirectBuffer) region.data).cleaner().clean();
+1:         super.setDiscarded();
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 region = new Region(allocateOnHeapOnly ? ByteBuffer.allocate(REGION_SIZE) : ByteBuffer.allocateDirect(REGION_SIZE));
+1:                 if (!allocateOnHeapOnly)
+1:                     offHeapRegions.add(region);
+/////////////////////////////////////////////////////////////////////////
+1:          * @param buffer bytes
+1:         private Region(ByteBuffer buffer)
+1:             data = buffer;
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:4b54b8a
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.cassandra.utils.memory;
+1: import java.util.concurrent.ConcurrentLinkedQueue;
+0: import org.apache.cassandra.utils.ByteBufferUtil;
+0: import org.apache.cassandra.utils.concurrent.OpOrder;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0: public class HeapSlabAllocator extends PoolAllocator
+0:     private static final Logger logger = LoggerFactory.getLogger(HeapSlabAllocator.class);
+1:     // globally stash any Regions we allocate but are beaten to using, and use these up before allocating any more
+1:     private static final ConcurrentLinkedQueue<Region> RACE_ALLOCATED = new ConcurrentLinkedQueue<>();
+1: 
+0:     HeapSlabAllocator(Pool pool)
+1:     {
+0:         super(pool);
+1:     }
+1: 
+1:         return allocate(size, null);
+1:     }
+1: 
+1:     public ByteBuffer allocate(int size, OpOrder.Group opGroup)
+1:     {
+0:         markAllocated(size, opGroup);
+/////////////////////////////////////////////////////////////////////////
+0:     public void free(ByteBuffer name)
+1:     {
+0:         // have to assume we cannot free the memory here, and just reclaim it all when we flush
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             // against other allocators to CAS in a Region, and if we fail we stash the region for re-use
+1:             region = RACE_ALLOCATED.poll();
+1:             if (region == null)
+0:                 region = new Region(REGION_SIZE);
+1: 
+1:             RACE_ALLOCATED.add(region);
+/////////////////////////////////////////////////////////////////////////
+0:         private AtomicInteger nextFreeOffset = new AtomicInteger(0);
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+commit:a06a138
+commit:16f19a7
+/////////////////////////////////////////////////////////////////////////
+commit:f022354
+/////////////////////////////////////////////////////////////////////////
+1:     private final AtomicInteger regionCount = new AtomicInteger(0);
+/////////////////////////////////////////////////////////////////////////
+1:                 regionCount.incrementAndGet();
+/////////////////////////////////////////////////////////////////////////
+0:         return unslabbed.get() + (regionCount.get() - 1) * (long)REGION_SIZE;
+/////////////////////////////////////////////////////////////////////////
+0:         return unslabbed.get() + regionCount.get() * (long)REGION_SIZE;
+commit:813a937
+commit:7d36c1e
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.atomic.AtomicLong;
+/////////////////////////////////////////////////////////////////////////
+0:     private volatile int regionCount = 0;
+0:     private AtomicLong unslabbed = new AtomicLong(0);
+/////////////////////////////////////////////////////////////////////////
+1:         {
+0:             unslabbed.addAndGet(size);
+1:         }
+/////////////////////////////////////////////////////////////////////////
+0:      * @return a lower bound on how much space has been allocated
+1:      */
+0:     public long getMinimumSize()
+1:     {
+0:         return unslabbed.get() + (regionCount - 1) * REGION_SIZE;
+1:     }
+1: 
+1:     /**
+0:      * @return an upper bound on how much space has been allocated
+1:      */
+0:     public long getMaximumSize()
+1:     {
+0:         return unslabbed.get() + regionCount * REGION_SIZE;
+1:     }
+1: 
+1:     /**
+commit:36b40be
+/////////////////////////////////////////////////////////////////////////
+1:                 logger.trace("{} regions now allocated in {}", regionCount, this);
+commit:58a2427
+/////////////////////////////////////////////////////////////////////////
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+/////////////////////////////////////////////////////////////////////////
+0:     private static Logger logger = LoggerFactory.getLogger(SlabAllocator.class);
+1: 
+0:     private volatile int regionCount;
+/////////////////////////////////////////////////////////////////////////
+1:             currentRegion.compareAndSet(region, null);
+/////////////////////////////////////////////////////////////////////////
+0:                 regionCount++;
+0:                 logger.debug("{} regions now allocated in {}", regionCount, this);
+commit:680798e
+/////////////////////////////////////////////////////////////////////////
+0: import com.google.common.collect.MapMaker;
+/////////////////////////////////////////////////////////////////////////
+1:     private final static int REGION_SIZE = 1024 * 1024;
+1:     private final static int MAX_CLONED_SIZE = 128 * 1024; // bigger than this don't go in the region
+0:     private final Collection<Region> filledRegions = Collections.newSetFromMap(new MapMaker().weakKeys().<Region, Boolean>makeMap());
+commit:b95a49c
+/////////////////////////////////////////////////////////////////////////
+1: /**
+0:  * Copyright 2011 The Apache Software Foundation
+1:  *
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+0: package org.apache.cassandra.utils;
+1: 
+1: import java.nio.ByteBuffer;
+0: import java.util.Collection;
+0: import java.util.Collections;
+0: import java.util.concurrent.LinkedBlockingQueue;
+1: import java.util.concurrent.atomic.AtomicInteger;
+1: import java.util.concurrent.atomic.AtomicReference;
+1: 
+0: import com.google.common.base.Preconditions;
+0: import com.google.common.collect.Iterables;
+1: 
+1: /**
+0:  * The SlabAllocator is a bump-the-pointer allocator that allocates
+0:  * large (2MB by default) regions and then doles them out to threads that request
+0:  * slices into the array.
+0:  * <p/>
+1:  * The purpose of this class is to combat heap fragmentation in long lived
+1:  * objects: by ensuring that all allocations with similar lifetimes
+1:  * only to large regions of contiguous memory, we ensure that large blocks
+1:  * get freed up at the same time.
+0:  * <p/>
+1:  * Otherwise, variable length byte arrays allocated end up
+1:  * interleaved throughout the heap, and the old generation gets progressively
+1:  * more fragmented until a stop-the-world compacting collection occurs.
+1:  */
+0: public class SlabAllocator extends Allocator
+1: {
+0:     private final static int REGION_SIZE = 2 * 1024 * 1024;
+0:     private final static int MAX_CLONED_SIZE = 256 * 1024; // bigger than this don't go in the region
+1: 
+0:     private final AtomicReference<Region> currentRegion = new AtomicReference<Region>();
+0:     private final Collection<Region> filledRegions = new LinkedBlockingQueue<Region>();
+1: 
+0:     /** @return Total number of bytes allocated by this allocator. */
+0:     public long size()
+1:     {
+0:         Iterable<Region> regions = filledRegions;
+0:         if (currentRegion.get() != null)
+0:             regions = Iterables.concat(regions, Collections.<Region>singleton(currentRegion.get()));
+1: 
+0:         long total = 0;
+0:         for (Region region : regions)
+0:             total += region.size;
+0:         return total;
+1:     }
+1: 
+1:     public ByteBuffer allocate(int size)
+1:     {
+1:         assert size >= 0;
+1:         if (size == 0)
+1:             return ByteBufferUtil.EMPTY_BYTE_BUFFER;
+1: 
+1:         // satisfy large allocations directly from JVM since they don't cause fragmentation
+1:         // as badly, and fill up our regions quickly
+1:         if (size > MAX_CLONED_SIZE)
+0:             return ByteBuffer.allocate(size);
+1: 
+1:         while (true)
+1:         {
+1:             Region region = getRegion();
+1: 
+1:             // Try to allocate from this region
+1:             ByteBuffer cloned = region.allocate(size);
+1:             if (cloned != null)
+1:                 return cloned;
+1: 
+1:             // not enough space!
+0:             tryRetireRegion(region);
+1:         }
+1:     }
+1:     
+1:     /**
+0:      * Try to retire the current region if it is still <code>region</code>.
+0:      * Postcondition is that curRegion.get() != region
+1:      */
+0:     private void tryRetireRegion(Region region)
+1:     {
+0:         if (currentRegion.compareAndSet(region, null))
+1:         {
+0:             filledRegions.add(region);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Get the current region, or, if there is no current region, allocate a new one
+1:      */
+1:     private Region getRegion()
+1:     {
+1:         while (true)
+1:         {
+1:             // Try to get the region
+1:             Region region = currentRegion.get();
+1:             if (region != null)
+1:                 return region;
+1: 
+1:             // No current region, so we want to allocate one. We race
+0:             // against other allocators to CAS in an uninitialized region
+0:             // (which is cheap to allocate)
+0:             region = new Region(REGION_SIZE);
+1:             if (currentRegion.compareAndSet(null, region))
+1:             {
+0:                 // we won race - now we need to actually do the expensive allocation step
+0:                 region.init();
+1:                 return region;
+1:             }
+1:             // someone else won race - that's fine, we'll try to grab theirs
+1:             // in the next iteration of the loop.
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * A region of memory out of which allocations are sliced.
+1:      *
+1:      * This serves two purposes:
+1:      *  - to provide a step between initialization and allocation, so that racing to CAS a
+1:      *    new region in is harmless
+1:      *  - encapsulates the allocation offset
+1:      */
+1:     private static class Region
+1:     {
+1:         /**
+1:          * Actual underlying data
+1:          */
+0:         private ByteBuffer data;
+1: 
+0:         private static final int UNINITIALIZED = -1;
+1:         /**
+1:          * Offset for the next allocation, or the sentinel value -1
+1:          * which implies that the region is still uninitialized.
+1:          */
+0:         private AtomicInteger nextFreeOffset = new AtomicInteger(UNINITIALIZED);
+1: 
+1:         /**
+1:          * Total number of allocations satisfied from this buffer
+1:          */
+0:         private AtomicInteger allocCount = new AtomicInteger();
+1: 
+1:         /**
+0:          * Size of region in bytes
+1:          */
+0:         private final int size;
+1: 
+1:         /**
+1:          * Create an uninitialized region. Note that memory is not allocated yet, so
+1:          * this is cheap.
+1:          *
+0:          * @param size in bytes
+1:          */
+0:         private Region(int size)
+1:         {
+0:             this.size = size;
+1:         }
+1: 
+1:         /**
+0:          * Actually claim the memory for this region. This should only be called from
+0:          * the thread that constructed the region. It is thread-safe against other
+0:          * threads calling alloc(), who will block until the allocation is complete.
+1:          */
+0:         public void init()
+1:         {
+0:             assert nextFreeOffset.get() == UNINITIALIZED;
+0:             data = ByteBuffer.allocate(size);
+0:             assert data.remaining() == data.capacity();
+0:             // Mark that it's ready for use
+0:             boolean initted = nextFreeOffset.compareAndSet(UNINITIALIZED, 0);
+0:             // We should always succeed the above CAS since only one thread calls init()!
+0:             Preconditions.checkState(initted, "Multiple threads tried to init same region");
+1:         }
+1: 
+1:         /**
+1:          * Try to allocate <code>size</code> bytes from the region.
+1:          *
+1:          * @return the successful allocation, or null to indicate not-enough-space
+1:          */
+1:         public ByteBuffer allocate(int size)
+1:         {
+1:             while (true)
+1:             {
+1:                 int oldOffset = nextFreeOffset.get();
+0:                 if (oldOffset == UNINITIALIZED)
+1:                 {
+0:                     // The region doesn't have its data allocated yet.
+0:                     // Since we found this in currentRegion, we know that whoever
+0:                     // CAS-ed it there is allocating it right now. So spin-loop
+0:                     // shouldn't spin long!
+0:                     Thread.yield();
+0:                     continue;
+1:                 }
+1: 
+1:                 if (oldOffset + size > data.capacity()) // capacity == remaining
+1:                     return null;
+1: 
+1:                 // Try to atomically claim this region
+1:                 if (nextFreeOffset.compareAndSet(oldOffset, oldOffset + size))
+1:                 {
+1:                     // we got the alloc
+1:                     allocCount.incrementAndGet();
+1:                     return (ByteBuffer) data.duplicate().position(oldOffset).limit(oldOffset + size);
+1:                 }
+1:                 // we raced and lost alloc, try again
+1:             }
+1:         }
+1: 
+1:         @Override
+1:         public String toString()
+1:         {
+1:             return "Region@" + System.identityHashCode(this) +
+1:                    " allocs=" + allocCount.get() + "waste=" +
+1:                    (data.capacity() - nextFreeOffset.get());
+1:         }
+1:     }
+1: }
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:a15c35b
+/////////////////////////////////////////////////////////////////////////
+commit:07cdfd0
+/////////////////////////////////////////////////////////////////////////
+0: 
+commit:2fd3268
+/////////////////////////////////////////////////////////////////////////
+0: 
+commit:5a6e2b0
+/////////////////////////////////////////////////////////////////////////
+0:     private static final Logger logger = LoggerFactory.getLogger(SlabAllocator.class);
+commit:37f6a9f
+/////////////////////////////////////////////////////////////////////////
+commit:07cf56f
+/////////////////////////////////////////////////////////////////////////
+1: /*
+============================================================================

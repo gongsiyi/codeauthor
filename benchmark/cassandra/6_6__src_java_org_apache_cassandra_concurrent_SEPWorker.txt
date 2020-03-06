@@ -1,0 +1,815 @@
+1:c108ce5: /*
+1:c108ce5:  * Licensed to the Apache Software Foundation (ASF) under one
+1:c108ce5:  * or more contributor license agreements.  See the NOTICE file
+1:c108ce5:  * distributed with this work for additional information
+1:c108ce5:  * regarding copyright ownership.  The ASF licenses this file
+1:c108ce5:  * to you under the Apache License, Version 2.0 (the
+1:c108ce5:  * "License"); you may not use this file except in compliance
+1:c108ce5:  * with the License.  You may obtain a copy of the License at
+1:c108ce5:  *
+1:c108ce5:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:c108ce5:  *
+1:c108ce5:  * Unless required by applicable law or agreed to in writing, software
+1:c108ce5:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:c108ce5:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:c108ce5:  * See the License for the specific language governing permissions and
+1:c108ce5:  * limitations under the License.
+1:c108ce5:  */
+1:5420b7a: package org.apache.cassandra.concurrent;
+1:5420b7a: 
+1:5420b7a: import java.util.concurrent.TimeUnit;
+1:5420b7a: import java.util.concurrent.atomic.AtomicReference;
+1:5420b7a: import java.util.concurrent.locks.LockSupport;
+1:5420b7a: 
+1:5420b7a: import org.slf4j.Logger;
+1:5420b7a: import org.slf4j.LoggerFactory;
+1:5420b7a: 
+1:1e92ce4: import io.netty.util.concurrent.FastThreadLocalThread;
+1:1452134: import org.apache.cassandra.utils.JVMStabilityInspector;
+1:1452134: 
+1:5420b7a: final class SEPWorker extends AtomicReference<SEPWorker.Work> implements Runnable
+1:5420b7a: {
+1:5420b7a:     private static final Logger logger = LoggerFactory.getLogger(SEPWorker.class);
+1:7ede582:     private static final boolean SET_THREAD_NAME = Boolean.parseBoolean(System.getProperty("cassandra.set_sep_thread_name", "true"));
+1:5420b7a: 
+1:5420b7a:     final Long workerId;
+1:5420b7a:     final Thread thread;
+1:5420b7a:     final SharedExecutorPool pool;
+1:5420b7a: 
+1:5420b7a:     // prevStopCheck stores the value of pool.stopCheck after we last incremented it; if it hasn't changed,
+1:5420b7a:     // we know nobody else was spinning in the interval, so we increment our soleSpinnerSpinTime accordingly,
+1:5420b7a:     // and otherwise we set it to zero; this is then used to terminate the final spinning thread, as the coordinated
+1:5420b7a:     // strategy can only work when there are multiple threads spinning (as more sleep time must elapse than real time)
+1:5420b7a:     long prevStopCheck = 0;
+1:5420b7a:     long soleSpinnerSpinTime = 0;
+1:5420b7a: 
+1:5420b7a:     SEPWorker(Long workerId, Work initialState, SharedExecutorPool pool)
+1:5420b7a:     {
+1:5420b7a:         this.pool = pool;
+1:5420b7a:         this.workerId = workerId;
+1:1e92ce4:         thread = new FastThreadLocalThread(this, pool.poolName + "-Worker-" + workerId);
+1:5420b7a:         thread.setDaemon(true);
+1:5420b7a:         set(initialState);
+1:5420b7a:         thread.start();
+1:5420b7a:     }
+1:5420b7a: 
+1:5420b7a:     public void run()
+1:5420b7a:     {
+1:5420b7a:         /**
+1:5420b7a:          * we maintain two important invariants:
+1:5420b7a:          * 1)   after exiting spinning phase, we ensure at least one more task on _each_ queue will be processed
+1:5420b7a:          *      promptly after we begin, assuming any are outstanding on any pools. this is to permit producers to
+1:5420b7a:          *      avoid signalling if there are _any_ spinning threads. we achieve this by simply calling maybeSchedule()
+1:5420b7a:          *      on each queue if on decrementing the spin counter we hit zero.
+1:5420b7a:          * 2)   before processing a task on a given queue, we attempt to assign another worker to the _same queue only_;
+1:5420b7a:          *      this allows a producer to skip signalling work if the task queue is currently non-empty, and in conjunction
+1:5420b7a:          *      with invariant (1) ensures that if any thread was spinning when a task was added to any executor, that
+1:5420b7a:          *      task will be processed immediately if work permits are available
+1:5420b7a:          */
+1:5420b7a: 
+1:5420b7a:         SEPExecutor assigned = null;
+1:5420b7a:         Runnable task = null;
+1:5420b7a:         try
+1:5420b7a:         {
+1:5420b7a:             while (true)
+1:5420b7a:             {
+1:5420b7a:                 if (isSpinning() && !selfAssign())
+1:5420b7a:                 {
+1:5420b7a:                     doWaitSpin();
+1:5420b7a:                     continue;
+1:5420b7a:                 }
+1:5420b7a: 
+1:5420b7a:                 // if stop was signalled, go to sleep (don't try self-assign; being put to sleep is rare, so let's obey it
+1:5420b7a:                 // whenever we receive it - though we don't apply this constraint to producers, who may reschedule us before
+1:5420b7a:                 // we go to sleep)
+1:5420b7a:                 if (stop())
+1:5420b7a:                     while (isStopped())
+1:5420b7a:                         LockSupport.park();
+1:5420b7a: 
+1:5420b7a:                 // we can be assigned any state from STOPPED, so loop if we don't actually have any tasks assigned
+1:5420b7a:                 assigned = get().assigned;
+1:5420b7a:                 if (assigned == null)
+1:5420b7a:                     continue;
+1:7ede582:                 if (SET_THREAD_NAME)
+1:7ede582:                     Thread.currentThread().setName(assigned.name + "-" + workerId);
+1:5420b7a:                 task = assigned.tasks.poll();
+1:5420b7a: 
+1:5420b7a:                 // if we do have tasks assigned, nobody will change our state so we can simply set it to WORKING
+1:5420b7a:                 // (which is also a state that will never be interrupted externally)
+1:5420b7a:                 set(Work.WORKING);
+1:5420b7a:                 boolean shutdown;
+1:5420b7a:                 while (true)
+1:5420b7a:                 {
+1:5420b7a:                     // before we process any task, we maybe schedule a new worker _to our executor only_; this
+1:5420b7a:                     // ensures that even once all spinning threads have found work, if more work is left to be serviced
+1:5420b7a:                     // and permits are available, it will be dealt with immediately.
+1:5420b7a:                     assigned.maybeSchedule();
+1:5420b7a: 
+1:5420b7a:                     // we know there is work waiting, as we have a work permit, so poll() will always succeed
+1:5420b7a:                     task.run();
+1:5420b7a:                     task = null;
+1:5420b7a: 
+1:5420b7a:                     // if we're shutting down, or we fail to take a permit, we don't perform any more work
+1:5420b7a:                     if ((shutdown = assigned.shuttingDown) || !assigned.takeTaskPermit())
+1:5420b7a:                         break;
+1:5420b7a:                     task = assigned.tasks.poll();
+1:5420b7a:                 }
+1:5420b7a: 
+1:5420b7a:                 // return our work permit, and maybe signal shutdown
+1:5420b7a:                 assigned.returnWorkPermit();
+1:5420b7a:                 if (shutdown && assigned.getActiveCount() == 0)
+1:5420b7a:                     assigned.shutdown.signalAll();
+1:5420b7a:                 assigned = null;
+1:5420b7a: 
+1:5420b7a:                 // try to immediately reassign ourselves some work; if we fail, start spinning
+1:5420b7a:                 if (!selfAssign())
+1:5420b7a:                     startSpinning();
+1:5420b7a:             }
+1:5420b7a:         }
+1:5420b7a:         catch (Throwable t)
+1:5420b7a:         {
+1:1452134:             JVMStabilityInspector.inspectThrowable(t);
+1:5420b7a:             while (true)
+1:5420b7a:             {
+1:5420b7a:                 if (get().assigned != null)
+1:5420b7a:                 {
+1:5420b7a:                     assigned = get().assigned;
+1:5420b7a:                     set(Work.WORKING);
+1:5420b7a:                 }
+1:5420b7a:                 if (assign(Work.STOPPED, true))
+1:5420b7a:                     break;
+1:5420b7a:             }
+1:5420b7a:             if (assigned != null)
+1:5420b7a:                 assigned.returnWorkPermit();
+1:5420b7a:             if (task != null)
+1:5420b7a:                 logger.error("Failed to execute task, unexpected exception killed worker: {}", t);
+1:5420b7a:             else
+1:5420b7a:                 logger.error("Unexpected exception killed worker: {}", t);
+1:5420b7a:         }
+1:5420b7a:     }
+1:5420b7a: 
+1:5420b7a:     // try to assign this worker the provided work
+1:5420b7a:     // valid states to assign are SPINNING, STOP_SIGNALLED, (ASSIGNED);
+1:5420b7a:     // restores invariants of the various states (e.g. spinningCount, descheduled collection and thread park status)
+1:5420b7a:     boolean assign(Work work, boolean self)
+1:5420b7a:     {
+1:5420b7a:         Work state = get();
+1:5420b7a:         while (state.canAssign(self))
+1:5420b7a:         {
+1:5420b7a:             if (!compareAndSet(state, work))
+1:5420b7a:             {
+1:5420b7a:                 state = get();
+1:5420b7a:                 continue;
+1:5420b7a:             }
+1:5420b7a:             // if we were spinning, exit the state (decrement the count); this is valid even if we are already spinning,
+1:5420b7a:             // as the assigning thread will have incremented the spinningCount
+1:5420b7a:             if (state.isSpinning())
+1:5420b7a:                 stopSpinning();
+1:5420b7a: 
+1:5420b7a:             // if we're being descheduled, place ourselves in the descheduled collection
+1:5420b7a:             if (work.isStop())
+1:5420b7a:                 pool.descheduled.put(workerId, this);
+1:5420b7a: 
+1:5420b7a:             // if we're currently stopped, and the new state is not a stop signal
+1:5420b7a:             // (which we can immediately convert to stopped), unpark the worker
+1:5420b7a:             if (state.isStopped() && (!work.isStop() || !stop()))
+1:5420b7a:                 LockSupport.unpark(thread);
+1:5420b7a:             return true;
+1:5420b7a:         }
+1:5420b7a:         return false;
+1:5420b7a:     }
+1:5420b7a: 
+1:5420b7a:     // try to assign ourselves an executor with work available
+1:5420b7a:     private boolean selfAssign()
+1:5420b7a:     {
+1:5420b7a:         // if we aren't permitted to assign in this state, fail
+1:5420b7a:         if (!get().canAssign(true))
+1:5420b7a:             return false;
+1:5420b7a:         for (SEPExecutor exec : pool.executors)
+1:5420b7a:         {
+1:5420b7a:             if (exec.takeWorkPermit(true))
+1:5420b7a:             {
+1:5420b7a:                 Work work = new Work(exec);
+1:5420b7a:                 // we successfully started work on this executor, so we must either assign it to ourselves or ...
+1:5420b7a:                 if (assign(work, true))
+1:5420b7a:                     return true;
+1:5420b7a:                 // ... if we fail, schedule it to another worker
+1:5420b7a:                 pool.schedule(work);
+1:5420b7a:                 // and return success as we must have already been assigned a task
+1:5420b7a:                 assert get().assigned != null;
+1:5420b7a:                 return true;
+1:5420b7a:             }
+1:5420b7a:         }
+1:5420b7a:         return false;
+1:5420b7a:     }
+1:5420b7a: 
+1:5420b7a:     // we can only call this when our state is WORKING, and no other thread may change our state in this case;
+1:5420b7a:     // so in this case only we do not need to CAS. We increment the spinningCount and add ourselves to the spinning
+1:5420b7a:     // collection at the same time
+1:5420b7a:     private void startSpinning()
+1:5420b7a:     {
+1:5420b7a:         assert get() == Work.WORKING;
+1:5420b7a:         pool.spinningCount.incrementAndGet();
+1:5420b7a:         set(Work.SPINNING);
+1:5420b7a:     }
+1:5420b7a: 
+1:5420b7a:     // exit the spinning state; if there are no remaining spinners, we immediately try and schedule work for all executors
+1:5420b7a:     // so that any producer is safe to not spin up a worker when they see a spinning thread (invariant (1) above)
+1:5420b7a:     private void stopSpinning()
+1:5420b7a:     {
+1:5420b7a:         if (pool.spinningCount.decrementAndGet() == 0)
+1:5420b7a:             for (SEPExecutor executor : pool.executors)
+1:5420b7a:                 executor.maybeSchedule();
+1:5420b7a:         prevStopCheck = soleSpinnerSpinTime = 0;
+1:5420b7a:     }
+1:5420b7a: 
+1:5420b7a:     // perform a sleep-spin, incrementing pool.stopCheck accordingly
+1:5420b7a:     private void doWaitSpin()
+1:5420b7a:     {
+1:5420b7a:         // pick a random sleep interval based on the number of threads spinning, so that
+1:5420b7a:         // we should always have a thread about to wake up, but most threads are sleeping
+1:1c33ea3:         long sleep = 10000L * pool.spinningCount.get();
+1:5420b7a:         sleep = Math.min(1000000, sleep);
+1:5420b7a:         sleep *= Math.random();
+1:5420b7a:         sleep = Math.max(10000, sleep);
+1:5420b7a: 
+1:5420b7a:         long start = System.nanoTime();
+1:5420b7a: 
+1:5420b7a:         // place ourselves in the spinning collection; if we clash with another thread just exit
+1:5420b7a:         Long target = start + sleep;
+1:5420b7a:         if (pool.spinning.putIfAbsent(target, this) != null)
+1:5420b7a:             return;
+1:5420b7a:         LockSupport.parkNanos(sleep);
+1:5420b7a: 
+1:5420b7a:         // remove ourselves (if haven't been already) - we should be at or near the front, so should be cheap-ish
+1:5420b7a:         pool.spinning.remove(target, this);
+1:5420b7a: 
+1:5420b7a:         // finish timing and grab spinningTime (before we finish timing so it is under rather than overestimated)
+1:5420b7a:         long end = System.nanoTime();
+1:5420b7a:         long spin = end - start;
+1:5420b7a:         long stopCheck = pool.stopCheck.addAndGet(spin);
+1:5420b7a:         maybeStop(stopCheck, end);
+1:5420b7a:         if (prevStopCheck + spin == stopCheck)
+1:5420b7a:             soleSpinnerSpinTime += spin;
+1:5420b7a:         else
+1:5420b7a:             soleSpinnerSpinTime = 0;
+1:5420b7a:         prevStopCheck = stopCheck;
+1:5420b7a:     }
+1:5420b7a: 
+1:5420b7a:     private static final long stopCheckInterval = TimeUnit.MILLISECONDS.toNanos(10L);
+1:5420b7a: 
+1:5420b7a:     // stops a worker if elapsed real time is less than elapsed spin time, as this implies the equivalent of
+1:5420b7a:     // at least one worker achieved nothing in the interval. we achieve this by maintaining a stopCheck which
+1:5420b7a:     // is initialised to a negative offset from realtime; as we spin we add to this value, and if we ever exceed
+1:5420b7a:     // realtime we have spun too much and deschedule; if we get too far behind realtime, we reset to our initial offset
+1:5420b7a:     private void maybeStop(long stopCheck, long now)
+1:5420b7a:     {
+1:5420b7a:         long delta = now - stopCheck;
+1:5420b7a:         if (delta <= 0)
+1:5420b7a:         {
+1:5420b7a:             // if stopCheck has caught up with present, we've been spinning too much, so if we can atomically
+1:5420b7a:             // set it to the past again, we should stop a worker
+1:5420b7a:             if (pool.stopCheck.compareAndSet(stopCheck, now - stopCheckInterval))
+1:5420b7a:             {
+1:5420b7a:                 // try and stop ourselves;
+1:5420b7a:                 // if we've already been assigned work stop another worker
+1:5420b7a:                 if (!assign(Work.STOP_SIGNALLED, true))
+1:5420b7a:                     pool.schedule(Work.STOP_SIGNALLED);
+1:5420b7a:             }
+1:5420b7a:         }
+1:5420b7a:         else if (soleSpinnerSpinTime > stopCheckInterval && pool.spinningCount.get() == 1)
+1:5420b7a:         {
+1:5420b7a:             // permit self-stopping
+1:5420b7a:             assign(Work.STOP_SIGNALLED, true);
+1:5420b7a:         }
+1:5420b7a:         else
+1:5420b7a:         {
+1:5420b7a:             // if stop check has gotten too far behind present, update it so new spins can affect it
+1:5420b7a:             while (delta > stopCheckInterval * 2 && !pool.stopCheck.compareAndSet(stopCheck, now - stopCheckInterval))
+1:5420b7a:             {
+1:5420b7a:                 stopCheck = pool.stopCheck.get();
+1:5420b7a:                 delta = now - stopCheck;
+1:5420b7a:             }
+1:5420b7a:         }
+1:5420b7a:     }
+1:5420b7a: 
+1:5420b7a:     private boolean isSpinning()
+1:5420b7a:     {
+1:5420b7a:         return get().isSpinning();
+1:5420b7a:     }
+1:5420b7a: 
+1:5420b7a:     private boolean stop()
+1:5420b7a:     {
+1:5420b7a:         return get().isStop() && compareAndSet(Work.STOP_SIGNALLED, Work.STOPPED);
+1:5420b7a:     }
+1:5420b7a: 
+1:5420b7a:     private boolean isStopped()
+1:5420b7a:     {
+1:5420b7a:         return get().isStopped();
+1:5420b7a:     }
+1:5420b7a: 
+1:5420b7a:     /**
+1:5420b7a:      * Represents, and communicates changes to, a worker's work state - there are three non-actively-working
+1:5420b7a:      * states (STOP_SIGNALLED, STOPPED, AND SPINNING) and two working states: WORKING, and (ASSIGNED), the last
+1:5420b7a:      * being represented by a non-static instance with its "assigned" executor set.
+1:5420b7a:      *
+1:5420b7a:      * STOPPED:         indicates the worker is descheduled, and whilst accepts work in this state (causing it to
+1:5420b7a:      *                  be rescheduled) it will generally not be considered for work until all other worker threads are busy.
+1:5420b7a:      *                  In this state we should be present in the pool.descheduled collection, and should be parked
+1:5420b7a:      * -> (ASSIGNED)|SPINNING
+1:5420b7a:      * STOP_SIGNALLED:  the worker has been asked to deschedule itself, but has not yet done so; only entered from a SPINNING
+1:5420b7a:      *                  state, and generally communicated to itself, but maybe set from any worker. this state may be preempted
+1:5420b7a:      *                  and replaced with (ASSIGNED) or SPINNING
+1:5420b7a:      *                  In this state we should be present in the pool.descheduled collection
+1:5420b7a:      * -> (ASSIGNED)|STOPPED|SPINNING
+1:5420b7a:      * SPINNING:        indicates the worker has no work to perform, so is performing a friendly wait-based-spinning
+1:5420b7a:      *                  until it either is (ASSIGNED) some work (by itself or another thread), or sent STOP_SIGNALLED
+1:5420b7a:      *                  In this state we _may_ be in the pool.spinning collection (but only if we are in the middle of a sleep)
+1:5420b7a:      * -> (ASSIGNED)|STOP_SIGNALLED|SPINNING
+1:5420b7a:      * (ASSIGNED):      asks the worker to perform some work against the specified executor, and preassigns a task permit
+1:5420b7a:      *                  from that executor so that in this state there is always work to perform.
+1:5420b7a:      *                  In general a worker assigns itself this state, but sometimes it may assign another worker the state
+1:5420b7a:      *                  either if there is work outstanding and no-spinning threads, or there is a race to self-assign
+1:5420b7a:      * -> WORKING
+1:5420b7a:      * WORKING:         indicates the worker is actively processing an executor's task queue; in this state it accepts
+1:5420b7a:      *                  no state changes/communications, except from itself; it usually exits this mode into SPINNING,
+1:5420b7a:      *                  but if work is immediately available on another executor it self-triggers (ASSIGNED)
+1:5420b7a:      * -> SPINNING|(ASSIGNED)
+1:5420b7a:      */
+1:5420b7a: 
+1:5420b7a:     static final class Work
+1:5420b7a:     {
+1:5420b7a:         static final Work STOP_SIGNALLED = new Work();
+1:5420b7a:         static final Work STOPPED = new Work();
+1:5420b7a:         static final Work SPINNING = new Work();
+1:5420b7a:         static final Work WORKING = new Work();
+1:5420b7a: 
+1:5420b7a:         final SEPExecutor assigned;
+1:5420b7a: 
+1:5420b7a:         Work(SEPExecutor executor)
+1:5420b7a:         {
+1:5420b7a:             this.assigned = executor;
+1:5420b7a:         }
+1:5420b7a: 
+1:5420b7a:         private Work()
+1:5420b7a:         {
+1:5420b7a:             this.assigned = null;
+1:5420b7a:         }
+1:5420b7a: 
+1:5420b7a:         boolean canAssign(boolean self)
+1:5420b7a:         {
+1:5420b7a:             // we can assign work if there isn't new work already assigned and either
+1:5420b7a:             // 1) we are assigning to ourselves
+1:5420b7a:             // 2) the worker we are assigning to is not already in the middle of WORKING
+1:5420b7a:             return assigned == null && (self || !isWorking());
+1:5420b7a:         }
+1:5420b7a: 
+1:5420b7a:         boolean isSpinning()
+1:5420b7a:         {
+1:5420b7a:             return this == Work.SPINNING;
+1:5420b7a:         }
+1:5420b7a: 
+1:5420b7a:         boolean isWorking()
+1:5420b7a:         {
+1:5420b7a:             return this == Work.WORKING;
+1:5420b7a:         }
+1:5420b7a: 
+1:5420b7a:         boolean isStop()
+1:5420b7a:         {
+1:5420b7a:             return this == Work.STOP_SIGNALLED;
+1:5420b7a:         }
+1:5420b7a: 
+1:5420b7a:         boolean isStopped()
+1:5420b7a:         {
+1:5420b7a:             return this == Work.STOPPED;
+1:5420b7a:         }
+1:5420b7a: 
+1:5420b7a:         boolean isAssigned()
+1:5420b7a:         {
+1:5420b7a:             return assigned != null;
+1:5420b7a:         }
+1:5420b7a:     }
+1:5420b7a: }
+============================================================================
+author:Chris Lohfink
+-------------------------------------------------------------------------------
+commit:7ede582
+/////////////////////////////////////////////////////////////////////////
+1:     private static final boolean SET_THREAD_NAME = Boolean.parseBoolean(System.getProperty("cassandra.set_sep_thread_name", "true"));
+/////////////////////////////////////////////////////////////////////////
+1:                 if (SET_THREAD_NAME)
+1:                     Thread.currentThread().setName(assigned.name + "-" + workerId);
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:1e92ce4
+/////////////////////////////////////////////////////////////////////////
+1: import io.netty.util.concurrent.FastThreadLocalThread;
+/////////////////////////////////////////////////////////////////////////
+1:         thread = new FastThreadLocalThread(this, pool.poolName + "-Worker-" + workerId);
+author:Joshua McKenzie
+-------------------------------------------------------------------------------
+commit:1452134
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.JVMStabilityInspector;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             JVMStabilityInspector.inspectThrowable(t);
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:1c33ea3
+/////////////////////////////////////////////////////////////////////////
+1:         long sleep = 10000L * pool.spinningCount.get();
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:c108ce5
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+author:belliottsmith
+-------------------------------------------------------------------------------
+commit:5420b7a
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.cassandra.concurrent;
+1: 
+1: import java.util.concurrent.TimeUnit;
+1: import java.util.concurrent.atomic.AtomicReference;
+1: import java.util.concurrent.locks.LockSupport;
+1: 
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: final class SEPWorker extends AtomicReference<SEPWorker.Work> implements Runnable
+1: {
+1:     private static final Logger logger = LoggerFactory.getLogger(SEPWorker.class);
+1: 
+1:     final Long workerId;
+1:     final Thread thread;
+1:     final SharedExecutorPool pool;
+1: 
+1:     // prevStopCheck stores the value of pool.stopCheck after we last incremented it; if it hasn't changed,
+1:     // we know nobody else was spinning in the interval, so we increment our soleSpinnerSpinTime accordingly,
+1:     // and otherwise we set it to zero; this is then used to terminate the final spinning thread, as the coordinated
+1:     // strategy can only work when there are multiple threads spinning (as more sleep time must elapse than real time)
+1:     long prevStopCheck = 0;
+1:     long soleSpinnerSpinTime = 0;
+1: 
+1:     SEPWorker(Long workerId, Work initialState, SharedExecutorPool pool)
+1:     {
+1:         this.pool = pool;
+1:         this.workerId = workerId;
+0:         thread = new Thread(this, pool.poolName + "-Worker-" + workerId);
+1:         thread.setDaemon(true);
+1:         set(initialState);
+1:         thread.start();
+1:     }
+1: 
+1:     public void run()
+1:     {
+1:         /**
+1:          * we maintain two important invariants:
+1:          * 1)   after exiting spinning phase, we ensure at least one more task on _each_ queue will be processed
+1:          *      promptly after we begin, assuming any are outstanding on any pools. this is to permit producers to
+1:          *      avoid signalling if there are _any_ spinning threads. we achieve this by simply calling maybeSchedule()
+1:          *      on each queue if on decrementing the spin counter we hit zero.
+1:          * 2)   before processing a task on a given queue, we attempt to assign another worker to the _same queue only_;
+1:          *      this allows a producer to skip signalling work if the task queue is currently non-empty, and in conjunction
+1:          *      with invariant (1) ensures that if any thread was spinning when a task was added to any executor, that
+1:          *      task will be processed immediately if work permits are available
+1:          */
+1: 
+1:         SEPExecutor assigned = null;
+1:         Runnable task = null;
+1:         try
+1:         {
+1:             while (true)
+1:             {
+1:                 if (isSpinning() && !selfAssign())
+1:                 {
+1:                     doWaitSpin();
+1:                     continue;
+1:                 }
+1: 
+1:                 // if stop was signalled, go to sleep (don't try self-assign; being put to sleep is rare, so let's obey it
+1:                 // whenever we receive it - though we don't apply this constraint to producers, who may reschedule us before
+1:                 // we go to sleep)
+1:                 if (stop())
+1:                     while (isStopped())
+1:                         LockSupport.park();
+1: 
+1:                 // we can be assigned any state from STOPPED, so loop if we don't actually have any tasks assigned
+1:                 assigned = get().assigned;
+1:                 if (assigned == null)
+1:                     continue;
+1:                 task = assigned.tasks.poll();
+1: 
+1:                 // if we do have tasks assigned, nobody will change our state so we can simply set it to WORKING
+1:                 // (which is also a state that will never be interrupted externally)
+1:                 set(Work.WORKING);
+1:                 boolean shutdown;
+1:                 while (true)
+1:                 {
+1:                     // before we process any task, we maybe schedule a new worker _to our executor only_; this
+1:                     // ensures that even once all spinning threads have found work, if more work is left to be serviced
+1:                     // and permits are available, it will be dealt with immediately.
+1:                     assigned.maybeSchedule();
+1: 
+1:                     // we know there is work waiting, as we have a work permit, so poll() will always succeed
+1:                     task.run();
+1:                     task = null;
+1: 
+1:                     // if we're shutting down, or we fail to take a permit, we don't perform any more work
+1:                     if ((shutdown = assigned.shuttingDown) || !assigned.takeTaskPermit())
+1:                         break;
+1:                     task = assigned.tasks.poll();
+1:                 }
+1: 
+1:                 // return our work permit, and maybe signal shutdown
+1:                 assigned.returnWorkPermit();
+1:                 if (shutdown && assigned.getActiveCount() == 0)
+1:                     assigned.shutdown.signalAll();
+1:                 assigned = null;
+1: 
+1:                 // try to immediately reassign ourselves some work; if we fail, start spinning
+1:                 if (!selfAssign())
+1:                     startSpinning();
+1:             }
+1:         }
+1:         catch (Throwable t)
+1:         {
+1:             while (true)
+1:             {
+1:                 if (get().assigned != null)
+1:                 {
+1:                     assigned = get().assigned;
+1:                     set(Work.WORKING);
+1:                 }
+1:                 if (assign(Work.STOPPED, true))
+1:                     break;
+1:             }
+1:             if (assigned != null)
+1:                 assigned.returnWorkPermit();
+1:             if (task != null)
+1:                 logger.error("Failed to execute task, unexpected exception killed worker: {}", t);
+1:             else
+1:                 logger.error("Unexpected exception killed worker: {}", t);
+1:         }
+1:     }
+1: 
+1:     // try to assign this worker the provided work
+1:     // valid states to assign are SPINNING, STOP_SIGNALLED, (ASSIGNED);
+1:     // restores invariants of the various states (e.g. spinningCount, descheduled collection and thread park status)
+1:     boolean assign(Work work, boolean self)
+1:     {
+1:         Work state = get();
+1:         while (state.canAssign(self))
+1:         {
+1:             if (!compareAndSet(state, work))
+1:             {
+1:                 state = get();
+1:                 continue;
+1:             }
+1:             // if we were spinning, exit the state (decrement the count); this is valid even if we are already spinning,
+1:             // as the assigning thread will have incremented the spinningCount
+1:             if (state.isSpinning())
+1:                 stopSpinning();
+1: 
+1:             // if we're being descheduled, place ourselves in the descheduled collection
+1:             if (work.isStop())
+1:                 pool.descheduled.put(workerId, this);
+1: 
+1:             // if we're currently stopped, and the new state is not a stop signal
+1:             // (which we can immediately convert to stopped), unpark the worker
+1:             if (state.isStopped() && (!work.isStop() || !stop()))
+1:                 LockSupport.unpark(thread);
+1:             return true;
+1:         }
+1:         return false;
+1:     }
+1: 
+1:     // try to assign ourselves an executor with work available
+1:     private boolean selfAssign()
+1:     {
+1:         // if we aren't permitted to assign in this state, fail
+1:         if (!get().canAssign(true))
+1:             return false;
+1:         for (SEPExecutor exec : pool.executors)
+1:         {
+1:             if (exec.takeWorkPermit(true))
+1:             {
+1:                 Work work = new Work(exec);
+1:                 // we successfully started work on this executor, so we must either assign it to ourselves or ...
+1:                 if (assign(work, true))
+1:                     return true;
+1:                 // ... if we fail, schedule it to another worker
+1:                 pool.schedule(work);
+1:                 // and return success as we must have already been assigned a task
+1:                 assert get().assigned != null;
+1:                 return true;
+1:             }
+1:         }
+1:         return false;
+1:     }
+1: 
+1:     // we can only call this when our state is WORKING, and no other thread may change our state in this case;
+1:     // so in this case only we do not need to CAS. We increment the spinningCount and add ourselves to the spinning
+1:     // collection at the same time
+1:     private void startSpinning()
+1:     {
+1:         assert get() == Work.WORKING;
+1:         pool.spinningCount.incrementAndGet();
+1:         set(Work.SPINNING);
+1:     }
+1: 
+1:     // exit the spinning state; if there are no remaining spinners, we immediately try and schedule work for all executors
+1:     // so that any producer is safe to not spin up a worker when they see a spinning thread (invariant (1) above)
+1:     private void stopSpinning()
+1:     {
+1:         if (pool.spinningCount.decrementAndGet() == 0)
+1:             for (SEPExecutor executor : pool.executors)
+1:                 executor.maybeSchedule();
+1:         prevStopCheck = soleSpinnerSpinTime = 0;
+1:     }
+1: 
+1:     // perform a sleep-spin, incrementing pool.stopCheck accordingly
+1:     private void doWaitSpin()
+1:     {
+1:         // pick a random sleep interval based on the number of threads spinning, so that
+1:         // we should always have a thread about to wake up, but most threads are sleeping
+0:         long sleep = 10000 * pool.spinningCount.get();
+1:         sleep = Math.min(1000000, sleep);
+1:         sleep *= Math.random();
+1:         sleep = Math.max(10000, sleep);
+1: 
+1:         long start = System.nanoTime();
+1: 
+1:         // place ourselves in the spinning collection; if we clash with another thread just exit
+1:         Long target = start + sleep;
+1:         if (pool.spinning.putIfAbsent(target, this) != null)
+1:             return;
+1:         LockSupport.parkNanos(sleep);
+1: 
+1:         // remove ourselves (if haven't been already) - we should be at or near the front, so should be cheap-ish
+1:         pool.spinning.remove(target, this);
+1: 
+1:         // finish timing and grab spinningTime (before we finish timing so it is under rather than overestimated)
+1:         long end = System.nanoTime();
+1:         long spin = end - start;
+1:         long stopCheck = pool.stopCheck.addAndGet(spin);
+1:         maybeStop(stopCheck, end);
+1:         if (prevStopCheck + spin == stopCheck)
+1:             soleSpinnerSpinTime += spin;
+1:         else
+1:             soleSpinnerSpinTime = 0;
+1:         prevStopCheck = stopCheck;
+1:     }
+1: 
+1:     private static final long stopCheckInterval = TimeUnit.MILLISECONDS.toNanos(10L);
+1: 
+1:     // stops a worker if elapsed real time is less than elapsed spin time, as this implies the equivalent of
+1:     // at least one worker achieved nothing in the interval. we achieve this by maintaining a stopCheck which
+1:     // is initialised to a negative offset from realtime; as we spin we add to this value, and if we ever exceed
+1:     // realtime we have spun too much and deschedule; if we get too far behind realtime, we reset to our initial offset
+1:     private void maybeStop(long stopCheck, long now)
+1:     {
+1:         long delta = now - stopCheck;
+1:         if (delta <= 0)
+1:         {
+1:             // if stopCheck has caught up with present, we've been spinning too much, so if we can atomically
+1:             // set it to the past again, we should stop a worker
+1:             if (pool.stopCheck.compareAndSet(stopCheck, now - stopCheckInterval))
+1:             {
+1:                 // try and stop ourselves;
+1:                 // if we've already been assigned work stop another worker
+1:                 if (!assign(Work.STOP_SIGNALLED, true))
+1:                     pool.schedule(Work.STOP_SIGNALLED);
+1:             }
+1:         }
+1:         else if (soleSpinnerSpinTime > stopCheckInterval && pool.spinningCount.get() == 1)
+1:         {
+1:             // permit self-stopping
+1:             assign(Work.STOP_SIGNALLED, true);
+1:         }
+1:         else
+1:         {
+1:             // if stop check has gotten too far behind present, update it so new spins can affect it
+1:             while (delta > stopCheckInterval * 2 && !pool.stopCheck.compareAndSet(stopCheck, now - stopCheckInterval))
+1:             {
+1:                 stopCheck = pool.stopCheck.get();
+1:                 delta = now - stopCheck;
+1:             }
+1:         }
+1:     }
+1: 
+1:     private boolean isSpinning()
+1:     {
+1:         return get().isSpinning();
+1:     }
+1: 
+1:     private boolean stop()
+1:     {
+1:         return get().isStop() && compareAndSet(Work.STOP_SIGNALLED, Work.STOPPED);
+1:     }
+1: 
+1:     private boolean isStopped()
+1:     {
+1:         return get().isStopped();
+1:     }
+1: 
+1:     /**
+1:      * Represents, and communicates changes to, a worker's work state - there are three non-actively-working
+1:      * states (STOP_SIGNALLED, STOPPED, AND SPINNING) and two working states: WORKING, and (ASSIGNED), the last
+1:      * being represented by a non-static instance with its "assigned" executor set.
+1:      *
+1:      * STOPPED:         indicates the worker is descheduled, and whilst accepts work in this state (causing it to
+1:      *                  be rescheduled) it will generally not be considered for work until all other worker threads are busy.
+1:      *                  In this state we should be present in the pool.descheduled collection, and should be parked
+1:      * -> (ASSIGNED)|SPINNING
+1:      * STOP_SIGNALLED:  the worker has been asked to deschedule itself, but has not yet done so; only entered from a SPINNING
+1:      *                  state, and generally communicated to itself, but maybe set from any worker. this state may be preempted
+1:      *                  and replaced with (ASSIGNED) or SPINNING
+1:      *                  In this state we should be present in the pool.descheduled collection
+1:      * -> (ASSIGNED)|STOPPED|SPINNING
+1:      * SPINNING:        indicates the worker has no work to perform, so is performing a friendly wait-based-spinning
+1:      *                  until it either is (ASSIGNED) some work (by itself or another thread), or sent STOP_SIGNALLED
+1:      *                  In this state we _may_ be in the pool.spinning collection (but only if we are in the middle of a sleep)
+1:      * -> (ASSIGNED)|STOP_SIGNALLED|SPINNING
+1:      * (ASSIGNED):      asks the worker to perform some work against the specified executor, and preassigns a task permit
+1:      *                  from that executor so that in this state there is always work to perform.
+1:      *                  In general a worker assigns itself this state, but sometimes it may assign another worker the state
+1:      *                  either if there is work outstanding and no-spinning threads, or there is a race to self-assign
+1:      * -> WORKING
+1:      * WORKING:         indicates the worker is actively processing an executor's task queue; in this state it accepts
+1:      *                  no state changes/communications, except from itself; it usually exits this mode into SPINNING,
+1:      *                  but if work is immediately available on another executor it self-triggers (ASSIGNED)
+1:      * -> SPINNING|(ASSIGNED)
+1:      */
+1: 
+1:     static final class Work
+1:     {
+1:         static final Work STOP_SIGNALLED = new Work();
+1:         static final Work STOPPED = new Work();
+1:         static final Work SPINNING = new Work();
+1:         static final Work WORKING = new Work();
+1: 
+1:         final SEPExecutor assigned;
+1: 
+1:         Work(SEPExecutor executor)
+1:         {
+1:             this.assigned = executor;
+1:         }
+1: 
+1:         private Work()
+1:         {
+1:             this.assigned = null;
+1:         }
+1: 
+1:         boolean canAssign(boolean self)
+1:         {
+1:             // we can assign work if there isn't new work already assigned and either
+1:             // 1) we are assigning to ourselves
+1:             // 2) the worker we are assigning to is not already in the middle of WORKING
+1:             return assigned == null && (self || !isWorking());
+1:         }
+1: 
+1:         boolean isSpinning()
+1:         {
+1:             return this == Work.SPINNING;
+1:         }
+1: 
+1:         boolean isWorking()
+1:         {
+1:             return this == Work.WORKING;
+1:         }
+1: 
+1:         boolean isStop()
+1:         {
+1:             return this == Work.STOP_SIGNALLED;
+1:         }
+1: 
+1:         boolean isStopped()
+1:         {
+1:             return this == Work.STOPPED;
+1:         }
+1: 
+1:         boolean isAssigned()
+1:         {
+1:             return assigned != null;
+1:         }
+1:     }
+1: }
+============================================================================

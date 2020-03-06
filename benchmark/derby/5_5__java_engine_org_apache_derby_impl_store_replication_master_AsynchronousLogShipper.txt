@@ -1,0 +1,1082 @@
+1:eeeece4: /*
+1:eeeece4:  
+1:1bac3f3:    Derby - Class org.apache.derby.impl.store.replication.master.AsynchronousLogShipper
+1:eeeece4:  
+1:eeeece4:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:eeeece4:    contributor license agreements.  See the NOTICE file distributed with
+1:eeeece4:    this work for additional information regarding copyright ownership.
+1:eeeece4:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:eeeece4:    (the "License"); you may not use this file except in compliance with
+1:eeeece4:    the License.  You may obtain a copy of the License at
+1:eeeece4:  
+1:eeeece4:       http://www.apache.org/licenses/LICENSE-2.0
+1:eeeece4:  
+1:eeeece4:    Unless required by applicable law or agreed to in writing, software
+1:eeeece4:    distributed under the License is distributed on an "AS IS" BASIS,
+1:eeeece4:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:eeeece4:    See the License for the specific language governing permissions and
+1:eeeece4:    limitations under the License.
+1:eeeece4:  
+1:eeeece4:  */
+1:eeeece4: 
+1:1bac3f3: package org.apache.derby.impl.store.replication.master;
+1:eeeece4: 
+1:eeeece4: import java.io.IOException;
+1:eeeece4: import java.util.NoSuchElementException;
+1:eeeece4: 
+1:eeeece4: import org.apache.derby.iapi.error.StandardException;
+1:1d0892e: import org.apache.derby.iapi.reference.Property;
+1:eeeece4: import org.apache.derby.iapi.reference.SQLState;
+1:1d0892e: import org.apache.derby.iapi.services.property.PropertyUtil;
+1:7e51e9d: import org.apache.derby.shared.common.sanity.SanityManager;
+1:eeeece4: 
+1:1bac3f3: import org.apache.derby.impl.store.replication.ReplicationLogger;
+1:1bac3f3: import org.apache.derby.impl.store.replication.buffer.ReplicationLogBuffer;
+1:1bac3f3: import org.apache.derby.impl.store.replication.net.ReplicationMessage;
+1:1bac3f3: import org.apache.derby.impl.store.replication.net.ReplicationMessageTransmit;
+1:5d97422: import org.apache.derby.iapi.util.InterruptStatus;
+1:eeeece4: 
+1:eeeece4: /**
+2:eeeece4:  * <p>
+1:eeeece4:  * Does asynchronous shipping of log records from the master to the slave being
+1:eeeece4:  * replicated to. The implementation does not ship log records as soon as they
+1:eeeece4:  * become available in the log buffer (synchronously), instead it does log
+1:eeeece4:  * shipping in the following two-fold scenarios
+1:eeeece4:  *
+1:eeeece4:  * 1) Periodically (i.e.) at regular intervals of time.
+1:eeeece4:  *
+1:eeeece4:  * 2) when a request is sent from the master controller (force flushing of
+1:eeeece4:  *    the log buffer).
+1:eeeece4:  *
+1:2146e78:  * 3) when a notification is received from the log shipper about a log
+1:2146e78:  *    buffer element becoming full and the load on the log buffer so
+1:2146e78:  *    warrants a ship.
+2:eeeece4:  * </p>
+1:eeeece4:  */
+1:eeeece4: public class AsynchronousLogShipper extends Thread implements
+1:eeeece4:     LogShipper {
+1:eeeece4:     
+1:eeeece4:     /**
+1:eeeece4:      * Replication log buffer that contains the log records that need to
+1:eeeece4:      * be transmitted to the slave.
+1:eeeece4:      */
+1:eeeece4:     final private ReplicationLogBuffer logBuffer;
+1:eeeece4:     
+1:eeeece4:     /**
+1:eeeece4:      * Replication message transmitter that is used for the network
+1:eeeece4:      * transmission of the log records retrieved from the log buffer
+1:eeeece4:      * (on the master) to the slave being replicated to.
+1:eeeece4:      */
+1:8971c8b:     private ReplicationMessageTransmit transmitter;
+1:eeeece4:     
+1:eeeece4:     /**
+1:eeeece4:      * Time interval (in milliseconds) at which the log shipping takes place.
+1:eeeece4:      */
+1:eeeece4:     private long shippingInterval;
+1:eeeece4:     /**
+1:1d0892e:      * Minimum interval (in milliseconds) between log shipping.
+1:1d0892e:      * Defaults to MIN, but can be configured using system property
+1:1d0892e:      * derby.replication.minLogShippingInterval
+1:68b4227:      * @see #MIN
+1:1d0892e:      */
+1:1d0892e:     private long minShippingInterval;
+1:1d0892e:     /**
+1:1d0892e:      * Minimum interval (in milliseconds) between log shipping.
+1:1d0892e:      * Defaults to MAX, but can be configured using system property
+1:1d0892e:      * derby.replication.maxLogShippingInterval
+1:68b4227:      * @see #MAX
+1:1d0892e:      */
+1:1d0892e:     private long maxShippingInterval;
+1:eeeece4:     
+1:1d0892e:     /**
+1:2146e78:      * Will store the time at which the last shipping happened. Will be used
+1:2146e78:      * to calculate the interval between the log ships upon receiving a
+1:2146e78:      * notification from the log buffer.
+1:2146e78:      */
+1:2146e78:     private long lastShippingTime;
+1:2146e78:     
+1:2146e78:     /**
+1:eeeece4:      * Indicates whether a stop shipping request has been sent.
+1:eeeece4:      * true - stop shipping log records
+1:eeeece4:      * false - shipping can continue without interruption.
+1:eeeece4:      */
+1:0c97a10:     private volatile boolean stopShipping = false;
+1:eeeece4:     
+1:eeeece4:     /**
+1:eeeece4:      * The master controller that initialized this log shipper.
+1:eeeece4:      */
+1:eeeece4:     private MasterController masterController = null;
+1:eeeece4:     
+1:eeeece4:     /**
+1:d18f338:      * Object used to synchronize on while the log shipper thread
+1:d18f338:      * is moved into the wait state, or while notifying it.
+1:d18f338:      */
+1:d18f338:     private Object objLSTSync = new Object(); // LST->Log Shippper Thread
+1:0c97a10: 
+1:0c97a10:     /** Used to synchronize forceFlush calls */
+1:0c97a10:     private Object forceFlushSemaphore = new Object();
+1:0c97a10: 
+1:0c97a10:     /** The number of millis a call to forceFlush will wait before giving
+1:0c97a10:      * up sending a chunk of log to the slave */
+1:0c97a10:     public static final int DEFAULT_FORCEFLUSH_TIMEOUT = 5000;
+1:d18f338:     
+1:d18f338:     /**
+1:864d9d1:      * Store the log chunk that failed during a previous shipping attempt
+1:864d9d1:      * so that it can be re-shipped to the slave.
+1:864d9d1:      */
+1:864d9d1:     private ReplicationMessage failedChunk = null;
+1:29fd25c:     /** The highest log instant in failedChunk  */
+1:29fd25c:     private long failedChunkHighestInstant = -1;
+1:29fd25c:     /** The highest log instant shipped so far  */
+1:29fd25c:     private long highestShippedInstant = -1;
+1:864d9d1:     
+1:864d9d1:     /**
+1:2146e78:      * Fill information value indicative of a low load in the log buffer.
+1:2146e78:      */
+1:2146e78:     private static final int FI_LOW = 10;
+1:2146e78:     
+1:2146e78:     /**
+1:2146e78:      * Fill information value indicative of a high load in the log buffer.
+1:2146e78:      */
+1:2146e78:     private static final int FI_HIGH = 80;
+1:2146e78:     
+1:2146e78:     
+1:2146e78:     /**
+1:2146e78:      * If the fill information (obtained from the log buffer) is less than 
+1:2146e78:      * FI_HIGH but greater than FI_LOW the log shipper will ship with a MIN ms delay.
+1:2146e78:      * MIN is a value that is only as large as not to affect the performance
+1:2146e78:      * of the master database significantly.
+1:2146e78:      */
+1:2146e78:     private static final long MIN = 100;
+1:2146e78:     
+1:2146e78:     /**
+1:2146e78:      * If the fill information is less than FI_LOW the log shipper will ship 
+1:2146e78:      * with a MAX ms delay or when a buffer becomes full whichever comes 
+1:2146e78:      * first. The delay however will not be smaller than MIN. 
+1:2146e78:      * max(MAX, DEFAULT_NUMBER_LOG_BUFFERS*MIN) is the maximum delay between a 
+1:2146e78:      * log record is committed at the master until it is replicated  to the 
+1:2146e78:      * slave. Hence the default latency should be atleast greater than the maximum
+1:dbed020:      * latency offered by the choice of MIN, hence MAX &gt; DEFAULT_NUMBER_LOG_BUFFERS*MIN.
+1:2146e78:      */
+1:2146e78:     private static final long MAX = 5000;
+1:2146e78: 
+1:1d0892e:     private final ReplicationLogger repLogger;
+1:1d0892e: 
+1:2146e78:     /**
+1:eeeece4:      * Constructor initializes the log buffer, the replication message
+1:eeeece4:      * transmitter, the shipping interval and the master controller.
+1:eeeece4:      *
+1:eeeece4:      * @param logBuffer the replication log buffer that contains the log record
+1:eeeece4:      *                  chunks to be transmitted to the slave.
+1:eeeece4:      * @param transmitter the replication message transmitter that is used for
+1:eeeece4:      *                    network transmission of retrieved log records.
+1:eeeece4:      * @param masterController The master controller that initialized this log
+1:eeeece4:      *                         shipper.
+1:1d0892e:      * @param repLogger The replication logger that will write messages to
+1:1d0892e:      * the log file (typically derby.log)
+1:eeeece4:      */
+1:eeeece4:     public AsynchronousLogShipper(ReplicationLogBuffer logBuffer,
+1:eeeece4:                                   ReplicationMessageTransmit transmitter,
+1:1d0892e:                                   MasterController masterController,
+1:1d0892e:                                   ReplicationLogger repLogger) {
+1:41a2601:         super("derby.master.logger-" + masterController.getDbName());
+1:eeeece4:         this.logBuffer = logBuffer;
+1:eeeece4:         this.transmitter = transmitter;
+1:eeeece4:         this.masterController = masterController;
+1:864d9d1:         this.stopShipping = false;
+1:1d0892e:         this.repLogger = repLogger;
+1:eeeece4: 
+1:1d0892e:         getLogShipperProperties();
+1:1d0892e:         shippingInterval = minShippingInterval;
+1:1d0892e: 
+1:2146e78:         lastShippingTime = System.currentTimeMillis();
+1:eeeece4:     }
+1:c283bcd:     
+1:eeeece4:     /**
+1:eeeece4:      * Ships log records from the log buffer to the slave being replicated to.
+1:2146e78:      * The log shipping happens between shipping intervals of time, the 
+1:2146e78:      * shipping interval being derived from the fill information (an indicator
+1:2146e78:      * of load in the log buffer) obtained from the log buffer. The shipping
+1:2146e78:      * can also be triggered in the following situations,
+1:2146e78:      * 
+1:2146e78:      * 1) Based on notifications from the log buffer, where the fill 
+1:2146e78:      *    information is again used as the basis to decide whether a
+1:2146e78:      *    shipping should happen or not
+1:2146e78:      * 2) On a forceFlush triggered by the log buffer becoming full
+1:2146e78:      *    and the LogBufferFullException being thrown. 
+1:eeeece4:      */
+1:eeeece4:     public void run() {
+1:eeeece4:         while (!stopShipping) {
+1:eeeece4:             try {
+1:0c97a10:                 synchronized (forceFlushSemaphore) {
+1:c083785:                     shipALogChunk();
+1:0c97a10:                     // Wake up a thread waiting for forceFlush, if any
+1:0c97a10:                     forceFlushSemaphore.notify();
+1:0c97a10:                 }
+1:2146e78:                 //calculate the shipping interval (wait time) based on the
+1:2146e78:                 //fill information obtained from the log buffer.
+1:d18f338:                 shippingInterval = calculateSIfromFI();
+1:d18f338:                 if (shippingInterval != -1) {
+1:d18f338:                     synchronized(objLSTSync) {
+1:d18f338:                         objLSTSync.wait(shippingInterval);
+1:2146e78:                     }
+1:eeeece4:                 }
+1:eeeece4:             } catch (InterruptedException ie) {
+1:5d97422:                 InterruptStatus.setInterrupted();
+1:eeeece4:             } catch (IOException ioe) {
+1:8971c8b:                 //The transmitter is recreated if the connection to the
+1:8971c8b:                 //slave can be re-established.
+1:8971c8b:                 transmitter = masterController.handleExceptions(ioe);
+1:8971c8b:                 //The transmitter cannot be recreated hence stop the log
+1:8971c8b:                 //shipper thread.
+1:8971c8b:                 if (transmitter != null) {
+1:8971c8b:                     continue;
+1:8971c8b:                 }
+1:eeeece4:             } catch (StandardException se) {
+1:eeeece4:                 masterController.handleExceptions(se);
+1:eeeece4:             }
+1:eeeece4:         }
+1:eeeece4:     }
+1:eeeece4:     
+1:eeeece4:     /**
+1:eeeece4:      * Retrieves a chunk of log records, if available, from the log buffer and
+1:eeeece4:      * transmits them to the slave. Used for both periodic and forced shipping.
+1:eeeece4:      *
+1:eeeece4:      * @throws IOException If an exception occurs while trying to ship the
+1:eeeece4:      *                     replication message (containing the log records)
+1:eeeece4:      *                     across the network.
+1:eeeece4:      * @throws StandardException If an exception occurs while trying to read
+1:eeeece4:      *                           log records from the log buffer.
+1:0f8eece:      * 
+1:0f8eece:      * @return true if a chunk of log records was shipped.
+1:0f8eece:      *         false if no log records were shipped because log buffer is empty.
+1:eeeece4:      */
+1:0f8eece:     private synchronized boolean shipALogChunk()
+1:eeeece4:     throws IOException, StandardException {
+1:eeeece4:         byte [] logRecords = null;
+1:864d9d1:         ReplicationMessage mesg = null;
+1:eeeece4:         try {
+1:864d9d1:             //Check to see if a previous log record exists that needs
+1:864d9d1:             //to be re-transmitted. If there is then transmit that
+1:864d9d1:             //log record and then transmit the next log record in the
+1:864d9d1:             //log buffer.
+1:864d9d1:             if (failedChunk != null) {
+1:864d9d1:                 transmitter.sendMessage(failedChunk);
+1:29fd25c:                 highestShippedInstant = failedChunkHighestInstant;
+1:864d9d1:                 failedChunk = null;
+1:864d9d1:             }
+1:864d9d1:             //transmit the log record that is at the head of
+1:864d9d1:             //the log buffer.
+1:eeeece4:             if (logBuffer.next()) {
+1:eeeece4:                 logRecords = logBuffer.getData();
+1:eeeece4:                 
+1:864d9d1:                 mesg = new ReplicationMessage(
+1:eeeece4:                     ReplicationMessage.TYPE_LOG, logRecords);
+1:eeeece4:                 
+1:eeeece4:                 transmitter.sendMessage(mesg);
+1:29fd25c:                 highestShippedInstant = logBuffer.getLastInstant();
+1:2146e78:                 lastShippingTime = System.currentTimeMillis();
+1:0f8eece:                 return true;
+1:0f8eece:             } 
+1:eeeece4:         } catch (NoSuchElementException nse) {
+1:eeeece4:             //Although next() returns true a request for data on the buffer
+1:eeeece4:             //fails implying that there has been a fatal exception in the
+1:eeeece4:             //buffer.
+1:eeeece4:             masterController.handleExceptions(StandardException.newException
+1:eeeece4:                 (SQLState.REPLICATION_UNEXPECTED_EXCEPTION, nse));
+1:864d9d1:         } catch (IOException ioe) {
+1:864d9d1:             //An exception occurred while transmitting the log record.
+1:864d9d1:             //Store the previous log record so that it can be re-transmitted
+1:29fd25c:             if (mesg != null) {
+1:29fd25c:                 failedChunk = mesg;
+1:29fd25c:                 failedChunkHighestInstant = logBuffer.getLastInstant();
+1:29fd25c:             }
+1:864d9d1:             throw ioe;
+1:864d9d1:         }
+1:0f8eece:         return false;
+1:0f8eece:     }
+1:0f8eece:     
+1:0f8eece:     /**
+1:0f8eece:      *
+1:0f8eece:      * Transmits all the log records in the log buffer to the slave.
+1:0f8eece:      *
+1:0f8eece:      * @throws IOException If an exception occurs while trying to ship the
+1:0f8eece:      *                     replication message (containing the log records)
+1:0f8eece:      *                     across the network.
+1:0f8eece:      * @throws StandardException If an exception occurs while trying to read
+1:0f8eece:      *                           log records from the log buffer.
+1:0f8eece:      */
+1:0f8eece:     public void flushBuffer() throws IOException, StandardException {
+1:0f8eece:         while (shipALogChunk());
+1:eeeece4:     }
+1:eeeece4:     
+1:eeeece4:     /**
+1:eeeece4:      * Transmits a chunk of log record from the log buffer to the slave, used
+1:eeeece4:      * by the master controller when the log buffer is full and some space
+1:eeeece4:      * needs to be freed for further log records.
+1:eeeece4:      *
+1:eeeece4:      * @throws IOException If an exception occurs while trying to ship the
+1:eeeece4:      *                     replication message (containing the log records)
+1:eeeece4:      *                     across the network.
+1:eeeece4:      * @throws StandardException If an exception occurs while trying to read
+1:eeeece4:      *                           log records from the log buffer.
+1:eeeece4:      */
+1:0c97a10:     public void forceFlush() throws IOException, StandardException 
+1:0c97a10:     {
+1:0c97a10:         if (stopShipping) return;
+1:0c97a10:         synchronized (forceFlushSemaphore) {
+1:0c97a10:             synchronized (objLSTSync) {
+1:0c97a10:                 // Notify the log shipping thread that
+1:0c97a10:                 // it is time for another send.
+1:0c97a10:                 objLSTSync.notify();
+1:0c97a10:             }
+1:0c97a10: 
+1:0c97a10:             try {
+1:0c97a10:                 forceFlushSemaphore.wait(DEFAULT_FORCEFLUSH_TIMEOUT);
+1:0c97a10:             } catch (InterruptedException ex) {
+1:5d97422:                 InterruptStatus.setInterrupted();
+1:0c97a10:             }
+1:eeeece4:         }
+1:eeeece4:     }
+1:eeeece4:     
+1:eeeece4:     /**
+1:29fd25c:      * Get the highest log instant shipped so far
+1:29fd25c:      * @return the highest log instant shipped so far
+1:29fd25c:      */
+1:29fd25c:     public long getHighestShippedInstant() {
+1:29fd25c:         return highestShippedInstant;
+1:29fd25c:     }
+1:29fd25c: 
+1:29fd25c:     /**
+1:eeeece4:      * updates the information about the latest instance of the log record
+1:eeeece4:      * that has been flushed to the disk. Calling this method has no effect
+1:eeeece4:      * in this asynchronous implementation of the log shipper.
+1:eeeece4:      *
+1:eeeece4:      *
+1:eeeece4:      * @param latestInstanceFlushedToDisk a long that contains the latest
+1:eeeece4:      *        instance of the log record that has been flushed to the disk.
+1:eeeece4:      */
+1:eeeece4:     public void flushedInstance(long latestInstanceFlushedToDisk) {
+1:eeeece4:         //Currently the Asynchronous log shipper
+1:eeeece4:         //does not worry about the last instance flushed.
+1:eeeece4:     }
+1:eeeece4:     
+1:eeeece4:     /**
+1:eeeece4:      * Stop shipping log records. If a ship is currently in progress
+1:eeeece4:      * it will not be interrupted, shipping will stop only after the
+1:0c97a10:      * current shipment is done.
+1:eeeece4:      */
+1:eeeece4:     public void stopLogShipment() {
+1:eeeece4:         stopShipping = true;
+1:eeeece4:     }
+1:2146e78:     
+1:2146e78:     /**
+1:2146e78:      * Used to notify the log shipper that a log buffer element is full.
+1:2146e78:      * This method would basically use the following steps to decide on the 
+1:2146e78:      * action to be taken when a notification from the log shipper is received,
+1:2146e78:      * 
+1:2146e78:      * a) Get FI from log buffer
+1:dbed020:      * b) If FI &gt;= FI_HIGH
+1:2146e78:      *     b.1) notify the log shipper thread.
+1:1d0892e:      * c) Else If the time elapsed since last ship is greater than
+1:1d0892e:      *    minShippingInterval
+1:2146e78:      *     c.1) notify the log shipper thread.
+1:2146e78:      */
+1:2146e78:     public void workToDo() {
+1:2146e78:         //Fill information obtained from the log buffer
+1:2146e78:         int fi;
+1:2146e78:         
+1:2146e78:         fi = logBuffer.getFillInformation();
+1:2146e78:         
+1:d588984:         if (fi >= FI_HIGH || 
+1:1d0892e:                 (System.currentTimeMillis() - lastShippingTime) >
+1:1d0892e:                  minShippingInterval) {
+1:d18f338:             synchronized (objLSTSync) {
+1:d18f338:                 objLSTSync.notify();
+1:d588984:             }
+1:2146e78:         }
+1:2146e78:     }
+1:2146e78:     
+1:2146e78:     /**
+1:2146e78:      * Will be used to calculate the shipping interval based on the fill
+1:2146e78:      * information obtained from the log buffer. This method uses the following
+1:2146e78:      * steps to arrive at the shipping interval,
+1:2146e78:      * 
+1:dbed020:      * a) FI &gt;= FI_HIGH return -1 (signifies that the waiting time should be 0)
+1:dbed020:      * b) FI &gt;  FI_LOW and FI &lt; FI_HIGH return minShippingInterval
+1:dbed020:      * c) FI &lt;= FI_LOW return maxShippingInterval.
+1:2146e78:      * 
+1:2146e78:      * @return the shipping interval based on the fill information.
+1:2146e78:      */
+1:2146e78:     private long calculateSIfromFI() {
+1:2146e78:         //Fill information obtained from the log buffer.
+1:2146e78:         int fi;
+1:2146e78:         
+1:2146e78:         //shipping interval derived from the fill information.
+1:2146e78:         long si;
+1:2146e78:         
+1:2146e78:         fi = logBuffer.getFillInformation();
+1:2146e78:         
+2:2146e78:         if (fi >= FI_HIGH) {
+1:2146e78:             si = -1;
+1:2146e78:         } else if (fi > FI_LOW && fi < FI_HIGH) {
+1:1d0892e:             si = minShippingInterval;
+1:2146e78:         } else {
+1:1d0892e:             si = maxShippingInterval;
+1:2146e78:         }
+1:2146e78:         
+1:2146e78:         return si;
+1:2146e78:     }
+1:eeeece4: 
+1:1d0892e:     /**
+1:1d0892e:      * Load relevant system properties: max and min log shipping interval
+1:1d0892e:      */
+1:1d0892e:     private void getLogShipperProperties() {
+1:1d0892e:         minShippingInterval = PropertyUtil.
+1:1d0892e:             getSystemInt(Property.REPLICATION_MIN_SHIPPING_INTERVAL, (int)MIN);
+1:1d0892e:         maxShippingInterval = PropertyUtil.
+1:1d0892e:             getSystemInt(Property.REPLICATION_MAX_SHIPPING_INTERVAL, (int)MAX);
+1:1d0892e: 
+1:1d0892e:         // To guarantee a maximum log shipping delay,
+1:1d0892e:         // minShippingInterval cannot be higher than
+1:1d0892e:         // maxShippingInterval / #logbuffers. See javadoc for MAX
+1:c283bcd:         int buffers = ReplicationLogBuffer.DEFAULT_NUMBER_LOG_BUFFERS;
+1:1d0892e:         if (minShippingInterval > maxShippingInterval / buffers) {
+1:1d0892e:             minShippingInterval = maxShippingInterval / buffers;
+1:1d0892e:             if (SanityManager.DEBUG) {
+1:1d0892e:                 repLogger.logText("Minimum log shipping " +
+1:1d0892e:                                   "interval too large to guarantee " +
+1:1d0892e:                                   "the current maximum interval (" +
+1:1d0892e:                                   maxShippingInterval +
+1:1d0892e:                                   "). New minimum interval: " +
+1:1d0892e:                                   minShippingInterval,
+1:1d0892e:                                   false);
+1:eeeece4:             }
+1:eeeece4:         }
+1:eeeece4:     }
+2:1d0892e: 
+3:1d0892e: }
+============================================================================
+author:Richard N. Hillegas
+-------------------------------------------------------------------------------
+commit:dbed020
+/////////////////////////////////////////////////////////////////////////
+1:      * latency offered by the choice of MIN, hence MAX &gt; DEFAULT_NUMBER_LOG_BUFFERS*MIN.
+/////////////////////////////////////////////////////////////////////////
+1:      * b) If FI &gt;= FI_HIGH
+/////////////////////////////////////////////////////////////////////////
+1:      * a) FI &gt;= FI_HIGH return -1 (signifies that the waiting time should be 0)
+1:      * b) FI &gt;  FI_LOW and FI &lt; FI_HIGH return minShippingInterval
+1:      * c) FI &lt;= FI_LOW return maxShippingInterval.
+author:Bryan Pendleton
+-------------------------------------------------------------------------------
+commit:7e51e9d
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.shared.common.sanity.SanityManager;
+author:Dag H. Wanvik
+-------------------------------------------------------------------------------
+commit:5d97422
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.util.InterruptStatus;
+/////////////////////////////////////////////////////////////////////////
+1:                 InterruptStatus.setInterrupted();
+/////////////////////////////////////////////////////////////////////////
+1:                 InterruptStatus.setInterrupted();
+commit:c083785
+/////////////////////////////////////////////////////////////////////////
+1:                     shipALogChunk();
+author:Oystein Grovlen
+-------------------------------------------------------------------------------
+commit:0c97a10
+/////////////////////////////////////////////////////////////////////////
+1:     private volatile boolean stopShipping = false;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     /** Used to synchronize forceFlush calls */
+1:     private Object forceFlushSemaphore = new Object();
+1: 
+1:     /** The number of millis a call to forceFlush will wait before giving
+1:      * up sending a chunk of log to the slave */
+1:     public static final int DEFAULT_FORCEFLUSH_TIMEOUT = 5000;
+/////////////////////////////////////////////////////////////////////////
+1:                 synchronized (forceFlushSemaphore) {
+1:                     // Wake up a thread waiting for forceFlush, if any
+1:                     forceFlushSemaphore.notify();
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+1:     public void forceFlush() throws IOException, StandardException 
+1:     {
+1:         if (stopShipping) return;
+1:         synchronized (forceFlushSemaphore) {
+1:             synchronized (objLSTSync) {
+1:                 // Notify the log shipping thread that
+1:                 // it is time for another send.
+1:                 objLSTSync.notify();
+1:             }
+1: 
+1:             try {
+1:                 forceFlushSemaphore.wait(DEFAULT_FORCEFLUSH_TIMEOUT);
+1:             } catch (InterruptedException ex) {
+1:             }
+/////////////////////////////////////////////////////////////////////////
+1:      * current shipment is done.
+commit:8971c8b
+/////////////////////////////////////////////////////////////////////////
+1:     private ReplicationMessageTransmit transmitter;
+/////////////////////////////////////////////////////////////////////////
+1:                 //The transmitter is recreated if the connection to the
+1:                 //slave can be re-established.
+1:                 transmitter = masterController.handleExceptions(ioe);
+1:                 //The transmitter cannot be recreated hence stop the log
+1:                 //shipper thread.
+1:                 if (transmitter != null) {
+1:                     continue;
+1:                 }
+commit:c283bcd
+/////////////////////////////////////////////////////////////////////////
+1:         int buffers = ReplicationLogBuffer.DEFAULT_NUMBER_LOG_BUFFERS;
+/////////////////////////////////////////////////////////////////////////
+1: 
+commit:d18f338
+/////////////////////////////////////////////////////////////////////////
+1:      * Object used to synchronize on while the log shipper thread
+1:      * is moved into the wait state, or while notifying it.
+1:      */
+1:     private Object objLSTSync = new Object(); // LST->Log Shippper Thread
+1:     
+1:     /**
+/////////////////////////////////////////////////////////////////////////
+1:                 shippingInterval = calculateSIfromFI();
+1:                 if (shippingInterval != -1) {
+1:                     synchronized(objLSTSync) {
+1:                         objLSTSync.wait(shippingInterval);
+/////////////////////////////////////////////////////////////////////////
+0:         synchronized(objLSTSync) {
+1:             objLSTSync.notify();
+/////////////////////////////////////////////////////////////////////////
+1:             synchronized (objLSTSync) {
+0:                 objLSTSync.notify();
+commit:1bac3f3
+/////////////////////////////////////////////////////////////////////////
+1:    Derby - Class org.apache.derby.impl.store.replication.master.AsynchronousLogShipper
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.derby.impl.store.replication.master;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.impl.store.replication.ReplicationLogger;
+1: import org.apache.derby.impl.store.replication.buffer.ReplicationLogBuffer;
+1: import org.apache.derby.impl.store.replication.net.ReplicationMessage;
+1: import org.apache.derby.impl.store.replication.net.ReplicationMessageTransmit;
+commit:41a2601
+/////////////////////////////////////////////////////////////////////////
+1:         super("derby.master.logger-" + masterController.getDbName());
+commit:29fd25c
+/////////////////////////////////////////////////////////////////////////
+1:     /** The highest log instant in failedChunk  */
+1:     private long failedChunkHighestInstant = -1;
+1:     /** The highest log instant shipped so far  */
+1:     private long highestShippedInstant = -1;
+/////////////////////////////////////////////////////////////////////////
+1:                 highestShippedInstant = failedChunkHighestInstant;
+/////////////////////////////////////////////////////////////////////////
+1:                 highestShippedInstant = logBuffer.getLastInstant();
+/////////////////////////////////////////////////////////////////////////
+1:             if (mesg != null) {
+1:                 failedChunk = mesg;
+1:                 failedChunkHighestInstant = logBuffer.getLastInstant();
+1:             }
+/////////////////////////////////////////////////////////////////////////
+1:      * Get the highest log instant shipped so far
+1:      * @return the highest log instant shipped so far
+1:      */
+1:     public long getHighestShippedInstant() {
+1:         return highestShippedInstant;
+1:     }
+1: 
+1:     /**
+commit:d588984
+/////////////////////////////////////////////////////////////////////////
+1:         if (fi >= FI_HIGH || 
+0:                 (System.currentTimeMillis() - lastShippingTime) > MIN) {
+0:             synchronized (this) {
+0:                 notify();
+1:             }
+commit:2146e78
+/////////////////////////////////////////////////////////////////////////
+1:  * 3) when a notification is received from the log shipper about a log
+1:  *    buffer element becoming full and the load on the log buffer so
+1:  *    warrants a ship.
+/////////////////////////////////////////////////////////////////////////
+1:      * Will store the time at which the last shipping happened. Will be used
+1:      * to calculate the interval between the log ships upon receiving a
+1:      * notification from the log buffer.
+1:      */
+1:     private long lastShippingTime;
+1:     
+1:     /**
+/////////////////////////////////////////////////////////////////////////
+1:      * Fill information value indicative of a low load in the log buffer.
+1:      */
+1:     private static final int FI_LOW = 10;
+1:     
+1:     /**
+1:      * Fill information value indicative of a high load in the log buffer.
+1:      */
+1:     private static final int FI_HIGH = 80;
+1:     
+1:     
+1:     /**
+1:      * If the fill information (obtained from the log buffer) is less than 
+1:      * FI_HIGH but greater than FI_LOW the log shipper will ship with a MIN ms delay.
+1:      * MIN is a value that is only as large as not to affect the performance
+1:      * of the master database significantly.
+1:      */
+1:     private static final long MIN = 100;
+1:     
+1:     /**
+1:      * If the fill information is less than FI_LOW the log shipper will ship 
+1:      * with a MAX ms delay or when a buffer becomes full whichever comes 
+1:      * first. The delay however will not be smaller than MIN. 
+1:      * max(MAX, DEFAULT_NUMBER_LOG_BUFFERS*MIN) is the maximum delay between a 
+1:      * log record is committed at the master until it is replicated  to the 
+1:      * slave. Hence the default latency should be atleast greater than the maximum
+0:      * latency offered by the choice of MIN, hence MAX > DEFAULT_NUMBER_LOG_BUFFERS*MIN.
+1:      */
+1:     private static final long MAX = 5000;
+1: 
+1:     /**
+/////////////////////////////////////////////////////////////////////////
+0:         shippingInterval = MIN;
+1:         lastShippingTime = System.currentTimeMillis();
+1:      * The log shipping happens between shipping intervals of time, the 
+1:      * shipping interval being derived from the fill information (an indicator
+1:      * of load in the log buffer) obtained from the log buffer. The shipping
+1:      * can also be triggered in the following situations,
+1:      * 
+1:      * 1) Based on notifications from the log buffer, where the fill 
+1:      *    information is again used as the basis to decide whether a
+1:      *    shipping should happen or not
+1:      * 2) On a forceFlush triggered by the log buffer becoming full
+1:      *    and the LogBufferFullException being thrown. 
+1:                 //calculate the shipping interval (wait time) based on the
+1:                 //fill information obtained from the log buffer.
+0:                     shippingInterval = calculateSIfromFI();
+0:                     if (shippingInterval != -1) {
+0:                         wait(shippingInterval);
+1:                     }
+/////////////////////////////////////////////////////////////////////////
+1:                 lastShippingTime = System.currentTimeMillis();
+/////////////////////////////////////////////////////////////////////////
+1:     
+1:     /**
+1:      * Used to notify the log shipper that a log buffer element is full.
+1:      * This method would basically use the following steps to decide on the 
+1:      * action to be taken when a notification from the log shipper is received,
+1:      * 
+1:      * a) Get FI from log buffer
+0:      * b) If FI >= FI_HIGH
+1:      *     b.1) notify the log shipper thread.
+0:      * c) Else If the time elapsed since last ship is greater than MIN
+1:      *     c.1) notify the log shipper thread.
+1:      */
+1:     public void workToDo() {
+1:         //Fill information obtained from the log buffer
+1:         int fi;
+1:         
+1:         fi = logBuffer.getFillInformation();
+1:         
+1:         if (fi >= FI_HIGH) {
+0:             notify();
+0:         } else if ((System.currentTimeMillis() - lastShippingTime) > MIN) {
+0:             // Minimum MIN time between messages unless buffer is almost full
+0:             notify();
+1:         }
+1:     }
+1:     
+1:     /**
+1:      * Will be used to calculate the shipping interval based on the fill
+1:      * information obtained from the log buffer. This method uses the following
+1:      * steps to arrive at the shipping interval,
+1:      * 
+0:      * a) FI >= FI_HIGH return -1 (signifies that the waiting time should be 0)
+0:      * b) FI >  FI_LOW and FI < FI_HIGH return MIN
+0:      * c) FI <= FI_LOW return MAX.
+1:      * 
+1:      * @return the shipping interval based on the fill information.
+1:      */
+1:     private long calculateSIfromFI() {
+1:         //Fill information obtained from the log buffer.
+1:         int fi;
+1:         
+1:         //shipping interval derived from the fill information.
+1:         long si;
+1:         
+1:         fi = logBuffer.getFillInformation();
+1:         
+1:         if (fi >= FI_HIGH) {
+1:             si = -1;
+1:         } else if (fi > FI_LOW && fi < FI_HIGH) {
+0:             si = MIN;
+1:         } else {
+0:             si = MAX;
+1:         }
+1:         
+1:         return si;
+1:     }
+commit:0f8eece
+/////////////////////////////////////////////////////////////////////////
+1:      * 
+1:      * @return true if a chunk of log records was shipped.
+1:      *         false if no log records were shipped because log buffer is empty.
+1:     private synchronized boolean shipALogChunk()
+/////////////////////////////////////////////////////////////////////////
+1:                 return true;
+1:             } 
+/////////////////////////////////////////////////////////////////////////
+1:         return false;
+1:     }
+1:     
+1:     /**
+1:      *
+1:      * Transmits all the log records in the log buffer to the slave.
+1:      *
+1:      * @throws IOException If an exception occurs while trying to ship the
+1:      *                     replication message (containing the log records)
+1:      *                     across the network.
+1:      * @throws StandardException If an exception occurs while trying to read
+1:      *                           log records from the log buffer.
+1:      */
+1:     public void flushBuffer() throws IOException, StandardException {
+1:         while (shipALogChunk());
+commit:864d9d1
+/////////////////////////////////////////////////////////////////////////
+1:      * Store the log chunk that failed during a previous shipping attempt
+1:      * so that it can be re-shipped to the slave.
+1:      */
+1:     private ReplicationMessage failedChunk = null;
+1:     
+1:     /**
+/////////////////////////////////////////////////////////////////////////
+1:         this.stopShipping = false;
+/////////////////////////////////////////////////////////////////////////
+0:                 //Interrupt the log shipping thread.
+0:                 return;
+/////////////////////////////////////////////////////////////////////////
+1:         ReplicationMessage mesg = null;
+1:             //Check to see if a previous log record exists that needs
+1:             //to be re-transmitted. If there is then transmit that
+1:             //log record and then transmit the next log record in the
+1:             //log buffer.
+1:             if (failedChunk != null) {
+1:                 transmitter.sendMessage(failedChunk);
+1:                 failedChunk = null;
+1:             }
+1:             //transmit the log record that is at the head of
+1:             //the log buffer.
+1:                 mesg = new ReplicationMessage(
+/////////////////////////////////////////////////////////////////////////
+1:         } catch (IOException ioe) {
+1:             //An exception occurred while transmitting the log record.
+1:             //Store the previous log record so that it can be re-transmitted
+0:             failedChunk = (mesg==null) ? failedChunk : mesg;
+1:             throw ioe;
+/////////////////////////////////////////////////////////////////////////
+0:         if (!stopShipping) {
+0:             shipALogChunk();
+1:         }
+commit:eeeece4
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  
+0:    Derby - Class org.apache.derby.impl.services.replication.master.AsynchronousLogShipper
+1:  
+1:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:    contributor license agreements.  See the NOTICE file distributed with
+1:    this work for additional information regarding copyright ownership.
+1:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:    (the "License"); you may not use this file except in compliance with
+1:    the License.  You may obtain a copy of the License at
+1:  
+1:       http://www.apache.org/licenses/LICENSE-2.0
+1:  
+1:    Unless required by applicable law or agreed to in writing, software
+1:    distributed under the License is distributed on an "AS IS" BASIS,
+1:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:    See the License for the specific language governing permissions and
+1:    limitations under the License.
+1:  
+1:  */
+1: 
+0: package org.apache.derby.impl.services.replication.master;
+1: 
+1: import java.io.IOException;
+1: import java.util.NoSuchElementException;
+1: 
+1: import org.apache.derby.iapi.error.StandardException;
+1: import org.apache.derby.iapi.reference.SQLState;
+1: 
+0: import org.apache.derby.impl.services.replication.buffer.ReplicationLogBuffer;
+0: import org.apache.derby.impl.services.replication.net.ReplicationMessage;
+0: import org.apache.derby.impl.services.replication.net.ReplicationMessageTransmit;
+1: 
+1: /**
+1:  * <p>
+1:  * Does asynchronous shipping of log records from the master to the slave being
+1:  * replicated to. The implementation does not ship log records as soon as they
+1:  * become available in the log buffer (synchronously), instead it does log
+1:  * shipping in the following two-fold scenarios
+1:  *
+1:  * 1) Periodically (i.e.) at regular intervals of time.
+1:  *
+1:  * 2) when a request is sent from the master controller (force flushing of
+1:  *    the log buffer).
+1:  * </p>
+1:  * <p>
+0:  * The interval at which log shipping happens is configurable. The log shipper
+0:  * accepts the interval at which the shipping should be done during
+0:  * initialization.
+1:  *
+0:  * Periodic shipping and force flushing are time aware of each other (i.e.)
+0:  * a force flush results in the time of next periodic shipping being calculated
+0:  * from the force flush time.
+1:  * </p>
+1:  */
+1: public class AsynchronousLogShipper extends Thread implements
+1:     LogShipper {
+1:     
+1:     /**
+1:      * Replication log buffer that contains the log records that need to
+1:      * be transmitted to the slave.
+1:      */
+1:     final private ReplicationLogBuffer logBuffer;
+1:     
+1:     /**
+1:      * Replication message transmitter that is used for the network
+1:      * transmission of the log records retrieved from the log buffer
+1:      * (on the master) to the slave being replicated to.
+1:      */
+0:     final private ReplicationMessageTransmit transmitter;
+1:     
+1:     /**
+1:      * Time interval (in milliseconds) at which the log shipping takes place.
+1:      */
+1:     private long shippingInterval;
+1:     
+1:     /**
+1:      * Indicates whether a stop shipping request has been sent.
+1:      * true - stop shipping log records
+1:      * false - shipping can continue without interruption.
+1:      */
+0:     private boolean stopShipping = false;
+1:     
+1:     /**
+1:      * The master controller that initialized this log shipper.
+1:      */
+1:     private MasterController masterController = null;
+1:     
+1:     /**
+1:      * Constructor initializes the log buffer, the replication message
+1:      * transmitter, the shipping interval and the master controller.
+1:      *
+1:      * @param logBuffer the replication log buffer that contains the log record
+1:      *                  chunks to be transmitted to the slave.
+1:      * @param transmitter the replication message transmitter that is used for
+1:      *                    network transmission of retrieved log records.
+0:      * @param shippingInterval a long value that stores the time interval in
+0:      *                         milliseconds at which the log shipping takes
+0:      *                         place.
+1:      * @param masterController The master controller that initialized this log
+1:      *                         shipper.
+1:      */
+1:     public AsynchronousLogShipper(ReplicationLogBuffer logBuffer,
+1:         ReplicationMessageTransmit transmitter,
+0:         long shippingInterval,
+0:         MasterController masterController) {
+1:         this.logBuffer = logBuffer;
+1:         this.transmitter = transmitter;
+0:         this.shippingInterval = shippingInterval;
+1:         this.masterController = masterController;
+1:     }
+1:     
+1:     /**
+1:      * Ships log records from the log buffer to the slave being replicated to.
+0:      * The log shipping happens at the configured shipping intervals unless a
+0:      * force flush happens, which triggers periodic shipping also since there
+0:      * will still be more log to send after the forceFlush has sent one chunk.
+1:      */
+1:     public void run() {
+1:         while (!stopShipping) {
+1:             try {
+0:                 shipALogChunk();
+0:                 //Make the thread wait for shipping interval of time before
+0:                 //the next transmission happens.
+0:                 synchronized(this) {
+0:                     wait(shippingInterval);
+1:                 }
+1:             } catch (InterruptedException ie) {
+0:                 //Ignore the Interrupted exception to enable stopping
+0:                 //the shipping thread in a controlled way.
+1:             } catch (IOException ioe) {
+0:                 masterController.handleExceptions(ioe);
+1:             } catch (StandardException se) {
+1:                 masterController.handleExceptions(se);
+1:             }
+1:         }
+1:     }
+1:     
+1:     /**
+1:      * Retrieves a chunk of log records, if available, from the log buffer and
+1:      * transmits them to the slave. Used for both periodic and forced shipping.
+1:      *
+1:      * @throws IOException If an exception occurs while trying to ship the
+1:      *                     replication message (containing the log records)
+1:      *                     across the network.
+1:      * @throws StandardException If an exception occurs while trying to read
+1:      *                           log records from the log buffer.
+1:      */
+0:     private synchronized void shipALogChunk()
+1:     throws IOException, StandardException {
+1:         byte [] logRecords = null;
+1:         try {
+1:             if (logBuffer.next()) {
+1:                 logRecords = logBuffer.getData();
+1:                 
+0:                 ReplicationMessage mesg = new ReplicationMessage(
+1:                     ReplicationMessage.TYPE_LOG, logRecords);
+1:                 
+1:                 transmitter.sendMessage(mesg);
+1:             }
+1:         } catch (NoSuchElementException nse) {
+1:             //Although next() returns true a request for data on the buffer
+1:             //fails implying that there has been a fatal exception in the
+1:             //buffer.
+1:             masterController.handleExceptions(StandardException.newException
+1:                 (SQLState.REPLICATION_UNEXPECTED_EXCEPTION, nse));
+1:         }
+1:     }
+1:     
+1:     /**
+1:      * Transmits a chunk of log record from the log buffer to the slave, used
+1:      * by the master controller when the log buffer is full and some space
+1:      * needs to be freed for further log records.
+1:      *
+1:      * @throws IOException If an exception occurs while trying to ship the
+1:      *                     replication message (containing the log records)
+1:      *                     across the network.
+1:      * @throws StandardException If an exception occurs while trying to read
+1:      *                           log records from the log buffer.
+1:      */
+0:     public void forceFlush() throws IOException, StandardException {
+0:         shipALogChunk();
+1:         
+0:         synchronized(this) {
+0:             //There will still be more log to send after the forceFlush
+0:             //has sent one chunk.  Notify the log shipping thread that
+0:             //it is time for another send.
+0:             notify();
+1:         }
+1:     }
+1:     
+1:     /**
+1:      * updates the information about the latest instance of the log record
+1:      * that has been flushed to the disk. Calling this method has no effect
+1:      * in this asynchronous implementation of the log shipper.
+1:      *
+1:      *
+1:      * @param latestInstanceFlushedToDisk a long that contains the latest
+1:      *        instance of the log record that has been flushed to the disk.
+1:      */
+1:     public void flushedInstance(long latestInstanceFlushedToDisk) {
+1:         //Currently the Asynchronous log shipper
+1:         //does not worry about the last instance flushed.
+1:     }
+1:     
+1:     /**
+1:      * Stop shipping log records. If a ship is currently in progress
+1:      * it will not be interrupted, shipping will stop only after the
+0:      * current shippment is done.
+1:      */
+1:     public void stopLogShipment() {
+1:         stopShipping = true;
+1:     }
+1: }
+author:Knut Anders Hatlen
+-------------------------------------------------------------------------------
+commit:68b4227
+/////////////////////////////////////////////////////////////////////////
+1:      * @see #MIN
+1:      * @see #MAX
+commit:1d0892e
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.reference.Property;
+1: import org.apache.derby.iapi.services.property.PropertyUtil;
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+0: import org.apache.derby.impl.services.replication.ReplicationLogger;
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Minimum interval (in milliseconds) between log shipping.
+1:      * Defaults to MIN, but can be configured using system property
+1:      * derby.replication.minLogShippingInterval
+0:      * @see MIN
+1:      */
+1:     private long minShippingInterval;
+1:     /**
+1:      * Minimum interval (in milliseconds) between log shipping.
+1:      * Defaults to MAX, but can be configured using system property
+1:      * derby.replication.maxLogShippingInterval
+0:      * @see MAX
+1:      */
+1:     private long maxShippingInterval;
+/////////////////////////////////////////////////////////////////////////
+1:     private final ReplicationLogger repLogger;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:      * @param repLogger The replication logger that will write messages to
+1:      * the log file (typically derby.log)
+0:                                   ReplicationMessageTransmit transmitter,
+1:                                   MasterController masterController,
+1:                                   ReplicationLogger repLogger) {
+1:         this.repLogger = repLogger;
+1: 
+1:         getLogShipperProperties();
+1:         shippingInterval = minShippingInterval;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:      * c) Else If the time elapsed since last ship is greater than
+1:      *    minShippingInterval
+/////////////////////////////////////////////////////////////////////////
+1:                 (System.currentTimeMillis() - lastShippingTime) >
+1:                  minShippingInterval) {
+/////////////////////////////////////////////////////////////////////////
+0:      * b) FI >  FI_LOW and FI < FI_HIGH return minShippingInterval
+0:      * c) FI <= FI_LOW return maxShippingInterval.
+/////////////////////////////////////////////////////////////////////////
+1:             si = minShippingInterval;
+1:             si = maxShippingInterval;
+1: 
+1:     /**
+1:      * Load relevant system properties: max and min log shipping interval
+1:      */
+1:     private void getLogShipperProperties() {
+1:         minShippingInterval = PropertyUtil.
+1:             getSystemInt(Property.REPLICATION_MIN_SHIPPING_INTERVAL, (int)MIN);
+1:         maxShippingInterval = PropertyUtil.
+1:             getSystemInt(Property.REPLICATION_MAX_SHIPPING_INTERVAL, (int)MAX);
+1: 
+1:         // To guarantee a maximum log shipping delay,
+1:         // minShippingInterval cannot be higher than
+1:         // maxShippingInterval / #logbuffers. See javadoc for MAX
+0:         int buffers = logBuffer.DEFAULT_NUMBER_LOG_BUFFERS;
+1:         if (minShippingInterval > maxShippingInterval / buffers) {
+1:             minShippingInterval = maxShippingInterval / buffers;
+1:             if (SanityManager.DEBUG) {
+1:                 repLogger.logText("Minimum log shipping " +
+1:                                   "interval too large to guarantee " +
+1:                                   "the current maximum interval (" +
+1:                                   maxShippingInterval +
+1:                                   "). New minimum interval: " +
+1:                                   minShippingInterval,
+1:                                   false);
+1:             }
+1:         }
+1:     }
+============================================================================

@@ -1,0 +1,584 @@
+1:c055ab9: /*
+1:c055ab9:  * Licensed to the Apache Software Foundation (ASF) under one
+1:c055ab9:  * or more contributor license agreements.  See the NOTICE file
+1:c055ab9:  * distributed with this work for additional information
+1:c055ab9:  * regarding copyright ownership.  The ASF licenses this file
+1:c055ab9:  * to you under the Apache License, Version 2.0 (the
+1:c055ab9:  * "License"); you may not use this file except in compliance
+1:c055ab9:  * with the License.  You may obtain a copy of the License at
+1:c055ab9:  *
+1:c055ab9:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:c055ab9:  *
+1:c055ab9:  * Unless required by applicable law or agreed to in writing, software
+1:c055ab9:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:c055ab9:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:c055ab9:  * See the License for the specific language governing permissions and
+1:c055ab9:  * limitations under the License.
+1:c055ab9:  */
+1:c055ab9: package org.apache.cassandra.db.rows;
+6:c055ab9: 
+1:c055ab9: import java.io.IOException;
+1:c055ab9: import java.util.*;
+1:c055ab9: 
+1:c055ab9: import org.apache.cassandra.db.*;
+1:c055ab9: import org.apache.cassandra.db.partitions.PartitionStatisticsCollector;
+1:c055ab9: import org.apache.cassandra.io.util.DataInputPlus;
+1:c055ab9: import org.apache.cassandra.io.util.DataOutputPlus;
+1:c055ab9: 
+1:c055ab9: /**
+1:c055ab9:  * Stats used for the encoding of the rows and tombstones of a given source.
+1:c055ab9:  * <p>
+1:c055ab9:  * Those stats are used to optimize the on-wire and on-disk storage of rows. More precisely,
+1:c055ab9:  * the {@code minTimestamp}, {@code minLocalDeletionTime} and {@code minTTL} stats are used to
+1:0d74c3e:  * delta-encode those information for the sake of vint encoding.
+1:c055ab9:  * <p>
+1:c055ab9:  * Note that due to their use, those stats can suffer to be somewhat inaccurate (the more incurrate
+1:c055ab9:  * they are, the less effective the storage will be, but provided the stats are not completly wacky,
+1:c055ab9:  * this shouldn't have too huge an impact on performance) and in fact they will not always be
+1:c055ab9:  * accurate for reasons explained in {@link SerializationHeader#make}.
+1:c055ab9:  */
+1:c055ab9: public class EncodingStats
+2:c055ab9: {
+1:c055ab9:     // Default values for the timestamp, deletion time and ttl. We use this both for NO_STATS, but also to serialize
+1:c055ab9:     // an EncodingStats. Basically, we encode the diff of each value of to these epoch, which give values with better vint encoding.
+1:c055ab9:     private static final long TIMESTAMP_EPOCH;
+1:c055ab9:     private static final int DELETION_TIME_EPOCH;
+1:c055ab9:     private static final int TTL_EPOCH = 0;
+1:c055ab9:     static
+1:c055ab9:     {
+1:c055ab9:         // We want a fixed epoch, but that provide small values when substracted from our timestamp and deletion time.
+1:c055ab9:         // So we somewhat arbitrary use the date of the summit 2015, which should hopefully roughly correspond to 3.0 release.
+1:c055ab9:         Calendar c = Calendar.getInstance(TimeZone.getTimeZone("GMT-0"), Locale.US);
+1:c055ab9:         c.set(Calendar.YEAR, 2015);
+1:c055ab9:         c.set(Calendar.MONTH, Calendar.SEPTEMBER);
+1:c055ab9:         c.set(Calendar.DAY_OF_MONTH, 22);
+1:c055ab9:         c.set(Calendar.HOUR_OF_DAY, 0);
+1:c055ab9:         c.set(Calendar.MINUTE, 0);
+1:c055ab9:         c.set(Calendar.SECOND, 0);
+1:c055ab9:         c.set(Calendar.MILLISECOND, 0);
+1:c055ab9: 
+1:c055ab9:         TIMESTAMP_EPOCH = c.getTimeInMillis() * 1000; // timestamps should be in microseconds by convention
+1:c055ab9:         DELETION_TIME_EPOCH = (int)(c.getTimeInMillis() / 1000); // local deletion times are in seconds
+2:c055ab9:     }
+1:e51f83b: 
+1:c055ab9:     // We should use this sparingly obviously
+1:0d74c3e:     public static final EncodingStats NO_STATS = new EncodingStats(TIMESTAMP_EPOCH, DELETION_TIME_EPOCH, TTL_EPOCH);
+1:c055ab9: 
+1:c055ab9:     public static final Serializer serializer = new Serializer();
+1:c055ab9: 
+1:c055ab9:     public final long minTimestamp;
+1:c055ab9:     public final int minLocalDeletionTime;
+1:c055ab9:     public final int minTTL;
+1:c055ab9: 
+1:c055ab9:     public EncodingStats(long minTimestamp,
+1:c055ab9:                          int minLocalDeletionTime,
+1:0d74c3e:                          int minTTL)
+1:c055ab9:     {
+1:c055ab9:         // Note that the exact value of those don't impact correctness, just the efficiency of the encoding. So when we
+1:c055ab9:         // get a value for timestamp (resp. minLocalDeletionTime) that means 'no object had a timestamp' (resp. 'a local
+1:c055ab9:         // deletion time'), then what value we store for minTimestamp (resp. minLocalDeletionTime) doesn't matter, and
+1:c055ab9:         // it's thus more efficient to use our EPOCH numbers, since it will result in a guaranteed 1 byte encoding.
+1:c055ab9: 
+1:c055ab9:         this.minTimestamp = minTimestamp == LivenessInfo.NO_TIMESTAMP ? TIMESTAMP_EPOCH : minTimestamp;
+1:c055ab9:         this.minLocalDeletionTime = minLocalDeletionTime == LivenessInfo.NO_EXPIRATION_TIME ? DELETION_TIME_EPOCH : minLocalDeletionTime;
+1:c055ab9:         this.minTTL = minTTL;
+1:c055ab9:     }
+1:c055ab9: 
+1:c055ab9:     /**
+1:c055ab9:      * Merge this stats with another one.
+1:c055ab9:      * <p>
+1:c055ab9:      * The comments of {@link SerializationHeader#make} applies here too, i.e. the result of
+1:c055ab9:      * merging will be not totally accurate but we can live with that.
+1:c055ab9:      */
+1:c055ab9:     public EncodingStats mergeWith(EncodingStats that)
+1:c055ab9:     {
+1:c055ab9:         long minTimestamp = this.minTimestamp == TIMESTAMP_EPOCH
+1:c055ab9:                           ? that.minTimestamp
+1:c055ab9:                           : (that.minTimestamp == TIMESTAMP_EPOCH ? this.minTimestamp : Math.min(this.minTimestamp, that.minTimestamp));
+1:c055ab9: 
+1:c055ab9:         int minDelTime = this.minLocalDeletionTime == DELETION_TIME_EPOCH
+1:c055ab9:                        ? that.minLocalDeletionTime
+1:c055ab9:                        : (that.minLocalDeletionTime == DELETION_TIME_EPOCH ? this.minLocalDeletionTime : Math.min(this.minLocalDeletionTime, that.minLocalDeletionTime));
+1:c055ab9: 
+1:c055ab9:         int minTTL = this.minTTL == TTL_EPOCH
+1:c055ab9:                    ? that.minTTL
+1:c055ab9:                    : (that.minTTL == TTL_EPOCH ? this.minTTL : Math.min(this.minTTL, that.minTTL));
+1:c055ab9: 
+1:0d74c3e:         return new EncodingStats(minTimestamp, minDelTime, minTTL);
+1:c055ab9:     }
+1:c055ab9: 
+1:c055ab9:     @Override
+1:c055ab9:     public boolean equals(Object o)
+1:c055ab9:     {
+1:c055ab9:         if (this == o) return true;
+1:c055ab9:         if (o == null || getClass() != o.getClass()) return false;
+1:c055ab9: 
+1:c055ab9:         EncodingStats that = (EncodingStats) o;
+1:c055ab9: 
+1:0d74c3e:         return this.minLocalDeletionTime == that.minLocalDeletionTime
+1:c055ab9:             && this.minTTL == that.minTTL
+1:c055ab9:             && this.minTimestamp == that.minTimestamp;
+1:c055ab9:     }
+1:c055ab9: 
+1:c055ab9:     @Override
+1:c055ab9:     public int hashCode()
+1:c055ab9:     {
+1:0d74c3e:         return Objects.hash(minTimestamp, minLocalDeletionTime, minTTL);
+1:c055ab9:     }
+1:c055ab9: 
+1:c055ab9:     @Override
+1:c055ab9:     public String toString()
+1:c055ab9:     {
+1:80a141c:         return String.format("EncodingStats(ts=%d, ldt=%d, ttl=%d)", minTimestamp, minLocalDeletionTime, minTTL);
+1:c055ab9:     }
+1:c055ab9: 
+1:c055ab9:     public static class Collector implements PartitionStatisticsCollector
+1:c055ab9:     {
+1:c055ab9:         private boolean isTimestampSet;
+1:c055ab9:         private long minTimestamp = Long.MAX_VALUE;
+1:c055ab9: 
+1:c055ab9:         private boolean isDelTimeSet;
+1:c055ab9:         private int minDeletionTime = Integer.MAX_VALUE;
+1:c055ab9: 
+1:c055ab9:         private boolean isTTLSet;
+1:c055ab9:         private int minTTL = Integer.MAX_VALUE;
+1:c055ab9: 
+1:c055ab9:         public void update(LivenessInfo info)
+1:c055ab9:         {
+1:c055ab9:             if (info.isEmpty())
+2:c055ab9:                 return;
+1:c055ab9: 
+1:c055ab9:             updateTimestamp(info.timestamp());
+1:c055ab9: 
+1:c055ab9:             if (info.isExpiring())
+1:c055ab9:             {
+1:c055ab9:                 updateTTL(info.ttl());
+1:c055ab9:                 updateLocalDeletionTime(info.localExpirationTime());
+1:c055ab9:             }
+1:c055ab9:         }
+1:c055ab9: 
+1:c055ab9:         public void update(Cell cell)
+1:c055ab9:         {
+1:c055ab9:             updateTimestamp(cell.timestamp());
+1:c055ab9:             if (cell.isExpiring())
+1:c055ab9:             {
+1:c055ab9:                 updateTTL(cell.ttl());
+1:c055ab9:                 updateLocalDeletionTime(cell.localDeletionTime());
+1:c055ab9:             }
+1:c055ab9:             else if (cell.isTombstone())
+1:c055ab9:             {
+1:c055ab9:                 updateLocalDeletionTime(cell.localDeletionTime());
+1:c055ab9:             }
+1:c055ab9:         }
+1:c055ab9: 
+1:c055ab9:         public void update(DeletionTime deletionTime)
+1:c055ab9:         {
+1:c055ab9:             if (deletionTime.isLive())
+1:c055ab9:                 return;
+1:c055ab9: 
+1:c055ab9:             updateTimestamp(deletionTime.markedForDeleteAt());
+1:c055ab9:             updateLocalDeletionTime(deletionTime.localDeletionTime());
+1:c055ab9:         }
+1:c055ab9: 
+1:c055ab9:         public void updateTimestamp(long timestamp)
+1:c055ab9:         {
+1:c055ab9:             isTimestampSet = true;
+1:c055ab9:             minTimestamp = Math.min(minTimestamp, timestamp);
+1:c055ab9:         }
+1:c055ab9: 
+1:c055ab9:         public void updateLocalDeletionTime(int deletionTime)
+1:c055ab9:         {
+1:c055ab9:             isDelTimeSet = true;
+1:c055ab9:             minDeletionTime = Math.min(minDeletionTime, deletionTime);
+1:c055ab9:         }
+1:c055ab9: 
+1:c055ab9:         public void updateTTL(int ttl)
+1:c055ab9:         {
+1:c055ab9:             isTTLSet = true;
+1:c055ab9:             minTTL = Math.min(minTTL, ttl);
+1:c055ab9:         }
+1:c055ab9: 
+1:c055ab9:         public void updateColumnSetPerRow(long columnSetInRow)
+1:c055ab9:         {
+1:c055ab9:         }
+1:c055ab9: 
+1:c055ab9:         public void updateHasLegacyCounterShards(boolean hasLegacyCounterShards)
+1:c055ab9:         {
+1:c055ab9:             // We don't care about this but this come with PartitionStatisticsCollector
+1:c055ab9:         }
+1:c055ab9: 
+1:c055ab9:         public EncodingStats get()
+1:c055ab9:         {
+1:c055ab9:             return new EncodingStats(isTimestampSet ? minTimestamp : TIMESTAMP_EPOCH,
+1:c055ab9:                                      isDelTimeSet ? minDeletionTime : DELETION_TIME_EPOCH,
+1:0d74c3e:                                      isTTLSet ? minTTL : TTL_EPOCH);
+1:c055ab9:         }
+1:c055ab9: 
+1:e51f83b:         public static EncodingStats collect(Row staticRow, Iterator<Row> rows, DeletionInfo deletionInfo)
+1:e51f83b:         {
+1:e51f83b:             Collector collector = new Collector();
+1:e51f83b:             deletionInfo.collectStats(collector);
+1:e51f83b:             if (!staticRow.isEmpty())
+1:e51f83b:                 Rows.collectStats(staticRow, collector);
+1:e51f83b:             while (rows.hasNext())
+1:e51f83b:                 Rows.collectStats(rows.next(), collector);
+1:e51f83b:             return collector.get();
+1:e51f83b:         }
+1:c055ab9:     }
+1:c055ab9: 
+1:c055ab9:     public static class Serializer
+1:c055ab9:     {
+1:c055ab9:         public void serialize(EncodingStats stats, DataOutputPlus out) throws IOException
+1:c055ab9:         {
+1:649a106:             out.writeUnsignedVInt(stats.minTimestamp - TIMESTAMP_EPOCH);
+1:649a106:             out.writeUnsignedVInt(stats.minLocalDeletionTime - DELETION_TIME_EPOCH);
+1:649a106:             out.writeUnsignedVInt(stats.minTTL - TTL_EPOCH);
+1:c055ab9:         }
+1:c055ab9: 
+1:c055ab9:         public int serializedSize(EncodingStats stats)
+1:c055ab9:         {
+1:649a106:             return TypeSizes.sizeofUnsignedVInt(stats.minTimestamp - TIMESTAMP_EPOCH)
+1:649a106:                    + TypeSizes.sizeofUnsignedVInt(stats.minLocalDeletionTime - DELETION_TIME_EPOCH)
+1:649a106:                    + TypeSizes.sizeofUnsignedVInt(stats.minTTL - TTL_EPOCH);
+1:c055ab9:         }
+1:c055ab9: 
+1:c055ab9:         public EncodingStats deserialize(DataInputPlus in) throws IOException
+1:c055ab9:         {
+1:649a106:             long minTimestamp = in.readUnsignedVInt() + TIMESTAMP_EPOCH;
+1:649a106:             int minLocalDeletionTime = (int)in.readUnsignedVInt() + DELETION_TIME_EPOCH;
+1:649a106:             int minTTL = (int)in.readUnsignedVInt() + TTL_EPOCH;
+1:0d74c3e:             return new EncodingStats(minTimestamp, minLocalDeletionTime, minTTL);
+1:c055ab9:         }
+1:c055ab9:     }
+1:c055ab9: }
+============================================================================
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:649a106
+/////////////////////////////////////////////////////////////////////////
+1:             out.writeUnsignedVInt(stats.minTimestamp - TIMESTAMP_EPOCH);
+1:             out.writeUnsignedVInt(stats.minLocalDeletionTime - DELETION_TIME_EPOCH);
+1:             out.writeUnsignedVInt(stats.minTTL - TTL_EPOCH);
+1:             return TypeSizes.sizeofUnsignedVInt(stats.minTimestamp - TIMESTAMP_EPOCH)
+1:                    + TypeSizes.sizeofUnsignedVInt(stats.minLocalDeletionTime - DELETION_TIME_EPOCH)
+1:                    + TypeSizes.sizeofUnsignedVInt(stats.minTTL - TTL_EPOCH);
+1:             long minTimestamp = in.readUnsignedVInt() + TIMESTAMP_EPOCH;
+1:             int minLocalDeletionTime = (int)in.readUnsignedVInt() + DELETION_TIME_EPOCH;
+1:             int minTTL = (int)in.readUnsignedVInt() + TTL_EPOCH;
+commit:80a141c
+/////////////////////////////////////////////////////////////////////////
+1:         return String.format("EncodingStats(ts=%d, ldt=%d, ttl=%d)", minTimestamp, minLocalDeletionTime, minTTL);
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+commit:0d74c3e
+/////////////////////////////////////////////////////////////////////////
+1:  * delta-encode those information for the sake of vint encoding.
+/////////////////////////////////////////////////////////////////////////
+1:     public static final EncodingStats NO_STATS = new EncodingStats(TIMESTAMP_EPOCH, DELETION_TIME_EPOCH, TTL_EPOCH);
+/////////////////////////////////////////////////////////////////////////
+1:                          int minTTL)
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         return new EncodingStats(minTimestamp, minDelTime, minTTL);
+/////////////////////////////////////////////////////////////////////////
+1:         return this.minLocalDeletionTime == that.minLocalDeletionTime
+/////////////////////////////////////////////////////////////////////////
+1:         return Objects.hash(minTimestamp, minLocalDeletionTime, minTTL);
+0:         return String.format("EncodingStats(ts=%d, ldt=%d, ttl=%d, avgColPerRow=%d)", minTimestamp, minLocalDeletionTime, minTTL);
+/////////////////////////////////////////////////////////////////////////
+1:                                      isTTLSet ? minTTL : TTL_EPOCH);
+/////////////////////////////////////////////////////////////////////////
+0:                    + TypeSizes.sizeofVInt(stats.minLocalDeletionTime - DELETION_TIME_EPOCH)
+0:                    + TypeSizes.sizeofVInt(stats.minTTL - TTL_EPOCH);
+/////////////////////////////////////////////////////////////////////////
+1:             return new EncodingStats(minTimestamp, minLocalDeletionTime, minTTL);
+commit:e51f83b
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         public static EncodingStats collect(Row staticRow, Iterator<Row> rows, DeletionInfo deletionInfo)
+1:         {
+1:             Collector collector = new Collector();
+1:             deletionInfo.collectStats(collector);
+1:             if (!staticRow.isEmpty())
+1:                 Rows.collectStats(staticRow, collector);
+1:             while (rows.hasNext())
+1:                 Rows.collectStats(rows.next(), collector);
+1:             return collector.get();
+1:         }
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:c055ab9
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.db.rows;
+1: 
+1: import java.io.IOException;
+1: import java.util.*;
+1: 
+1: import org.apache.cassandra.db.*;
+1: import org.apache.cassandra.db.partitions.PartitionStatisticsCollector;
+1: import org.apache.cassandra.io.util.DataInputPlus;
+1: import org.apache.cassandra.io.util.DataOutputPlus;
+1: 
+1: /**
+1:  * Stats used for the encoding of the rows and tombstones of a given source.
+1:  * <p>
+1:  * Those stats are used to optimize the on-wire and on-disk storage of rows. More precisely,
+1:  * the {@code minTimestamp}, {@code minLocalDeletionTime} and {@code minTTL} stats are used to
+0:  * delta-encode those information for the sake of vint encoding. And {@code avgColumnSetPerRow}
+0:  * is used to decide if cells should be stored in a sparse or dense way (see {@link UnfilteredSerializer}).
+1:  * <p>
+1:  * Note that due to their use, those stats can suffer to be somewhat inaccurate (the more incurrate
+1:  * they are, the less effective the storage will be, but provided the stats are not completly wacky,
+1:  * this shouldn't have too huge an impact on performance) and in fact they will not always be
+1:  * accurate for reasons explained in {@link SerializationHeader#make}.
+1:  */
+1: public class EncodingStats
+1: {
+1:     // Default values for the timestamp, deletion time and ttl. We use this both for NO_STATS, but also to serialize
+1:     // an EncodingStats. Basically, we encode the diff of each value of to these epoch, which give values with better vint encoding.
+1:     private static final long TIMESTAMP_EPOCH;
+1:     private static final int DELETION_TIME_EPOCH;
+1:     private static final int TTL_EPOCH = 0;
+1:     static
+1:     {
+1:         // We want a fixed epoch, but that provide small values when substracted from our timestamp and deletion time.
+1:         // So we somewhat arbitrary use the date of the summit 2015, which should hopefully roughly correspond to 3.0 release.
+1:         Calendar c = Calendar.getInstance(TimeZone.getTimeZone("GMT-0"), Locale.US);
+1:         c.set(Calendar.YEAR, 2015);
+1:         c.set(Calendar.MONTH, Calendar.SEPTEMBER);
+1:         c.set(Calendar.DAY_OF_MONTH, 22);
+1:         c.set(Calendar.HOUR_OF_DAY, 0);
+1:         c.set(Calendar.MINUTE, 0);
+1:         c.set(Calendar.SECOND, 0);
+1:         c.set(Calendar.MILLISECOND, 0);
+1: 
+1:         TIMESTAMP_EPOCH = c.getTimeInMillis() * 1000; // timestamps should be in microseconds by convention
+1:         DELETION_TIME_EPOCH = (int)(c.getTimeInMillis() / 1000); // local deletion times are in seconds
+1:     }
+1: 
+1:     // We should use this sparingly obviously
+0:     public static final EncodingStats NO_STATS = new EncodingStats(TIMESTAMP_EPOCH, DELETION_TIME_EPOCH, TTL_EPOCH, -1);
+1: 
+1:     public static final Serializer serializer = new Serializer();
+1: 
+1:     public final long minTimestamp;
+1:     public final int minLocalDeletionTime;
+1:     public final int minTTL;
+1: 
+0:     // Will be < 0 if the value is unknown
+0:     public final int avgColumnSetPerRow;
+1: 
+1:     public EncodingStats(long minTimestamp,
+1:                          int minLocalDeletionTime,
+0:                          int minTTL,
+0:                          int avgColumnSetPerRow)
+1:     {
+1:         // Note that the exact value of those don't impact correctness, just the efficiency of the encoding. So when we
+1:         // get a value for timestamp (resp. minLocalDeletionTime) that means 'no object had a timestamp' (resp. 'a local
+1:         // deletion time'), then what value we store for minTimestamp (resp. minLocalDeletionTime) doesn't matter, and
+1:         // it's thus more efficient to use our EPOCH numbers, since it will result in a guaranteed 1 byte encoding.
+1: 
+1:         this.minTimestamp = minTimestamp == LivenessInfo.NO_TIMESTAMP ? TIMESTAMP_EPOCH : minTimestamp;
+1:         this.minLocalDeletionTime = minLocalDeletionTime == LivenessInfo.NO_EXPIRATION_TIME ? DELETION_TIME_EPOCH : minLocalDeletionTime;
+1:         this.minTTL = minTTL;
+0:         this.avgColumnSetPerRow = avgColumnSetPerRow;
+1:     }
+1: 
+1:     /**
+1:      * Merge this stats with another one.
+1:      * <p>
+1:      * The comments of {@link SerializationHeader#make} applies here too, i.e. the result of
+1:      * merging will be not totally accurate but we can live with that.
+1:      */
+1:     public EncodingStats mergeWith(EncodingStats that)
+1:     {
+1:         long minTimestamp = this.minTimestamp == TIMESTAMP_EPOCH
+1:                           ? that.minTimestamp
+1:                           : (that.minTimestamp == TIMESTAMP_EPOCH ? this.minTimestamp : Math.min(this.minTimestamp, that.minTimestamp));
+1: 
+1:         int minDelTime = this.minLocalDeletionTime == DELETION_TIME_EPOCH
+1:                        ? that.minLocalDeletionTime
+1:                        : (that.minLocalDeletionTime == DELETION_TIME_EPOCH ? this.minLocalDeletionTime : Math.min(this.minLocalDeletionTime, that.minLocalDeletionTime));
+1: 
+1:         int minTTL = this.minTTL == TTL_EPOCH
+1:                    ? that.minTTL
+1:                    : (that.minTTL == TTL_EPOCH ? this.minTTL : Math.min(this.minTTL, that.minTTL));
+1: 
+0:         int avgColumnSetPerRow = this.avgColumnSetPerRow < 0
+0:                                ? that.avgColumnSetPerRow
+0:                                : (that.avgColumnSetPerRow < 0 ? this.avgColumnSetPerRow : (this.avgColumnSetPerRow + that.avgColumnSetPerRow) / 2);
+1: 
+0:         return new EncodingStats(minTimestamp, minDelTime, minTTL, avgColumnSetPerRow);
+1:     }
+1: 
+1:     @Override
+1:     public boolean equals(Object o)
+1:     {
+1:         if (this == o) return true;
+1:         if (o == null || getClass() != o.getClass()) return false;
+1: 
+1:         EncodingStats that = (EncodingStats) o;
+1: 
+0:         return this.avgColumnSetPerRow == that.avgColumnSetPerRow
+0:             && this.minLocalDeletionTime == that.minLocalDeletionTime
+1:             && this.minTTL == that.minTTL
+1:             && this.minTimestamp == that.minTimestamp;
+1:     }
+1: 
+1:     @Override
+1:     public int hashCode()
+1:     {
+0:         return Objects.hash(minTimestamp, minLocalDeletionTime, minTTL, avgColumnSetPerRow);
+1:     }
+1: 
+1:     @Override
+1:     public String toString()
+1:     {
+0:         return String.format("EncodingStats(ts=%d, ldt=%d, ttl=%d, avgColPerRow=%d)", minTimestamp, minLocalDeletionTime, minTTL, avgColumnSetPerRow);
+1:     }
+1: 
+1:     public static class Collector implements PartitionStatisticsCollector
+1:     {
+1:         private boolean isTimestampSet;
+1:         private long minTimestamp = Long.MAX_VALUE;
+1: 
+1:         private boolean isDelTimeSet;
+1:         private int minDeletionTime = Integer.MAX_VALUE;
+1: 
+1:         private boolean isTTLSet;
+1:         private int minTTL = Integer.MAX_VALUE;
+1: 
+0:         private boolean isColumnSetPerRowSet;
+0:         private long totalColumnsSet;
+0:         private long rows;
+1: 
+1:         public void update(LivenessInfo info)
+1:         {
+1:             if (info.isEmpty())
+1:                 return;
+1: 
+1:             updateTimestamp(info.timestamp());
+1: 
+1:             if (info.isExpiring())
+1:             {
+1:                 updateTTL(info.ttl());
+1:                 updateLocalDeletionTime(info.localExpirationTime());
+1:             }
+1:         }
+1: 
+1:         public void update(Cell cell)
+1:         {
+1:             updateTimestamp(cell.timestamp());
+1:             if (cell.isExpiring())
+1:             {
+1:                 updateTTL(cell.ttl());
+1:                 updateLocalDeletionTime(cell.localDeletionTime());
+1:             }
+1:             else if (cell.isTombstone())
+1:             {
+1:                 updateLocalDeletionTime(cell.localDeletionTime());
+1:             }
+1:         }
+1: 
+1:         public void update(DeletionTime deletionTime)
+1:         {
+1:             if (deletionTime.isLive())
+1:                 return;
+1: 
+1:             updateTimestamp(deletionTime.markedForDeleteAt());
+1:             updateLocalDeletionTime(deletionTime.localDeletionTime());
+1:         }
+1: 
+1:         public void updateTimestamp(long timestamp)
+1:         {
+1:             isTimestampSet = true;
+1:             minTimestamp = Math.min(minTimestamp, timestamp);
+1:         }
+1: 
+1:         public void updateLocalDeletionTime(int deletionTime)
+1:         {
+1:             isDelTimeSet = true;
+1:             minDeletionTime = Math.min(minDeletionTime, deletionTime);
+1:         }
+1: 
+1:         public void updateTTL(int ttl)
+1:         {
+1:             isTTLSet = true;
+1:             minTTL = Math.min(minTTL, ttl);
+1:         }
+1: 
+1:         public void updateColumnSetPerRow(long columnSetInRow)
+1:         {
+0:             updateColumnSetPerRow(columnSetInRow, 1);
+1:         }
+1: 
+0:         public void updateColumnSetPerRow(long totalColumnsSet, long rows)
+1:         {
+0:             if (totalColumnsSet < 0 || rows < 0)
+1:                 return;
+1: 
+0:             this.isColumnSetPerRowSet = true;
+0:             this.totalColumnsSet += totalColumnsSet;
+0:             this.rows += rows;
+1:         }
+1: 
+1:         public void updateHasLegacyCounterShards(boolean hasLegacyCounterShards)
+1:         {
+1:             // We don't care about this but this come with PartitionStatisticsCollector
+1:         }
+1: 
+1:         public EncodingStats get()
+1:         {
+1:             return new EncodingStats(isTimestampSet ? minTimestamp : TIMESTAMP_EPOCH,
+1:                                      isDelTimeSet ? minDeletionTime : DELETION_TIME_EPOCH,
+0:                                      isTTLSet ? minTTL : TTL_EPOCH,
+0:                                      isColumnSetPerRowSet ? (rows == 0 ? 0 : (int)(totalColumnsSet / rows)) : -1);
+1:         }
+1:     }
+1: 
+1:     public static class Serializer
+1:     {
+1:         public void serialize(EncodingStats stats, DataOutputPlus out) throws IOException
+1:         {
+0:             out.writeVInt(stats.minTimestamp - TIMESTAMP_EPOCH);
+0:             out.writeVInt(stats.minLocalDeletionTime - DELETION_TIME_EPOCH);
+0:             out.writeVInt(stats.minTTL - TTL_EPOCH);
+0:             out.writeVInt(stats.avgColumnSetPerRow);
+1:         }
+1: 
+1:         public int serializedSize(EncodingStats stats)
+1:         {
+0:             return TypeSizes.sizeofVInt(stats.minTimestamp - TIMESTAMP_EPOCH)
+0:                  + TypeSizes.sizeofVInt(stats.minLocalDeletionTime - DELETION_TIME_EPOCH)
+0:                  + TypeSizes.sizeofVInt(stats.minTTL - TTL_EPOCH)
+0:                  + TypeSizes.sizeofVInt(stats.avgColumnSetPerRow);
+1:         }
+1: 
+1:         public EncodingStats deserialize(DataInputPlus in) throws IOException
+1:         {
+0:             long minTimestamp = in.readVInt() + TIMESTAMP_EPOCH;
+0:             int minLocalDeletionTime = (int)in.readVInt() + DELETION_TIME_EPOCH;
+0:             int minTTL = (int)in.readVInt() + TTL_EPOCH;
+0:             int avgColumnSetPerRow = (int)in.readVInt();
+0:             return new EncodingStats(minTimestamp, minLocalDeletionTime, minTTL, avgColumnSetPerRow);
+1:         }
+1:     }
+1: }
+============================================================================

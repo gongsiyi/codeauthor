@@ -1,0 +1,699 @@
+1:81f7dfa: /**
+1:81f7dfa:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:81f7dfa:  * contributor license agreements.  See the NOTICE file distributed with
+1:81f7dfa:  * this work for additional information regarding copyright ownership.
+1:81f7dfa:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:81f7dfa:  * (the "License"); you may not use this file except in compliance with
+1:81f7dfa:  * the License.  You may obtain a copy of the License at
+1:81f7dfa:  *
+1:81f7dfa:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:81f7dfa:  *
+1:81f7dfa:  * Unless required by applicable law or agreed to in writing, software
+1:81f7dfa:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:81f7dfa:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:81f7dfa:  * See the License for the specific language governing permissions and
+1:81f7dfa:  * limitations under the License.
+1:81f7dfa:  */
+1:81f7dfa: 
+1:81f7dfa: package org.apache.mahout.cf.taste.impl.recommender.svd;
+1:81f7dfa: 
+1:81f7dfa: import java.util.concurrent.ExecutorService;
+1:81f7dfa: import java.util.concurrent.Executors;
+1:81f7dfa: import java.util.concurrent.TimeUnit;
+1:81f7dfa: 
+1:81f7dfa: import org.apache.mahout.cf.taste.common.TasteException;
+1:81f7dfa: import org.apache.mahout.cf.taste.impl.common.FullRunningAverage;
+1:81f7dfa: import org.apache.mahout.cf.taste.impl.common.LongPrimitiveIterator;
+1:81f7dfa: import org.apache.mahout.cf.taste.impl.common.RunningAverage;
+1:81f7dfa: import org.apache.mahout.cf.taste.model.DataModel;
+1:81f7dfa: import org.apache.mahout.cf.taste.model.Preference;
+1:81f7dfa: import org.apache.mahout.cf.taste.model.PreferenceArray;
+1:81f7dfa: import org.apache.mahout.common.RandomUtils;
+1:81f7dfa: import org.apache.mahout.common.RandomWrapper;
+1:81f7dfa: import org.slf4j.Logger;
+1:81f7dfa: import org.slf4j.LoggerFactory;
+1:81f7dfa: 
+1:81f7dfa: /** Minimalistic implementation of Parallel SGD factorizer based on
+1:81f7dfa:  * <a href="http://www.sze.hu/~gtakacs/download/jmlr_2009.pdf">
+1:81f7dfa:  * "Scalable Collaborative Filtering Approaches for Large Recommender Systems"</a>
+1:81f7dfa:  * and
+1:81f7dfa:  * <a href="hwww.cs.wisc.edu/~brecht/papers/hogwildTR.pdf">
+1:81f7dfa:  * "Hogwild!: A Lock-Free Approach to Parallelizing Stochastic Gradient Descent"</a> */
+1:81f7dfa: public class ParallelSGDFactorizer extends AbstractFactorizer {
+1:81f7dfa: 
+1:81f7dfa:   private final DataModel dataModel;
+1:81f7dfa:   /** Parameter used to prevent overfitting. */
+1:81f7dfa:   private final double lambda;
+1:81f7dfa:   /** Number of features used to compute this factorization */
+1:81f7dfa:   private final int rank;
+1:81f7dfa:   /** Number of iterations */
+1:81f7dfa:   private final int numEpochs;
+1:81f7dfa: 
+1:81f7dfa:   private int numThreads;
+1:81f7dfa: 
+1:81f7dfa:   // these next two control decayFactor^steps exponential type of annealing learning rate and decay factor
+1:81f7dfa:   private double mu0 = 0.01;
+1:81f7dfa:   private double decayFactor = 1;
+1:81f7dfa:   // these next two control 1/steps^forget type annealing
+1:81f7dfa:   private int stepOffset = 0;
+1:81f7dfa:   // -1 equals even weighting of all examples, 0 means only use exponential annealing
+1:81f7dfa:   private double forgettingExponent = 0;
+1:81f7dfa: 
+1:81f7dfa:   // The following two should be inversely proportional :)
+1:81f7dfa:   private double biasMuRatio = 0.5;
+1:81f7dfa:   private double biasLambdaRatio = 0.1;
+1:81f7dfa: 
+1:81f7dfa:   /** TODO: this is not safe as += is not atomic on many processors, can be replaced with AtomicDoubleArray
+1:81f7dfa:    * but it works just fine right now  */
+1:81f7dfa:   /** user features */
+1:81f7dfa:   protected volatile double[][] userVectors;
+1:81f7dfa:   /** item features */
+1:81f7dfa:   protected volatile double[][] itemVectors;
+1:81f7dfa: 
+1:81f7dfa:   private final PreferenceShuffler shuffler;
+1:81f7dfa: 
+1:81f7dfa:   private int epoch = 1;
+1:81f7dfa:   /** place in user vector where the bias is stored */
+1:81f7dfa:   private static final int USER_BIAS_INDEX = 1;
+1:81f7dfa:   /** place in item vector where the bias is stored */
+1:81f7dfa:   private static final int ITEM_BIAS_INDEX = 2;
+1:81f7dfa:   private static final int FEATURE_OFFSET = 3;
+1:81f7dfa:   /** Standard deviation for random initialization of features */
+1:81f7dfa:   private static final double NOISE = 0.02;
+1:81f7dfa: 
+1:81f7dfa:   private static final Logger logger = LoggerFactory.getLogger(ParallelSGDFactorizer.class);
+1:81f7dfa: 
+1:81f7dfa:   protected static class PreferenceShuffler {
+1:81f7dfa: 
+1:81f7dfa:     private Preference[] preferences;
+1:81f7dfa:     private Preference[] unstagedPreferences;
+1:81f7dfa: 
+1:81f7dfa:     protected final RandomWrapper random = RandomUtils.getRandom();
+1:81f7dfa: 
+1:81f7dfa:     public PreferenceShuffler(DataModel dataModel) throws TasteException {
+1:81f7dfa:       cachePreferences(dataModel);
+1:81f7dfa:       shuffle();
+1:81f7dfa:       stage();
+1:81f7dfa:     }
+1:81f7dfa: 
+1:81f7dfa:     private int countPreferences(DataModel dataModel) throws TasteException {
+1:81f7dfa:       int numPreferences = 0;
+1:81f7dfa:       LongPrimitiveIterator userIDs = dataModel.getUserIDs();
+1:81f7dfa:       while (userIDs.hasNext()) {
+1:81f7dfa:         PreferenceArray preferencesFromUser = dataModel.getPreferencesFromUser(userIDs.nextLong());
+1:81f7dfa:         numPreferences += preferencesFromUser.length();
+1:81f7dfa:       }
+1:81f7dfa:       return numPreferences;
+1:81f7dfa:     }
+1:81f7dfa: 
+1:81f7dfa:     private void cachePreferences(DataModel dataModel) throws TasteException {
+1:81f7dfa:       int numPreferences = countPreferences(dataModel);
+1:81f7dfa:       preferences = new Preference[numPreferences];
+1:81f7dfa: 
+1:81f7dfa:       LongPrimitiveIterator userIDs = dataModel.getUserIDs();
+1:81f7dfa:       int index = 0;
+1:81f7dfa:       while (userIDs.hasNext()) {
+1:81f7dfa:         long userID = userIDs.nextLong();
+1:81f7dfa:         PreferenceArray preferencesFromUser = dataModel.getPreferencesFromUser(userID);
+1:81f7dfa:         for (Preference preference : preferencesFromUser) {
+1:81f7dfa:           preferences[index++] = preference;
+1:81f7dfa:         }
+1:81f7dfa:       }
+1:81f7dfa:     }
+1:81f7dfa: 
+1:0844e69:     public final void shuffle() {
+1:81f7dfa:       unstagedPreferences = preferences.clone();
+1:81f7dfa:       /* Durstenfeld shuffle */
+1:81f7dfa:       for (int i = unstagedPreferences.length - 1; i > 0; i--) {
+1:81f7dfa:         int rand = random.nextInt(i + 1);
+1:81f7dfa:         swapCachedPreferences(i, rand);
+1:81f7dfa:       }
+1:81f7dfa:     }
+1:81f7dfa: 
+1:81f7dfa:     //merge this part into shuffle() will make compiler-optimizer do some real absurd stuff, test on OpenJDK7
+1:81f7dfa:     private void swapCachedPreferences(int x, int y) {
+1:81f7dfa:       Preference p = unstagedPreferences[x];
+1:81f7dfa: 
+1:81f7dfa:       unstagedPreferences[x] = unstagedPreferences[y];
+1:81f7dfa:       unstagedPreferences[y] = p;
+1:81f7dfa:     }
+1:81f7dfa: 
+1:0844e69:     public final void stage() {
+1:81f7dfa:       preferences = unstagedPreferences;
+1:81f7dfa:     }
+1:81f7dfa: 
+1:81f7dfa:     public Preference get(int i) {
+1:81f7dfa:       return preferences[i];
+1:81f7dfa:     }
+1:81f7dfa: 
+1:81f7dfa:     public int size() {
+1:81f7dfa:       return preferences.length;
+1:81f7dfa:     }
+1:81f7dfa: 
+1:81f7dfa:   }
+1:81f7dfa: 
+1:81f7dfa:   public ParallelSGDFactorizer(DataModel dataModel, int numFeatures, double lambda, int numEpochs)
+1:81f7dfa:     throws TasteException {
+1:81f7dfa:     super(dataModel);
+1:81f7dfa:     this.dataModel = dataModel;
+1:81f7dfa:     this.rank = numFeatures + FEATURE_OFFSET;
+1:81f7dfa:     this.lambda = lambda;
+1:81f7dfa:     this.numEpochs = numEpochs;
+1:81f7dfa: 
+1:81f7dfa:     shuffler = new PreferenceShuffler(dataModel);
+1:81f7dfa: 
+1:81f7dfa:     //max thread num set to n^0.25 as suggested by hogwild! paper
+1:81f7dfa:     numThreads = Math.min(Runtime.getRuntime().availableProcessors(), (int) Math.pow((double) shuffler.size(), 0.25));
+1:81f7dfa:   }
+1:81f7dfa: 
+1:81f7dfa:   public ParallelSGDFactorizer(DataModel dataModel, int numFeatures, double lambda, int numIterations,
+1:81f7dfa:       double mu0, double decayFactor, int stepOffset, double forgettingExponent) throws TasteException {
+1:81f7dfa:     this(dataModel, numFeatures, lambda, numIterations);
+1:81f7dfa: 
+1:81f7dfa:     this.mu0 = mu0;
+1:81f7dfa:     this.decayFactor = decayFactor;
+1:81f7dfa:     this.stepOffset = stepOffset;
+1:81f7dfa:     this.forgettingExponent = forgettingExponent;
+1:81f7dfa:   }
+1:81f7dfa: 
+1:81f7dfa:   public ParallelSGDFactorizer(DataModel dataModel, int numFeatures, double lambda, int numIterations,
+1:81f7dfa:       double mu0, double decayFactor, int stepOffset, double forgettingExponent, int numThreads) throws TasteException {
+1:81f7dfa:     this(dataModel, numFeatures, lambda, numIterations, mu0, decayFactor, stepOffset, forgettingExponent);
+1:81f7dfa: 
+1:81f7dfa:     this.numThreads = numThreads;
+1:81f7dfa:   }
+1:81f7dfa: 
+1:81f7dfa:   public ParallelSGDFactorizer(DataModel dataModel, int numFeatures, double lambda, int numIterations,
+1:81f7dfa:       double mu0, double decayFactor, int stepOffset, double forgettingExponent,
+1:81f7dfa:       double biasMuRatio, double biasLambdaRatio) throws TasteException {
+1:81f7dfa:     this(dataModel, numFeatures, lambda, numIterations, mu0, decayFactor, stepOffset, forgettingExponent);
+1:81f7dfa: 
+1:81f7dfa:     this.biasMuRatio = biasMuRatio;
+1:81f7dfa:     this.biasLambdaRatio = biasLambdaRatio;
+1:81f7dfa:   }
+1:81f7dfa: 
+1:81f7dfa:   public ParallelSGDFactorizer(DataModel dataModel, int numFeatures, double lambda, int numIterations,
+1:81f7dfa:       double mu0, double decayFactor, int stepOffset, double forgettingExponent,
+1:81f7dfa:       double biasMuRatio, double biasLambdaRatio, int numThreads) throws TasteException {
+1:81f7dfa:     this(dataModel, numFeatures, lambda, numIterations, mu0, decayFactor, stepOffset, forgettingExponent, biasMuRatio,
+1:81f7dfa:          biasLambdaRatio);
+1:81f7dfa: 
+1:81f7dfa:     this.numThreads = numThreads;
+1:81f7dfa:   }
+1:81f7dfa: 
+1:81f7dfa:   protected void initialize() throws TasteException {
+1:81f7dfa:     RandomWrapper random = RandomUtils.getRandom();
+1:81f7dfa:     userVectors = new double[dataModel.getNumUsers()][rank];
+1:81f7dfa:     itemVectors = new double[dataModel.getNumItems()][rank];
+1:81f7dfa: 
+1:81f7dfa:     double globalAverage = getAveragePreference();
+1:81f7dfa:     for (int userIndex = 0; userIndex < userVectors.length; userIndex++) {
+1:81f7dfa:       userVectors[userIndex][0] = globalAverage;
+1:81f7dfa:       userVectors[userIndex][USER_BIAS_INDEX] = 0; // will store user bias
+1:81f7dfa:       userVectors[userIndex][ITEM_BIAS_INDEX] = 1; // corresponding item feature contains item bias
+1:81f7dfa:       for (int feature = FEATURE_OFFSET; feature < rank; feature++) {
+1:81f7dfa:         userVectors[userIndex][feature] = random.nextGaussian() * NOISE;
+1:81f7dfa:       }
+1:81f7dfa:     }
+1:81f7dfa:     for (int itemIndex = 0; itemIndex < itemVectors.length; itemIndex++) {
+1:81f7dfa:       itemVectors[itemIndex][0] = 1; // corresponding user feature contains global average
+1:81f7dfa:       itemVectors[itemIndex][USER_BIAS_INDEX] = 1; // corresponding user feature contains user bias
+1:81f7dfa:       itemVectors[itemIndex][ITEM_BIAS_INDEX] = 0; // will store item bias
+1:81f7dfa:       for (int feature = FEATURE_OFFSET; feature < rank; feature++) {
+1:81f7dfa:         itemVectors[itemIndex][feature] = random.nextGaussian() * NOISE;
+1:81f7dfa:       }
+1:81f7dfa:     }
+1:81f7dfa:   }
+1:81f7dfa: 
+1:81f7dfa:   //TODO: needs optimization
+1:81f7dfa:   private double getMu(int i) {
+1:81f7dfa:     return mu0 * Math.pow(decayFactor, i - 1) * Math.pow(i + stepOffset, forgettingExponent);
+1:81f7dfa:   }
+1:81f7dfa: 
+1:81f7dfa:   @Override
+1:81f7dfa:   public Factorization factorize() throws TasteException {
+1:81f7dfa:     initialize();
+1:81f7dfa: 
+1:81f7dfa:     if (logger.isInfoEnabled()) {
+1:81f7dfa:       logger.info("starting to compute the factorization...");
+1:81f7dfa:     }
+1:81f7dfa: 
+1:81f7dfa:     for (epoch = 1; epoch <= numEpochs; epoch++) {
+1:81f7dfa:       shuffler.stage();
+1:81f7dfa: 
+1:81f7dfa:       final double mu = getMu(epoch);
+1:81f7dfa:       int subSize = shuffler.size() / numThreads + 1;
+1:81f7dfa: 
+1:81f7dfa:       ExecutorService executor=Executors.newFixedThreadPool(numThreads);
+1:81f7dfa: 
+1:81f7dfa:       try {
+1:81f7dfa:         for (int t = 0; t < numThreads; t++) {
+1:81f7dfa:           final int iStart = t * subSize;
+1:81f7dfa:           final int iEnd = Math.min((t + 1) * subSize, shuffler.size());
+1:81f7dfa: 
+1:81f7dfa:           executor.execute(new Runnable() {
+1:81f7dfa:             @Override
+1:81f7dfa:             public void run() {
+1:81f7dfa:               for (int i = iStart; i < iEnd; i++) {
+1:81f7dfa:                 update(shuffler.get(i), mu);
+1:81f7dfa:               }
+1:81f7dfa:             }
+1:81f7dfa:           });
+1:81f7dfa:         }
+1:81f7dfa:       } finally {
+1:81f7dfa:         executor.shutdown();
+1:81f7dfa:         shuffler.shuffle();
+1:81f7dfa: 
+1:81f7dfa:         try {
+1:81f7dfa:           boolean terminated = executor.awaitTermination(numEpochs * shuffler.size(), TimeUnit.MICROSECONDS);
+1:81f7dfa:           if (!terminated) {
+1:81f7dfa:             logger.error("subtasks takes forever, return anyway");
+1:81f7dfa:           }
+1:81f7dfa:         } catch (InterruptedException e) {
+1:81f7dfa:           throw new TasteException("waiting fof termination interrupted", e);
+1:81f7dfa:         }
+1:81f7dfa:       }
+1:81f7dfa: 
+1:81f7dfa:     }
+1:81f7dfa: 
+1:81f7dfa:     return createFactorization(userVectors, itemVectors);
+1:81f7dfa:   }
+1:81f7dfa: 
+1:81f7dfa:   double getAveragePreference() throws TasteException {
+1:81f7dfa:     RunningAverage average = new FullRunningAverage();
+1:81f7dfa:     LongPrimitiveIterator it = dataModel.getUserIDs();
+1:81f7dfa:     while (it.hasNext()) {
+1:81f7dfa:       for (Preference pref : dataModel.getPreferencesFromUser(it.nextLong())) {
+1:81f7dfa:         average.addDatum(pref.getValue());
+1:81f7dfa:       }
+1:81f7dfa:     }
+1:81f7dfa:     return average.getAverage();
+1:81f7dfa:   }
+1:81f7dfa: 
+1:81f7dfa:   /** TODO: this is the vanilla sgd by Tacaks 2009, I speculate that using scaling technique proposed in:
+1:81f7dfa:    * Towards Optimal One Pass Large Scale Learning with Averaged Stochastic Gradient Descent section 5, page 6
+1:81f7dfa:    * can be beneficial in term s of both speed and accuracy.
+1:81f7dfa:    *
+1:81f7dfa:    * Tacaks' method doesn't calculate gradient of regularization correctly, which has non-zero elements everywhere of
+1:81f7dfa:    * the matrix. While Tacaks' method can only updates a single row/column, if one user has a lot of recommendation,
+1:81f7dfa:    * her vector will be more affected by regularization using an isolated scaling factor for both user vectors and
+1:81f7dfa:    * item vectors can remove this issue without inducing more update cost it even reduces it a bit by only performing
+1:81f7dfa:    * one addition and one multiplication.
+1:81f7dfa:    *
+1:81f7dfa:    * BAD SIDE1: the scaling factor decreases fast, it has to be scaled up from time to time before dropped to zero or
+1:81f7dfa:    *            caused roundoff error
+1:81f7dfa:    * BAD SIDE2: no body experiment on it before, and people generally use very small lambda
+1:81f7dfa:    *            so it's impact on accuracy may still be unknown.
+1:81f7dfa:    * BAD SIDE3: don't know how to make it work for L1-regularization or
+1:81f7dfa:    *            "pseudorank?" (sum of singular values)-regularization */
+1:81f7dfa:   protected void update(Preference preference, double mu) {
+1:81f7dfa:     int userIndex = userIndex(preference.getUserID());
+1:81f7dfa:     int itemIndex = itemIndex(preference.getItemID());
+1:81f7dfa: 
+1:81f7dfa:     double[] userVector = userVectors[userIndex];
+1:81f7dfa:     double[] itemVector = itemVectors[itemIndex];
+1:81f7dfa: 
+1:81f7dfa:     double prediction = dot(userVector, itemVector);
+1:81f7dfa:     double err = preference.getValue() - prediction;
+1:81f7dfa: 
+1:81f7dfa:     // adjust features
+1:81f7dfa:     for (int k = FEATURE_OFFSET; k < rank; k++) {
+1:81f7dfa:       double userFeature = userVector[k];
+1:81f7dfa:       double itemFeature = itemVector[k];
+1:81f7dfa: 
+1:81f7dfa:       userVector[k] += mu * (err * itemFeature - lambda * userFeature);
+1:81f7dfa:       itemVector[k] += mu * (err * userFeature - lambda * itemFeature);
+1:81f7dfa:     }
+1:81f7dfa: 
+1:81f7dfa:     // adjust user and item bias
+1:81f7dfa:     userVector[USER_BIAS_INDEX] += biasMuRatio * mu * (err - biasLambdaRatio * lambda * userVector[USER_BIAS_INDEX]);
+1:81f7dfa:     itemVector[ITEM_BIAS_INDEX] += biasMuRatio * mu * (err - biasLambdaRatio * lambda * itemVector[ITEM_BIAS_INDEX]);
+1:81f7dfa:   }
+1:81f7dfa: 
+1:81f7dfa:   private double dot(double[] userVector, double[] itemVector) {
+1:81f7dfa:     double sum = 0;
+1:81f7dfa:     for (int k = 0; k < rank; k++) {
+1:81f7dfa:       sum += userVector[k] * itemVector[k];
+1:81f7dfa:     }
+1:81f7dfa:     return sum;
+1:81f7dfa:   }
+1:81f7dfa: }
+============================================================================
+author:pferrel
+-------------------------------------------------------------------------------
+commit:b988c49
+author:Ted Dunning
+-------------------------------------------------------------------------------
+commit:0844e69
+/////////////////////////////////////////////////////////////////////////
+1:     public final void shuffle() {
+/////////////////////////////////////////////////////////////////////////
+1:     public final void stage() {
+author:frankscholten
+-------------------------------------------------------------------------------
+commit:1a42d85
+author:Sebastian Schelter
+-------------------------------------------------------------------------------
+commit:81f7dfa
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: 
+1: package org.apache.mahout.cf.taste.impl.recommender.svd;
+1: 
+1: import java.util.concurrent.ExecutorService;
+1: import java.util.concurrent.Executors;
+1: import java.util.concurrent.TimeUnit;
+1: 
+1: import org.apache.mahout.cf.taste.common.TasteException;
+1: import org.apache.mahout.cf.taste.impl.common.FullRunningAverage;
+1: import org.apache.mahout.cf.taste.impl.common.LongPrimitiveIterator;
+1: import org.apache.mahout.cf.taste.impl.common.RunningAverage;
+1: import org.apache.mahout.cf.taste.model.DataModel;
+1: import org.apache.mahout.cf.taste.model.Preference;
+1: import org.apache.mahout.cf.taste.model.PreferenceArray;
+1: import org.apache.mahout.common.RandomUtils;
+1: import org.apache.mahout.common.RandomWrapper;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: /** Minimalistic implementation of Parallel SGD factorizer based on
+1:  * <a href="http://www.sze.hu/~gtakacs/download/jmlr_2009.pdf">
+1:  * "Scalable Collaborative Filtering Approaches for Large Recommender Systems"</a>
+1:  * and
+1:  * <a href="hwww.cs.wisc.edu/~brecht/papers/hogwildTR.pdf">
+1:  * "Hogwild!: A Lock-Free Approach to Parallelizing Stochastic Gradient Descent"</a> */
+1: public class ParallelSGDFactorizer extends AbstractFactorizer {
+1: 
+1:   private final DataModel dataModel;
+1:   /** Parameter used to prevent overfitting. */
+1:   private final double lambda;
+1:   /** Number of features used to compute this factorization */
+1:   private final int rank;
+1:   /** Number of iterations */
+1:   private final int numEpochs;
+1: 
+1:   private int numThreads;
+1: 
+1:   // these next two control decayFactor^steps exponential type of annealing learning rate and decay factor
+1:   private double mu0 = 0.01;
+1:   private double decayFactor = 1;
+1:   // these next two control 1/steps^forget type annealing
+1:   private int stepOffset = 0;
+1:   // -1 equals even weighting of all examples, 0 means only use exponential annealing
+1:   private double forgettingExponent = 0;
+1: 
+1:   // The following two should be inversely proportional :)
+1:   private double biasMuRatio = 0.5;
+1:   private double biasLambdaRatio = 0.1;
+1: 
+1:   /** TODO: this is not safe as += is not atomic on many processors, can be replaced with AtomicDoubleArray
+1:    * but it works just fine right now  */
+1:   /** user features */
+1:   protected volatile double[][] userVectors;
+1:   /** item features */
+1:   protected volatile double[][] itemVectors;
+1: 
+1:   private final PreferenceShuffler shuffler;
+1: 
+1:   private int epoch = 1;
+1:   /** place in user vector where the bias is stored */
+1:   private static final int USER_BIAS_INDEX = 1;
+1:   /** place in item vector where the bias is stored */
+1:   private static final int ITEM_BIAS_INDEX = 2;
+1:   private static final int FEATURE_OFFSET = 3;
+1:   /** Standard deviation for random initialization of features */
+1:   private static final double NOISE = 0.02;
+1: 
+1:   private static final Logger logger = LoggerFactory.getLogger(ParallelSGDFactorizer.class);
+1: 
+1:   protected static class PreferenceShuffler {
+1: 
+1:     private Preference[] preferences;
+1:     private Preference[] unstagedPreferences;
+1: 
+1:     protected final RandomWrapper random = RandomUtils.getRandom();
+1: 
+1:     public PreferenceShuffler(DataModel dataModel) throws TasteException {
+1:       cachePreferences(dataModel);
+1:       shuffle();
+1:       stage();
+1:     }
+1: 
+1:     private int countPreferences(DataModel dataModel) throws TasteException {
+1:       int numPreferences = 0;
+1:       LongPrimitiveIterator userIDs = dataModel.getUserIDs();
+1:       while (userIDs.hasNext()) {
+1:         PreferenceArray preferencesFromUser = dataModel.getPreferencesFromUser(userIDs.nextLong());
+1:         numPreferences += preferencesFromUser.length();
+1:       }
+1:       return numPreferences;
+1:     }
+1: 
+1:     private void cachePreferences(DataModel dataModel) throws TasteException {
+1:       int numPreferences = countPreferences(dataModel);
+1:       preferences = new Preference[numPreferences];
+1: 
+1:       LongPrimitiveIterator userIDs = dataModel.getUserIDs();
+1:       int index = 0;
+1:       while (userIDs.hasNext()) {
+1:         long userID = userIDs.nextLong();
+1:         PreferenceArray preferencesFromUser = dataModel.getPreferencesFromUser(userID);
+1:         for (Preference preference : preferencesFromUser) {
+1:           preferences[index++] = preference;
+1:         }
+1:       }
+1:     }
+1: 
+0:     public void shuffle() {
+1:       unstagedPreferences = preferences.clone();
+1:       /* Durstenfeld shuffle */
+1:       for (int i = unstagedPreferences.length - 1; i > 0; i--) {
+1:         int rand = random.nextInt(i + 1);
+1:         swapCachedPreferences(i, rand);
+1:       }
+1:     }
+1: 
+1:     //merge this part into shuffle() will make compiler-optimizer do some real absurd stuff, test on OpenJDK7
+1:     private void swapCachedPreferences(int x, int y) {
+1:       Preference p = unstagedPreferences[x];
+1: 
+1:       unstagedPreferences[x] = unstagedPreferences[y];
+1:       unstagedPreferences[y] = p;
+1:     }
+1: 
+0:     public void stage() {
+1:       preferences = unstagedPreferences;
+1:     }
+1: 
+1:     public Preference get(int i) {
+1:       return preferences[i];
+1:     }
+1: 
+1:     public int size() {
+1:       return preferences.length;
+1:     }
+1: 
+1:   }
+1: 
+1:   public ParallelSGDFactorizer(DataModel dataModel, int numFeatures, double lambda, int numEpochs)
+1:     throws TasteException {
+1:     super(dataModel);
+1:     this.dataModel = dataModel;
+1:     this.rank = numFeatures + FEATURE_OFFSET;
+1:     this.lambda = lambda;
+1:     this.numEpochs = numEpochs;
+1: 
+1:     shuffler = new PreferenceShuffler(dataModel);
+1: 
+1:     //max thread num set to n^0.25 as suggested by hogwild! paper
+1:     numThreads = Math.min(Runtime.getRuntime().availableProcessors(), (int) Math.pow((double) shuffler.size(), 0.25));
+1:   }
+1: 
+1:   public ParallelSGDFactorizer(DataModel dataModel, int numFeatures, double lambda, int numIterations,
+1:       double mu0, double decayFactor, int stepOffset, double forgettingExponent) throws TasteException {
+1:     this(dataModel, numFeatures, lambda, numIterations);
+1: 
+1:     this.mu0 = mu0;
+1:     this.decayFactor = decayFactor;
+1:     this.stepOffset = stepOffset;
+1:     this.forgettingExponent = forgettingExponent;
+1:   }
+1: 
+1:   public ParallelSGDFactorizer(DataModel dataModel, int numFeatures, double lambda, int numIterations,
+1:       double mu0, double decayFactor, int stepOffset, double forgettingExponent, int numThreads) throws TasteException {
+1:     this(dataModel, numFeatures, lambda, numIterations, mu0, decayFactor, stepOffset, forgettingExponent);
+1: 
+1:     this.numThreads = numThreads;
+1:   }
+1: 
+1:   public ParallelSGDFactorizer(DataModel dataModel, int numFeatures, double lambda, int numIterations,
+1:       double mu0, double decayFactor, int stepOffset, double forgettingExponent,
+1:       double biasMuRatio, double biasLambdaRatio) throws TasteException {
+1:     this(dataModel, numFeatures, lambda, numIterations, mu0, decayFactor, stepOffset, forgettingExponent);
+1: 
+1:     this.biasMuRatio = biasMuRatio;
+1:     this.biasLambdaRatio = biasLambdaRatio;
+1:   }
+1: 
+1:   public ParallelSGDFactorizer(DataModel dataModel, int numFeatures, double lambda, int numIterations,
+1:       double mu0, double decayFactor, int stepOffset, double forgettingExponent,
+1:       double biasMuRatio, double biasLambdaRatio, int numThreads) throws TasteException {
+1:     this(dataModel, numFeatures, lambda, numIterations, mu0, decayFactor, stepOffset, forgettingExponent, biasMuRatio,
+1:          biasLambdaRatio);
+1: 
+1:     this.numThreads = numThreads;
+1:   }
+1: 
+1:   protected void initialize() throws TasteException {
+1:     RandomWrapper random = RandomUtils.getRandom();
+1:     userVectors = new double[dataModel.getNumUsers()][rank];
+1:     itemVectors = new double[dataModel.getNumItems()][rank];
+1: 
+1:     double globalAverage = getAveragePreference();
+1:     for (int userIndex = 0; userIndex < userVectors.length; userIndex++) {
+1:       userVectors[userIndex][0] = globalAverage;
+1:       userVectors[userIndex][USER_BIAS_INDEX] = 0; // will store user bias
+1:       userVectors[userIndex][ITEM_BIAS_INDEX] = 1; // corresponding item feature contains item bias
+1:       for (int feature = FEATURE_OFFSET; feature < rank; feature++) {
+1:         userVectors[userIndex][feature] = random.nextGaussian() * NOISE;
+1:       }
+1:     }
+1:     for (int itemIndex = 0; itemIndex < itemVectors.length; itemIndex++) {
+1:       itemVectors[itemIndex][0] = 1; // corresponding user feature contains global average
+1:       itemVectors[itemIndex][USER_BIAS_INDEX] = 1; // corresponding user feature contains user bias
+1:       itemVectors[itemIndex][ITEM_BIAS_INDEX] = 0; // will store item bias
+1:       for (int feature = FEATURE_OFFSET; feature < rank; feature++) {
+1:         itemVectors[itemIndex][feature] = random.nextGaussian() * NOISE;
+1:       }
+1:     }
+1:   }
+1: 
+1:   //TODO: needs optimization
+1:   private double getMu(int i) {
+1:     return mu0 * Math.pow(decayFactor, i - 1) * Math.pow(i + stepOffset, forgettingExponent);
+1:   }
+1: 
+1:   @Override
+1:   public Factorization factorize() throws TasteException {
+1:     initialize();
+1: 
+1:     if (logger.isInfoEnabled()) {
+1:       logger.info("starting to compute the factorization...");
+1:     }
+1: 
+1:     for (epoch = 1; epoch <= numEpochs; epoch++) {
+1:       shuffler.stage();
+1: 
+1:       final double mu = getMu(epoch);
+1:       int subSize = shuffler.size() / numThreads + 1;
+1: 
+1:       ExecutorService executor=Executors.newFixedThreadPool(numThreads);
+1: 
+1:       try {
+1:         for (int t = 0; t < numThreads; t++) {
+1:           final int iStart = t * subSize;
+1:           final int iEnd = Math.min((t + 1) * subSize, shuffler.size());
+1: 
+1:           executor.execute(new Runnable() {
+1:             @Override
+1:             public void run() {
+1:               for (int i = iStart; i < iEnd; i++) {
+1:                 update(shuffler.get(i), mu);
+1:               }
+1:             }
+1:           });
+1:         }
+1:       } finally {
+1:         executor.shutdown();
+1:         shuffler.shuffle();
+1: 
+1:         try {
+1:           boolean terminated = executor.awaitTermination(numEpochs * shuffler.size(), TimeUnit.MICROSECONDS);
+1:           if (!terminated) {
+1:             logger.error("subtasks takes forever, return anyway");
+1:           }
+1:         } catch (InterruptedException e) {
+1:           throw new TasteException("waiting fof termination interrupted", e);
+1:         }
+1:       }
+1: 
+1:     }
+1: 
+1:     return createFactorization(userVectors, itemVectors);
+1:   }
+1: 
+1:   double getAveragePreference() throws TasteException {
+1:     RunningAverage average = new FullRunningAverage();
+1:     LongPrimitiveIterator it = dataModel.getUserIDs();
+1:     while (it.hasNext()) {
+1:       for (Preference pref : dataModel.getPreferencesFromUser(it.nextLong())) {
+1:         average.addDatum(pref.getValue());
+1:       }
+1:     }
+1:     return average.getAverage();
+1:   }
+1: 
+1:   /** TODO: this is the vanilla sgd by Tacaks 2009, I speculate that using scaling technique proposed in:
+1:    * Towards Optimal One Pass Large Scale Learning with Averaged Stochastic Gradient Descent section 5, page 6
+1:    * can be beneficial in term s of both speed and accuracy.
+1:    *
+1:    * Tacaks' method doesn't calculate gradient of regularization correctly, which has non-zero elements everywhere of
+1:    * the matrix. While Tacaks' method can only updates a single row/column, if one user has a lot of recommendation,
+1:    * her vector will be more affected by regularization using an isolated scaling factor for both user vectors and
+1:    * item vectors can remove this issue without inducing more update cost it even reduces it a bit by only performing
+1:    * one addition and one multiplication.
+1:    *
+1:    * BAD SIDE1: the scaling factor decreases fast, it has to be scaled up from time to time before dropped to zero or
+1:    *            caused roundoff error
+1:    * BAD SIDE2: no body experiment on it before, and people generally use very small lambda
+1:    *            so it's impact on accuracy may still be unknown.
+1:    * BAD SIDE3: don't know how to make it work for L1-regularization or
+1:    *            "pseudorank?" (sum of singular values)-regularization */
+1:   protected void update(Preference preference, double mu) {
+1:     int userIndex = userIndex(preference.getUserID());
+1:     int itemIndex = itemIndex(preference.getItemID());
+1: 
+1:     double[] userVector = userVectors[userIndex];
+1:     double[] itemVector = itemVectors[itemIndex];
+1: 
+1:     double prediction = dot(userVector, itemVector);
+1:     double err = preference.getValue() - prediction;
+1: 
+1:     // adjust features
+1:     for (int k = FEATURE_OFFSET; k < rank; k++) {
+1:       double userFeature = userVector[k];
+1:       double itemFeature = itemVector[k];
+1: 
+1:       userVector[k] += mu * (err * itemFeature - lambda * userFeature);
+1:       itemVector[k] += mu * (err * userFeature - lambda * itemFeature);
+1:     }
+1: 
+1:     // adjust user and item bias
+1:     userVector[USER_BIAS_INDEX] += biasMuRatio * mu * (err - biasLambdaRatio * lambda * userVector[USER_BIAS_INDEX]);
+1:     itemVector[ITEM_BIAS_INDEX] += biasMuRatio * mu * (err - biasLambdaRatio * lambda * itemVector[ITEM_BIAS_INDEX]);
+1:   }
+1: 
+1:   private double dot(double[] userVector, double[] itemVector) {
+1:     double sum = 0;
+1:     for (int k = 0; k < rank; k++) {
+1:       sum += userVector[k] * itemVector[k];
+1:     }
+1:     return sum;
+1:   }
+1: }
+============================================================================

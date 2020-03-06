@@ -1,0 +1,733 @@
+1:131eb4a: /**
+1:131eb4a:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:131eb4a:  * contributor license agreements.  See the NOTICE file distributed with
+1:131eb4a:  * this work for additional information regarding copyright ownership.
+1:131eb4a:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:131eb4a:  * (the "License"); you may not use this file except in compliance with
+1:131eb4a:  * the License.  You may obtain a copy of the License at
+1:131eb4a:  *
+1:131eb4a:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:131eb4a:  *
+1:131eb4a:  * Unless required by applicable law or agreed to in writing, software
+1:131eb4a:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:131eb4a:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:131eb4a:  * See the License for the specific language governing permissions and
+1:131eb4a:  * limitations under the License.
+1:131eb4a:  */
+1:131eb4a: package org.apache.mahout.clustering.lda.cvb;
+2:131eb4a: 
+1:131eb4a: import java.io.IOException;
+1:85f9ece: import java.util.ArrayList;
+1:131eb4a: import java.util.Arrays;
+1:85f9ece: import java.util.HashMap;
+1:131eb4a: import java.util.Iterator;
+1:131eb4a: import java.util.List;
+1:131eb4a: import java.util.Map;
+1:131eb4a: import java.util.concurrent.ArrayBlockingQueue;
+1:131eb4a: import java.util.concurrent.BlockingQueue;
+1:131eb4a: import java.util.concurrent.Callable;
+1:131eb4a: import java.util.concurrent.ThreadPoolExecutor;
+1:131eb4a: import java.util.concurrent.TimeUnit;
+1:131eb4a: 
+1:85f9ece: import org.apache.hadoop.fs.Path;
+1:85f9ece: import org.apache.mahout.math.Matrix;
+1:85f9ece: import org.apache.mahout.math.MatrixSlice;
+1:85f9ece: import org.apache.mahout.math.SparseRowMatrix;
+1:85f9ece: import org.apache.mahout.math.Vector;
+1:85f9ece: import org.apache.mahout.math.VectorIterable;
+1:85f9ece: import org.slf4j.Logger;
+1:85f9ece: import org.slf4j.LoggerFactory;
+1:85f9ece: 
+1:131eb4a: /**
+1:131eb4a:  * Multithreaded LDA model trainer class, which primarily operates by running a "map/reduce"
+1:131eb4a:  * operation, all in memory locally (ie not a hadoop job!) : the "map" operation is to take
+1:131eb4a:  * the "read-only" {@link TopicModel} and use it to iteratively learn the p(topic|term, doc)
+1:131eb4a:  * distribution for documents (this can be done in parallel across many documents, as the
+1:131eb4a:  * "read-only" model is, well, read-only.  Then the outputs of this are "reduced" onto the
+1:131eb4a:  * "write" model, and these updates are not parallelizable in the same way: individual
+1:131eb4a:  * documents can't be added to the same entries in different threads at the same time, but
+1:131eb4a:  * updates across many topics to the same term from the same document can be done in parallel,
+1:131eb4a:  * so they are.
+1:131eb4a:  *
+1:131eb4a:  * Because computation is done asynchronously, when iteration is done, it's important to call
+1:131eb4a:  * the stop() method, which blocks until work is complete.
+1:131eb4a:  *
+1:131eb4a:  * Setting the read model and the write model to be the same object may not quite work yet,
+1:131eb4a:  * on account of parallelism badness.
+1:131eb4a:  */
+1:131eb4a: public class ModelTrainer {
+1:564c3e1: 
+1:131eb4a:   private static final Logger log = LoggerFactory.getLogger(ModelTrainer.class);
+1:564c3e1: 
+1:564c3e1:   private final int numTopics;
+1:564c3e1:   private final int numTerms;
+1:131eb4a:   private TopicModel readModel;
+1:131eb4a:   private TopicModel writeModel;
+1:131eb4a:   private ThreadPoolExecutor threadPool;
+1:131eb4a:   private BlockingQueue<Runnable> workQueue;
+1:564c3e1:   private final int numTrainThreads;
+1:564c3e1:   private final boolean isReadWrite;
+1:131eb4a: 
+1:131eb4a:   public ModelTrainer(TopicModel initialReadModel, TopicModel initialWriteModel,
+1:131eb4a:       int numTrainThreads, int numTopics, int numTerms) {
+1:131eb4a:     this.readModel = initialReadModel;
+1:131eb4a:     this.writeModel = initialWriteModel;
+1:131eb4a:     this.numTrainThreads = numTrainThreads;
+1:131eb4a:     this.numTopics = numTopics;
+1:131eb4a:     this.numTerms = numTerms;
+1:564c3e1:     isReadWrite = initialReadModel == initialWriteModel;
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   /**
+1:131eb4a:    * WARNING: this constructor may not lead to good behavior.  What should be verified is that
+1:131eb4a:    * the model updating process does not conflict with model reading.  It might work, but then
+1:131eb4a:    * again, it might not!
+1:131eb4a:    * @param model to be used for both reading (inference) and accumulating (learning)
+1:131eb4a:    * @param numTrainThreads
+1:131eb4a:    * @param numTopics
+1:131eb4a:    * @param numTerms
+1:131eb4a:    */
+1:131eb4a:   public ModelTrainer(TopicModel model, int numTrainThreads, int numTopics, int numTerms) {
+1:131eb4a:     this(model, model, numTrainThreads, numTopics, numTerms);
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public TopicModel getReadModel() {
+1:131eb4a:     return readModel;
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public void start() {
+1:10c535c:     log.info("Starting training threadpool with {} threads", numTrainThreads);
+1:87c15be:     workQueue = new ArrayBlockingQueue<>(numTrainThreads * 10);
+1:131eb4a:     threadPool = new ThreadPoolExecutor(numTrainThreads, numTrainThreads, 0, TimeUnit.SECONDS,
+1:131eb4a:         workQueue);
+1:131eb4a:     threadPool.allowCoreThreadTimeOut(false);
+1:131eb4a:     threadPool.prestartAllCoreThreads();
+1:67d1490:     writeModel.reset();
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public void train(VectorIterable matrix, VectorIterable docTopicCounts) {
+1:131eb4a:     train(matrix, docTopicCounts, 1);
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public double calculatePerplexity(VectorIterable matrix, VectorIterable docTopicCounts) {
+1:131eb4a:     return calculatePerplexity(matrix, docTopicCounts, 0);
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public double calculatePerplexity(VectorIterable matrix, VectorIterable docTopicCounts,
+1:131eb4a:       double testFraction) {
+1:131eb4a:     Iterator<MatrixSlice> docIterator = matrix.iterator();
+1:131eb4a:     Iterator<MatrixSlice> docTopicIterator = docTopicCounts.iterator();
+1:131eb4a:     double perplexity = 0;
+1:131eb4a:     double matrixNorm = 0;
+1:e64dd36:     while (docIterator.hasNext() && docTopicIterator.hasNext()) {
+1:131eb4a:       MatrixSlice docSlice = docIterator.next();
+1:131eb4a:       MatrixSlice topicSlice = docTopicIterator.next();
+1:131eb4a:       int docId = docSlice.index();
+1:131eb4a:       Vector document = docSlice.vector();
+1:131eb4a:       Vector topicDist = topicSlice.vector();
+1:4841efb:       if (testFraction == 0 || docId % (1 / testFraction) == 0) {
+1:131eb4a:         trainSync(document, topicDist, false, 10);
+1:131eb4a:         perplexity += readModel.perplexity(document, topicDist);
+1:131eb4a:         matrixNorm += document.norm(1);
+1:131eb4a:       }
+1:131eb4a:     }
+1:131eb4a:     return perplexity / matrixNorm;
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public void train(VectorIterable matrix, VectorIterable docTopicCounts, int numDocTopicIters) {
+1:131eb4a:     start();
+1:131eb4a:     Iterator<MatrixSlice> docIterator = matrix.iterator();
+1:131eb4a:     Iterator<MatrixSlice> docTopicIterator = docTopicCounts.iterator();
+1:131eb4a:     long startTime = System.nanoTime();
+1:131eb4a:     int i = 0;
+1:131eb4a:     double[] times = new double[100];
+1:85f9ece:     Map<Vector, Vector> batch = new HashMap<>();
+1:131eb4a:     int numTokensInBatch = 0;
+1:131eb4a:     long batchStart = System.nanoTime();
+1:e64dd36:     while (docIterator.hasNext() && docTopicIterator.hasNext()) {
+1:131eb4a:       i++;
+1:131eb4a:       Vector document = docIterator.next().vector();
+1:131eb4a:       Vector topicDist = docTopicIterator.next().vector();
+1:e64dd36:       if (isReadWrite) {
+1:e64dd36:         if (batch.size() < numTrainThreads) {
+1:131eb4a:           batch.put(document, topicDist);
+1:e64dd36:           if (log.isDebugEnabled()) {
+1:131eb4a:             numTokensInBatch += document.getNumNondefaultElements();
+1:131eb4a:           }
+1:131eb4a:         } else {
+1:131eb4a:           batchTrain(batch, true, numDocTopicIters);
+1:131eb4a:           long time = System.nanoTime();
+1:131eb4a:           log.debug("trained {} docs with {} tokens, start time {}, end time {}",
+1:8396a27:                     numTrainThreads, numTokensInBatch, batchStart, time);
+1:131eb4a:           batchStart = time;
+1:131eb4a:           numTokensInBatch = 0;
+1:131eb4a:         }
+1:131eb4a:       } else {
+1:131eb4a:         long start = System.nanoTime();
+1:131eb4a:         train(document, topicDist, true, numDocTopicIters);
+1:e64dd36:         if (log.isDebugEnabled()) {
+1:131eb4a:           times[i % times.length] =
+1:4841efb:               (System.nanoTime() - start) / (1.0e6 * document.getNumNondefaultElements());
+1:e64dd36:           if (i % 100 == 0) {
+1:131eb4a:             long time = System.nanoTime() - startTime;
+1:10c535c:             log.debug("trained {} documents in {}ms", i, time / 1.0e6);
+1:e64dd36:             if (i % 500 == 0) {
+1:131eb4a:               Arrays.sort(times);
+1:10c535c:               log.debug("training took median {}ms per token-instance", times[times.length / 2]);
+1:131eb4a:             }
+1:131eb4a:           }
+1:131eb4a:         }
+1:131eb4a:       }
+1:131eb4a:     }
+1:131eb4a:     stop();
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public void batchTrain(Map<Vector, Vector> batch, boolean update, int numDocTopicsIters) {
+1:e64dd36:     while (true) {
+1:131eb4a:       try {
+1:85f9ece:         List<TrainerRunnable> runnables = new ArrayList<>();
+1:e64dd36:         for (Map.Entry<Vector, Vector> entry : batch.entrySet()) {
+1:131eb4a:           runnables.add(new TrainerRunnable(readModel, null, entry.getKey(),
+1:131eb4a:               entry.getValue(), new SparseRowMatrix(numTopics, numTerms, true),
+1:131eb4a:               numDocTopicsIters));
+1:131eb4a:         }
+1:131eb4a:         threadPool.invokeAll(runnables);
+1:e64dd36:         if (update) {
+1:e64dd36:           for (TrainerRunnable runnable : runnables) {
+1:131eb4a:             writeModel.update(runnable.docTopicModel);
+1:131eb4a:           }
+1:131eb4a:         }
+1:131eb4a:         break;
+1:131eb4a:       } catch (InterruptedException e) {
+1:131eb4a:         log.warn("Interrupted during batch training, retrying!", e);
+1:131eb4a:       }
+1:131eb4a:     }
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public void train(Vector document, Vector docTopicCounts, boolean update, int numDocTopicIters) {
+1:e64dd36:     while (true) {
+1:131eb4a:       try {
+1:6d16230:         workQueue.put(new TrainerRunnable(readModel, update
+1:6d16230:             ? writeModel
+1:6d16230:             : null, document, docTopicCounts, new SparseRowMatrix(numTopics, numTerms, true), numDocTopicIters));
+1:131eb4a:         return;
+1:131eb4a:       } catch (InterruptedException e) {
+1:10c535c:         log.warn("Interrupted waiting to submit document to work queue: {}", document, e);
+1:131eb4a:       }
+1:131eb4a:     }
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public void trainSync(Vector document, Vector docTopicCounts, boolean update,
+1:131eb4a:       int numDocTopicIters) {
+1:6d16230:     new TrainerRunnable(readModel, update
+1:6d16230:         ? writeModel
+1:6d16230:         : null, document, docTopicCounts, new SparseRowMatrix(numTopics, numTerms, true), numDocTopicIters).run();
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public double calculatePerplexity(Vector document, Vector docTopicCounts, int numDocTopicIters) {
+1:6d16230:     TrainerRunnable runner =  new TrainerRunnable(readModel, null, document, docTopicCounts,
+1:6d16230:         new SparseRowMatrix(numTopics, numTerms, true), numDocTopicIters);
+1:131eb4a:     return runner.call();
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public void stop() {
+1:131eb4a:     long startTime = System.nanoTime();
+1:131eb4a:     log.info("Initiating stopping of training threadpool");
+1:131eb4a:     try {
+1:131eb4a:       threadPool.shutdown();
+1:e64dd36:       if (!threadPool.awaitTermination(60, TimeUnit.SECONDS)) {
+1:131eb4a:         log.warn("Threadpool timed out on await termination - jobs still running!");
+1:131eb4a:       }
+1:131eb4a:       long newTime = System.nanoTime();
+1:10c535c:       log.info("threadpool took: {}ms", (newTime - startTime) / 1.0e6);
+1:131eb4a:       startTime = newTime;
+1:67d1490:       readModel.stop();
+1:131eb4a:       newTime = System.nanoTime();
+1:67d1490:       log.info("readModel.stop() took {}ms", (newTime - startTime) / 1.0e6);
+1:67d1490:       startTime = newTime;
+1:67d1490:       writeModel.stop();
+1:67d1490:       newTime = System.nanoTime();
+1:67d1490:       log.info("writeModel.stop() took {}ms", (newTime - startTime) / 1.0e6);
+1:131eb4a:       TopicModel tmpModel = writeModel;
+1:131eb4a:       writeModel = readModel;
+1:131eb4a:       readModel = tmpModel;
+1:131eb4a:     } catch (InterruptedException e) {
+1:131eb4a:       log.error("Interrupted shutting down!", e);
+1:131eb4a:     }
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   public void persist(Path outputPath) throws IOException {
+1:131eb4a:     readModel.persist(outputPath, true);
+1:131eb4a:   }
+1:131eb4a: 
+1:4841efb:   private static final class TrainerRunnable implements Runnable, Callable<Double> {
+1:131eb4a:     private final TopicModel readModel;
+1:131eb4a:     private final TopicModel writeModel;
+1:131eb4a:     private final Vector document;
+1:131eb4a:     private final Vector docTopics;
+1:131eb4a:     private final Matrix docTopicModel;
+1:131eb4a:     private final int numDocTopicIters;
+1:131eb4a: 
+1:4fbfbc6:     private TrainerRunnable(TopicModel readModel, TopicModel writeModel, Vector document,
+1:131eb4a:         Vector docTopics, Matrix docTopicModel, int numDocTopicIters) {
+1:131eb4a:       this.readModel = readModel;
+1:131eb4a:       this.writeModel = writeModel;
+1:131eb4a:       this.document = document;
+1:131eb4a:       this.docTopics = docTopics;
+1:131eb4a:       this.docTopicModel = docTopicModel;
+1:131eb4a:       this.numDocTopicIters = numDocTopicIters;
+1:131eb4a:     }
+1:131eb4a: 
+1:564c3e1:     @Override
+1:564c3e1:     public void run() {
+1:e64dd36:       for (int i = 0; i < numDocTopicIters; i++) {
+1:131eb4a:         // synchronous read-only call:
+1:131eb4a:         readModel.trainDocTopicModel(document, docTopics, docTopicModel);
+1:131eb4a:       }
+1:e64dd36:       if (writeModel != null) {
+1:131eb4a:         // parallel call which is read-only on the docTopicModel, and write-only on the writeModel
+1:131eb4a:         // this method does not return until all rows of the docTopicModel have been submitted
+1:131eb4a:         // to write work queues
+1:131eb4a:         writeModel.update(docTopicModel);
+1:131eb4a:       }
+1:131eb4a:     }
+1:131eb4a: 
+1:564c3e1:     @Override
+1:564c3e1:     public Double call() {
+1:131eb4a:       run();
+1:131eb4a:       return readModel.perplexity(document, docTopics);
+1:131eb4a:     }
+1:131eb4a:   }
+1:131eb4a: }
+============================================================================
+author:Suneel Marthi
+-------------------------------------------------------------------------------
+commit:85f9ece
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.ArrayList;
+1: import java.util.HashMap;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.hadoop.fs.Path;
+1: import org.apache.mahout.math.Matrix;
+1: import org.apache.mahout.math.MatrixSlice;
+1: import org.apache.mahout.math.SparseRowMatrix;
+1: import org.apache.mahout.math.Vector;
+1: import org.apache.mahout.math.VectorIterable;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     Map<Vector, Vector> batch = new HashMap<>();
+/////////////////////////////////////////////////////////////////////////
+1:         List<TrainerRunnable> runnables = new ArrayList<>();
+commit:87c15be
+/////////////////////////////////////////////////////////////////////////
+1:     workQueue = new ArrayBlockingQueue<>(numTrainThreads * 10);
+author:pferrel
+-------------------------------------------------------------------------------
+commit:b988c49
+author:frankscholten
+-------------------------------------------------------------------------------
+commit:1a42d85
+author:smarthi
+-------------------------------------------------------------------------------
+commit:67d1490
+/////////////////////////////////////////////////////////////////////////
+1:     writeModel.reset();
+/////////////////////////////////////////////////////////////////////////
+1:       readModel.stop();
+1:       log.info("readModel.stop() took {}ms", (newTime - startTime) / 1.0e6);
+1:       startTime = newTime;
+1:       writeModel.stop();
+1:       newTime = System.nanoTime();
+1:       log.info("writeModel.stop() took {}ms", (newTime - startTime) / 1.0e6);
+author:Sebastian Schelter
+-------------------------------------------------------------------------------
+commit:6d16230
+/////////////////////////////////////////////////////////////////////////
+1:         workQueue.put(new TrainerRunnable(readModel, update
+1:             ? writeModel
+1:             : null, document, docTopicCounts, new SparseRowMatrix(numTopics, numTerms, true), numDocTopicIters));
+/////////////////////////////////////////////////////////////////////////
+1:     new TrainerRunnable(readModel, update
+1:         ? writeModel
+1:         : null, document, docTopicCounts, new SparseRowMatrix(numTopics, numTerms, true), numDocTopicIters).run();
+1:     TrainerRunnable runner =  new TrainerRunnable(readModel, null, document, docTopicCounts,
+1:         new SparseRowMatrix(numTopics, numTerms, true), numDocTopicIters);
+commit:4841efb
+/////////////////////////////////////////////////////////////////////////
+1:       if (testFraction == 0 || docId % (1 / testFraction) == 0) {
+/////////////////////////////////////////////////////////////////////////
+1:               (System.nanoTime() - start) / (1.0e6 * document.getNumNondefaultElements());
+/////////////////////////////////////////////////////////////////////////
+1:   private static final class TrainerRunnable implements Runnable, Callable<Double> {
+author:Sean R. Owen
+-------------------------------------------------------------------------------
+commit:10c535c
+/////////////////////////////////////////////////////////////////////////
+1:     log.info("Starting training threadpool with {} threads", numTrainThreads);
+/////////////////////////////////////////////////////////////////////////
+1:             log.debug("trained {} documents in {}ms", i, time / 1.0e6);
+1:               log.debug("training took median {}ms per token-instance", times[times.length / 2]);
+/////////////////////////////////////////////////////////////////////////
+1:         log.warn("Interrupted waiting to submit document to work queue: {}", document, e);
+/////////////////////////////////////////////////////////////////////////
+1:       log.info("threadpool took: {}ms", (newTime - startTime) / 1.0e6);
+0:       log.info("writeModel.awaitTermination() took {}ms", (newTime - startTime) / 1.0e6);
+commit:8396a27
+/////////////////////////////////////////////////////////////////////////
+1:                     numTrainThreads, numTokensInBatch, batchStart, time);
+commit:564c3e1
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: 
+1:   private final int numTopics;
+1:   private final int numTerms;
+1:   private final int numTrainThreads;
+1:   private final boolean isReadWrite;
+/////////////////////////////////////////////////////////////////////////
+1:     isReadWrite = initialReadModel == initialWriteModel;
+/////////////////////////////////////////////////////////////////////////
+0:       if(testFraction == 0 || docId % (1/testFraction) == 0) {
+/////////////////////////////////////////////////////////////////////////
+0:             log.debug("trained " + i + " documents in " + (time / 1.0e6) + "ms");
+/////////////////////////////////////////////////////////////////////////
+0:       log.info("threadpool took: " + (newTime - startTime) / 1.0e6 + "ms");
+0:       log.info("writeModel.awaitTermination() took " + (newTime - startTime) / 1.0e6 + "ms");
+/////////////////////////////////////////////////////////////////////////
+1:     @Override
+1:     public void run() {
+/////////////////////////////////////////////////////////////////////////
+1:     @Override
+1:     public Double call() {
+commit:4fbfbc6
+/////////////////////////////////////////////////////////////////////////
+0:               (System.nanoTime() - start) /(1.0e6 * document.getNumNondefaultElements());
+/////////////////////////////////////////////////////////////////////////
+1:     private TrainerRunnable(TopicModel readModel, TopicModel writeModel, Vector document,
+author:tcp
+-------------------------------------------------------------------------------
+commit:e64dd36
+/////////////////////////////////////////////////////////////////////////
+1:     while (docIterator.hasNext() && docTopicIterator.hasNext()) {
+0:       if (testFraction == 0 || docId % (1/testFraction) == 0) {
+/////////////////////////////////////////////////////////////////////////
+1:     while (docIterator.hasNext() && docTopicIterator.hasNext()) {
+1:       if (isReadWrite) {
+1:         if (batch.size() < numTrainThreads) {
+1:           if (log.isDebugEnabled()) {
+/////////////////////////////////////////////////////////////////////////
+1:         if (log.isDebugEnabled()) {
+1:           if (i % 100 == 0) {
+1:             if (i % 500 == 0) {
+/////////////////////////////////////////////////////////////////////////
+1:     while (true) {
+1:         for (Map.Entry<Vector, Vector> entry : batch.entrySet()) {
+1:         if (update) {
+1:           for (TrainerRunnable runnable : runnables) {
+/////////////////////////////////////////////////////////////////////////
+1:     while (true) {
+/////////////////////////////////////////////////////////////////////////
+1:       if (!threadPool.awaitTermination(60, TimeUnit.SECONDS)) {
+/////////////////////////////////////////////////////////////////////////
+1:       for (int i = 0; i < numDocTopicIters; i++) {
+1:       if (writeModel != null) {
+author:Jacob Alexander Mannix
+-------------------------------------------------------------------------------
+commit:131eb4a
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.mahout.clustering.lda.cvb;
+1: 
+0: import com.google.common.collect.Lists;
+0: import com.google.common.collect.Maps;
+0: import org.apache.hadoop.fs.Path;
+0: import org.apache.mahout.math.Matrix;
+0: import org.apache.mahout.math.MatrixSlice;
+0: import org.apache.mahout.math.SparseRowMatrix;
+0: import org.apache.mahout.math.Vector;
+0: import org.apache.mahout.math.VectorIterable;
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+1: 
+1: import java.io.IOException;
+1: import java.util.Arrays;
+1: import java.util.Iterator;
+1: import java.util.List;
+1: import java.util.Map;
+1: import java.util.concurrent.ArrayBlockingQueue;
+1: import java.util.concurrent.BlockingQueue;
+1: import java.util.concurrent.Callable;
+1: import java.util.concurrent.ThreadPoolExecutor;
+1: import java.util.concurrent.TimeUnit;
+1: 
+1: /**
+1:  * Multithreaded LDA model trainer class, which primarily operates by running a "map/reduce"
+1:  * operation, all in memory locally (ie not a hadoop job!) : the "map" operation is to take
+1:  * the "read-only" {@link TopicModel} and use it to iteratively learn the p(topic|term, doc)
+1:  * distribution for documents (this can be done in parallel across many documents, as the
+1:  * "read-only" model is, well, read-only.  Then the outputs of this are "reduced" onto the
+1:  * "write" model, and these updates are not parallelizable in the same way: individual
+1:  * documents can't be added to the same entries in different threads at the same time, but
+1:  * updates across many topics to the same term from the same document can be done in parallel,
+1:  * so they are.
+1:  *
+1:  * Because computation is done asynchronously, when iteration is done, it's important to call
+1:  * the stop() method, which blocks until work is complete.
+1:  *
+1:  * Setting the read model and the write model to be the same object may not quite work yet,
+1:  * on account of parallelism badness.
+1:  */
+1: public class ModelTrainer {
+1:   private static final Logger log = LoggerFactory.getLogger(ModelTrainer.class);
+0:   private int numTopics;
+0:   private int numTerms;
+1:   private TopicModel readModel;
+1:   private TopicModel writeModel;
+1:   private ThreadPoolExecutor threadPool;
+1:   private BlockingQueue<Runnable> workQueue;
+0:   private int numTrainThreads;
+0:   private boolean isReadWrite;
+1: 
+1:   public ModelTrainer(TopicModel initialReadModel, TopicModel initialWriteModel,
+1:       int numTrainThreads, int numTopics, int numTerms) {
+1:     this.readModel = initialReadModel;
+1:     this.writeModel = initialWriteModel;
+1:     this.numTrainThreads = numTrainThreads;
+1:     this.numTopics = numTopics;
+1:     this.numTerms = numTerms;
+0:     isReadWrite = (initialReadModel == initialWriteModel);
+1:   }
+1: 
+1:   /**
+1:    * WARNING: this constructor may not lead to good behavior.  What should be verified is that
+1:    * the model updating process does not conflict with model reading.  It might work, but then
+1:    * again, it might not!
+1:    * @param model to be used for both reading (inference) and accumulating (learning)
+1:    * @param numTrainThreads
+1:    * @param numTopics
+1:    * @param numTerms
+1:    */
+1:   public ModelTrainer(TopicModel model, int numTrainThreads, int numTopics, int numTerms) {
+1:     this(model, model, numTrainThreads, numTopics, numTerms);
+1:   }
+1: 
+1:   public TopicModel getReadModel() {
+1:     return readModel;
+1:   }
+1: 
+1:   public void start() {
+0:     log.info("Starting training threadpool with " + numTrainThreads + " threads");
+0:     workQueue = new ArrayBlockingQueue<Runnable>(numTrainThreads * 10);
+1:     threadPool = new ThreadPoolExecutor(numTrainThreads, numTrainThreads, 0, TimeUnit.SECONDS,
+1:         workQueue);
+1:     threadPool.allowCoreThreadTimeOut(false);
+1:     threadPool.prestartAllCoreThreads();
+1:   }
+1: 
+1:   public void train(VectorIterable matrix, VectorIterable docTopicCounts) {
+1:     train(matrix, docTopicCounts, 1);
+1:   }
+1: 
+1:   public double calculatePerplexity(VectorIterable matrix, VectorIterable docTopicCounts) {
+1:     return calculatePerplexity(matrix, docTopicCounts, 0);
+1:   }
+1: 
+1:   public double calculatePerplexity(VectorIterable matrix, VectorIterable docTopicCounts,
+1:       double testFraction) {
+1:     Iterator<MatrixSlice> docIterator = matrix.iterator();
+1:     Iterator<MatrixSlice> docTopicIterator = docTopicCounts.iterator();
+1:     double perplexity = 0;
+1:     double matrixNorm = 0;
+0:     while(docIterator.hasNext() && docTopicIterator.hasNext()) {
+1:       MatrixSlice docSlice = docIterator.next();
+1:       MatrixSlice topicSlice = docTopicIterator.next();
+1:       int docId = docSlice.index();
+1:       Vector document = docSlice.vector();
+1:       Vector topicDist = topicSlice.vector();
+0:       if(testFraction == 0 || docId % ((int)1/testFraction) == 0) {
+1:         trainSync(document, topicDist, false, 10);
+1:         perplexity += readModel.perplexity(document, topicDist);
+1:         matrixNorm += document.norm(1);
+1:       }
+1:     }
+1:     return perplexity / matrixNorm;
+1:   }
+1: 
+1:   public void train(VectorIterable matrix, VectorIterable docTopicCounts, int numDocTopicIters) {
+1:     start();
+1:     Iterator<MatrixSlice> docIterator = matrix.iterator();
+1:     Iterator<MatrixSlice> docTopicIterator = docTopicCounts.iterator();
+1:     long startTime = System.nanoTime();
+1:     int i = 0;
+1:     double[] times = new double[100];
+0:     Map<Vector, Vector> batch = Maps.newHashMap();
+1:     int numTokensInBatch = 0;
+1:     long batchStart = System.nanoTime();
+0:     while(docIterator.hasNext() && docTopicIterator.hasNext()) {
+1:       i++;
+1:       Vector document = docIterator.next().vector();
+1:       Vector topicDist = docTopicIterator.next().vector();
+0:       if(isReadWrite) {
+0:         if(batch.size() < numTrainThreads) {
+1:           batch.put(document, topicDist);
+0:           if(log.isDebugEnabled()) {
+1:             numTokensInBatch += document.getNumNondefaultElements();
+1:           }
+1:         } else {
+1:           batchTrain(batch, true, numDocTopicIters);
+1:           long time = System.nanoTime();
+1:           log.debug("trained {} docs with {} tokens, start time {}, end time {}",
+0:               new Object[] {numTrainThreads, numTokensInBatch, batchStart, time});
+1:           batchStart = time;
+1:           numTokensInBatch = 0;
+1:         }
+1:       } else {
+1:         long start = System.nanoTime();
+1:         train(document, topicDist, true, numDocTopicIters);
+0:         if(log.isDebugEnabled()) {
+1:           times[i % times.length] =
+0:               ((System.nanoTime() - start)/(1e6 * document.getNumNondefaultElements()));
+0:           if(i % 100 == 0) {
+1:             long time = System.nanoTime() - startTime;
+0:             log.debug("trained " + i + " documents in " + (time * 1d / 1e6) + "ms");
+0:             if(i % 500 == 0) {
+1:               Arrays.sort(times);
+0:               log.debug("training took median " + times[times.length / 2] + "ms per token-instance");
+1:             }
+1:           }
+1:         }
+1:       }
+1:     }
+1:     stop();
+1:   }
+1: 
+1:   public void batchTrain(Map<Vector, Vector> batch, boolean update, int numDocTopicsIters) {
+0:     while(true) {
+1:       try {
+0:         List<TrainerRunnable> runnables = Lists.newArrayList();
+0:         for(Map.Entry<Vector, Vector> entry : batch.entrySet()) {
+1:           runnables.add(new TrainerRunnable(readModel, null, entry.getKey(),
+1:               entry.getValue(), new SparseRowMatrix(numTopics, numTerms, true),
+1:               numDocTopicsIters));
+1:         }
+1:         threadPool.invokeAll(runnables);
+0:         if(update) {
+0:           for(TrainerRunnable runnable : runnables) {
+1:             writeModel.update(runnable.docTopicModel);
+1:           }
+1:         }
+1:         break;
+1:       } catch (InterruptedException e) {
+1:         log.warn("Interrupted during batch training, retrying!", e);
+1:       }
+1:     }
+1:   }
+1: 
+1:   public void train(Vector document, Vector docTopicCounts, boolean update, int numDocTopicIters) {
+0:     while(true) {
+1:       try {
+0:         workQueue.put(new TrainerRunnable(readModel,
+0:             update ? writeModel : null, document, docTopicCounts, new SparseRowMatrix(
+0:             numTopics, numTerms, true), numDocTopicIters));
+1:         return;
+1:       } catch (InterruptedException e) {
+0:         log.warn("Interrupted waiting to submit document to work queue: " + document, e);
+1:       }
+1:     }
+1:   }
+1: 
+1:   public void trainSync(Vector document, Vector docTopicCounts, boolean update,
+1:       int numDocTopicIters) {
+0:     new TrainerRunnable(readModel,
+0:             update ? writeModel : null, document, docTopicCounts, new SparseRowMatrix(
+0:             numTopics, numTerms, true), numDocTopicIters).run();
+1:   }
+1: 
+1:   public double calculatePerplexity(Vector document, Vector docTopicCounts, int numDocTopicIters) {
+0:     TrainerRunnable runner =  new TrainerRunnable(readModel,
+0:             null, document, docTopicCounts, new SparseRowMatrix(
+0:             numTopics, numTerms, true), numDocTopicIters);
+1:     return runner.call();
+1:   }
+1: 
+1:   public void stop() {
+1:     long startTime = System.nanoTime();
+1:     log.info("Initiating stopping of training threadpool");
+1:     try {
+1:       threadPool.shutdown();
+0:       if(!threadPool.awaitTermination(60, TimeUnit.SECONDS)) {
+1:         log.warn("Threadpool timed out on await termination - jobs still running!");
+1:       }
+1:       long newTime = System.nanoTime();
+0:       log.info("threadpool took: " + (newTime - startTime)*1d/1e6 + "ms");
+1:       startTime = newTime;
+0:       writeModel.awaitTermination();
+1:       newTime = System.nanoTime();
+0:       log.info("writeModel.awaitTermination() took " + (newTime - startTime)*1d/1e6 + "ms");
+1:       TopicModel tmpModel = writeModel;
+1:       writeModel = readModel;
+1:       readModel = tmpModel;
+0:       writeModel.reset();
+1:     } catch (InterruptedException e) {
+1:       log.error("Interrupted shutting down!", e);
+1:     }
+1:   }
+1: 
+1:   public void persist(Path outputPath) throws IOException {
+1:     readModel.persist(outputPath, true);
+1:   }
+1: 
+0:   private static class TrainerRunnable implements Runnable, Callable<Double> {
+1:     private final TopicModel readModel;
+1:     private final TopicModel writeModel;
+1:     private final Vector document;
+1:     private final Vector docTopics;
+1:     private final Matrix docTopicModel;
+1:     private final int numDocTopicIters;
+1: 
+0:     public TrainerRunnable(TopicModel readModel, TopicModel writeModel, Vector document,
+1:         Vector docTopics, Matrix docTopicModel, int numDocTopicIters) {
+1:       this.readModel = readModel;
+1:       this.writeModel = writeModel;
+1:       this.document = document;
+1:       this.docTopics = docTopics;
+1:       this.docTopicModel = docTopicModel;
+1:       this.numDocTopicIters = numDocTopicIters;
+1:     }
+1: 
+0:     @Override public void run() {
+0:       for(int i = 0; i < numDocTopicIters; i++) {
+1:         // synchronous read-only call:
+1:         readModel.trainDocTopicModel(document, docTopics, docTopicModel);
+1:       }
+0:       if(writeModel != null) {
+1:         // parallel call which is read-only on the docTopicModel, and write-only on the writeModel
+1:         // this method does not return until all rows of the docTopicModel have been submitted
+1:         // to write work queues
+1:         writeModel.update(docTopicModel);
+1:       }
+1:     }
+1: 
+0:     @Override public Double call() {
+1:       run();
+1:       return readModel.perplexity(document, docTopics);
+1:     }
+1:   }
+1: }
+============================================================================

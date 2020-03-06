@@ -1,0 +1,741 @@
+1:e16d8a7: /*
+1:e16d8a7:  * Licensed to the Apache Software Foundation (ASF) under one
+1:e16d8a7:  * or more contributor license agreements.  See the NOTICE file
+1:e16d8a7:  * distributed with this work for additional information
+1:e16d8a7:  * regarding copyright ownership.  The ASF licenses this file
+1:e16d8a7:  * to you under the Apache License, Version 2.0 (the
+1:e16d8a7:  * "License"); you may not use this file except in compliance
+1:e16d8a7:  * with the License.  You may obtain a copy of the License at
+1:e16d8a7:  *
+1:e16d8a7:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:e16d8a7:  *
+1:e16d8a7:  * Unless required by applicable law or agreed to in writing, software
+1:e16d8a7:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:e16d8a7:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:e16d8a7:  * See the License for the specific language governing permissions and
+1:e16d8a7:  * limitations under the License.
+1:e16d8a7:  */
+1:e16d8a7: 
+1:e16d8a7: package org.apache.cassandra.db.compaction;
+1:e16d8a7: 
+1:e16d8a7: import java.io.IOException;
+1:e16d8a7: import java.io.OutputStreamWriter;
+1:6bb7577: import java.lang.ref.WeakReference;
+1:e16d8a7: import java.nio.file.*;
+1:e16d8a7: import java.util.Collection;
+1:e16d8a7: import java.util.HashSet;
+1:e16d8a7: import java.util.List;
+1:e16d8a7: import java.util.Map;
+1:e16d8a7: import java.util.Set;
+1:e16d8a7: import java.util.concurrent.*;
+1:e16d8a7: import java.util.concurrent.atomic.AtomicBoolean;
+1:e16d8a7: import java.util.concurrent.atomic.AtomicInteger;
+1:e16d8a7: import java.util.function.Consumer;
+1:e16d8a7: import java.util.function.Function;
+1:e16d8a7: 
+1:6bb7577: import com.google.common.collect.MapMaker;
+1:e16d8a7: import org.slf4j.Logger;
+1:e16d8a7: import org.slf4j.LoggerFactory;
+1:e16d8a7: 
+1:e16d8a7: import org.apache.cassandra.db.ColumnFamilyStore;
+1:e16d8a7: import org.apache.cassandra.io.sstable.format.SSTableReader;
+1:e16d8a7: import org.apache.cassandra.utils.NoSpamLogger;
+1:e16d8a7: import org.codehaus.jackson.JsonNode;
+1:e16d8a7: import org.codehaus.jackson.node.ArrayNode;
+1:e16d8a7: import org.codehaus.jackson.node.JsonNodeFactory;
+1:e16d8a7: import org.codehaus.jackson.node.ObjectNode;
+1:e16d8a7: 
+1:e16d8a7: public class CompactionLogger
+1:e16d8a7: {
+1:e16d8a7:     public interface Strategy
+1:e16d8a7:     {
+1:e16d8a7:         JsonNode sstable(SSTableReader sstable);
+1:e16d8a7: 
+1:e16d8a7:         JsonNode options();
+1:e16d8a7: 
+1:e16d8a7:         static Strategy none = new Strategy()
+1:e16d8a7:         {
+1:e16d8a7:             public JsonNode sstable(SSTableReader sstable)
+1:e16d8a7:             {
+1:e16d8a7:                 return null;
+1:e16d8a7:             }
+1:e16d8a7: 
+1:e16d8a7:             public JsonNode options()
+1:e16d8a7:             {
+1:e16d8a7:                 return null;
+1:e16d8a7:             }
+1:e16d8a7:         };
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     /**
+1:e16d8a7:      * This will produce the compaction strategy's starting information.
+1:e16d8a7:      */
+1:e16d8a7:     public interface StrategySummary
+1:e16d8a7:     {
+1:e16d8a7:         JsonNode getSummary();
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     /**
+1:e16d8a7:      * This is an interface to allow writing to a different interface.
+1:e16d8a7:      */
+1:e16d8a7:     public interface Writer
+1:e16d8a7:     {
+1:e16d8a7:         /**
+1:e16d8a7:          * This is used when we are already trying to write out the start of a
+1:e16d8a7:          * @param statement This should be written out to the medium capturing the logs
+1:e16d8a7:          * @param tag       This is an identifier for a strategy; each strategy should have a distinct Object
+1:e16d8a7:          */
+1:e16d8a7:         void writeStart(JsonNode statement, Object tag);
+1:e16d8a7: 
+1:e16d8a7:         /**
+1:e16d8a7:          * @param statement This should be written out to the medium capturing the logs
+1:e16d8a7:          * @param summary   This can be used when a tag is not recognized by this writer; this can be because the file
+1:e16d8a7:          *                  has been rolled, or otherwise the writer had to start over
+1:e16d8a7:          * @param tag       This is an identifier for a strategy; each strategy should have a distinct Object
+1:e16d8a7:          */
+1:e16d8a7:         void write(JsonNode statement, StrategySummary summary, Object tag);
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     private interface CompactionStrategyAndTableFunction
+1:e16d8a7:     {
+1:e16d8a7:         JsonNode apply(AbstractCompactionStrategy strategy, SSTableReader sstable);
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     private static final JsonNodeFactory json = JsonNodeFactory.instance;
+1:e16d8a7:     private static final Logger logger = LoggerFactory.getLogger(CompactionLogger.class);
+1:e16d8a7:     private static final Writer serializer = new CompactionLogSerializer();
+1:6bb7577:     private final WeakReference<ColumnFamilyStore> cfsRef;
+1:6bb7577:     private final WeakReference<CompactionStrategyManager> csmRef;
+1:e16d8a7:     private final AtomicInteger identifier = new AtomicInteger(0);
+1:6bb7577:     private final Map<AbstractCompactionStrategy, String> compactionStrategyMapping = new MapMaker().weakKeys().makeMap();
+1:e16d8a7:     private final AtomicBoolean enabled = new AtomicBoolean(false);
+1:e16d8a7: 
+1:e16d8a7:     public CompactionLogger(ColumnFamilyStore cfs, CompactionStrategyManager csm)
+1:e16d8a7:     {
+1:6bb7577:         csmRef = new WeakReference<>(csm);
+1:6bb7577:         cfsRef = new WeakReference<>(cfs);
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     private void forEach(Consumer<AbstractCompactionStrategy> consumer)
+1:e16d8a7:     {
+1:6bb7577:         CompactionStrategyManager csm = csmRef.get();
+1:6bb7577:         if (csm == null)
+1:6bb7577:             return;
+1:e16d8a7:         csm.getStrategies()
+1:e16d8a7:            .forEach(l -> l.forEach(consumer));
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     private ArrayNode compactionStrategyMap(Function<AbstractCompactionStrategy, JsonNode> select)
+1:e16d8a7:     {
+1:e16d8a7:         ArrayNode node = json.arrayNode();
+1:e16d8a7:         forEach(acs -> node.add(select.apply(acs)));
+1:e16d8a7:         return node;
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     private ArrayNode sstableMap(Collection<SSTableReader> sstables, CompactionStrategyAndTableFunction csatf)
+1:e16d8a7:     {
+1:6bb7577:         CompactionStrategyManager csm = csmRef.get();
+1:e16d8a7:         ArrayNode node = json.arrayNode();
+1:6bb7577:         if (csm == null)
+1:6bb7577:             return node;
+1:e16d8a7:         sstables.forEach(t -> node.add(csatf.apply(csm.getCompactionStrategyFor(t), t)));
+1:e16d8a7:         return node;
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     private String getId(AbstractCompactionStrategy strategy)
+1:e16d8a7:     {
+1:e16d8a7:         return compactionStrategyMapping.computeIfAbsent(strategy, s -> String.valueOf(identifier.getAndIncrement()));
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     private JsonNode formatSSTables(AbstractCompactionStrategy strategy)
+1:e16d8a7:     {
+1:e16d8a7:         ArrayNode node = json.arrayNode();
+1:6bb7577:         CompactionStrategyManager csm = csmRef.get();
+1:6bb7577:         ColumnFamilyStore cfs = cfsRef.get();
+1:6bb7577:         if (csm == null || cfs == null)
+1:6bb7577:             return node;
+1:e16d8a7:         for (SSTableReader sstable : cfs.getLiveSSTables())
+1:e16d8a7:         {
+1:e16d8a7:             if (csm.getCompactionStrategyFor(sstable) == strategy)
+1:e16d8a7:                 node.add(formatSSTable(strategy, sstable));
+1:e16d8a7:         }
+1:e16d8a7:         return node;
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     private JsonNode formatSSTable(AbstractCompactionStrategy strategy, SSTableReader sstable)
+1:e16d8a7:     {
+1:e16d8a7:         ObjectNode node = json.objectNode();
+1:e16d8a7:         node.put("generation", sstable.descriptor.generation);
+1:e16d8a7:         node.put("version", sstable.descriptor.version.getVersion());
+1:e16d8a7:         node.put("size", sstable.onDiskLength());
+1:e16d8a7:         JsonNode logResult = strategy.strategyLogger().sstable(sstable);
+1:e16d8a7:         if (logResult != null)
+1:e16d8a7:             node.put("details", logResult);
+1:e16d8a7:         return node;
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     private JsonNode startStrategy(AbstractCompactionStrategy strategy)
+1:e16d8a7:     {
+1:e16d8a7:         ObjectNode node = json.objectNode();
+1:6bb7577:         CompactionStrategyManager csm = csmRef.get();
+1:6bb7577:         if (csm == null)
+1:6bb7577:             return node;
+1:e16d8a7:         node.put("strategyId", getId(strategy));
+1:e16d8a7:         node.put("type", strategy.getName());
+1:e16d8a7:         node.put("tables", formatSSTables(strategy));
+1:e16d8a7:         node.put("repaired", csm.isRepaired(strategy));
+1:e16d8a7:         List<String> folders = csm.getStrategyFolders(strategy);
+1:e16d8a7:         ArrayNode folderNode = json.arrayNode();
+1:e16d8a7:         for (String folder : folders)
+1:e16d8a7:         {
+1:e16d8a7:             folderNode.add(folder);
+1:e16d8a7:         }
+1:e16d8a7:         node.put("folders", folderNode);
+1:e16d8a7: 
+1:e16d8a7:         JsonNode logResult = strategy.strategyLogger().options();
+1:e16d8a7:         if (logResult != null)
+1:e16d8a7:             node.put("options", logResult);
+1:e16d8a7:         return node;
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     private JsonNode shutdownStrategy(AbstractCompactionStrategy strategy)
+1:e16d8a7:     {
+1:e16d8a7:         ObjectNode node = json.objectNode();
+1:e16d8a7:         node.put("strategyId", getId(strategy));
+1:e16d8a7:         return node;
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     private JsonNode describeSSTable(AbstractCompactionStrategy strategy, SSTableReader sstable)
+1:e16d8a7:     {
+1:e16d8a7:         ObjectNode node = json.objectNode();
+1:e16d8a7:         node.put("strategyId", getId(strategy));
+1:e16d8a7:         node.put("table", formatSSTable(strategy, sstable));
+1:e16d8a7:         return node;
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     private void describeStrategy(ObjectNode node)
+1:e16d8a7:     {
+1:6bb7577:         ColumnFamilyStore cfs = cfsRef.get();
+1:6bb7577:         if (cfs == null)
+1:6bb7577:             return;
+1:e16d8a7:         node.put("keyspace", cfs.keyspace.getName());
+1:e16d8a7:         node.put("table", cfs.getTableName());
+1:e16d8a7:         node.put("time", System.currentTimeMillis());
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     private JsonNode startStrategies()
+1:e16d8a7:     {
+1:e16d8a7:         ObjectNode node = json.objectNode();
+1:e16d8a7:         node.put("type", "enable");
+1:e16d8a7:         describeStrategy(node);
+1:e16d8a7:         node.put("strategies", compactionStrategyMap(this::startStrategy));
+1:e16d8a7:         return node;
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     public void enable()
+1:e16d8a7:     {
+1:e16d8a7:         if (enabled.compareAndSet(false, true))
+1:e16d8a7:         {
+1:e16d8a7:             serializer.writeStart(startStrategies(), this);
+1:e16d8a7:         }
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     public void disable()
+1:e16d8a7:     {
+1:e16d8a7:         if (enabled.compareAndSet(true, false))
+1:e16d8a7:         {
+1:e16d8a7:             ObjectNode node = json.objectNode();
+1:e16d8a7:             node.put("type", "disable");
+1:e16d8a7:             describeStrategy(node);
+1:e16d8a7:             node.put("strategies", compactionStrategyMap(this::shutdownStrategy));
+1:e16d8a7:             serializer.write(node, this::startStrategies, this);
+1:e16d8a7:         }
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     public void flush(Collection<SSTableReader> sstables)
+1:e16d8a7:     {
+1:e16d8a7:         if (enabled.get())
+1:e16d8a7:         {
+1:e16d8a7:             ObjectNode node = json.objectNode();
+1:e16d8a7:             node.put("type", "flush");
+1:e16d8a7:             describeStrategy(node);
+1:e16d8a7:             node.put("tables", sstableMap(sstables, this::describeSSTable));
+1:e16d8a7:             serializer.write(node, this::startStrategies, this);
+1:e16d8a7:         }
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     public void compaction(long startTime, Collection<SSTableReader> input, long endTime, Collection<SSTableReader> output)
+1:e16d8a7:     {
+1:e16d8a7:         if (enabled.get())
+1:e16d8a7:         {
+1:e16d8a7:             ObjectNode node = json.objectNode();
+1:e16d8a7:             node.put("type", "compaction");
+1:e16d8a7:             describeStrategy(node);
+1:e16d8a7:             node.put("start", String.valueOf(startTime));
+1:e16d8a7:             node.put("end", String.valueOf(endTime));
+1:e16d8a7:             node.put("input", sstableMap(input, this::describeSSTable));
+1:e16d8a7:             node.put("output", sstableMap(output, this::describeSSTable));
+1:e16d8a7:             serializer.write(node, this::startStrategies, this);
+1:e16d8a7:         }
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     public void pending(AbstractCompactionStrategy strategy, int remaining)
+1:e16d8a7:     {
+1:e16d8a7:         if (remaining != 0 && enabled.get())
+1:e16d8a7:         {
+1:e16d8a7:             ObjectNode node = json.objectNode();
+1:e16d8a7:             node.put("type", "pending");
+1:e16d8a7:             describeStrategy(node);
+1:e16d8a7:             node.put("strategyId", getId(strategy));
+1:e16d8a7:             node.put("pending", remaining);
+1:e16d8a7:             serializer.write(node, this::startStrategies, this);
+1:e16d8a7:         }
+1:e16d8a7:     }
+1:e16d8a7: 
+1:e16d8a7:     private static class CompactionLogSerializer implements Writer
+1:e16d8a7:     {
+1:e16d8a7:         private static final String logDirectory = System.getProperty("cassandra.logdir", ".");
+1:e16d8a7:         private final ExecutorService loggerService = Executors.newFixedThreadPool(1);
+1:e16d8a7:         // This is only accessed on the logger service thread, so it does not need to be thread safe
+1:e16d8a7:         private final Set<Object> rolled = new HashSet<>();
+1:e16d8a7:         private OutputStreamWriter stream;
+1:e16d8a7: 
+1:e16d8a7:         private static OutputStreamWriter createStream() throws IOException
+1:e16d8a7:         {
+1:e16d8a7:             int count = 0;
+1:e16d8a7:             Path compactionLog = Paths.get(logDirectory, "compaction.log");
+1:e16d8a7:             if (Files.exists(compactionLog))
+1:e16d8a7:             {
+1:e16d8a7:                 Path tryPath = compactionLog;
+1:e16d8a7:                 while (Files.exists(tryPath))
+1:e16d8a7:                 {
+1:e16d8a7:                     tryPath = Paths.get(logDirectory, String.format("compaction-%d.log", count++));
+1:e16d8a7:                 }
+1:e16d8a7:                 Files.move(compactionLog, tryPath);
+1:e16d8a7:             }
+1:e16d8a7: 
+1:e16d8a7:             return new OutputStreamWriter(Files.newOutputStream(compactionLog, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE));
+1:e16d8a7:         }
+1:e16d8a7: 
+1:e16d8a7:         private void writeLocal(String toWrite)
+1:e16d8a7:         {
+1:e16d8a7:             try
+1:e16d8a7:             {
+1:e16d8a7:                 if (stream == null)
+1:e16d8a7:                     stream = createStream();
+1:e16d8a7:                 stream.write(toWrite);
+1:e16d8a7:                 stream.flush();
+1:e16d8a7:             }
+1:e16d8a7:             catch (IOException ioe)
+1:e16d8a7:             {
+1:e16d8a7:                 // We'll drop the change and log the error to the logger.
+1:e16d8a7:                 NoSpamLogger.log(logger, NoSpamLogger.Level.ERROR, 1, TimeUnit.MINUTES,
+1:e16d8a7:                                  "Could not write to the log file: {}", ioe);
+1:e16d8a7:             }
+1:e16d8a7: 
+1:e16d8a7:         }
+1:e16d8a7: 
+1:e16d8a7:         public void writeStart(JsonNode statement, Object tag)
+1:e16d8a7:         {
+1:e16d8a7:             final String toWrite = statement.toString() + System.lineSeparator();
+1:e16d8a7:             loggerService.execute(() -> {
+1:e16d8a7:                 rolled.add(tag);
+1:e16d8a7:                 writeLocal(toWrite);
+1:e16d8a7:             });
+1:e16d8a7:         }
+1:e16d8a7: 
+1:e16d8a7:         public void write(JsonNode statement, StrategySummary summary, Object tag)
+1:e16d8a7:         {
+1:e16d8a7:             final String toWrite = statement.toString() + System.lineSeparator();
+1:e16d8a7:             loggerService.execute(() -> {
+1:e16d8a7:                 if (!rolled.contains(tag))
+1:e16d8a7:                 {
+1:e16d8a7:                     writeLocal(summary.getSummary().toString() + System.lineSeparator());
+1:e16d8a7:                     rolled.add(tag);
+1:e16d8a7:                 }
+1:e16d8a7:                 writeLocal(toWrite);
+1:e16d8a7:             });
+1:e16d8a7:         }
+1:e16d8a7:     }
+1:e16d8a7: }
+============================================================================
+author:Marcus Eriksson
+-------------------------------------------------------------------------------
+commit:6bb7577
+/////////////////////////////////////////////////////////////////////////
+1: import java.lang.ref.WeakReference;
+/////////////////////////////////////////////////////////////////////////
+1: import com.google.common.collect.MapMaker;
+/////////////////////////////////////////////////////////////////////////
+1:     private final WeakReference<ColumnFamilyStore> cfsRef;
+1:     private final WeakReference<CompactionStrategyManager> csmRef;
+1:     private final Map<AbstractCompactionStrategy, String> compactionStrategyMapping = new MapMaker().weakKeys().makeMap();
+1:         csmRef = new WeakReference<>(csm);
+1:         cfsRef = new WeakReference<>(cfs);
+1:         CompactionStrategyManager csm = csmRef.get();
+1:         if (csm == null)
+1:             return;
+/////////////////////////////////////////////////////////////////////////
+1:         CompactionStrategyManager csm = csmRef.get();
+1:         if (csm == null)
+1:             return node;
+/////////////////////////////////////////////////////////////////////////
+1:         CompactionStrategyManager csm = csmRef.get();
+1:         ColumnFamilyStore cfs = cfsRef.get();
+1:         if (csm == null || cfs == null)
+1:             return node;
+/////////////////////////////////////////////////////////////////////////
+1:         CompactionStrategyManager csm = csmRef.get();
+1:         if (csm == null)
+1:             return node;
+/////////////////////////////////////////////////////////////////////////
+1:         ColumnFamilyStore cfs = cfsRef.get();
+1:         if (cfs == null)
+1:             return;
+author:Carl Yeksigian
+-------------------------------------------------------------------------------
+commit:e16d8a7
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: 
+1: package org.apache.cassandra.db.compaction;
+1: 
+1: import java.io.IOException;
+1: import java.io.OutputStreamWriter;
+1: import java.nio.file.*;
+1: import java.util.Collection;
+1: import java.util.HashSet;
+1: import java.util.List;
+1: import java.util.Map;
+1: import java.util.Set;
+1: import java.util.concurrent.*;
+1: import java.util.concurrent.atomic.AtomicBoolean;
+1: import java.util.concurrent.atomic.AtomicInteger;
+1: import java.util.function.Consumer;
+1: import java.util.function.Function;
+1: 
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import org.apache.cassandra.db.ColumnFamilyStore;
+1: import org.apache.cassandra.io.sstable.format.SSTableReader;
+1: import org.apache.cassandra.utils.NoSpamLogger;
+1: import org.codehaus.jackson.JsonNode;
+1: import org.codehaus.jackson.node.ArrayNode;
+1: import org.codehaus.jackson.node.JsonNodeFactory;
+1: import org.codehaus.jackson.node.ObjectNode;
+1: 
+1: public class CompactionLogger
+1: {
+1:     public interface Strategy
+1:     {
+1:         JsonNode sstable(SSTableReader sstable);
+1: 
+1:         JsonNode options();
+1: 
+1:         static Strategy none = new Strategy()
+1:         {
+1:             public JsonNode sstable(SSTableReader sstable)
+1:             {
+1:                 return null;
+1:             }
+1: 
+1:             public JsonNode options()
+1:             {
+1:                 return null;
+1:             }
+1:         };
+1:     }
+1: 
+1:     /**
+1:      * This will produce the compaction strategy's starting information.
+1:      */
+1:     public interface StrategySummary
+1:     {
+1:         JsonNode getSummary();
+1:     }
+1: 
+1:     /**
+1:      * This is an interface to allow writing to a different interface.
+1:      */
+1:     public interface Writer
+1:     {
+1:         /**
+1:          * This is used when we are already trying to write out the start of a
+1:          * @param statement This should be written out to the medium capturing the logs
+1:          * @param tag       This is an identifier for a strategy; each strategy should have a distinct Object
+1:          */
+1:         void writeStart(JsonNode statement, Object tag);
+1: 
+1:         /**
+1:          * @param statement This should be written out to the medium capturing the logs
+1:          * @param summary   This can be used when a tag is not recognized by this writer; this can be because the file
+1:          *                  has been rolled, or otherwise the writer had to start over
+1:          * @param tag       This is an identifier for a strategy; each strategy should have a distinct Object
+1:          */
+1:         void write(JsonNode statement, StrategySummary summary, Object tag);
+1:     }
+1: 
+1:     private interface CompactionStrategyAndTableFunction
+1:     {
+1:         JsonNode apply(AbstractCompactionStrategy strategy, SSTableReader sstable);
+1:     }
+1: 
+1:     private static final JsonNodeFactory json = JsonNodeFactory.instance;
+1:     private static final Logger logger = LoggerFactory.getLogger(CompactionLogger.class);
+1:     private static final Writer serializer = new CompactionLogSerializer();
+0:     private final ColumnFamilyStore cfs;
+0:     private final CompactionStrategyManager csm;
+1:     private final AtomicInteger identifier = new AtomicInteger(0);
+0:     private final Map<AbstractCompactionStrategy, String> compactionStrategyMapping = new ConcurrentHashMap<>();
+1:     private final AtomicBoolean enabled = new AtomicBoolean(false);
+1: 
+1:     public CompactionLogger(ColumnFamilyStore cfs, CompactionStrategyManager csm)
+1:     {
+0:         this.csm = csm;
+0:         this.cfs = cfs;
+1:     }
+1: 
+1:     private void forEach(Consumer<AbstractCompactionStrategy> consumer)
+1:     {
+1:         csm.getStrategies()
+1:            .forEach(l -> l.forEach(consumer));
+1:     }
+1: 
+1:     private ArrayNode compactionStrategyMap(Function<AbstractCompactionStrategy, JsonNode> select)
+1:     {
+1:         ArrayNode node = json.arrayNode();
+1:         forEach(acs -> node.add(select.apply(acs)));
+1:         return node;
+1:     }
+1: 
+1:     private ArrayNode sstableMap(Collection<SSTableReader> sstables, CompactionStrategyAndTableFunction csatf)
+1:     {
+1:         ArrayNode node = json.arrayNode();
+1:         sstables.forEach(t -> node.add(csatf.apply(csm.getCompactionStrategyFor(t), t)));
+1:         return node;
+1:     }
+1: 
+1:     private String getId(AbstractCompactionStrategy strategy)
+1:     {
+1:         return compactionStrategyMapping.computeIfAbsent(strategy, s -> String.valueOf(identifier.getAndIncrement()));
+1:     }
+1: 
+1:     private JsonNode formatSSTables(AbstractCompactionStrategy strategy)
+1:     {
+1:         ArrayNode node = json.arrayNode();
+1:         for (SSTableReader sstable : cfs.getLiveSSTables())
+1:         {
+1:             if (csm.getCompactionStrategyFor(sstable) == strategy)
+1:                 node.add(formatSSTable(strategy, sstable));
+1:         }
+1:         return node;
+1:     }
+1: 
+1:     private JsonNode formatSSTable(AbstractCompactionStrategy strategy, SSTableReader sstable)
+1:     {
+1:         ObjectNode node = json.objectNode();
+1:         node.put("generation", sstable.descriptor.generation);
+1:         node.put("version", sstable.descriptor.version.getVersion());
+1:         node.put("size", sstable.onDiskLength());
+1:         JsonNode logResult = strategy.strategyLogger().sstable(sstable);
+1:         if (logResult != null)
+1:             node.put("details", logResult);
+1:         return node;
+1:     }
+1: 
+1:     private JsonNode startStrategy(AbstractCompactionStrategy strategy)
+1:     {
+1:         ObjectNode node = json.objectNode();
+1:         node.put("strategyId", getId(strategy));
+1:         node.put("type", strategy.getName());
+1:         node.put("tables", formatSSTables(strategy));
+1:         node.put("repaired", csm.isRepaired(strategy));
+1:         List<String> folders = csm.getStrategyFolders(strategy);
+1:         ArrayNode folderNode = json.arrayNode();
+1:         for (String folder : folders)
+1:         {
+1:             folderNode.add(folder);
+1:         }
+1:         node.put("folders", folderNode);
+1: 
+1:         JsonNode logResult = strategy.strategyLogger().options();
+1:         if (logResult != null)
+1:             node.put("options", logResult);
+1:         return node;
+1:     }
+1: 
+1:     private JsonNode shutdownStrategy(AbstractCompactionStrategy strategy)
+1:     {
+1:         ObjectNode node = json.objectNode();
+1:         node.put("strategyId", getId(strategy));
+1:         return node;
+1:     }
+1: 
+1:     private JsonNode describeSSTable(AbstractCompactionStrategy strategy, SSTableReader sstable)
+1:     {
+1:         ObjectNode node = json.objectNode();
+1:         node.put("strategyId", getId(strategy));
+1:         node.put("table", formatSSTable(strategy, sstable));
+1:         return node;
+1:     }
+1: 
+1:     private void describeStrategy(ObjectNode node)
+1:     {
+1:         node.put("keyspace", cfs.keyspace.getName());
+1:         node.put("table", cfs.getTableName());
+1:         node.put("time", System.currentTimeMillis());
+1:     }
+1: 
+1:     private JsonNode startStrategies()
+1:     {
+1:         ObjectNode node = json.objectNode();
+1:         node.put("type", "enable");
+1:         describeStrategy(node);
+1:         node.put("strategies", compactionStrategyMap(this::startStrategy));
+1:         return node;
+1:     }
+1: 
+1:     public void enable()
+1:     {
+1:         if (enabled.compareAndSet(false, true))
+1:         {
+1:             serializer.writeStart(startStrategies(), this);
+1:         }
+1:     }
+1: 
+1:     public void disable()
+1:     {
+1:         if (enabled.compareAndSet(true, false))
+1:         {
+1:             ObjectNode node = json.objectNode();
+1:             node.put("type", "disable");
+1:             describeStrategy(node);
+1:             node.put("strategies", compactionStrategyMap(this::shutdownStrategy));
+1:             serializer.write(node, this::startStrategies, this);
+1:         }
+1:     }
+1: 
+1:     public void flush(Collection<SSTableReader> sstables)
+1:     {
+1:         if (enabled.get())
+1:         {
+1:             ObjectNode node = json.objectNode();
+1:             node.put("type", "flush");
+1:             describeStrategy(node);
+1:             node.put("tables", sstableMap(sstables, this::describeSSTable));
+1:             serializer.write(node, this::startStrategies, this);
+1:         }
+1:     }
+1: 
+1:     public void compaction(long startTime, Collection<SSTableReader> input, long endTime, Collection<SSTableReader> output)
+1:     {
+1:         if (enabled.get())
+1:         {
+1:             ObjectNode node = json.objectNode();
+1:             node.put("type", "compaction");
+1:             describeStrategy(node);
+1:             node.put("start", String.valueOf(startTime));
+1:             node.put("end", String.valueOf(endTime));
+1:             node.put("input", sstableMap(input, this::describeSSTable));
+1:             node.put("output", sstableMap(output, this::describeSSTable));
+1:             serializer.write(node, this::startStrategies, this);
+1:         }
+1:     }
+1: 
+1:     public void pending(AbstractCompactionStrategy strategy, int remaining)
+1:     {
+1:         if (remaining != 0 && enabled.get())
+1:         {
+1:             ObjectNode node = json.objectNode();
+1:             node.put("type", "pending");
+1:             describeStrategy(node);
+1:             node.put("strategyId", getId(strategy));
+1:             node.put("pending", remaining);
+1:             serializer.write(node, this::startStrategies, this);
+1:         }
+1:     }
+1: 
+1:     private static class CompactionLogSerializer implements Writer
+1:     {
+1:         private static final String logDirectory = System.getProperty("cassandra.logdir", ".");
+1:         private final ExecutorService loggerService = Executors.newFixedThreadPool(1);
+1:         // This is only accessed on the logger service thread, so it does not need to be thread safe
+1:         private final Set<Object> rolled = new HashSet<>();
+1:         private OutputStreamWriter stream;
+1: 
+1:         private static OutputStreamWriter createStream() throws IOException
+1:         {
+1:             int count = 0;
+1:             Path compactionLog = Paths.get(logDirectory, "compaction.log");
+1:             if (Files.exists(compactionLog))
+1:             {
+1:                 Path tryPath = compactionLog;
+1:                 while (Files.exists(tryPath))
+1:                 {
+1:                     tryPath = Paths.get(logDirectory, String.format("compaction-%d.log", count++));
+1:                 }
+1:                 Files.move(compactionLog, tryPath);
+1:             }
+1: 
+1:             return new OutputStreamWriter(Files.newOutputStream(compactionLog, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE));
+1:         }
+1: 
+1:         private void writeLocal(String toWrite)
+1:         {
+1:             try
+1:             {
+1:                 if (stream == null)
+1:                     stream = createStream();
+1:                 stream.write(toWrite);
+1:                 stream.flush();
+1:             }
+1:             catch (IOException ioe)
+1:             {
+1:                 // We'll drop the change and log the error to the logger.
+1:                 NoSpamLogger.log(logger, NoSpamLogger.Level.ERROR, 1, TimeUnit.MINUTES,
+1:                                  "Could not write to the log file: {}", ioe);
+1:             }
+1: 
+1:         }
+1: 
+1:         public void writeStart(JsonNode statement, Object tag)
+1:         {
+1:             final String toWrite = statement.toString() + System.lineSeparator();
+1:             loggerService.execute(() -> {
+1:                 rolled.add(tag);
+1:                 writeLocal(toWrite);
+1:             });
+1:         }
+1: 
+1:         public void write(JsonNode statement, StrategySummary summary, Object tag)
+1:         {
+1:             final String toWrite = statement.toString() + System.lineSeparator();
+1:             loggerService.execute(() -> {
+1:                 if (!rolled.contains(tag))
+1:                 {
+1:                     writeLocal(summary.getSummary().toString() + System.lineSeparator());
+1:                     rolled.add(tag);
+1:                 }
+1:                 writeLocal(toWrite);
+1:             });
+1:         }
+1:     }
+1: }
+============================================================================

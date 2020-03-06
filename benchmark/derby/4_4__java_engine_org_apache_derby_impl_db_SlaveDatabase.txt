@@ -1,0 +1,1169 @@
+1:836ab97: /*
+4:836ab97: 
+1:836ab97:    Derby - Class org.apache.derby.impl.db.SlaveDatabase
+1:836ab97: 
+1:836ab97:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:836ab97:    contributor license agreements.  See the NOTICE file distributed with
+1:836ab97:    this work for additional information regarding copyright ownership.
+1:836ab97:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:836ab97:    (the "License"); you may not use this file except in compliance with
+1:836ab97:    the License.  You may obtain a copy of the License at
+1:836ab97: 
+1:836ab97:       http://www.apache.org/licenses/LICENSE-2.0
+1:836ab97: 
+1:836ab97:    Unless required by applicable law or agreed to in writing, software
+1:836ab97:    distributed under the License is distributed on an "AS IS" BASIS,
+1:836ab97:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:836ab97:    See the License for the specific language governing permissions and
+1:836ab97:    limitations under the License.
+1:836ab97: 
+2:836ab97:  */
+1:836ab97: 
+1:836ab97: package org.apache.derby.impl.db;
+1:836ab97: 
+1:b9c57d5: import org.apache.derby.iapi.error.PublicAPI;
+1:b9c57d5: import org.apache.derby.iapi.reference.Attribute;
+1:836ab97: import org.apache.derby.iapi.reference.SQLState;
+1:836ab97: import org.apache.derby.iapi.error.StandardException;
+1:836ab97: import org.apache.derby.iapi.jdbc.AuthenticationService;
+1:836ab97: import org.apache.derby.iapi.services.context.ContextManager;
+1:836ab97: import org.apache.derby.iapi.services.context.ContextService;
+1:836ab97: import org.apache.derby.iapi.services.monitor.Monitor;
+1:ec9d167: import org.apache.derby.iapi.util.InterruptStatus;
+1:1bac3f3: import org.apache.derby.iapi.store.replication.slave.SlaveFactory;
+1:836ab97: import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
+1:836ab97: 
+1:a6532d0: import org.apache.derby.jdbc.InternalDriver;
+1:a6532d0: 
+1:a0dbbd7: import java.security.PrivilegedAction;
+1:56c1dc2: import java.security.PrivilegedExceptionAction;
+1:56c1dc2: import java.security.PrivilegedActionException;
+1:a0dbbd7: import java.security.AccessController;
+1:a0dbbd7: 
+1:b9c57d5: import java.sql.SQLException;
+1:836ab97: import java.util.Properties;
+1:2cd035c: import org.apache.derby.iapi.reference.MessageId;
+1:2cd035c: import org.apache.derby.impl.store.replication.ReplicationLogger;
+1:836ab97: 
+2:836ab97: /**
+1:836ab97:  * SlaveDatabase is an instance of Database, and is booted instead of
+1:836ab97:  * BasicDatabase if this database will have the replication slave
+1:836ab97:  * role. SlaveDatabase differs from BasicDatabase in the following
+1:836ab97:  * ways:
+1:836ab97:  *
+1:836ab97:  * 1: When starting a non-replicated database (i.e., BasicDatabase),
+1:836ab97:  *    only one thread is used to start all modules of the database.
+1:836ab97:  *    When booted in slave mode, the thread that boots the store
+1:836ab97:  *    module will be blocked during log recovery. To remedy this,
+1:836ab97:  *    SlaveDatabase runs the boot method of BasicDatabase in a
+1:836ab97:  *    separate thread. This ensures that the connection attempt that
+1:836ab97:  *    started slave replication mode will not hang.
+1:836ab97:  *
+1:836ab97:  * 2: While the database is in replication slave mode, the
+1:836ab97:  *    authentication services are not available because these require
+1:836ab97:  *    that the store module has been booted first. Calling
+1:836ab97:  *    getAuthenticationService when in slave mode will raise an
+1:836ab97:  *    exception.
+1:836ab97:  *
+1:836ab97:  * 3: While the database is in replication slave mode, connections are
+1:836ab97:  *    not accepted since the database cannot process transaction
+1:836ab97:  *    requests. Calling setupConnection when in slave mode will raise
+1:836ab97:  *    an exception.
+1:836ab97:  *
+1:836ab97:  * 4: If the failover command has been executed for this database, it
+1:836ab97:  *    is no longer in replication slave mode. When this has
+1:836ab97:  *    happened, SlaveDatabase works exactly as BasicDatabase.
+1:836ab97:  */
+1:836ab97: 
+1:836ab97: public class SlaveDatabase extends BasicDatabase {
+1:836ab97:     /** True until SlaveDatabaseBootThread has successfully booted the
+1:836ab97:      * database. Does not happen until the failover command has been
+1:836ab97:      * executed for this database */
+1:836ab97:     private volatile boolean inReplicationSlaveMode;
+1:b9c57d5:     private volatile boolean shutdownInitiated;
+1:334e9a3: 
+1:334e9a3:     /** True until this database has been successfully booted. Any
+1:334e9a3:      * exception that occurs while inBoot is true will be handed to
+1:334e9a3:      * the client thread booting this database. */
+1:334e9a3:     private volatile boolean inBoot;
+1:334e9a3: 
+1:334e9a3:     /** Set by the database boot thread if it fails before slave mode
+1:334e9a3:      * has been started properly (i.e., if inBoot is true). This
+1:334e9a3:      * exception will then be reported to the client connection. */
+1:334e9a3:     private volatile StandardException bootException;
+1:696377a:     private String dbname; // The name of the replicated database
+1:b9c57d5:     private volatile SlaveFactory slaveFac;
+1:836ab97: 
+1:836ab97:     /////////////////////////////
+1:836ab97:     // ModuleControl interface //
+1:836ab97:     /////////////////////////////
+1:836ab97:     /**
+1:836ab97:      * Determines whether this Database implementation should be used
+1:836ab97:      * to boot the database.
+1:836ab97:      * @param startParams The properties used to decide if
+1:836ab97:      * SlaveDatabase is the correct implementation of Database for the
+1:836ab97:      * database to be booted. 
+1:836ab97:      * @return true if the database is updatable (not read-only) and
+1:836ab97:      * replication slave mode is specified in startParams
+1:836ab97:      */
+1:836ab97:     public boolean canSupport(Properties startParams) {
+1:836ab97: 
+1:836ab97:         boolean supported =
+1:836ab97:             Monitor.isDesiredCreateType(startParams, getEngineType());
+1:836ab97:         if (supported) {
+1:836ab97:             String repliMode =
+1:836ab97:                 startParams.getProperty(SlaveFactory.REPLICATION_MODE);
+1:836ab97:             if (repliMode == null ||
+1:836ab97:                 !repliMode.equals(SlaveFactory.SLAVE_MODE)) {
+1:836ab97:                 supported = false;
+7:836ab97:             }
+1:836ab97:         }
+1:72b50c0: 
+1:836ab97:         return supported;
+1:836ab97:     }
+1:72b50c0: 
+1:836ab97:     public void boot(boolean create, Properties startParams)
+1:836ab97:         throws StandardException {
+1:836ab97: 
+1:836ab97:         inReplicationSlaveMode = true;
+1:334e9a3:         inBoot = true;
+1:b9c57d5:         shutdownInitiated = false;
+1:b9c57d5: 
+1:696377a:         dbname = startParams.getProperty(SlaveFactory.SLAVE_DB);
+1:836ab97: 
+1:836ab97:         // SlaveDatabaseBootThread is an internal class
+1:836ab97:         SlaveDatabaseBootThread dbBootThread =
+1:836ab97:             new SlaveDatabaseBootThread(create, startParams);
+1:56c419e:         Thread sdbThread = 
+1:56c419e:                 new Thread(dbBootThread, "derby.slave.boot-" + dbname);
+1:56c419e:         sdbThread.setDaemon(true);
+1:56c419e:         sdbThread.start();
+1:836ab97: 
+1:334e9a3:         // Check that the database was booted successfully, or throw
+1:334e9a3:         // the exception that caused the boot to fail.
+1:334e9a3:         verifySuccessfulBoot();
+1:72b50c0: 
+1:334e9a3:         inBoot = false;
+1:836ab97: 
+1:836ab97:         // This module has now been booted (hence active=true) even
+1:836ab97:         // though submodules like store and authentication may not
+1:836ab97:         // have completed their boot yet. We deal with that by raising
+1:836ab97:         // an error on attempts to use these 
+1:836ab97:         active=true;
+1:836ab97:     }
+1:836ab97: 
+1:b9c57d5:     /**
+1:b9c57d5:      * Called by Monitor when this module is stopped, i.e. when the
+1:b9c57d5:      * database is shut down. When the database is shut down using the
+1:b9c57d5:      * stopSlave command, the stopReplicationSlave method has already
+1:b9c57d5:      * been called when this method is called. In this case, the
+1:b9c57d5:      * replication functionality has already been stopped. If the
+1:b9c57d5:      * database is shutdown as part of a system shutdown, however, we
+1:b9c57d5:      * need to cleanup slave replication as part of database shutdown.
+1:b9c57d5:      */
+1:b9c57d5:     public void stop() {
+1:b9c57d5:         if (inReplicationSlaveMode && slaveFac != null) {
+1:b9c57d5:             try {
+1:b9c57d5:                 slaveFac.stopSlave(true);
+1:b9c57d5:             } catch (StandardException ex) {
+1:b9c57d5:             } finally {
+1:b9c57d5:                 slaveFac = null;
+1:b9c57d5:             }
+1:b9c57d5:         }
+1:b9c57d5:         super.stop();
+1:b9c57d5:     }
+1:b9c57d5:     
+1:836ab97:     /////////////////////
+1:836ab97:     // Class interface //
+1:836ab97:     /////////////////////
+1:836ab97:     public SlaveDatabase() {
+1:b9c57d5:     }
+1:b9c57d5: 
+1:836ab97:     ////////////////////////
+1:836ab97:     // Database interface //
+1:836ab97:     ////////////////////////
+1:9e88b9d:     public boolean isInSlaveMode() {
+1:9e88b9d:         return inReplicationSlaveMode;
+1:9e88b9d:     }
+1:9e88b9d:     
+1:836ab97:     public LanguageConnectionContext setupConnection(ContextManager cm, 
+1:836ab97:                                                      String user, 
+1:836ab97:                                                      String drdaID, 
+1:836ab97:                                                      String dbname)
+1:836ab97:         throws StandardException {
+1:836ab97: 
+1:9e88b9d:         if (inReplicationSlaveMode) {
+1:836ab97:             // do not allow connections to a database that is
+1:836ab97:             // currently in replication slave move
+1:836ab97:             throw StandardException.newException(
+1:836ab97:                         SQLState.CANNOT_CONNECT_TO_DB_IN_SLAVE_MODE, dbname);
+1:836ab97:         }
+1:836ab97:         return super.setupConnection(cm, user, drdaID, dbname);
+1:836ab97:     }
+1:836ab97: 
+1:696377a:     public AuthenticationService getAuthenticationService()
+1:696377a:         throws StandardException{
+2:836ab97:         if (inReplicationSlaveMode) {
+1:836ab97:             // Cannot get authentication service for a database that
+1:836ab97:             // is currently in replication slave move
+1:696377a:             throw StandardException.newException(
+1:696377a:                 SQLState.CANNOT_CONNECT_TO_DB_IN_SLAVE_MODE, dbname);
+1:836ab97:         }
+1:836ab97:         return super.getAuthenticationService();
+1:836ab97:     }
+1:836ab97: 
+1:b9c57d5:     /**
+1:b9c57d5:      * Verify that a connection to stop the slave has been made from
+1:b9c57d5:      * here. If verified, the database context is given to the method
+1:b9c57d5:      * caller. This will ensure this database is shutdown when an
+1:b9c57d5:      * exception with database severity is thrown. If not verified, an
+1:b9c57d5:      * exception is thrown.
+1:b9c57d5:      * 
+1:b9c57d5:      * @exception StandardException Thrown if a stop slave connection
+1:b9c57d5:      * attempt was not made from this class
+1:b9c57d5:      */
+1:b9c57d5:     public void verifyShutdownSlave() throws StandardException {
+1:b9c57d5:         if (!shutdownInitiated) {
+1:b9c57d5:             throw StandardException.
+1:b9c57d5:                 newException(SQLState.REPLICATION_STOPSLAVE_NOT_INITIATED);
+1:b9c57d5:         }
+1:a0dbbd7:         pushDbContext(getContextService().
+1:b9c57d5:                       getCurrentContextManager());
+1:b9c57d5:     }
+1:b9c57d5: 
+1:b9c57d5:     /**
+1:b9c57d5:      * Stop replication slave mode if replication slave mode is active and 
+1:b9c57d5:      * the network connection with the master is down
+1:b9c57d5:      * 
+1:b9c57d5:      * @exception SQLException Thrown on error, if not in replication 
+1:b9c57d5:      * slave mode or if the network connection with the master is not down
+1:b9c57d5:      */
+1:b9c57d5:     public  void stopReplicationSlave() throws SQLException {
+1:b9c57d5: 
+1:b9c57d5:         if (shutdownInitiated) {
+1:b9c57d5:             // The boot thread has failed or stopReplicationSlave has
+1:b9c57d5:             // already been called. There is nothing more to do to
+1:b9c57d5:             // stop slave replication mode.
+1:b9c57d5:             return;
+1:b9c57d5:         }
+1:b9c57d5:         
+1:b9c57d5:         if (!inReplicationSlaveMode) {
+1:b9c57d5:             StandardException se = StandardException.
+1:b9c57d5:                 newException(SQLState.REPLICATION_NOT_IN_SLAVE_MODE);
+2:b9c57d5:             throw PublicAPI.wrapStandardException(se);
+1:b9c57d5:         }
+1:b9c57d5: 
+1:b9c57d5:         // stop slave without using force, meaning that this method
+1:b9c57d5:         // call will fail with an exception if the network connection
+1:b9c57d5:         // with the master is up
+1:9e88b9d:         try {
+1:b9c57d5:             slaveFac.stopSlave(false);
+1:334e9a3:         } catch (StandardException se) {
+1:9e88b9d:             throw PublicAPI.wrapStandardException(se);
+1:b9c57d5:         }
+1:b9c57d5: 
+1:b9c57d5:         slaveFac = null;
+1:b9c57d5:     }
+1:b9c57d5: 
+1:5a6acbf:     public void failover(String dbname) throws StandardException {
+1:5a6acbf:         if (inReplicationSlaveMode) {
+1:5a6acbf:             slaveFac.failover();
+1:5a6acbf:             // SlaveFactory#failover will make the
+1:5a6acbf:             // SlaveDatabaseBootThread complete booting of the store
+1:5a6acbf:             // modules, and inReplicationSlaveMode will then be set to
+1:5a6acbf:             // false (see SlaveDatabaseBootThread#run).
+1:5a6acbf:             // Wait until store is completely booted before returning from
+1:5a6acbf:             // this method
+1:5a6acbf:             while (inReplicationSlaveMode) {
+1:5a6acbf:                 try {
+1:5a6acbf:                     Thread.sleep(500);
+1:5a6acbf:                 } catch (InterruptedException ie) {
+1:ec9d167:                     InterruptStatus.setInterrupted();
+1:9e88b9d:                 }
+1:9e88b9d:             }
+1:5a6acbf:         } else {
+1:5a6acbf:             // If failover is performed on a master that has been a slave
+1:5a6acbf:             // earlier
+1:5a6acbf:             super.failover(dbname);
+1:9e88b9d:         }
+1:9e88b9d:     }
+1:9e88b9d:     
+1:836ab97:     /////////////////
+1:836ab97:     // Inner Class //
+1:836ab97:     /////////////////
+1:b9c57d5:     /**
+1:836ab97:      * Thread that boots the slave database. Will be blocked in
+1:836ab97:      * LogFactory.recover until database is no longer in slave
+1:836ab97:      * replication mode.
+1:b9c57d5:      */
+1:836ab97:     private class SlaveDatabaseBootThread implements Runnable {
+1:836ab97: 
+1:836ab97:         private boolean create;
+1:836ab97:         private Properties params;
+1:836ab97: 
+1:836ab97:         public SlaveDatabaseBootThread(boolean create, Properties startParams){
+1:836ab97:             this.create = create;
+1:836ab97:             params = startParams;
+1:9e88b9d:         }
+1:836ab97: 
+1:836ab97:         public void run() {
+1:836ab97: 
+1:836ab97:             // The thread needs a ContextManager since two threads
+1:836ab97:             // cannot share a context
+1:696377a:             ContextManager bootThreadCm = null;
+1:9e88b9d:             try {
+1:836ab97: 
+1:a0dbbd7:                 bootThreadCm = getContextService().newContextManager();
+1:a0dbbd7:                 getContextService().
+1:836ab97:                     setCurrentContextManager(bootThreadCm);
+1:836ab97: 
+1:836ab97:                 bootBasicDatabase(create, params); // will be blocked
+1:836ab97: 
+1:b9c57d5:                 // if we get here, failover has been called and the
+1:b9c57d5:                 // database can now be connected to
+1:b9c57d5:                 inReplicationSlaveMode = false; 
+1:b9c57d5: 
+1:696377a:                 if (bootThreadCm != null) {
+1:a0dbbd7:                     getContextService().
+1:696377a:                         resetCurrentContextManager(bootThreadCm);
+1:696377a:                     bootThreadCm = null;
+1:696377a:                 }
+1:2cd035c:             } catch (Exception e) {
+1:2cd035c:                 // We get here when SlaveController#stopSlave has been called,
+1:2cd035c:                 // a fatal Derby exception has been thrown, or if a run-time
+1:2cd035c:                 // error is thrown.  Log the error unconditionally to make sure
+1:2cd035c:                 // it can be observed, since if this happens during or after
+1:2cd035c:                 // recovery on a failover, there will be no connection attempt
+1:2cd035c:                 // failing with the error. New connection attempts will just
+1:2cd035c:                 // hang...
+1:2cd035c: 
+1:2cd035c:                 ReplicationLogger rl = new ReplicationLogger(dbname);
+1:2cd035c:                 rl.logError(MessageId.REPLICATION_FATAL_ERROR, e);
+1:2cd035c:                 
+1:2cd035c:                 if (e instanceof StandardException) {
+1:2cd035c:                     handleShutdown((StandardException)e);
+1:2cd035c:                 }
+1:2cd035c:             } 
+1:836ab97:         }
+1:836ab97:     }
+1:b9c57d5: 
+1:334e9a3:     ////////////////////
+1:334e9a3:     // Private Methods//
+1:334e9a3:     ////////////////////
+1:b9c57d5: 
+1:334e9a3:     /**
+1:334e9a3:      * Verify that the slave functionality has been properly started.
+1:334e9a3:      * This method will block until a successful slave startup has
+1:334e9a3:      * been confirmed, or it will throw the exception that caused it
+1:334e9a3:      * to fail.
+1:334e9a3:      */
+1:334e9a3:     private void verifySuccessfulBoot() throws StandardException {
+1:334e9a3:         while (!(isSlaveFactorySet() && slaveFac.isStarted())) {
+1:ad95897:             if (bootException != null) {
+1:334e9a3:                 throw bootException;
+1:9e88b9d:             } else {
+1:334e9a3:                 try {
+1:9e88b9d:                     Thread.sleep(500);
+1:9e88b9d:                 } catch (InterruptedException ie) {
+1:ec9d167:                     InterruptStatus.setInterrupted();
+1:334e9a3:                 }
+1:334e9a3:             }
+1:334e9a3:         }
+1:334e9a3: 
+1:334e9a3:         if (bootException != null) {
+1:b9c57d5: 
+1:72b50c0:             // DERBY-4186: This is a corner case. Master made us shut down
+1:72b50c0:             // before the initial connect which establishes the slave has
+1:72b50c0:             // finalized it setting up of the slave and returned control to the
+1:72b50c0:             // application. bootException is set while we (application thread)
+1:72b50c0:             // are waiting in the sleep in the loop above (by the
+1:72b50c0:             // SlaveDatabaseBootThread thread in its call to handleShutdown),
+1:72b50c0:             // and this was previously ignored.
+1:72b50c0:             throw bootException;
+1:72b50c0:         }
+1:334e9a3:     }
+1:836ab97: 
+1:334e9a3:     /** 
+1:334e9a3:      * If slaveFac (the reference to the SlaveFactory) has not already
+1:334e9a3:      * been set, this method will try to set it by calling
+1:334e9a3:      * Monitor.findServiceModule. If slavFac was already set, the
+1:334e9a3:      * method does not do anything.
+1:334e9a3:      *
+1:334e9a3:      * @return true if slaveFac is set after calling this method,
+1:334e9a3:      * false otherwise
+1:334e9a3:      */
+1:334e9a3:     private boolean isSlaveFactorySet() {
+1:334e9a3:         if (slaveFac != null) {
+1:334e9a3:             return true;
+1:334e9a3:         }
+1:334e9a3: 
+1:334e9a3:         try {
+1:56c1dc2:             slaveFac = (SlaveFactory)
+1:334e9a3:                 findServiceModule(this, SlaveFactory.MODULE);
+1:334e9a3:             return true;
+1:9e88b9d:         } catch (StandardException se) {
+1:334e9a3:             // We get a StandardException if SlaveFactory has not been 
+1:334e9a3:             // booted yet. Safe to retry later.
+1:334e9a3:             return false;
+1:334e9a3:         }
+1:334e9a3:     }
+1:334e9a3: 
+1:334e9a3:     /**
+1:334e9a3:      * Used to shutdown this database. 
+1:334e9a3:      *
+1:334e9a3:      * If an error occurs as part of the database boot process, we
+1:334e9a3:      * hand the exception that caused boot to fail to the client
+1:334e9a3:      * thread. The client thread will in turn shut down this database.
+1:334e9a3:      *
+1:334e9a3:      * If an error occurs at a later stage than during boot, we shut
+1:334e9a3:      * down the database by setting up a connection with the shutdown
+1:334e9a3:      * attribute. The internal connection is required because database
+1:334e9a3:      * shutdown requires EmbedConnection to do cleanup.
+1:334e9a3:      *
+1:334e9a3:      * @param shutdownCause the reason why the database needs to be
+1:334e9a3:      * shutdown
+1:334e9a3:      */
+1:334e9a3:     private void handleShutdown(StandardException shutdownCause) {
+1:334e9a3:         if (inBoot) {
+1:334e9a3:             bootException = shutdownCause;
+1:334e9a3:             return;
+1:334e9a3:         } 
+1:b9c57d5:         try {
+1:b9c57d5:             shutdownInitiated = true;
+1:b9c57d5: 
+1:b9c57d5:             String conStr = "jdbc:derby:"+dbname+";"+
+1:b9c57d5:                 Attribute.REPLICATION_INTERNAL_SHUTDOWN_SLAVE+
+1:b9c57d5:                 "=true";
+1:b9c57d5: 
+1:a6532d0:             InternalDriver driver = InternalDriver.activeDriver();
+1:a6532d0:             if (driver != null) {
+1:25c1e7b:                 driver.connect( conStr, (Properties) null, 0 );
+1:a6532d0:             }
+1:b9c57d5:         } catch (Exception e) {
+1:b9c57d5:             // Todo: report error to derby.log if exception is not
+1:b9c57d5:             // SQLState.SHUTDOWN_DATABASE
+1:b9c57d5:         }
+1:b9c57d5:     }
+1:b9c57d5: 
+1:836ab97:     private void bootBasicDatabase(boolean create, Properties params)
+1:836ab97:         throws StandardException {
+1:836ab97:         // This call will be blocked while slave replication mode is
+1:836ab97:         // active
+1:836ab97:         super.boot(create, params);
+1:a0dbbd7:     }
+1:a0dbbd7:     
+1:a0dbbd7:     /**
+1:a0dbbd7:      * Privileged lookup of the ContextService. Must be private so that user code
+1:a0dbbd7:      * can't call this entry point.
+1:a0dbbd7:      */
+1:a0dbbd7:     private  static  ContextService    getContextService()
+3:a0dbbd7:     {
+1:56c1dc2:         return AccessController.doPrivileged
+1:56c1dc2:             (
+1:56c1dc2:              new PrivilegedAction<ContextService>()
+1:56c1dc2:              {
+1:56c1dc2:                  public ContextService run()
+1:56c1dc2:                  {
+1:56c1dc2:                      return ContextService.getFactory();
+1:56c1dc2:                  }
+1:56c1dc2:              }
+1:56c1dc2:              );
+1:56c1dc2:     }
+1:56c1dc2: 
+1:56c1dc2:     /**
+1:56c1dc2:      * Privileged startup. Must be private so that user code
+1:56c1dc2:      * can't call this entry point.
+1:56c1dc2:      */
+1:56c1dc2:     private  static  Object findServiceModule( final Object serviceModule, final String factoryInterface)
+1:56c1dc2:         throws StandardException
+1:56c1dc2:     {
+1:56c1dc2:         try {
+1:a0dbbd7:             return AccessController.doPrivileged
+1:a0dbbd7:                 (
+1:56c1dc2:                  new PrivilegedExceptionAction<Object>()
+1:a0dbbd7:                  {
+1:56c1dc2:                      public Object run()
+1:56c1dc2:                          throws StandardException
+1:a0dbbd7:                      {
+1:56c1dc2:                          return Monitor.findServiceModule( serviceModule, factoryInterface );
+1:a0dbbd7:                      }
+1:a0dbbd7:                  }
+1:a0dbbd7:                  );
+1:56c1dc2:         } catch (PrivilegedActionException pae)
+1:56c1dc2:         {
+1:56c1dc2:             throw StandardException.plainWrapException( pae );
+1:a0dbbd7:         }
+1:a0dbbd7:     }
+1:a0dbbd7: 
+1:836ab97: }
+============================================================================
+author:Richard N. Hillegas
+-------------------------------------------------------------------------------
+commit:56c1dc2
+/////////////////////////////////////////////////////////////////////////
+1: import java.security.PrivilegedExceptionAction;
+1: import java.security.PrivilegedActionException;
+/////////////////////////////////////////////////////////////////////////
+1:             slaveFac = (SlaveFactory)
+/////////////////////////////////////////////////////////////////////////
+1:         return AccessController.doPrivileged
+1:             (
+1:              new PrivilegedAction<ContextService>()
+1:              {
+1:                  public ContextService run()
+1:                  {
+1:                      return ContextService.getFactory();
+1:                  }
+1:              }
+1:              );
+1:     }
+1: 
+1:     /**
+1:      * Privileged startup. Must be private so that user code
+1:      * can't call this entry point.
+1:      */
+1:     private  static  Object findServiceModule( final Object serviceModule, final String factoryInterface)
+1:         throws StandardException
+1:     {
+1:         try {
+1:                  new PrivilegedExceptionAction<Object>()
+1:                      public Object run()
+1:                          throws StandardException
+1:                          return Monitor.findServiceModule( serviceModule, factoryInterface );
+1:         } catch (PrivilegedActionException pae)
+1:         {
+1:             throw StandardException.plainWrapException( pae );
+commit:a0dbbd7
+/////////////////////////////////////////////////////////////////////////
+1: import java.security.PrivilegedAction;
+1: import java.security.AccessController;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         pushDbContext(getContextService().
+/////////////////////////////////////////////////////////////////////////
+1:                 bootThreadCm = getContextService().newContextManager();
+1:                 getContextService().
+/////////////////////////////////////////////////////////////////////////
+1:                     getContextService().
+/////////////////////////////////////////////////////////////////////////
+1:     
+1:     /**
+1:      * Privileged lookup of the ContextService. Must be private so that user code
+1:      * can't call this entry point.
+1:      */
+1:     private  static  ContextService    getContextService()
+1:     {
+0:         if ( System.getSecurityManager() == null )
+1:         {
+0:             return ContextService.getFactory();
+1:         }
+0:         else
+1:         {
+1:             return AccessController.doPrivileged
+1:                 (
+0:                  new PrivilegedAction<ContextService>()
+1:                  {
+0:                      public ContextService run()
+1:                      {
+0:                          return ContextService.getFactory();
+1:                      }
+1:                  }
+1:                  );
+1:         }
+1:     }
+1: 
+commit:25c1e7b
+/////////////////////////////////////////////////////////////////////////
+1:                 driver.connect( conStr, (Properties) null, 0 );
+author:Dag H. Wanvik
+-------------------------------------------------------------------------------
+commit:2cd035c
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.reference.MessageId;
+1: import org.apache.derby.impl.store.replication.ReplicationLogger;
+/////////////////////////////////////////////////////////////////////////
+1:             } catch (Exception e) {
+1:                 // We get here when SlaveController#stopSlave has been called,
+1:                 // a fatal Derby exception has been thrown, or if a run-time
+1:                 // error is thrown.  Log the error unconditionally to make sure
+1:                 // it can be observed, since if this happens during or after
+1:                 // recovery on a failover, there will be no connection attempt
+1:                 // failing with the error. New connection attempts will just
+1:                 // hang...
+1: 
+1:                 ReplicationLogger rl = new ReplicationLogger(dbname);
+1:                 rl.logError(MessageId.REPLICATION_FATAL_ERROR, e);
+1:                 
+1:                 if (e instanceof StandardException) {
+1:                     handleShutdown((StandardException)e);
+1:                 }
+1:             } 
+commit:ec9d167
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.util.InterruptStatus;
+/////////////////////////////////////////////////////////////////////////
+1:                     InterruptStatus.setInterrupted();
+/////////////////////////////////////////////////////////////////////////
+1:                     InterruptStatus.setInterrupted();
+commit:ad95897
+/////////////////////////////////////////////////////////////////////////
+1:         if (bootException != null) {
+commit:72b50c0
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.derby.iapi.error.ExceptionSeverity;
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:         if (bootException != null &&
+0:             SQLState.SHUTDOWN_DATABASE.startsWith(
+0:                 bootException.getSQLState()) &&
+0:             bootException.getSeverity() == ExceptionSeverity.DATABASE_SEVERITY) {
+1: 
+1:             // DERBY-4186: This is a corner case. Master made us shut down
+1:             // before the initial connect which establishes the slave has
+1:             // finalized it setting up of the slave and returned control to the
+1:             // application. bootException is set while we (application thread)
+1:             // are waiting in the sleep in the loop above (by the
+1:             // SlaveDatabaseBootThread thread in its call to handleShutdown),
+1:             // and this was previously ignored.
+1:             throw bootException;
+1:         }
+author:Knut Anders Hatlen
+-------------------------------------------------------------------------------
+commit:a6532d0
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.jdbc.InternalDriver;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             InternalDriver driver = InternalDriver.activeDriver();
+1:             if (driver != null) {
+0:                 driver.connect(conStr, (Properties) null);
+1:             }
+author:Oystein Grovlen
+-------------------------------------------------------------------------------
+commit:56c419e
+/////////////////////////////////////////////////////////////////////////
+1:         Thread sdbThread = 
+1:                 new Thread(dbBootThread, "derby.slave.boot-" + dbname);
+1:         sdbThread.setDaemon(true);
+1:         sdbThread.start();
+commit:1bac3f3
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.store.replication.slave.SlaveFactory;
+commit:41a2601
+/////////////////////////////////////////////////////////////////////////
+0:         new Thread(dbBootThread, "derby.slave.boot-" + dbname).start();
+commit:5a6acbf
+/////////////////////////////////////////////////////////////////////////
+1:     public void failover(String dbname) throws StandardException {
+1:         if (inReplicationSlaveMode) {
+1:             slaveFac.failover();
+1:             // SlaveFactory#failover will make the
+1:             // SlaveDatabaseBootThread complete booting of the store
+1:             // modules, and inReplicationSlaveMode will then be set to
+1:             // false (see SlaveDatabaseBootThread#run).
+1:             // Wait until store is completely booted before returning from
+1:             // this method
+1:             while (inReplicationSlaveMode) {
+1:                 try {
+1:                     Thread.sleep(500);
+1:                 } catch (InterruptedException ie) {
+0:                 // do nothing
+1:         } else {
+1:             // If failover is performed on a master that has been a slave
+1:             // earlier
+1:             super.failover(dbname);
+commit:9e88b9d
+/////////////////////////////////////////////////////////////////////////
+1:     public boolean isInSlaveMode() {
+1:         return inReplicationSlaveMode;
+1:     }
+1:     
+/////////////////////////////////////////////////////////////////////////
+0:     public void failover(String dbname) throws SQLException {
+1:         try {
+1:             if (inReplicationSlaveMode) {
+0:                 slaveFac.failover();
+0:                 // SlaveFactory#failover will make the 
+0:                 // SlaveDatabaseBootThread complete booting of the store 
+0:                 // modules, and inReplicationSlaveMode will then be set to 
+0:                 // false (see SlaveDatabaseBootThread#run). 
+0:                 // Wait until store is completely booted before returning from 
+0:                 // this method
+0:                 while (inReplicationSlaveMode) {
+1:                     try {
+1:                         Thread.sleep(500);
+1:                     } catch (InterruptedException ie) {
+0:                     // do nothing
+1:                     }
+1:                 }
+1:             } else {
+0:                 // If failover is performed on a master that has been a slave 
+0:                 // earlier
+0:                 super.failover(dbname);
+1:             }
+1:         } catch (StandardException se) {
+1:             throw PublicAPI.wrapStandardException(se);
+1:         }
+1:     }
+1:     
+commit:334e9a3
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     /** True until this database has been successfully booted. Any
+1:      * exception that occurs while inBoot is true will be handed to
+1:      * the client thread booting this database. */
+1:     private volatile boolean inBoot;
+1: 
+1:     /** Set by the database boot thread if it fails before slave mode
+1:      * has been started properly (i.e., if inBoot is true). This
+1:      * exception will then be reported to the client connection. */
+1:     private volatile StandardException bootException;
+/////////////////////////////////////////////////////////////////////////
+1:         inBoot = true;
+/////////////////////////////////////////////////////////////////////////
+1:         // Check that the database was booted successfully, or throw
+1:         // the exception that caused the boot to fail.
+1:         verifySuccessfulBoot();
+1:         inBoot = false;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:                 handleShutdown(se);
+1:     ////////////////////
+1:     // Private Methods//
+1:     ////////////////////
+1:     /**
+1:      * Verify that the slave functionality has been properly started.
+1:      * This method will block until a successful slave startup has
+1:      * been confirmed, or it will throw the exception that caused it
+1:      * to fail.
+1:      */
+1:     private void verifySuccessfulBoot() throws StandardException {
+1:         while (!(isSlaveFactorySet() && slaveFac.isStarted())) {
+1:             if (bootException != null) {
+1:                 throw bootException;
+0:             } else {
+1:                 try {
+0:                     Thread.sleep(500);
+0:                 } catch (InterruptedException ie) {
+0:                     // do nothing
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+1:     /** 
+1:      * If slaveFac (the reference to the SlaveFactory) has not already
+1:      * been set, this method will try to set it by calling
+1:      * Monitor.findServiceModule. If slavFac was already set, the
+1:      * method does not do anything.
+1:      *
+1:      * @return true if slaveFac is set after calling this method,
+1:      * false otherwise
+1:      */
+1:     private boolean isSlaveFactorySet() {
+1:         if (slaveFac != null) {
+1:             return true;
+1:         }
+1: 
+1:         try {
+0:             slaveFac = (SlaveFactory)Monitor.
+1:                 findServiceModule(this, SlaveFactory.MODULE);
+1:             return true;
+1:         } catch (StandardException se) {
+1:             // We get a StandardException if SlaveFactory has not been 
+1:             // booted yet. Safe to retry later.
+1:             return false;
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Used to shutdown this database. 
+1:      *
+1:      * If an error occurs as part of the database boot process, we
+1:      * hand the exception that caused boot to fail to the client
+1:      * thread. The client thread will in turn shut down this database.
+1:      *
+1:      * If an error occurs at a later stage than during boot, we shut
+1:      * down the database by setting up a connection with the shutdown
+1:      * attribute. The internal connection is required because database
+1:      * shutdown requires EmbedConnection to do cleanup.
+1:      *
+1:      * @param shutdownCause the reason why the database needs to be
+1:      * shutdown
+1:      */
+1:     private void handleShutdown(StandardException shutdownCause) {
+1:         if (inBoot) {
+1:             bootException = shutdownCause;
+1:             return;
+1:         } 
+commit:b9c57d5
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.error.PublicAPI;
+1: import org.apache.derby.iapi.reference.Attribute;
+0: import java.sql.Driver;
+0: import java.sql.DriverManager;
+1: import java.sql.SQLException;
+/////////////////////////////////////////////////////////////////////////
+1:     private volatile boolean shutdownInitiated;
+1:     private volatile SlaveFactory slaveFac;
+/////////////////////////////////////////////////////////////////////////
+1:         shutdownInitiated = false;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Called by Monitor when this module is stopped, i.e. when the
+1:      * database is shut down. When the database is shut down using the
+1:      * stopSlave command, the stopReplicationSlave method has already
+1:      * been called when this method is called. In this case, the
+1:      * replication functionality has already been stopped. If the
+1:      * database is shutdown as part of a system shutdown, however, we
+1:      * need to cleanup slave replication as part of database shutdown.
+1:      */
+1:     public void stop() {
+1:         if (inReplicationSlaveMode && slaveFac != null) {
+1:             try {
+1:                 slaveFac.stopSlave(true);
+1:             } catch (StandardException ex) {
+1:             } finally {
+1:                 slaveFac = null;
+1:             }
+1:         }
+1:         super.stop();
+1:     }
+1:     
+0:     public void setSlaveFactory(SlaveFactory f) {
+0:         slaveFac = f;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Verify that a connection to stop the slave has been made from
+1:      * here. If verified, the database context is given to the method
+1:      * caller. This will ensure this database is shutdown when an
+1:      * exception with database severity is thrown. If not verified, an
+1:      * exception is thrown.
+1:      * 
+1:      * @exception StandardException Thrown if a stop slave connection
+1:      * attempt was not made from this class
+1:      */
+1:     public void verifyShutdownSlave() throws StandardException {
+1:         if (!shutdownInitiated) {
+1:             throw StandardException.
+1:                 newException(SQLState.REPLICATION_STOPSLAVE_NOT_INITIATED);
+1:         }
+0:         pushDbContext(ContextService.getFactory().
+1:                       getCurrentContextManager());
+1:     }
+1: 
+1:     /**
+1:      * Stop replication slave mode if replication slave mode is active and 
+1:      * the network connection with the master is down
+1:      * 
+1:      * @exception SQLException Thrown on error, if not in replication 
+1:      * slave mode or if the network connection with the master is not down
+1:      */
+1:     public  void stopReplicationSlave() throws SQLException {
+1: 
+1:         if (shutdownInitiated) {
+1:             // The boot thread has failed or stopReplicationSlave has
+1:             // already been called. There is nothing more to do to
+1:             // stop slave replication mode.
+1:             return;
+1:         }
+1:         
+1:         if (!inReplicationSlaveMode) {
+1:             StandardException se = StandardException.
+1:                 newException(SQLState.REPLICATION_NOT_IN_SLAVE_MODE);
+1:             throw PublicAPI.wrapStandardException(se);
+1:         }
+1: 
+1:         // stop slave without using force, meaning that this method
+1:         // call will fail with an exception if the network connection
+1:         // with the master is up
+1:         try {
+1:             slaveFac.stopSlave(false);
+0:         } catch (StandardException se) {
+1:             throw PublicAPI.wrapStandardException(se);
+1:         }
+1: 
+1:         slaveFac = null;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 // if we get here, failover has been called and the
+1:                 // database can now be connected to
+1:                 inReplicationSlaveMode = false; 
+1: 
+0:             } catch (StandardException se) {
+0:                 // We get here when SlaveController#stopSlave has been
+0:                 // called, or if a fatal exception has been thrown.
+0:                 handleShutdown ();
+1:     /**
+0:      * Shutdown this database
+1:      */
+0:     private void handleShutdown() {
+1: 
+0:         try {
+1:             shutdownInitiated = true;
+0:             String driverName = 
+0:                 "org.apache.derby.jdbc.EmbeddedDriver";
+1: 
+0:             Class.forName(driverName).newInstance();
+1: 
+0:             Driver embedDriver = 
+0:                 DriverManager.getDriver(Attribute.PROTOCOL);
+1: 
+1:             String conStr = "jdbc:derby:"+dbname+";"+
+1:                 Attribute.REPLICATION_INTERNAL_SHUTDOWN_SLAVE+
+1:                 "=true";
+1: 
+0:             embedDriver.connect(conStr, (Properties) null);
+1:         } catch (Exception e) {
+1:             // Todo: report error to derby.log if exception is not
+1:             // SQLState.SHUTDOWN_DATABASE
+1:         }
+1:     }
+1: 
+commit:696377a
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.derby.iapi.reference.MessageId;
+0: import org.apache.derby.impl.services.replication.ReplicationLogger;
+/////////////////////////////////////////////////////////////////////////
+1:     private String dbname; // The name of the replicated database
+/////////////////////////////////////////////////////////////////////////
+1:         dbname = startParams.getProperty(SlaveFactory.SLAVE_DB);
+/////////////////////////////////////////////////////////////////////////
+1:     public AuthenticationService getAuthenticationService()
+1:         throws StandardException{
+1:             throw StandardException.newException(
+1:                 SQLState.CANNOT_CONNECT_TO_DB_IN_SLAVE_MODE, dbname);
+/////////////////////////////////////////////////////////////////////////
+1:             ContextManager bootThreadCm = null;
+/////////////////////////////////////////////////////////////////////////
+0:                 ReplicationLogger.logError(MessageId.REPLICATION_FATAL_ERROR,
+0:                                            se, dbname);
+0:                 // todo: shutdown this database
+1:                 if (bootThreadCm != null) {
+0:                     ContextService.getFactory().
+1:                         resetCurrentContextManager(bootThreadCm);
+1:                     bootThreadCm = null;
+1:                 }
+commit:836ab97
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1: 
+1:    Derby - Class org.apache.derby.impl.db.SlaveDatabase
+1: 
+1:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:    contributor license agreements.  See the NOTICE file distributed with
+1:    this work for additional information regarding copyright ownership.
+1:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:    (the "License"); you may not use this file except in compliance with
+1:    the License.  You may obtain a copy of the License at
+1: 
+1:       http://www.apache.org/licenses/LICENSE-2.0
+1: 
+1:    Unless required by applicable law or agreed to in writing, software
+1:    distributed under the License is distributed on an "AS IS" BASIS,
+1:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:    See the License for the specific language governing permissions and
+1:    limitations under the License.
+1: 
+1:  */
+1: 
+1: package org.apache.derby.impl.db;
+1: 
+1: import org.apache.derby.iapi.reference.SQLState;
+1: import org.apache.derby.iapi.error.StandardException;
+1: import org.apache.derby.iapi.jdbc.AuthenticationService;
+1: import org.apache.derby.iapi.services.context.ContextManager;
+1: import org.apache.derby.iapi.services.context.ContextService;
+1: import org.apache.derby.iapi.services.monitor.Monitor;
+0: import org.apache.derby.iapi.services.replication.slave.SlaveFactory;
+1: import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
+0: import org.apache.derby.impl.services.monitor.UpdateServiceProperties;
+1: 
+1: import java.util.Properties;
+1: 
+1: /**
+1:  * SlaveDatabase is an instance of Database, and is booted instead of
+1:  * BasicDatabase if this database will have the replication slave
+1:  * role. SlaveDatabase differs from BasicDatabase in the following
+1:  * ways:
+1:  *
+1:  * 1: When starting a non-replicated database (i.e., BasicDatabase),
+1:  *    only one thread is used to start all modules of the database.
+1:  *    When booted in slave mode, the thread that boots the store
+1:  *    module will be blocked during log recovery. To remedy this,
+1:  *    SlaveDatabase runs the boot method of BasicDatabase in a
+1:  *    separate thread. This ensures that the connection attempt that
+1:  *    started slave replication mode will not hang.
+1:  *
+1:  * 2: While the database is in replication slave mode, the
+1:  *    authentication services are not available because these require
+1:  *    that the store module has been booted first. Calling
+1:  *    getAuthenticationService when in slave mode will raise an
+1:  *    exception.
+1:  *
+1:  * 3: While the database is in replication slave mode, connections are
+1:  *    not accepted since the database cannot process transaction
+1:  *    requests. Calling setupConnection when in slave mode will raise
+1:  *    an exception.
+1:  *
+1:  * 4: If the failover command has been executed for this database, it
+1:  *    is no longer in replication slave mode. When this has
+1:  *    happened, SlaveDatabase works exactly as BasicDatabase.
+1:  */
+1: 
+1: public class SlaveDatabase extends BasicDatabase {
+1:     /** True until SlaveDatabaseBootThread has successfully booted the
+1:      * database. Does not happen until the failover command has been
+1:      * executed for this database */
+1:     private volatile boolean inReplicationSlaveMode;
+1: 
+1:     /////////////////////////////
+1:     // ModuleControl interface //
+1:     /////////////////////////////
+1:     /**
+1:      * Determines whether this Database implementation should be used
+1:      * to boot the database.
+1:      * @param startParams The properties used to decide if
+1:      * SlaveDatabase is the correct implementation of Database for the
+1:      * database to be booted. 
+1:      * @return true if the database is updatable (not read-only) and
+1:      * replication slave mode is specified in startParams
+1:      */
+1:     public boolean canSupport(Properties startParams) {
+1: 
+1:         boolean supported =
+1:             Monitor.isDesiredCreateType(startParams, getEngineType());
+1:         if (supported) {
+1:             String repliMode =
+1:                 startParams.getProperty(SlaveFactory.REPLICATION_MODE);
+1:             if (repliMode == null ||
+1:                 !repliMode.equals(SlaveFactory.SLAVE_MODE)) {
+1:                 supported = false;
+1:             }
+1:         }
+1: 
+1:         return supported;
+1:     }
+1: 
+1:     public void boot(boolean create, Properties startParams)
+1:         throws StandardException {
+1: 
+1:         inReplicationSlaveMode = true;
+1: 
+1:         // SlaveDatabaseBootThread is an internal class
+1:         SlaveDatabaseBootThread dbBootThread =
+1:             new SlaveDatabaseBootThread(create, startParams);
+0:         new Thread(dbBootThread).start();
+1: 
+0:         try {
+0:             // We cannot claim to be booted until the storage factory
+0:             // has been set in the startParams because
+0:             // TopService.bootModule (the caller of this method) uses
+0:             // the storage factory object. The storage factory is set
+0:             // in RawStore.boot, and we have to wait for this to
+0:             // happen.
+0:             UpdateServiceProperties usp =
+0:                 (UpdateServiceProperties) startParams;
+0:             while (usp.getStorageFactory() == null){
+0:                 Thread.sleep(500);
+1:             }
+0:         } catch (Exception e) {
+0:             //Todo: report exception to derby.log
+1:         }
+1: 
+1:         // This module has now been booted (hence active=true) even
+1:         // though submodules like store and authentication may not
+1:         // have completed their boot yet. We deal with that by raising
+1:         // an error on attempts to use these 
+1:         active=true;
+1:     }
+1: 
+1:     /////////////////////
+1:     // Class interface //
+1:     /////////////////////
+1:     public SlaveDatabase() {
+1:     }
+1: 
+1:     ////////////////////////
+1:     // Database interface //
+1:     ////////////////////////
+1:     public LanguageConnectionContext setupConnection(ContextManager cm, 
+1:                                                      String user, 
+1:                                                      String drdaID, 
+1:                                                      String dbname)
+1:         throws StandardException {
+1: 
+1:         if (inReplicationSlaveMode) {
+1:             // do not allow connections to a database that is
+1:             // currently in replication slave move
+1:             throw StandardException.newException(
+1:                         SQLState.CANNOT_CONNECT_TO_DB_IN_SLAVE_MODE, dbname);
+1:         }
+1:         return super.setupConnection(cm, user, drdaID, dbname);
+1:     }
+1: 
+0:     public AuthenticationService getAuthenticationService() {
+1:         if (inReplicationSlaveMode) {
+1:             // Cannot get authentication service for a database that
+1:             // is currently in replication slave move
+0:             // Todo: throw exception
+1:         }
+1:         return super.getAuthenticationService();
+1:     }
+1: 
+1:     /////////////////
+1:     // Inner Class //
+1:     /////////////////
+1:     /**
+1:      * Thread that boots the slave database. Will be blocked in
+1:      * LogFactory.recover until database is no longer in slave
+1:      * replication mode.
+1:      */
+1:     private class SlaveDatabaseBootThread implements Runnable {
+1: 
+1:         private boolean create;
+1:         private Properties params;
+1: 
+1:         public SlaveDatabaseBootThread(boolean create, Properties startParams){
+1:             this.create = create;
+1:             params = startParams;
+1:         }
+1: 
+1:         public void run() {
+1: 
+1:             // The thread needs a ContextManager since two threads
+1:             // cannot share a context
+0:             ContextManager bootThreadCm;
+0:             try {
+1: 
+0:                 bootThreadCm = ContextService.getFactory().newContextManager();
+0:                 ContextService.getFactory().
+1:                     setCurrentContextManager(bootThreadCm);
+1: 
+1:                 bootBasicDatabase(create, params); // will be blocked
+1: 
+0:             } catch (StandardException se) {
+0:                 //todo - report exception
+0:             } finally {
+0:                 inReplicationSlaveMode = false;
+0:                 //todo: tear down context
+1:             }
+1:         }
+1:     }
+1: 
+1:     private void bootBasicDatabase(boolean create, Properties params)
+1:         throws StandardException {
+1:         // This call will be blocked while slave replication mode is
+1:         // active
+1:         super.boot(create, params);
+1:     }
+1: }
+============================================================================

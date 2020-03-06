@@ -1,0 +1,900 @@
+1:cfc6917: /**
+1:cfc6917:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:cfc6917:  * contributor license agreements.  See the NOTICE file distributed with
+1:cfc6917:  * this work for additional information regarding copyright ownership.
+1:cfc6917:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:cfc6917:  * (the "License"); you may not use this file except in compliance with
+1:cfc6917:  * the License.  You may obtain a copy of the License at
+1:cfc6917:  *
+1:cfc6917:  *      http://www.apache.org/licenses/LICENSE-2.0
+1:cfc6917:  *
+1:cfc6917:  * Unless required by applicable law or agreed to in writing, software
+1:cfc6917:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:cfc6917:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:cfc6917:  * See the License for the specific language governing permissions and
+1:cfc6917:  * limitations under the License.
+1:cfc6917:  */
+24:cfc6917: 
+1:cfc6917: package org.apache.activemq.transport.mqtt;
+1:cfc6917: 
+1:cfc6917: import java.io.IOException;
+1:cfc6917: import java.util.Timer;
+1:3125cae: import java.util.concurrent.RejectedExecutionException;
+1:cfc6917: import java.util.concurrent.SynchronousQueue;
+1:cfc6917: import java.util.concurrent.ThreadFactory;
+1:cfc6917: import java.util.concurrent.ThreadPoolExecutor;
+1:cfc6917: import java.util.concurrent.TimeUnit;
+1:cfc6917: import java.util.concurrent.atomic.AtomicBoolean;
+1:cfc6917: import java.util.concurrent.atomic.AtomicInteger;
+1:2ad13d6: import java.util.concurrent.locks.ReentrantLock;
+1:cfc6917: 
+1:cfc6917: import org.apache.activemq.thread.SchedulerTimerTask;
+1:cfc6917: import org.apache.activemq.transport.AbstractInactivityMonitor;
+1:cfc6917: import org.apache.activemq.transport.InactivityIOException;
+1:cfc6917: import org.apache.activemq.transport.Transport;
+1:cfc6917: import org.apache.activemq.transport.TransportFilter;
+1:cfc6917: import org.apache.activemq.wireformat.WireFormat;
+1:cfc6917: import org.slf4j.Logger;
+1:cfc6917: import org.slf4j.LoggerFactory;
+1:cfc6917: 
+1:cfc6917: public class MQTTInactivityMonitor extends TransportFilter {
+1:cfc6917: 
+1:cfc6917:     private static final Logger LOG = LoggerFactory.getLogger(MQTTInactivityMonitor.class);
+1:cfc6917: 
+1:2ad13d6:     private static final long DEFAULT_CHECK_TIME_MILLS = 30000;
+1:2ad13d6: 
+1:cfc6917:     private static ThreadPoolExecutor ASYNC_TASKS;
+1:cfc6917:     private static int CHECKER_COUNTER;
+1:cfc6917:     private static Timer READ_CHECK_TIMER;
+1:cfc6917: 
+1:cfc6917:     private final AtomicBoolean failed = new AtomicBoolean(false);
+1:cfc6917:     private final AtomicBoolean inReceive = new AtomicBoolean(false);
+1:cfc6917:     private final AtomicInteger lastReceiveCounter = new AtomicInteger(0);
+1:cfc6917: 
+1:2ad13d6:     private final ReentrantLock sendLock = new ReentrantLock();
+1:cfc6917:     private SchedulerTimerTask readCheckerTask;
+1:cfc6917: 
+1:6e68a37:     private long readGraceTime = DEFAULT_CHECK_TIME_MILLS;
+1:6e68a37:     private long readKeepAliveTime = DEFAULT_CHECK_TIME_MILLS;
+1:4c38438:     private MQTTProtocolConverter protocolConverter;
+1:cfc6917: 
+1:4b7131f:     private long connectionTimeout = MQTTWireFormat.DEFAULT_CONNECTION_TIMEOUT;
+1:4b7131f:     private SchedulerTimerTask connectCheckerTask;
+1:4b7131f:     private final Runnable connectChecker = new Runnable() {
+1:4b7131f: 
+1:4b7131f:         private final long startTime = System.currentTimeMillis();
+1:4b7131f: 
+1:4b7131f:         @Override
+1:4b7131f:         public void run() {
+1:4b7131f: 
+1:4b7131f:             long now = System.currentTimeMillis();
+1:4b7131f: 
+1:3125cae:             if ((now - startTime) >= connectionTimeout && connectCheckerTask != null && !ASYNC_TASKS.isShutdown()) {
+1:4b7131f:                 if (LOG.isDebugEnabled()) {
+1:4b7131f:                     LOG.debug("No CONNECT frame received in time for " + MQTTInactivityMonitor.this.toString() + "! Throwing InactivityIOException.");
+1:4b7131f:                 }
+1:3125cae: 
+1:3125cae:                 try {
+1:3125cae:                     ASYNC_TASKS.execute(new Runnable() {
+1:3125cae:                         @Override
+1:3125cae:                         public void run() {
+1:3125cae:                             onException(new InactivityIOException("Channel was inactive for too (>" + (readKeepAliveTime + readGraceTime) + ") long: "
+1:3125cae:                                 + next.getRemoteAddress()));
+1:3125cae:                         }
+1:3125cae:                     });
+1:3125cae:                 } catch (RejectedExecutionException ex) {
+1:3125cae:                     if (!ASYNC_TASKS.isShutdown()) {
+1:3125cae:                         LOG.error("Async connection timeout task was rejected from the executor: ", ex);
+1:3125cae:                         throw ex;
+1:3125cae:                     }
+1:4b7131f:                 }
+1:4b7131f:             }
+1:4b7131f:         }
+1:4b7131f:     };
+1:4b7131f: 
+1:cfc6917:     private final Runnable readChecker = new Runnable() {
+1:6e68a37:         long lastReceiveTime = System.currentTimeMillis();
+1:6e68a37: 
+1:4b7131f:         @Override
+1:4b7131f:         public void run() {
+1:2ad13d6: 
+1:cfc6917:             long now = System.currentTimeMillis();
+1:6e68a37:             int currentCounter = next.getReceiveCounter();
+1:6e68a37:             int previousCounter = lastReceiveCounter.getAndSet(currentCounter);
+1:d212d3c: 
+1:413e484:             // for the PINGREQ/RESP frames, the currentCounter will be different
+1:413e484:             // from previousCounter, and that
+1:413e484:             // should be sufficient to indicate the connection is still alive.
+1:413e484:             // If there were random data, or something
+1:413e484:             // outside the scope of the spec, the wire format unrmarshalling
+1:413e484:             // would fail, so we don't need to handle
+1:6e68a37:             // PINGREQ/RESP explicitly here
+1:6e68a37:             if (inReceive.get() || currentCounter != previousCounter) {
+1:6e68a37:                 if (LOG.isTraceEnabled()) {
+1:6e68a37:                     LOG.trace("Command received since last read check.");
+1:6e68a37:                 }
+1:6e68a37:                 lastReceiveTime = now;
+1:2ad13d6:                 return;
+1:6e68a37:             }
+1:2ad13d6: 
+1:3125cae:             if ((now - lastReceiveTime) >= readKeepAliveTime + readGraceTime && readCheckerTask != null && !ASYNC_TASKS.isShutdown()) {
+1:6e68a37:                 if (LOG.isDebugEnabled()) {
+1:6e68a37:                     LOG.debug("No message received since last read check for " + MQTTInactivityMonitor.this.toString() + "! Throwing InactivityIOException.");
+1:6e68a37:                 }
+1:3125cae:                 try {
+1:3125cae:                     ASYNC_TASKS.execute(new Runnable() {
+1:3125cae:                         @Override
+1:3125cae:                         public void run() {
+1:3125cae:                             onException(new InactivityIOException("Channel was inactive for too (>" +
+1:3125cae:                                         (connectionTimeout) + ") long: " + next.getRemoteAddress()));
+1:3125cae:                         }
+1:3125cae:                     });
+1:3125cae:                 } catch (RejectedExecutionException ex) {
+1:3125cae:                     if (!ASYNC_TASKS.isShutdown()) {
+1:3125cae:                         LOG.error("Async connection timeout task was rejected from the executor: ", ex);
+1:3125cae:                         throw ex;
+1:3125cae:                     }
+1:6e68a37:                 }
+1:2ad13d6:             }
+22:cfc6917:         }
+1:cfc6917:     };
+1:cfc6917: 
+1:cfc6917:     public MQTTInactivityMonitor(Transport next, WireFormat wireFormat) {
+1:cfc6917:         super(next);
+1:cfc6917:     }
+1:cfc6917: 
+1:a059bf4:     @Override
+1:cfc6917:     public void start() throws Exception {
+1:cfc6917:         next.start();
+1:cfc6917:     }
+1:cfc6917: 
+1:a059bf4:     @Override
+1:cfc6917:     public void stop() throws Exception {
+1:4b7131f:         stopReadChecker();
+1:4b7131f:         stopConnectChecker();
+1:cfc6917:         next.stop();
+1:cfc6917:     }
+1:cfc6917: 
+1:a059bf4:     @Override
+1:cfc6917:     public void onCommand(Object command) {
+1:cfc6917:         inReceive.set(true);
+2:cfc6917:         try {
+1:d212d3c:             transportListener.onCommand(command);
+2:cfc6917:         } finally {
+1:cfc6917:             inReceive.set(false);
+1:cfc6917:         }
+1:cfc6917:     }
+1:cfc6917: 
+1:a059bf4:     @Override
+1:cfc6917:     public void oneway(Object o) throws IOException {
+1:cfc6917:         // To prevent the inactivity monitor from sending a message while we
+1:2ad13d6:         // are performing a send we take the lock.
+1:2ad13d6:         this.sendLock.lock();
+1:cfc6917:         try {
+1:cfc6917:             doOnewaySend(o);
+1:cfc6917:         } finally {
+1:2ad13d6:             this.sendLock.unlock();
+1:cfc6917:         }
+1:cfc6917:     }
+1:cfc6917: 
+1:cfc6917:     // Must be called under lock, either read or write on sendLock.
+1:cfc6917:     private void doOnewaySend(Object command) throws IOException {
+1:cfc6917:         if (failed.get()) {
+1:cfc6917:             throw new InactivityIOException("Cannot send, channel has already failed: " + next.getRemoteAddress());
+1:cfc6917:         }
+1:cfc6917:         next.oneway(command);
+1:cfc6917:     }
+1:cfc6917: 
+1:a059bf4:     @Override
+1:cfc6917:     public void onException(IOException error) {
+1:cfc6917:         if (failed.compareAndSet(false, true)) {
+1:4b7131f:             stopConnectChecker();
+1:4b7131f:             stopReadChecker();
+1:030c2cc:             if (protocolConverter != null) {
+2:030c2cc:                 protocolConverter.onTransportError();
+1:030c2cc:             }
+1:cfc6917:             transportListener.onException(error);
+1:4c38438:         }
+1:cfc6917:     }
+1:cfc6917: 
+1:6e68a37:     public long getReadGraceTime() {
+1:6e68a37:         return readGraceTime;
+1:cfc6917:     }
+1:cfc6917: 
+1:6e68a37:     public void setReadGraceTime(long readGraceTime) {
+1:6e68a37:         this.readGraceTime = readGraceTime;
+1:cfc6917:     }
+1:cfc6917: 
+1:6e68a37:     public long getReadKeepAliveTime() {
+1:6e68a37:         return readKeepAliveTime;
+1:cfc6917:     }
+1:cfc6917: 
+1:6e68a37:     public void setReadKeepAliveTime(long readKeepAliveTime) {
+1:6e68a37:         this.readKeepAliveTime = readKeepAliveTime;
+1:cfc6917:     }
+1:cfc6917: 
+1:4c38438:     public void setProtocolConverter(MQTTProtocolConverter protocolConverter) {
+1:4c38438:         this.protocolConverter = protocolConverter;
+1:4c38438:     }
+1:4c38438: 
+1:4c38438:     public MQTTProtocolConverter getProtocolConverter() {
+1:4c38438:         return protocolConverter;
+1:4c38438:     }
+1:4c38438: 
+1:27edaff:     public synchronized void startConnectChecker(long connectionTimeout) {
+1:4b7131f:         this.connectionTimeout = connectionTimeout;
+1:4b7131f:         if (connectionTimeout > 0 && connectCheckerTask == null) {
+1:4b7131f:             connectCheckerTask = new SchedulerTimerTask(connectChecker);
+1:cfc6917: 
+1:4b7131f:             long connectionCheckInterval = Math.min(connectionTimeout, 1000);
+1:cfc6917: 
+1:cfc6917:             synchronized (AbstractInactivityMonitor.class) {
+1:cfc6917:                 if (CHECKER_COUNTER == 0) {
+1:3125cae:                     if (ASYNC_TASKS == null || ASYNC_TASKS.isShutdown()) {
+1:3125cae:                         ASYNC_TASKS = createExecutor();
+1:3125cae:                     }
+1:cfc6917:                     READ_CHECK_TIMER = new Timer("InactivityMonitor ReadCheck", true);
+1:3125cae:                 }
+1:cfc6917:                 CHECKER_COUNTER++;
+1:4b7131f:                 READ_CHECK_TIMER.schedule(connectCheckerTask, connectionCheckInterval, connectionCheckInterval);
+1:4b7131f:             }
+1:4b7131f:         }
+1:4b7131f:     }
+1:4b7131f: 
+1:4b7131f:     synchronized void startReadChecker() {
+1:4b7131f:         if (readKeepAliveTime > 0 && readCheckerTask == null) {
+1:4b7131f:             readCheckerTask = new SchedulerTimerTask(readChecker);
+1:4b7131f: 
+1:4b7131f:             synchronized (AbstractInactivityMonitor.class) {
+1:4b7131f:                 if (CHECKER_COUNTER == 0) {
+1:3125cae:                     if (ASYNC_TASKS == null || ASYNC_TASKS.isShutdown()) {
+1:3125cae:                         ASYNC_TASKS = createExecutor();
+1:4b7131f:                     }
+1:4b7131f:                     READ_CHECK_TIMER = new Timer("InactivityMonitor ReadCheck", true);
+1:cfc6917:                 }
+1:4b7131f:                 CHECKER_COUNTER++;
+1:4b7131f:                 READ_CHECK_TIMER.schedule(readCheckerTask, readKeepAliveTime, readGraceTime);
+1:4b7131f:             }
+1:4b7131f:         }
+1:4b7131f:     }
+1:4b7131f: 
+1:4b7131f:     synchronized void stopConnectChecker() {
+1:4b7131f:         if (connectCheckerTask != null) {
+1:4b7131f:             connectCheckerTask.cancel();
+1:4b7131f:             connectCheckerTask = null;
+1:4b7131f: 
+1:4b7131f:             synchronized (AbstractInactivityMonitor.class) {
+1:4b7131f:                 READ_CHECK_TIMER.purge();
+1:4b7131f:                 CHECKER_COUNTER--;
+1:4b7131f:                 if (CHECKER_COUNTER == 0) {
+1:4b7131f:                     READ_CHECK_TIMER.cancel();
+1:4b7131f:                     READ_CHECK_TIMER = null;
+1:cfc6917:                 }
+1:cfc6917:             }
+1:cfc6917:         }
+1:cfc6917:     }
+1:cfc6917: 
+1:4b7131f:     synchronized void stopReadChecker() {
+1:4b7131f:         if (readCheckerTask != null) {
+1:4b7131f:             readCheckerTask.cancel();
+1:4b7131f:             readCheckerTask = null;
+1:cfc6917: 
+1:cfc6917:             synchronized (AbstractInactivityMonitor.class) {
+1:cfc6917:                 READ_CHECK_TIMER.purge();
+1:cfc6917:                 CHECKER_COUNTER--;
+1:cfc6917:                 if (CHECKER_COUNTER == 0) {
+1:cfc6917:                     READ_CHECK_TIMER.cancel();
+1:cfc6917:                     READ_CHECK_TIMER = null;
+1:cfc6917:                 }
+1:cfc6917:             }
+1:cfc6917:         }
+1:cfc6917:     }
+1:cfc6917: 
+1:a059bf4:     private final ThreadFactory factory = new ThreadFactory() {
+1:a059bf4:         @Override
+1:cfc6917:         public Thread newThread(Runnable runnable) {
+1:cfc6917:             Thread thread = new Thread(runnable, "MQTTInactivityMonitor Async Task: " + runnable);
+1:cfc6917:             thread.setDaemon(true);
+1:cfc6917:             return thread;
+1:cfc6917:         }
+1:cfc6917:     };
+1:cfc6917: 
+1:cfc6917:     private ThreadPoolExecutor createExecutor() {
+1:2ad13d6:         ThreadPoolExecutor exec = new ThreadPoolExecutor(0, Integer.MAX_VALUE, 60, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(), factory);
+1:cfc6917:         exec.allowCoreThreadTimeOut(true);
+1:cfc6917:         return exec;
+1:cfc6917:     }
+1:cfc6917: }
+============================================================================
+author:Timothy Bish
+-------------------------------------------------------------------------------
+commit:27edaff
+/////////////////////////////////////////////////////////////////////////
+1:     public synchronized void startConnectChecker(long connectionTimeout) {
+commit:3125cae
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.RejectedExecutionException;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:             if ((now - startTime) >= connectionTimeout && connectCheckerTask != null && !ASYNC_TASKS.isShutdown()) {
+1: 
+1:                 try {
+1:                     ASYNC_TASKS.execute(new Runnable() {
+1:                         @Override
+1:                         public void run() {
+1:                             onException(new InactivityIOException("Channel was inactive for too (>" + (readKeepAliveTime + readGraceTime) + ") long: "
+1:                                 + next.getRemoteAddress()));
+1:                         }
+1:                     });
+1:                 } catch (RejectedExecutionException ex) {
+1:                     if (!ASYNC_TASKS.isShutdown()) {
+1:                         LOG.error("Async connection timeout task was rejected from the executor: ", ex);
+1:                         throw ex;
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+1:             if ((now - lastReceiveTime) >= readKeepAliveTime + readGraceTime && readCheckerTask != null && !ASYNC_TASKS.isShutdown()) {
+1:                 try {
+1:                     ASYNC_TASKS.execute(new Runnable() {
+1:                         @Override
+1:                         public void run() {
+1:                             onException(new InactivityIOException("Channel was inactive for too (>" +
+1:                                         (connectionTimeout) + ") long: " + next.getRemoteAddress()));
+1:                         }
+1:                     });
+1:                 } catch (RejectedExecutionException ex) {
+1:                     if (!ASYNC_TASKS.isShutdown()) {
+1:                         LOG.error("Async connection timeout task was rejected from the executor: ", ex);
+1:                         throw ex;
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+1:                     if (ASYNC_TASKS == null || ASYNC_TASKS.isShutdown()) {
+1:                         ASYNC_TASKS = createExecutor();
+1:                     }
+/////////////////////////////////////////////////////////////////////////
+1:                     if (ASYNC_TASKS == null || ASYNC_TASKS.isShutdown()) {
+1:                         ASYNC_TASKS = createExecutor();
+1:                     }
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+commit:4b7131f
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private long connectionTimeout = MQTTWireFormat.DEFAULT_CONNECTION_TIMEOUT;
+1:     private SchedulerTimerTask connectCheckerTask;
+1:     private final Runnable connectChecker = new Runnable() {
+1: 
+1:         private final long startTime = System.currentTimeMillis();
+1: 
+1:         @Override
+1:         public void run() {
+1: 
+1:             long now = System.currentTimeMillis();
+1: 
+0:             if ((now - startTime) >= connectionTimeout && connectCheckerTask != null && !ASYNC_TASKS.isTerminating()) {
+1:                 if (LOG.isDebugEnabled()) {
+1:                     LOG.debug("No CONNECT frame received in time for " + MQTTInactivityMonitor.this.toString() + "! Throwing InactivityIOException.");
+1:                 }
+0:                 ASYNC_TASKS.execute(new Runnable() {
+1:                     @Override
+1:                     public void run() {
+0:                         onException(new InactivityIOException("Channel was inactive for too (>" + (readKeepAliveTime + readGraceTime) + ") long: "
+0:                             + next.getRemoteAddress()));
+1:                     }
+0:                 });
+1:             }
+1:         }
+1:     };
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:             if ((now - lastReceiveTime) >= readKeepAliveTime + readGraceTime && readCheckerTask != null && !ASYNC_TASKS.isTerminating()) {
+0:                         onException(new InactivityIOException("Channel was inactive for too (>" +
+0:                                     (connectionTimeout) + ") long: " + next.getRemoteAddress()));
+/////////////////////////////////////////////////////////////////////////
+1:         stopReadChecker();
+1:         stopConnectChecker();
+/////////////////////////////////////////////////////////////////////////
+1:             stopConnectChecker();
+1:             stopReadChecker();
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     synchronized void startConnectChecker(long connectionTimeout) {
+1:         this.connectionTimeout = connectionTimeout;
+1:         if (connectionTimeout > 0 && connectCheckerTask == null) {
+1:             connectCheckerTask = new SchedulerTimerTask(connectChecker);
+1:             long connectionCheckInterval = Math.min(connectionTimeout, 1000);
+1:                 READ_CHECK_TIMER.schedule(connectCheckerTask, connectionCheckInterval, connectionCheckInterval);
+1:             }
+1:         }
+1:     }
+1: 
+1:     synchronized void startReadChecker() {
+1:         if (readKeepAliveTime > 0 && readCheckerTask == null) {
+1:             readCheckerTask = new SchedulerTimerTask(readChecker);
+1: 
+1:             synchronized (AbstractInactivityMonitor.class) {
+1:                 if (CHECKER_COUNTER == 0) {
+0:                     ASYNC_TASKS = createExecutor();
+1:                     READ_CHECK_TIMER = new Timer("InactivityMonitor ReadCheck", true);
+1:                 }
+1:                 CHECKER_COUNTER++;
+1:                 READ_CHECK_TIMER.schedule(readCheckerTask, readKeepAliveTime, readGraceTime);
+1:             }
+1:         }
+1:     }
+1: 
+1:     synchronized void stopConnectChecker() {
+1:         if (connectCheckerTask != null) {
+1:             connectCheckerTask.cancel();
+1:             connectCheckerTask = null;
+1: 
+1:             synchronized (AbstractInactivityMonitor.class) {
+1:                 READ_CHECK_TIMER.purge();
+1:                 CHECKER_COUNTER--;
+1:                 if (CHECKER_COUNTER == 0) {
+1:                     READ_CHECK_TIMER.cancel();
+1:                     READ_CHECK_TIMER = null;
+0:                     ThreadPoolUtils.shutdown(ASYNC_TASKS);
+0:                     ASYNC_TASKS = null;
+1:     synchronized void stopReadChecker() {
+1:         if (readCheckerTask != null) {
+1:             readCheckerTask.cancel();
+1:             readCheckerTask = null;
+commit:413e484
+/////////////////////////////////////////////////////////////////////////
+1:             // for the PINGREQ/RESP frames, the currentCounter will be different
+1:             // from previousCounter, and that
+1:             // should be sufficient to indicate the connection is still alive.
+1:             // If there were random data, or something
+1:             // outside the scope of the spec, the wire format unrmarshalling
+1:             // would fail, so we don't need to handle
+/////////////////////////////////////////////////////////////////////////
+0:             if ((now - lastReceiveTime) >= readKeepAliveTime + readGraceTime && monitorStarted.get() && !ASYNC_TASKS.isTerminating()) {
+0:                         onException(new InactivityIOException("Channel was inactive for too (>" + (readKeepAliveTime + readGraceTime) + ") long: "
+0:                             + next.getRemoteAddress()));
+commit:a059bf4
+/////////////////////////////////////////////////////////////////////////
+1:         @Override
+/////////////////////////////////////////////////////////////////////////
+1:                     @Override
+/////////////////////////////////////////////////////////////////////////
+1:     @Override
+1:     @Override
+1:     @Override
+/////////////////////////////////////////////////////////////////////////
+1:     @Override
+/////////////////////////////////////////////////////////////////////////
+0:     @Override
+/////////////////////////////////////////////////////////////////////////
+1:     private final ThreadFactory factory = new ThreadFactory() {
+0:         @Override
+author:Hiram Chirino
+-------------------------------------------------------------------------------
+commit:6e68a37
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private long readGraceTime = DEFAULT_CHECK_TIME_MILLS;
+1:     private long readKeepAliveTime = DEFAULT_CHECK_TIME_MILLS;
+1:         long lastReceiveTime = System.currentTimeMillis();
+1: 
+1:             int currentCounter = next.getReceiveCounter();
+1:             int previousCounter = lastReceiveCounter.getAndSet(currentCounter);
+0:             // for the PINGREQ/RESP frames, the currentCounter will be different from previousCounter, and that
+0:             // should be sufficient to indicate the connection is still alive. If there were random data, or something
+0:             // outside the scope of the spec, the wire format unrmarshalling would fail, so we don't need to handle
+1:             // PINGREQ/RESP explicitly here
+1:             if (inReceive.get() || currentCounter != previousCounter) {
+1:                 if (LOG.isTraceEnabled()) {
+1:                     LOG.trace("Command received since last read check.");
+1:                 }
+1:                 lastReceiveTime = now;
+0:             if( (now-lastReceiveTime) >= readKeepAliveTime+readGraceTime && monitorStarted.get() && !ASYNC_TASKS.isTerminating()) {
+1:                 if (LOG.isDebugEnabled()) {
+1:                     LOG.debug("No message received since last read check for " + MQTTInactivityMonitor.this.toString() + "! Throwing InactivityIOException.");
+1:                 }
+0:                 ASYNC_TASKS.execute(new Runnable() {
+0:                     public void run() {
+0:                         onException(new InactivityIOException("Channel was inactive for too (>" + (readKeepAliveTime+readGraceTime) + ") long: " + next.getRemoteAddress()));
+1:                     }
+0:                 });
+1:             }
+0:         return elapsed > (readGraceTime * 9 / 10);
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     public long getReadGraceTime() {
+1:         return readGraceTime;
+1:     public void setReadGraceTime(long readGraceTime) {
+1:         this.readGraceTime = readGraceTime;
+1:     public long getReadKeepAliveTime() {
+1:         return readKeepAliveTime;
+1:     public void setReadKeepAliveTime(long readKeepAliveTime) {
+1:         this.readKeepAliveTime = readKeepAliveTime;
+/////////////////////////////////////////////////////////////////////////
+0:         if (readKeepAliveTime > 0) {
+0:         if (readKeepAliveTime > 0) {
+/////////////////////////////////////////////////////////////////////////
+0:                 if (readKeepAliveTime > 0) {
+0:                     READ_CHECK_TIMER.schedule(readCheckerTask, readKeepAliveTime, readGraceTime);
+commit:030c2cc
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:             if (protocolConverter != null) {
+1:                 protocolConverter.onTransportError();
+1:             }
+1:             protocolConverter.onTransportError();
+author:Hiram R. Chirino
+-------------------------------------------------------------------------------
+commit:c5cf038
+author:Christian Posta
+-------------------------------------------------------------------------------
+commit:d212d3c
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:         // for the PINGREQ/RESP frames, the currentCounter will be different from previousCounter, and that
+0:         // should be sufficient to indicate the connection is still alive. If there were random data, or something
+0:         // outside the scope of the spec, the wire format unrmarshalling would fail, so we don't need to handle
+0:         // PINGREQ/RESP explicitly here
+/////////////////////////////////////////////////////////////////////////
+1:             transportListener.onCommand(command);
+author:Timothy A. Bish
+-------------------------------------------------------------------------------
+commit:2ad13d6
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.locks.ReentrantLock;
+/////////////////////////////////////////////////////////////////////////
+1:     private static final long DEFAULT_CHECK_TIME_MILLS = 30000;
+1: 
+1:     private final ReentrantLock sendLock = new ReentrantLock();
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:                     sendLock.lock();
+0:                         sendLock.unlock();
+/////////////////////////////////////////////////////////////////////////
+1:         // are performing a send we take the lock.
+1:         this.sendLock.lock();
+1:             this.sendLock.unlock();
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:         // Not yet configured if this isn't set yet.
+0:         if (protocolConverter == null) {
+1:             return;
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         ThreadPoolExecutor exec = new ThreadPoolExecutor(0, Integer.MAX_VALUE, 60, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(), factory);
+author:Claus Ibsen
+-------------------------------------------------------------------------------
+commit:6c1676b
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.activemq.util.ThreadPoolUtils;
+/////////////////////////////////////////////////////////////////////////
+0:                     ThreadPoolUtils.shutdown(ASYNC_TASKS);
+author:Robert Davies
+-------------------------------------------------------------------------------
+commit:4c38438
+/////////////////////////////////////////////////////////////////////////
+1:     private MQTTProtocolConverter protocolConverter;
+/////////////////////////////////////////////////////////////////////////
+0:                     if (protocolConverter != null) {
+0:                         protocolConverter.onTransportError();
+1:                     }
+/////////////////////////////////////////////////////////////////////////
+1:     public void setProtocolConverter(MQTTProtocolConverter protocolConverter) {
+1:         this.protocolConverter = protocolConverter;
+1:     }
+1: 
+1:     public MQTTProtocolConverter getProtocolConverter() {
+1:         return protocolConverter;
+1:     }
+1: 
+commit:0f5b406
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     synchronized void startMonitorThread() {
+/////////////////////////////////////////////////////////////////////////
+0:     synchronized void stopMonitorThread() {
+commit:cfc6917
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *      http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: 
+1: package org.apache.activemq.transport.mqtt;
+1: 
+1: import java.io.IOException;
+1: import java.util.Timer;
+1: import java.util.concurrent.SynchronousQueue;
+1: import java.util.concurrent.ThreadFactory;
+1: import java.util.concurrent.ThreadPoolExecutor;
+1: import java.util.concurrent.TimeUnit;
+1: import java.util.concurrent.atomic.AtomicBoolean;
+1: import java.util.concurrent.atomic.AtomicInteger;
+0: import java.util.concurrent.locks.ReentrantReadWriteLock;
+1: 
+0: import org.apache.activemq.command.KeepAliveInfo;
+1: import org.apache.activemq.thread.SchedulerTimerTask;
+1: import org.apache.activemq.transport.AbstractInactivityMonitor;
+1: import org.apache.activemq.transport.InactivityIOException;
+1: import org.apache.activemq.transport.Transport;
+1: import org.apache.activemq.transport.TransportFilter;
+1: import org.apache.activemq.wireformat.WireFormat;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: public class MQTTInactivityMonitor extends TransportFilter {
+1: 
+1:     private static final Logger LOG = LoggerFactory.getLogger(MQTTInactivityMonitor.class);
+1: 
+1:     private static ThreadPoolExecutor ASYNC_TASKS;
+1:     private static int CHECKER_COUNTER;
+0:     private static long DEFAULT_CHECK_TIME_MILLS = 30000;
+1:     private static Timer READ_CHECK_TIMER;
+1: 
+0:     private final AtomicBoolean monitorStarted = new AtomicBoolean(false);
+1: 
+0:     private final AtomicBoolean commandSent = new AtomicBoolean(false);
+0:     private final AtomicBoolean inSend = new AtomicBoolean(false);
+1:     private final AtomicBoolean failed = new AtomicBoolean(false);
+1: 
+0:     private final AtomicBoolean commandReceived = new AtomicBoolean(true);
+1:     private final AtomicBoolean inReceive = new AtomicBoolean(false);
+1:     private final AtomicInteger lastReceiveCounter = new AtomicInteger(0);
+1: 
+0:     private final ReentrantReadWriteLock sendLock = new ReentrantReadWriteLock();
+1:     private SchedulerTimerTask readCheckerTask;
+1: 
+0:     private long readCheckTime = DEFAULT_CHECK_TIME_MILLS;
+0:     private long initialDelayTime = DEFAULT_CHECK_TIME_MILLS;
+0:     private boolean useKeepAlive = true;
+0:     private boolean keepAliveResponseRequired;
+1: 
+0:     protected WireFormat wireFormat;
+1: 
+1:     private final Runnable readChecker = new Runnable() {
+0:         long lastRunTime;
+1: 
+0:         public void run() {
+1:             long now = System.currentTimeMillis();
+0:             long elapsed = (now - lastRunTime);
+1: 
+0:             if (lastRunTime != 0 && LOG.isDebugEnabled()) {
+0:                 LOG.debug("" + elapsed + " ms elapsed since last read check.");
+1:             }
+1: 
+0:             // Perhaps the timer executed a read check late.. and then executes
+0:             // the next read check on time which causes the time elapsed between
+0:             // read checks to be small..
+1: 
+0:             // If less than 90% of the read check Time elapsed then abort this readcheck.
+0:             if (!allowReadCheck(elapsed)) { // FUNKY qdox bug does not allow me to inline this expression.
+0:                 LOG.debug("Aborting read check.. Not enough time elapsed since last read check.");
+0:                 return;
+1:             }
+1: 
+0:             lastRunTime = now;
+0:             readCheck();
+1:         }
+1:     };
+1: 
+0:     private boolean allowReadCheck(long elapsed) {
+0:         return elapsed > (readCheckTime * 9 / 10);
+1:     }
+1: 
+1: 
+1:     public MQTTInactivityMonitor(Transport next, WireFormat wireFormat) {
+1:         super(next);
+0:         this.wireFormat = wireFormat;
+1:     }
+1: 
+1:     public void start() throws Exception {
+1:         next.start();
+0:         startMonitorThread();
+1:     }
+1: 
+1:     public void stop() throws Exception {
+0:         stopMonitorThread();
+1:         next.stop();
+1:     }
+1: 
+1: 
+0:     final void readCheck() {
+0:         int currentCounter = next.getReceiveCounter();
+0:         int previousCounter = lastReceiveCounter.getAndSet(currentCounter);
+0:         if (inReceive.get() || currentCounter != previousCounter) {
+0:             if (LOG.isTraceEnabled()) {
+0:                 LOG.trace("A receive is in progress");
+1:             }
+0:             return;
+1:         }
+0:         if (!commandReceived.get() && monitorStarted.get() && !ASYNC_TASKS.isTerminating()) {
+0:             if (LOG.isDebugEnabled()) {
+0:                 LOG.debug("No message received since last read check for " + toString() + "! Throwing InactivityIOException.");
+1:             }
+0:             ASYNC_TASKS.execute(new Runnable() {
+0:                 public void run() {
+0:                     onException(new InactivityIOException("Channel was inactive for too (>" + readCheckTime + ") long: " + next.getRemoteAddress()));
+1:                 }
+1: 
+0:                 ;
+0:             });
+0:         } else {
+0:             if (LOG.isTraceEnabled()) {
+0:                 LOG.trace("Message received since last read check, resetting flag: ");
+1:             }
+1:         }
+0:         commandReceived.set(false);
+1:     }
+1: 
+1: 
+1:     public void onCommand(Object command) {
+0:         commandReceived.set(true);
+1:         inReceive.set(true);
+1:         try {
+0:             if (command.getClass() == KeepAliveInfo.class) {
+0:                 KeepAliveInfo info = (KeepAliveInfo) command;
+0:                 if (info.isResponseRequired()) {
+0:                     sendLock.readLock().lock();
+1:                     try {
+0:                         info.setResponseRequired(false);
+0:                         oneway(info);
+0:                     } catch (IOException e) {
+0:                         onException(e);
+1:                     } finally {
+0:                         sendLock.readLock().unlock();
+1:                     }
+1:                 }
+0:             } else {
+0:                 transportListener.onCommand(command);
+1:             }
+1:         } finally {
+1:             inReceive.set(false);
+1:         }
+1:     }
+1: 
+1:     public void oneway(Object o) throws IOException {
+1:         // To prevent the inactivity monitor from sending a message while we
+0:         // are performing a send we take a read lock.  The inactivity monitor
+0:         // sends its Heart-beat commands under a write lock.  This means that
+0:         // the MutexTransport is still responsible for synchronizing sends
+0:         this.sendLock.readLock().lock();
+0:         inSend.set(true);
+1:         try {
+1:             doOnewaySend(o);
+1:         } finally {
+0:             commandSent.set(true);
+0:             inSend.set(false);
+0:             this.sendLock.readLock().unlock();
+1:         }
+1:     }
+1: 
+1:     // Must be called under lock, either read or write on sendLock.
+1:     private void doOnewaySend(Object command) throws IOException {
+1:         if (failed.get()) {
+1:             throw new InactivityIOException("Cannot send, channel has already failed: " + next.getRemoteAddress());
+1:         }
+1:         next.oneway(command);
+1:     }
+1: 
+1:     public void onException(IOException error) {
+1:         if (failed.compareAndSet(false, true)) {
+0:             stopMonitorThread();
+1:             transportListener.onException(error);
+1:         }
+1:     }
+1: 
+0:     public void setUseKeepAlive(boolean val) {
+0:         useKeepAlive = val;
+1:     }
+1: 
+0:     public long getReadCheckTime() {
+0:         return readCheckTime;
+1:     }
+1: 
+0:     public void setReadCheckTime(long readCheckTime) {
+0:         this.readCheckTime = readCheckTime;
+1:     }
+1: 
+1: 
+0:     public long getInitialDelayTime() {
+0:         return initialDelayTime;
+1:     }
+1: 
+0:     public void setInitialDelayTime(long initialDelayTime) {
+0:         this.initialDelayTime = initialDelayTime;
+1:     }
+1: 
+0:     public boolean isKeepAliveResponseRequired() {
+0:         return this.keepAliveResponseRequired;
+1:     }
+1: 
+0:     public void setKeepAliveResponseRequired(boolean value) {
+0:         this.keepAliveResponseRequired = value;
+1:     }
+1: 
+0:     public boolean isMonitorStarted() {
+0:         return this.monitorStarted.get();
+1:     }
+1: 
+0:     protected synchronized void startMonitorThread() throws IOException {
+0:         if (monitorStarted.get()) {
+0:             return;
+1:         }
+1: 
+1: 
+0:         if (readCheckTime > 0) {
+0:             readCheckerTask = new SchedulerTimerTask(readChecker);
+1:         }
+1: 
+1: 
+0:         if (readCheckTime > 0) {
+0:             monitorStarted.set(true);
+1:             synchronized (AbstractInactivityMonitor.class) {
+1:                 if (CHECKER_COUNTER == 0) {
+0:                     ASYNC_TASKS = createExecutor();
+1:                     READ_CHECK_TIMER = new Timer("InactivityMonitor ReadCheck", true);
+1:                 }
+1:                 CHECKER_COUNTER++;
+0:                 if (readCheckTime > 0) {
+0:                     READ_CHECK_TIMER.schedule(readCheckerTask, initialDelayTime, readCheckTime);
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+1: 
+0:     protected synchronized void stopMonitorThread() {
+0:         if (monitorStarted.compareAndSet(true, false)) {
+0:             if (readCheckerTask != null) {
+0:                 readCheckerTask.cancel();
+1:             }
+1: 
+1:             synchronized (AbstractInactivityMonitor.class) {
+1:                 READ_CHECK_TIMER.purge();
+1:                 CHECKER_COUNTER--;
+1:                 if (CHECKER_COUNTER == 0) {
+1:                     READ_CHECK_TIMER.cancel();
+1:                     READ_CHECK_TIMER = null;
+0:                     ASYNC_TASKS.shutdown();
+0:                     ASYNC_TASKS = null;
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+0:     private ThreadFactory factory = new ThreadFactory() {
+1:         public Thread newThread(Runnable runnable) {
+1:             Thread thread = new Thread(runnable, "MQTTInactivityMonitor Async Task: " + runnable);
+1:             thread.setDaemon(true);
+1:             return thread;
+1:         }
+1:     };
+1: 
+1:     private ThreadPoolExecutor createExecutor() {
+0:         ThreadPoolExecutor exec = new ThreadPoolExecutor(0, Integer.MAX_VALUE, 10, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(), factory);
+1:         exec.allowCoreThreadTimeOut(true);
+1:         return exec;
+1:     }
+1: }
+1: 
+============================================================================

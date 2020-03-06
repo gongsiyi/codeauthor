@@ -1,0 +1,1638 @@
+1:eac0369: /*
+1:345de35: 
+1:345de35:    Derby - Class org.apache.derby.impl.store.raw.data.ReclaimSpaceHelper
+1:345de35: 
+1:270a34d:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:270a34d:    contributor license agreements.  See the NOTICE file distributed with
+1:270a34d:    this work for additional information regarding copyright ownership.
+1:270a34d:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:270a34d:    (the "License"); you may not use this file except in compliance with
+1:270a34d:    the License.  You may obtain a copy of the License at
+1:345de35: 
+1:345de35:       http://www.apache.org/licenses/LICENSE-2.0
+1:345de35: 
+1:345de35:    Unless required by applicable law or agreed to in writing, software
+1:345de35:    distributed under the License is distributed on an "AS IS" BASIS,
+1:345de35:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:345de35:    See the License for the specific language governing permissions and
+1:345de35:    limitations under the License.
+4:eac0369: 
+2:eac0369:  */
+1:eac0369: 
+1:eac0369: package org.apache.derby.impl.store.raw.data;
+1:eac0369: 
+1:eac0369: import org.apache.derby.impl.store.raw.data.BasePage;
+1:eac0369: import org.apache.derby.impl.store.raw.data.ReclaimSpace;
+1:eac0369: 
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.services.daemon.DaemonService;
+1:eac0369: import org.apache.derby.iapi.services.daemon.Serviceable;
+1:7e51e9d: import org.apache.derby.shared.common.sanity.SanityManager;
+1:eac0369: import org.apache.derby.iapi.error.StandardException;
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.store.access.TransactionController;
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.store.raw.ContainerKey;
+1:eac0369: import org.apache.derby.iapi.store.raw.ContainerHandle;
+1:eac0369: import org.apache.derby.iapi.store.raw.LockingPolicy;
+1:eac0369: import org.apache.derby.iapi.store.raw.Page;
+1:eac0369: import org.apache.derby.iapi.store.raw.PageKey;
+1:eac0369: import org.apache.derby.iapi.store.raw.RecordHandle;
+1:eac0369: import org.apache.derby.iapi.store.raw.Transaction;
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.store.raw.xact.RawTransaction;
+1:eac0369: import org.apache.derby.iapi.store.raw.data.RawContainerHandle;
+1:921b264: import org.apache.derby.shared.common.reference.SQLState;
+1:eac0369: 
+1:eac0369: 
+2:eac0369: /**
+1:20bc69f: 	This class helps a BaseDataFactory reclaims unused space.
+1:eac0369: 
+1:eac0369: Space needs to be reclaimed in the following cases:
+1:eac0369: <BR><NL>
+1:eac0369: <LI> Row with long columns or overflow row pieces is deleted
+1:eac0369: <LI> Insertion of a row that has long columns or overflows to other row pieces is rolled back
+1:eac0369: <LI> Row is updated and the head row or some row pieces shrunk
+1:eac0369: <LI> Row is updated and some long columns are orphaned because they are updated
+1:eac0369: <LI> Row is updated and some long columns are created but the update rolled back
+1:eac0369: <LI> Row is updated and some new row pieces are created but the update rolled back
+1:eac0369: </NL> <P>
+1:eac0369: 
+1:eac0369: We can implement a lot of optimization if we know that btree does not overflow.
+1:eac0369: However, since that is not the case and Raw Store cannot tell if it is dealing
+1:eac0369: with a btree page or a heap page, they all have to be treated gingerly.  E.g.,
+1:eac0369: in heap page, once a head row is deleted (via a delete operation or via a
+1:eac0369: rollback of insert), all the long rows and long columns can be reclaimed - in
+1:eac0369: fact, most of the head row can be removed and reclaimed, only a row stub needs
+1:eac0369: to remain for locking purposes.  But in the btree, a deleted row still needs to
+1:eac0369: contain the key values so it cannot be cleaned up until the row is purged.
+1:eac0369: 
+1:eac0369: <P><B>
+1:eac0369: Row with long columns or long row is deleted
+1:eac0369: </B><BR>
+1:eac0369: 
+1:eac0369: When Access purge a committed deleted row, the purge operation will see if the
+1:eac0369: row has overflowed row pieces or if it has long columns.  If it has, then all
+1:eac0369: the long columns and row pieces are purged before the head row piece can be
+1:eac0369: purged.  When a row is purged from an overflow page and it is the only row on
+1:eac0369: the page, then the page is deallocated in the same transaction. Note that
+1:eac0369: non-overflow pages are removed by Access but overflow pages are removed by Raw
+1:eac0369: Store.  Note that page removal is done in the same transaction and not post
+1:eac0369: commit.  This is, in general, dangerous because if the transaction does not
+1:eac0369: commit for a long time, uncommit deallocated page slows down page allocation
+1:eac0369: for this container.  However, we know that access only purges committed delete
+1:eac0369: row in access post commit processing so we know the transaction will tend to
+1:eac0369: commit relatively fast.  The alternative is to queue up a post commit
+1:eac0369: ReclaimSpace.PAGE to reclaim the page after the purge commits.  In order to do
+1:eac0369: that, the time stamp of the page must also be remembered because post commit
+1:eac0369: work may be queued more than once, but in this case, it can only be done once.
+1:eac0369: Also, doing the page deallocation post commit adds to the overall cost and
+1:eac0369: tends to fill up the post commit queue. <BR>
+1:eac0369: 
+1:eac0369: This approach is simple but has the drawback that the entire long row and all
+1:eac0369: the long columns are logged in the purge operation.  The alternative is more
+1:eac0369: complicated, we can remember all the long columns on the head row piece and
+1:eac0369: where the row chain starts and clean them up during post commit.  During post
+1:eac0369: commit, because the head row piece is already purged, there is no need to log
+1:eac0369: the long column or the long rows, just wipe the page or just reuse the page if
+1:eac0369: that is the only thing on the page.  The problem with this approach is that we
+1:eac0369: need to make sure the purging of the head row does indeed commit (the
+1:eac0369: transaction may commit but the purging may be rolled back due to savepoint).
+1:eac0369: So, we need to find the head row in the post commit and only when we cannot
+1:eac0369: find it can we be sure that the purge is committed.  However, in cases where
+1:eac0369: the page can reuse its record Id (namely in btree), a new row may reuse the
+1:eac0369: same recordId.  In that case, the post commit can purge the long columns or the
+1:eac0369: rest of the row piece only if the head piece no longer points to it.  Because
+1:eac0369: of the complexity of this latter approach, the first simple approach is used.
+1:eac0369: However, if the performance due to extra logging becomes unbearble, we can
+1:eac0369: consider implementing the second approach.  
+1:eac0369: 
+1:eac0369: <P><B>
+1:eac0369: Insertion of a row with long column or long row is rolled back.
+1:eac0369: </B><BR>
+1:eac0369: 
+1:eac0369: Insertion can be rolled back with either delete or purge.  If the row is rolled
+1:eac0369: back with purge, then all the overflow columns pieces and row pieces are also
+1:eac0369: rolled back with purge.  When a row is purged from an overflow page and it is
+1:eac0369: the only row on the page, then a post commit ReclaimSpace.PAGE work is queued
+1:eac0369: by Raw Store to reclaim that page.<BR>
+1:eac0369: 
+1:eac0369: If the row is rolled back with delete, then all the overflow columns pieces and
+1:eac0369: row pieces are also rolled back with delete.  Access will purge the deleted row
+1:eac0369: in due time, see above.
+1:eac0369: 
+1:eac0369: <P><B>
+1:eac0369: Row is updated and the head row or some row pieces shrunk
+1:eac0369: </B><BR>
+1:eac0369: 
+1:eac0369: Every page that an update operation touches will see if the record on that page
+1:eac0369: has any reserve space.  It it does, and if the reserve space plus the record
+1:eac0369: size exceed the mininum record size, then a post commit ROW_RESERVE work will
+1:eac0369: be queued to reclaim all unnecessary row reserved space for the entire row.
+1:eac0369: 
+1:eac0369: <P><B>
+1:eac0369: Row is updated and old long columns are orphaned
+1:eac0369: </B><BR>
+1:eac0369: 
+1:eac0369: The ground rule is, whether a column is a long column or not before an update
+1:eac0369: has nothing to do with whether a column will be a long column or not after the
+1:eac0369: update.  In other words, update can turn a non-long column into a long column,
+1:eac0369: or it can turn a long column into a non-long column, or a long column can be
+1:eac0369: updated to another long column and a non-long column can be updated to a
+1:eac0369: non-long column.  The last case - update of a non-long column to another
+1:eac0369: non-long column - is only of concern if it shrinks the row piece it is on (see
+1:eac0369: above).<BR>
+1:eac0369: 
+1:eac0369: So update can be looked at as 2 separate problems: A) a column is a long column
+1:eac0369: before the update and the update will "orphaned" it.  B) a column is a long
+1:eac0369: column after the update and the rollback of the update will "orphaned" it if it
+1:eac0369: is rolled back with a delete.  This section deals with problem A, next section
+1:eac0369: deals with problem B.<BR>
+1:eac0369: 
+1:eac0369: Update specifies a set of columns to be updated.  If a row piece contains one
+1:eac0369: or more columns to be updated, those columns are examined to see if they are
+1:eac0369: actually long column chains.  If they are, then after the update, those long
+1:eac0369: column chains will be orphaned.  So before the update happens, a post commit
+1:eac0369: ReclaimSpace.COLUMN_CHAIN work is queued which contains the head rows id, the
+1:eac0369: column number, the location of the first piece of the column chain, and the
+1:eac0369: time stamp of the first page of the column chain. <BR>
+1:eac0369: 
+1:eac0369: If the update transaction commits, the post commit work will walk the row until
+1:eac0369: it finds the column number (note that it may not be on the page where the
+1:eac0369: update happened because of subsequent row splitting), and if it doesn't point
+1:eac0369: to the head of the column chain, we know the update operation has indeed
+1:eac0369: committed (versus rolled back by a savepoint).  If a piece of the the column
+1:eac0369: chain takes up an entire page, then the entire page can be reclaimed without
+1:eac0369: first purging the row because the column chain is already orphaned.<BR>
+1:eac0369: 
+1:eac0369: We need to page time stamp of the first page of the column chain because if the
+1:eac0369: post commit ReclaimSpace.COLUMN_CHAIN is queued more than once, as can happen
+1:eac0369: in repeated rollback to savepoint, then after the first time the column is
+1:eac0369: reclaimed, the pages in the column chain can be reused.  Therefore, we cannot
+1:eac0369: reclaim the column chain again.  Since there is no back pointer from the column
+1:eac0369: chain to the head row, we need the timestamp to tell us if that column chain
+1:eac0369: has already been touched (reclaimed) or not.
+1:eac0369: 
+1:eac0369: <P><B> 
+1:eac0369: Row is updated with new long columns and update is rolled back.
+1:eac0369: </B><BR>
+1:eac0369: 
+1:eac0369: When the update is rolled back, the new long columns, which got there by
+1:eac0369: insertion, got rolled back either by delete or by purge.  If they were rolled
+1:eac0369: back with delete, then they will be orphaned and need to be cleaned up with
+1:eac0369: post abort work.  Therefore, insertion of long columns due to update must be
+1:eac0369: rolled back with purge.<BR>
+1:eac0369: 
+1:eac0369: This is safe because the moment the rollback of the head row piece happens, the
+1:eac0369: new long column is orphaned anyway and nobody will be able to get to it.  Since
+1:eac0369: we don't attempt to share long column pages, we know that nobody else could be
+1:eac0369: on the page and it is safe to deallocate the page.
+1:eac0369: 
+1:eac0369: <P><B>
+1:eac0369: Row is updated with new long row piece and update is rolled back.
+1:eac0369: </B><BR>
+1:eac0369: 
+1:eac0369: When the update is rolled back, the new long row piece, which got there by
+1:eac0369: insertion, got rolled back either by delete or by purge.  Like update with new
+1:eac0369: long row, they should be rolled back with purge.  However, there is a problem
+1:eac0369: in that the insert log record does not contain the head row handle.  It is
+1:eac0369: possible that another long row emanating from the same head page overflows to
+1:eac0369: this page.  That row may since have been deleted and is now in the middle of a
+1:eac0369: purge, but the purge has not commit.  To the code that is rolling back the
+1:eac0369: insert (caused by the update that split off a new row piece) the overflow page
+1:eac0369: looks empty.  If it went ahead and deallocate the page, then the transaction
+1:eac0369: which purged the row piece on this page won't be able to roll back.  For this
+1:eac0369: reason, the rollback to insert of a long row piece due to update must be rolled
+1:eac0369: back with delete.  Furthermore, there is no easy way to lodge a post
+1:eac0369: termination work to reclaim this deleted row piece so it will be lost forever.
+1:eac0369: <BR>
+1:eac0369: 
+1:eac0369: RESOLVE: need to log the head row's handle in the insert log record, i.e., any
+1:eac0369: insert due to update of long row or column piece should have the head row's
+1:eac0369: handle on it so that when the insert is rolled back with purge, and there is no
+1:eac0369: more row on the page, it can file a post commit to reclaim the page safely.
+1:eac0369: The post commit reclaim page needs to lock the head row and latch the head page
+1:eac0369: to make sure the entire row chain is stable.
+1:eac0369: 
+1:eac0369: <P><B>
+1:eac0369: */
+1:eac0369: public class ReclaimSpaceHelper
+1:eac0369: {
+1:eac0369: 	/**
+1:eac0369: 		Reclaim space based on work.
+1:eac0369: 	 */
+1:eac0369: 	public static int reclaimSpace(BaseDataFileFactory dataFactory,
+1:eac0369: 							RawTransaction tran,
+1:eac0369: 							ReclaimSpace work) 
+1:eac0369: 		 throws StandardException
+1:eac0369: 	{
+1:eac0369: 	
+1:eac0369: 		if (work.reclaimWhat() == ReclaimSpace.CONTAINER)
+1:eac0369: 			return reclaimContainer(dataFactory, tran, work);
+1:eac0369: 
+1:eac0369: 		// Else, not reclaiming container. Get a no-wait shared lock on the 
+1:eac0369: 		// container regardless of how the user transaction had the
+1:eac0369: 		// container opened. 
+1:eac0369: 
+1:eac0369: 		LockingPolicy container_rlock = 
+1:eac0369: 			tran.newLockingPolicy(LockingPolicy.MODE_RECORD,
+1:eac0369: 								  TransactionController.ISOLATION_SERIALIZABLE, 
+1:eac0369: 								  true /* stricter OK */ );
+1:eac0369: 
+1:eac0369: 		if (SanityManager.DEBUG)
+1:eac0369: 			SanityManager.ASSERT(container_rlock != null);
+1:eac0369: 
+1:eac0369: 		ContainerHandle containerHdl = 
+1:eac0369: 			openContainerNW(tran, container_rlock, work.getContainerId());
+1:eac0369: 
+1:eac0369: 		if (containerHdl == null)
+1:eac0369: 		{
+2:eac0369: 			tran.abort();
+1:eac0369: 
+1:eac0369: 			if (SanityManager.DEBUG)
+1:eac0369:             {
+1:eac0369:                 if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369:                 {
+1:eac0369:                     SanityManager.DEBUG(
+1:eac0369:                         DaemonService.DaemonTrace, " aborted " + work + 
+1:eac0369:                         " because container is locked or dropped");
+2:eac0369:                 }
+1:eac0369:             }
+1:eac0369: 
+1:eac0369: 			if (work.incrAttempts() < 3) // retry this for serveral times
+1:921b264: 				// it is however, unlikely that three tries will be 
+1:921b264: 				// enough because there is no delay between retries.
+1:921b264: 				// See DERBY-4059 and DERBY-4055 for details.
+1:8f33dfd:             {
+2:eac0369: 				return Serviceable.REQUEUE;
+1:8f33dfd:             }
+2:eac0369: 			else
+1:8f33dfd:             {
+1:8f33dfd:                 // If code gets here, the space will be lost forever, and
+1:8f33dfd:                 // can only be reclaimed by a full offline compress of the
+1:8f33dfd:                 // table/index.
+1:8f33dfd: 
+1:8f33dfd:                 if (SanityManager.DEBUG)
+1:8f33dfd:                 {
+1:8f33dfd:                     if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:8f33dfd:                     {
+1:8f33dfd:                         SanityManager.DEBUG(
+1:8f33dfd:                             DaemonService.DaemonTrace, 
+1:8f33dfd:                             "  gave up after 3 tries to get container lock " + 
+1:8f33dfd:                             work);
+1:8f33dfd:                     }
+1:8f33dfd:                 }
+1:8f33dfd: 
+2:eac0369: 				return Serviceable.DONE;
+1:8f33dfd:             }
+1:eac0369: 		}	
+1:eac0369: 
+1:eac0369: 		// At this point, container is opened with IX lock.
+1:eac0369: 
+1:eac0369: 		if (work.reclaimWhat() == ReclaimSpace.PAGE)
+1:eac0369: 		{
+1:eac0369: 			// Reclaiming a page - called by undo of insert which purged the
+1:eac0369: 			// last row off an overflow page. It is safe to reclaim the page
+1:eac0369: 			// without first locking the head row because unlike post commit
+1:eac0369: 			// work, this is post abort work.  Abort is guarenteed to happen
+1:eac0369: 			// and to happen only once, if at all.
+1:eac0369: 			Page p = containerHdl.getPageNoWait(work.getPageId().getPageNumber());
+1:eac0369: 			if (p != null)
+1:eac0369: 				containerHdl.removePage(p);
+1:eac0369: 
+1:eac0369: 			tran.commit();
+1:eac0369: 			return Serviceable.DONE;
+1:eac0369: 		}
+1:eac0369: 
+1:8f33dfd: 		// We are reclaiming row space or long column.  
+1:8f33dfd: 		// First get an xlock on the head row piece.
+1:eac0369: 		RecordHandle headRecord = work.getHeadRowHandle();
+1:eac0369: 
+1:eac0369: 		if (!container_rlock.lockRecordForWrite(
+1:eac0369:                 tran, headRecord, false /* not insert */, false /* nowait */))
+1:eac0369: 		{
+1:eac0369: 			// cannot get the row lock, retry
+1:eac0369: 			tran.abort();
+2:eac0369: 			if (work.incrAttempts() < 3)
+1:8f33dfd:             {
+1:eac0369: 				return Serviceable.REQUEUE;
+1:8f33dfd:             }
+1:eac0369: 			else
+1:8f33dfd:             {
+1:8f33dfd:                 // If code gets here, the space will be lost forever, and
+1:8f33dfd:                 // can only be reclaimed by a full offline compress of the
+1:8f33dfd:                 // table/index.
+1:8f33dfd: 
+1:8f33dfd:                 if (SanityManager.DEBUG)
+1:8f33dfd:                 {
+1:8f33dfd:                     if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:8f33dfd:                     {
+1:8f33dfd:                         SanityManager.DEBUG(
+1:8f33dfd:                             DaemonService.DaemonTrace, 
+1:8f33dfd:                             "  gave up after 3 tries to get row lock " + 
+1:8f33dfd:                             work);
+1:8f33dfd:                     }
+1:8f33dfd:                 }
+1:eac0369: 				return Serviceable.DONE;
+1:8f33dfd:             }
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		// The exclusive lock on the head row has been gotten.
+1:eac0369: 
+1:eac0369: 		if (work.reclaimWhat() == ReclaimSpace.ROW_RESERVE)
+1:eac0369: 		{
+1:eac0369: 			// This row may benefit from compaction.
+1:eac0369: 			containerHdl.compactRecord(headRecord);
+1:eac0369: 
+1:eac0369:             // This work is being done - post commit, there is no user 
+1:eac0369:             // transaction that depends on the commit being sync'd.  It is safe
+1:eac0369:             // to commitNoSync() This do as one of 2 things will happen:
+1:eac0369:             //
+1:eac0369:             //     1) if any data page associated with this transaction is
+1:eac0369:             //        moved from cache to disk, then the transaction log
+1:eac0369:             //        must be sync'd to the log record for that change and
+1:eac0369:             //        all log records including the commit of this xact must
+1:eac0369:             //        be sync'd before returning.
+1:eac0369:             //
+1:eac0369:             //     2) if the data page is never written then the log record
+1:eac0369:             //        for the commit may never be written, and the xact will
+1:eac0369:             //        never make to disk.  This is ok as no subsequent action
+1:eac0369:             //        depends on this operation being committed.
+1:eac0369:             //
+1:eac0369: 			tran.commitNoSync(Transaction.RELEASE_LOCKS);
+1:eac0369: 
+1:eac0369: 			return Serviceable.DONE;
+1:eac0369: 		}
+1:eac0369: 		else
+1:eac0369: 		{
+1:eac0369: 			if (SanityManager.DEBUG)
+1:eac0369: 				SanityManager.ASSERT(work.reclaimWhat() == ReclaimSpace.COLUMN_CHAIN);
+1:eac0369: 
+1:eac0369: 			// Reclaiming a long column chain due to update.  The long column
+1:eac0369: 			// chain being reclaimed is the before image of the update
+1:eac0369: 			// operation.  
+1:eac0369: 			// 
+1:eac0369: 			long headPageId = ((PageKey)headRecord.getPageId()).getPageNumber();
+1:8f33dfd: 			//DERBY-4050 - we wait for the page so we don't have to retry.
+1:8f33dfd: 			// prior to the 4050 fix, we called getPageNoWait and just 
+1:8f33dfd: 			// retried 3 times.  This left unreclaimed space if we were 
+1:8f33dfd: 			// not successful after three tries.
+1:eac0369: 			StoredPage headRowPage = 
+1:8f33dfd: 				(StoredPage)containerHdl.getPage(headPageId);
+1:eac0369: 			if (headRowPage == null)
+1:eac0369: 			{
+1:8f33dfd: 				// It is not clear why headRowPage would be null,
+1:8f33dfd: 				// but logging the failure in case it happens.
+1:8f33dfd: 				// If code gets here, the space will be lost forever, and
+1:8f33dfd: 				// can only be reclaimed by a full offline compress of the
+1:8f33dfd: 				// table/index.
+1:eac0369: 
+1:8f33dfd: 				if (SanityManager.DEBUG)
+1:8f33dfd: 				{
+1:8f33dfd: 					if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:8f33dfd: 					{
+1:8f33dfd: 						SanityManager.DEBUG(
+1:8f33dfd: 								DaemonService.DaemonTrace, 
+1:8f33dfd: 								"gave up because hadRowPage was null" + 
+1:8f33dfd: 								work);
+1:8f33dfd: 					}
+1:8f33dfd: 				}
+1:8f33dfd: 				tran.abort();
+1:8f33dfd: 				return Serviceable.DONE;
+1:8f33dfd: 			}
+1:eac0369: 			try
+1:eac0369: 			{
+1:eac0369: 				headRowPage.removeOrphanedColumnChain(work, containerHdl);
+1:eac0369: 			}
+1:eac0369: 			finally
+1:eac0369: 			{
+1:eac0369: 				headRowPage.unlatch();
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369:             // This work is being done - post commit, there is no user 
+1:eac0369:             // transaction that depends on the commit being sync'd.  It is safe
+1:eac0369:             // to commitNoSync() This do as one of 2 things will happen:
+1:eac0369:             //
+1:eac0369:             //     1) if any data page associated with this transaction is
+1:eac0369:             //        moved from cache to disk, then the transaction log
+1:eac0369:             //        must be sync'd to the log record for that change and
+1:eac0369:             //        all log records including the commit of this xact must
+1:eac0369:             //        be sync'd before returning.
+1:eac0369:             //
+1:eac0369:             //     2) if the data page is never written then the log record
+1:eac0369:             //        for the commit may never be written, and the xact will
+1:eac0369:             //        never make to disk.  This is ok as no subsequent action
+1:eac0369:             //        depends on this operation being committed.
+1:eac0369:             //
+1:eac0369: 			tran.commitNoSync(Transaction.RELEASE_LOCKS);
+1:eac0369: 
+1:eac0369: 			return Serviceable.DONE;
+1:eac0369: 		}
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	private static int reclaimContainer(BaseDataFileFactory dataFactory,
+1:eac0369: 										RawTransaction tran,
+1:eac0369: 										ReclaimSpace work) 
+1:eac0369: 		 throws StandardException
+1:eac0369: 	{
+1:eac0369: 		// when we want to reclaim the whole container, gets an exclusive
+1:eac0369: 		// XLock on the container, wait for the lock.
+1:eac0369: 
+1:eac0369: 		LockingPolicy container_xlock = 
+1:eac0369: 			tran.newLockingPolicy(LockingPolicy.MODE_CONTAINER,
+1:eac0369: 								  TransactionController.ISOLATION_SERIALIZABLE, 
+1:eac0369: 								  true /* stricter OK */ );
+1:eac0369: 
+1:eac0369: 		if (SanityManager.DEBUG)
+1:eac0369: 			SanityManager.ASSERT(container_xlock != null);
+1:eac0369: 
+1:eac0369: 		// Try to just get the container thru the transaction.
+1:eac0369: 		// Need to do this to transition the transaction to active state. 
+1:eac0369: 		RawContainerHandle containerHdl = tran.openDroppedContainer(
+1:eac0369: 								work.getContainerId(), 
+1:eac0369: 								container_xlock);
+1:eac0369: 
+1:eac0369: 		// if it can get lock but it is not deleted or has already been
+1:eac0369: 		// deleted, done work
+1:eac0369: 		if (containerHdl == null || 
+1:eac0369: 			containerHdl.getContainerStatus() == RawContainerHandle.NORMAL ||
+1:eac0369: 			containerHdl.getContainerStatus() == RawContainerHandle.COMMITTED_DROP)
+1:eac0369: 		{
+1:eac0369: 			if (containerHdl != null)
+1:eac0369: 				containerHdl.close();
+1:eac0369: 			tran.abort();	// release xlock, if any
+1:eac0369: 
+1:eac0369: 			if (SanityManager.DEBUG)
+1:eac0369:             {
+1:eac0369:                 if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369:                 {
+1:eac0369:                     SanityManager.DEBUG(
+1:eac0369:                         DaemonService.DaemonTrace, "  aborted " + work);
+1:eac0369:                 }
+1:eac0369:             }
+1:eac0369: 		}	
+1:eac0369: 		else
+1:eac0369: 		{
+1:eac0369: 			// we got an xlock on a dropped container.  Must be committed.
+1:eac0369: 			// Get rid of the container now.
+1:eac0369: 			ContainerOperation lop = new
+1:eac0369: 				ContainerOperation(containerHdl, ContainerOperation.REMOVE);
+1:eac0369: 
+1:eac0369: 			// mark the container as pre-dirtied so that if a checkpoint
+1:eac0369: 			// happens after the log record is sent to the log stream, the
+1:eac0369: 			// cache cleaning will wait for this change.
+1:eac0369: 			containerHdl.preDirty(true);
+1:eac0369: 			try
+1:eac0369: 			{
+1:eac0369: 				tran.logAndDo(lop);
+1:eac0369: 			}
+1:eac0369: 			finally
+1:eac0369: 			{
+1:eac0369: 				// in case logAndDo fail, make sure the container is not
+1:eac0369: 				// stuck in preDirty state.
+1:eac0369: 				containerHdl.preDirty(false);
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 			containerHdl.close();
+1:eac0369: 			tran.commit();
+1:eac0369: 
+1:eac0369: 			if (SanityManager.DEBUG)
+1:eac0369:             {
+1:eac0369:                 if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:eac0369:                 {
+1:eac0369:                     SanityManager.DEBUG(
+1:eac0369:                         DaemonService.DaemonTrace, "  committed " + work);
+1:eac0369:                 }
+1:eac0369:             }
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		return Serviceable.DONE;
+1:eac0369: 
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 	/**
+1:921b264: 	 *	Open container shared no wait
+1:921b264: 	 *
+1:921b264: 	 * @param tran   Transaction
+1:921b264: 	 * @param rlock  LockingPolicy
+1:921b264: 	 * @param containerId container id.
+1:921b264: 	 * 
+1:921b264: 	 * @return ContainerHandle or null if it could not obtain lock.
+1:921b264: 	 * 
+1:921b264: 	 * @throws StandardException
+1:eac0369: 	 */
+1:eac0369: 	private static ContainerHandle openContainerNW(Transaction tran,
+1:eac0369: 		LockingPolicy rlock, ContainerKey containerId)
+1:eac0369: 		throws StandardException
+1:eac0369: 	{
+1:921b264: 		ContainerHandle containerHdl = null;
+1:921b264: 		try {
+1:921b264: 				containerHdl = tran.openContainer
+1:921b264: 				(containerId, rlock,
+1:921b264: 						ContainerHandle.MODE_FORUPDATE |
+1:921b264: 						ContainerHandle.MODE_LOCK_NOWAIT); 
+1:921b264: 		} catch (StandardException se) {
+1:921b264: 			// DERBY-4059
+1:921b264: 			// if this is a lock timeout just return null.
+1:921b264: 			// otherwise throw the exception
+1:c9ef166: 			if (!se.isLockTimeout()) {
+1:921b264: 				throw se;
+1:921b264: 			}
+1:921b264: 		}
+1:eac0369: 		return containerHdl;
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: }
+============================================================================
+author:Bryan Pendleton
+-------------------------------------------------------------------------------
+commit:7e51e9d
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.shared.common.sanity.SanityManager;
+author:Mike Matrigali
+-------------------------------------------------------------------------------
+commit:c9ef166
+/////////////////////////////////////////////////////////////////////////
+1: 			if (!se.isLockTimeout()) {
+commit:20bc69f
+/////////////////////////////////////////////////////////////////////////
+1: 	This class helps a BaseDataFactory reclaims unused space.
+author:Katherine Marsden
+-------------------------------------------------------------------------------
+commit:921b264
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.shared.common.reference.SQLState;
+/////////////////////////////////////////////////////////////////////////
+1: 				// it is however, unlikely that three tries will be 
+1: 				// enough because there is no delay between retries.
+1: 				// See DERBY-4059 and DERBY-4055 for details.
+/////////////////////////////////////////////////////////////////////////
+1: 	 *	Open container shared no wait
+1: 	 *
+1: 	 * @param tran   Transaction
+1: 	 * @param rlock  LockingPolicy
+1: 	 * @param containerId container id.
+1: 	 * 
+1: 	 * @return ContainerHandle or null if it could not obtain lock.
+1: 	 * 
+1: 	 * @throws StandardException
+1: 		ContainerHandle containerHdl = null;
+1: 		try {
+1: 				containerHdl = tran.openContainer
+1: 				(containerId, rlock,
+1: 						ContainerHandle.MODE_FORUPDATE |
+1: 						ContainerHandle.MODE_LOCK_NOWAIT); 
+1: 		} catch (StandardException se) {
+1: 			// DERBY-4059
+1: 			// if this is a lock timeout just return null.
+1: 			// otherwise throw the exception
+0: 			if (!se.getSQLState().equals(SQLState.LOCK_TIMEOUT)) {
+1: 				throw se;
+1: 			}
+1: 		}
+commit:8f33dfd
+/////////////////////////////////////////////////////////////////////////
+1:             {
+1:             }
+1:             {
+1:                 // If code gets here, the space will be lost forever, and
+1:                 // can only be reclaimed by a full offline compress of the
+1:                 // table/index.
+1: 
+1:                 if (SanityManager.DEBUG)
+1:                 {
+1:                     if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:                     {
+1:                         SanityManager.DEBUG(
+1:                             DaemonService.DaemonTrace, 
+1:                             "  gave up after 3 tries to get container lock " + 
+1:                             work);
+1:                     }
+1:                 }
+1: 
+1:             }
+/////////////////////////////////////////////////////////////////////////
+1: 		// We are reclaiming row space or long column.  
+1: 		// First get an xlock on the head row piece.
+/////////////////////////////////////////////////////////////////////////
+1:             {
+1:             }
+1:             {
+1:                 // If code gets here, the space will be lost forever, and
+1:                 // can only be reclaimed by a full offline compress of the
+1:                 // table/index.
+1: 
+1:                 if (SanityManager.DEBUG)
+1:                 {
+1:                     if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:                     {
+1:                         SanityManager.DEBUG(
+1:                             DaemonService.DaemonTrace, 
+1:                             "  gave up after 3 tries to get row lock " + 
+1:                             work);
+1:                     }
+1:                 }
+1:             }
+/////////////////////////////////////////////////////////////////////////
+1: 			//DERBY-4050 - we wait for the page so we don't have to retry.
+1: 			// prior to the 4050 fix, we called getPageNoWait and just 
+1: 			// retried 3 times.  This left unreclaimed space if we were 
+1: 			// not successful after three tries.
+1: 				(StoredPage)containerHdl.getPage(headPageId);
+1: 				// It is not clear why headRowPage would be null,
+1: 				// but logging the failure in case it happens.
+1: 				// If code gets here, the space will be lost forever, and
+1: 				// can only be reclaimed by a full offline compress of the
+1: 				// table/index.
+1: 				if (SanityManager.DEBUG)
+1: 				{
+1: 					if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1: 					{
+1: 						SanityManager.DEBUG(
+1: 								DaemonService.DaemonTrace, 
+1: 								"gave up because hadRowPage was null" + 
+1: 								work);
+1: 					}
+1: 				}
+1: 				tran.abort();
+1: 				return Serviceable.DONE;
+1: 			}
+author:Richard N. Hillegas
+-------------------------------------------------------------------------------
+commit:270a34d
+/////////////////////////////////////////////////////////////////////////
+1:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:    contributor license agreements.  See the NOTICE file distributed with
+1:    this work for additional information regarding copyright ownership.
+1:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:    (the "License"); you may not use this file except in compliance with
+1:    the License.  You may obtain a copy of the License at
+author:Oyvind Bakksjo
+-------------------------------------------------------------------------------
+commit:aaea357
+author:Daniel John Debrunner
+-------------------------------------------------------------------------------
+commit:345de35
+/////////////////////////////////////////////////////////////////////////
+1:    Derby - Class org.apache.derby.impl.store.raw.data.ReclaimSpaceHelper
+1: 
+0:    Copyright 1998, 2004 The Apache Software Foundation or its licensors, as applicable.
+1: 
+0:    Licensed under the Apache License, Version 2.0 (the "License");
+0:    you may not use this file except in compliance with the License.
+0:    You may obtain a copy of the License at
+1: 
+1:       http://www.apache.org/licenses/LICENSE-2.0
+1: 
+1:    Unless required by applicable law or agreed to in writing, software
+1:    distributed under the License is distributed on an "AS IS" BASIS,
+1:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:    See the License for the specific language governing permissions and
+1:    limitations under the License.
+commit:c6ad534
+/////////////////////////////////////////////////////////////////////////
+commit:eac0369
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1: 
+0:    Licensed Materials - Property of IBM
+0:    Cloudscape - Package org.apache.derby.impl.store.raw.data
+0:    (C) Copyright IBM Corp. 1998, 2004. All Rights Reserved.
+0:    US Government Users Restricted Rights - Use, duplication or
+0:    disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+1: 
+1:  */
+1: 
+1: package org.apache.derby.impl.store.raw.data;
+1: 
+1: import org.apache.derby.impl.store.raw.data.BasePage;
+1: import org.apache.derby.impl.store.raw.data.ReclaimSpace;
+1: 
+1: 
+1: import org.apache.derby.iapi.services.daemon.DaemonService;
+1: import org.apache.derby.iapi.services.daemon.Serviceable;
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+1: import org.apache.derby.iapi.error.StandardException;
+1: 
+1: import org.apache.derby.iapi.store.access.TransactionController;
+1: 
+1: import org.apache.derby.iapi.store.raw.ContainerKey;
+1: import org.apache.derby.iapi.store.raw.ContainerHandle;
+1: import org.apache.derby.iapi.store.raw.LockingPolicy;
+1: import org.apache.derby.iapi.store.raw.Page;
+1: import org.apache.derby.iapi.store.raw.PageKey;
+1: import org.apache.derby.iapi.store.raw.RecordHandle;
+1: import org.apache.derby.iapi.store.raw.Transaction;
+1: 
+1: import org.apache.derby.iapi.store.raw.xact.RawTransaction;
+1: import org.apache.derby.iapi.store.raw.data.RawContainerHandle;
+1: 
+1: 
+1: /**
+0: 	This class helps a BaseDataFactory reclaims unused space
+1: 
+1: Space needs to be reclaimed in the following cases:
+1: <BR><NL>
+1: <LI> Row with long columns or overflow row pieces is deleted
+1: <LI> Insertion of a row that has long columns or overflows to other row pieces is rolled back
+1: <LI> Row is updated and the head row or some row pieces shrunk
+1: <LI> Row is updated and some long columns are orphaned because they are updated
+1: <LI> Row is updated and some long columns are created but the update rolled back
+1: <LI> Row is updated and some new row pieces are created but the update rolled back
+1: </NL> <P>
+1: 
+1: We can implement a lot of optimization if we know that btree does not overflow.
+1: However, since that is not the case and Raw Store cannot tell if it is dealing
+1: with a btree page or a heap page, they all have to be treated gingerly.  E.g.,
+1: in heap page, once a head row is deleted (via a delete operation or via a
+1: rollback of insert), all the long rows and long columns can be reclaimed - in
+1: fact, most of the head row can be removed and reclaimed, only a row stub needs
+1: to remain for locking purposes.  But in the btree, a deleted row still needs to
+1: contain the key values so it cannot be cleaned up until the row is purged.
+1: 
+1: <P><B>
+1: Row with long columns or long row is deleted
+1: </B><BR>
+1: 
+1: When Access purge a committed deleted row, the purge operation will see if the
+1: row has overflowed row pieces or if it has long columns.  If it has, then all
+1: the long columns and row pieces are purged before the head row piece can be
+1: purged.  When a row is purged from an overflow page and it is the only row on
+1: the page, then the page is deallocated in the same transaction. Note that
+1: non-overflow pages are removed by Access but overflow pages are removed by Raw
+1: Store.  Note that page removal is done in the same transaction and not post
+1: commit.  This is, in general, dangerous because if the transaction does not
+1: commit for a long time, uncommit deallocated page slows down page allocation
+1: for this container.  However, we know that access only purges committed delete
+1: row in access post commit processing so we know the transaction will tend to
+1: commit relatively fast.  The alternative is to queue up a post commit
+1: ReclaimSpace.PAGE to reclaim the page after the purge commits.  In order to do
+1: that, the time stamp of the page must also be remembered because post commit
+1: work may be queued more than once, but in this case, it can only be done once.
+1: Also, doing the page deallocation post commit adds to the overall cost and
+1: tends to fill up the post commit queue. <BR>
+1: 
+1: This approach is simple but has the drawback that the entire long row and all
+1: the long columns are logged in the purge operation.  The alternative is more
+1: complicated, we can remember all the long columns on the head row piece and
+1: where the row chain starts and clean them up during post commit.  During post
+1: commit, because the head row piece is already purged, there is no need to log
+1: the long column or the long rows, just wipe the page or just reuse the page if
+1: that is the only thing on the page.  The problem with this approach is that we
+1: need to make sure the purging of the head row does indeed commit (the
+1: transaction may commit but the purging may be rolled back due to savepoint).
+1: So, we need to find the head row in the post commit and only when we cannot
+1: find it can we be sure that the purge is committed.  However, in cases where
+1: the page can reuse its record Id (namely in btree), a new row may reuse the
+1: same recordId.  In that case, the post commit can purge the long columns or the
+1: rest of the row piece only if the head piece no longer points to it.  Because
+1: of the complexity of this latter approach, the first simple approach is used.
+1: However, if the performance due to extra logging becomes unbearble, we can
+1: consider implementing the second approach.  
+1: 
+1: <P><B>
+1: Insertion of a row with long column or long row is rolled back.
+1: </B><BR>
+1: 
+1: Insertion can be rolled back with either delete or purge.  If the row is rolled
+1: back with purge, then all the overflow columns pieces and row pieces are also
+1: rolled back with purge.  When a row is purged from an overflow page and it is
+1: the only row on the page, then a post commit ReclaimSpace.PAGE work is queued
+1: by Raw Store to reclaim that page.<BR>
+1: 
+1: If the row is rolled back with delete, then all the overflow columns pieces and
+1: row pieces are also rolled back with delete.  Access will purge the deleted row
+1: in due time, see above.
+1: 
+1: <P><B>
+1: Row is updated and the head row or some row pieces shrunk
+1: </B><BR>
+1: 
+1: Every page that an update operation touches will see if the record on that page
+1: has any reserve space.  It it does, and if the reserve space plus the record
+1: size exceed the mininum record size, then a post commit ROW_RESERVE work will
+1: be queued to reclaim all unnecessary row reserved space for the entire row.
+1: 
+1: <P><B>
+1: Row is updated and old long columns are orphaned
+1: </B><BR>
+1: 
+1: The ground rule is, whether a column is a long column or not before an update
+1: has nothing to do with whether a column will be a long column or not after the
+1: update.  In other words, update can turn a non-long column into a long column,
+1: or it can turn a long column into a non-long column, or a long column can be
+1: updated to another long column and a non-long column can be updated to a
+1: non-long column.  The last case - update of a non-long column to another
+1: non-long column - is only of concern if it shrinks the row piece it is on (see
+1: above).<BR>
+1: 
+1: So update can be looked at as 2 separate problems: A) a column is a long column
+1: before the update and the update will "orphaned" it.  B) a column is a long
+1: column after the update and the rollback of the update will "orphaned" it if it
+1: is rolled back with a delete.  This section deals with problem A, next section
+1: deals with problem B.<BR>
+1: 
+1: Update specifies a set of columns to be updated.  If a row piece contains one
+1: or more columns to be updated, those columns are examined to see if they are
+1: actually long column chains.  If they are, then after the update, those long
+1: column chains will be orphaned.  So before the update happens, a post commit
+1: ReclaimSpace.COLUMN_CHAIN work is queued which contains the head rows id, the
+1: column number, the location of the first piece of the column chain, and the
+1: time stamp of the first page of the column chain. <BR>
+1: 
+1: If the update transaction commits, the post commit work will walk the row until
+1: it finds the column number (note that it may not be on the page where the
+1: update happened because of subsequent row splitting), and if it doesn't point
+1: to the head of the column chain, we know the update operation has indeed
+1: committed (versus rolled back by a savepoint).  If a piece of the the column
+1: chain takes up an entire page, then the entire page can be reclaimed without
+1: first purging the row because the column chain is already orphaned.<BR>
+1: 
+1: We need to page time stamp of the first page of the column chain because if the
+1: post commit ReclaimSpace.COLUMN_CHAIN is queued more than once, as can happen
+1: in repeated rollback to savepoint, then after the first time the column is
+1: reclaimed, the pages in the column chain can be reused.  Therefore, we cannot
+1: reclaim the column chain again.  Since there is no back pointer from the column
+1: chain to the head row, we need the timestamp to tell us if that column chain
+1: has already been touched (reclaimed) or not.
+1: 
+1: <P><B> 
+1: Row is updated with new long columns and update is rolled back.
+1: </B><BR>
+1: 
+1: When the update is rolled back, the new long columns, which got there by
+1: insertion, got rolled back either by delete or by purge.  If they were rolled
+1: back with delete, then they will be orphaned and need to be cleaned up with
+1: post abort work.  Therefore, insertion of long columns due to update must be
+1: rolled back with purge.<BR>
+1: 
+1: This is safe because the moment the rollback of the head row piece happens, the
+1: new long column is orphaned anyway and nobody will be able to get to it.  Since
+1: we don't attempt to share long column pages, we know that nobody else could be
+1: on the page and it is safe to deallocate the page.
+1: 
+1: <P><B>
+1: Row is updated with new long row piece and update is rolled back.
+1: </B><BR>
+1: 
+1: When the update is rolled back, the new long row piece, which got there by
+1: insertion, got rolled back either by delete or by purge.  Like update with new
+1: long row, they should be rolled back with purge.  However, there is a problem
+1: in that the insert log record does not contain the head row handle.  It is
+1: possible that another long row emanating from the same head page overflows to
+1: this page.  That row may since have been deleted and is now in the middle of a
+1: purge, but the purge has not commit.  To the code that is rolling back the
+1: insert (caused by the update that split off a new row piece) the overflow page
+1: looks empty.  If it went ahead and deallocate the page, then the transaction
+1: which purged the row piece on this page won't be able to roll back.  For this
+1: reason, the rollback to insert of a long row piece due to update must be rolled
+1: back with delete.  Furthermore, there is no easy way to lodge a post
+1: termination work to reclaim this deleted row piece so it will be lost forever.
+1: <BR>
+1: 
+1: RESOLVE: need to log the head row's handle in the insert log record, i.e., any
+1: insert due to update of long row or column piece should have the head row's
+1: handle on it so that when the insert is rolled back with purge, and there is no
+1: more row on the page, it can file a post commit to reclaim the page safely.
+1: The post commit reclaim page needs to lock the head row and latch the head page
+1: to make sure the entire row chain is stable.
+1: 
+1: <P><B>
+1: */
+1: public class ReclaimSpaceHelper
+1: {
+1: 	/**
+0: 		IBM Copyright &copy notice.
+1: 	*/
+0: 	public static final String copyrightNotice = org.apache.derby.iapi.reference.Copyright.SHORT_1998_2004;
+1: 	/**
+1: 		Reclaim space based on work.
+1: 	 */
+1: 	public static int reclaimSpace(BaseDataFileFactory dataFactory,
+1: 							RawTransaction tran,
+1: 							ReclaimSpace work) 
+1: 		 throws StandardException
+1: 	{
+1: 	
+1: 		if (work.reclaimWhat() == ReclaimSpace.CONTAINER)
+1: 			return reclaimContainer(dataFactory, tran, work);
+1: 
+1: 		// Else, not reclaiming container. Get a no-wait shared lock on the 
+1: 		// container regardless of how the user transaction had the
+1: 		// container opened. 
+1: 
+1: 		LockingPolicy container_rlock = 
+1: 			tran.newLockingPolicy(LockingPolicy.MODE_RECORD,
+1: 								  TransactionController.ISOLATION_SERIALIZABLE, 
+1: 								  true /* stricter OK */ );
+1: 
+1: 		if (SanityManager.DEBUG)
+1: 			SanityManager.ASSERT(container_rlock != null);
+1: 
+1: 		ContainerHandle containerHdl = 
+1: 			openContainerNW(tran, container_rlock, work.getContainerId());
+1: 
+1: 		if (containerHdl == null)
+1: 		{
+1: 			tran.abort();
+1: 
+1: 			if (SanityManager.DEBUG)
+1:             {
+1:                 if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:                 {
+1:                     SanityManager.DEBUG(
+1:                         DaemonService.DaemonTrace, " aborted " + work + 
+1:                         " because container is locked or dropped");
+1:                 }
+1:             }
+1: 
+1: 			if (work.incrAttempts() < 3) // retry this for serveral times
+1: 				return Serviceable.REQUEUE;
+1: 			else
+1: 				return Serviceable.DONE;
+1: 		}	
+1: 
+1: 		// At this point, container is opened with IX lock.
+1: 
+1: 		if (work.reclaimWhat() == ReclaimSpace.PAGE)
+1: 		{
+1: 			// Reclaiming a page - called by undo of insert which purged the
+1: 			// last row off an overflow page. It is safe to reclaim the page
+1: 			// without first locking the head row because unlike post commit
+1: 			// work, this is post abort work.  Abort is guarenteed to happen
+1: 			// and to happen only once, if at all.
+1: 			Page p = containerHdl.getPageNoWait(work.getPageId().getPageNumber());
+1: 			if (p != null)
+1: 				containerHdl.removePage(p);
+1: 
+1: 			tran.commit();
+1: 			return Serviceable.DONE;
+1: 		}
+1: 
+0: 		// We are reclaiming row space or long column.  First get an xlock on the
+0: 		// head row piece.
+1: 		RecordHandle headRecord = work.getHeadRowHandle();
+1: 
+1: 		if (!container_rlock.lockRecordForWrite(
+1:                 tran, headRecord, false /* not insert */, false /* nowait */))
+1: 		{
+1: 			// cannot get the row lock, retry
+1: 			tran.abort();
+1: 			if (work.incrAttempts() < 3)
+1: 				return Serviceable.REQUEUE;
+1: 			else
+1: 				return Serviceable.DONE;
+1: 		}
+1: 
+1: 		// The exclusive lock on the head row has been gotten.
+1: 
+1: 		if (work.reclaimWhat() == ReclaimSpace.ROW_RESERVE)
+1: 		{
+1: 			// This row may benefit from compaction.
+1: 			containerHdl.compactRecord(headRecord);
+1: 
+1:             // This work is being done - post commit, there is no user 
+1:             // transaction that depends on the commit being sync'd.  It is safe
+1:             // to commitNoSync() This do as one of 2 things will happen:
+1:             //
+1:             //     1) if any data page associated with this transaction is
+1:             //        moved from cache to disk, then the transaction log
+1:             //        must be sync'd to the log record for that change and
+1:             //        all log records including the commit of this xact must
+1:             //        be sync'd before returning.
+1:             //
+1:             //     2) if the data page is never written then the log record
+1:             //        for the commit may never be written, and the xact will
+1:             //        never make to disk.  This is ok as no subsequent action
+1:             //        depends on this operation being committed.
+1:             //
+1: 			tran.commitNoSync(Transaction.RELEASE_LOCKS);
+1: 
+1: 			return Serviceable.DONE;
+1: 		}
+1: 		else
+1: 		{
+1: 			if (SanityManager.DEBUG)
+1: 				SanityManager.ASSERT(work.reclaimWhat() == ReclaimSpace.COLUMN_CHAIN);
+1: 
+1: 			// Reclaiming a long column chain due to update.  The long column
+1: 			// chain being reclaimed is the before image of the update
+1: 			// operation.  
+1: 			// 
+1: 			long headPageId = ((PageKey)headRecord.getPageId()).getPageNumber();
+1: 			StoredPage headRowPage = 
+0: 				(StoredPage)containerHdl.getPageNoWait(headPageId);
+1: 
+1: 			if (headRowPage == null)
+1: 			{
+0: 				// Cannot get page no wait, try again later.
+1: 				tran.abort();
+1: 				if (work.incrAttempts() < 3)
+1: 					return Serviceable.REQUEUE;
+1: 				else
+1: 					return Serviceable.DONE;
+1: 			}
+1: 
+1: 			try
+1: 			{
+1: 				headRowPage.removeOrphanedColumnChain(work, containerHdl);
+1: 			}
+1: 			finally
+1: 			{
+1: 				headRowPage.unlatch();
+1: 			}
+1: 
+1:             // This work is being done - post commit, there is no user 
+1:             // transaction that depends on the commit being sync'd.  It is safe
+1:             // to commitNoSync() This do as one of 2 things will happen:
+1:             //
+1:             //     1) if any data page associated with this transaction is
+1:             //        moved from cache to disk, then the transaction log
+1:             //        must be sync'd to the log record for that change and
+1:             //        all log records including the commit of this xact must
+1:             //        be sync'd before returning.
+1:             //
+1:             //     2) if the data page is never written then the log record
+1:             //        for the commit may never be written, and the xact will
+1:             //        never make to disk.  This is ok as no subsequent action
+1:             //        depends on this operation being committed.
+1:             //
+1: 			tran.commitNoSync(Transaction.RELEASE_LOCKS);
+1: 
+1: 			return Serviceable.DONE;
+1: 		}
+1: 	}
+1: 
+1: 	private static int reclaimContainer(BaseDataFileFactory dataFactory,
+1: 										RawTransaction tran,
+1: 										ReclaimSpace work) 
+1: 		 throws StandardException
+1: 	{
+1: 		// when we want to reclaim the whole container, gets an exclusive
+1: 		// XLock on the container, wait for the lock.
+1: 
+1: 		LockingPolicy container_xlock = 
+1: 			tran.newLockingPolicy(LockingPolicy.MODE_CONTAINER,
+1: 								  TransactionController.ISOLATION_SERIALIZABLE, 
+1: 								  true /* stricter OK */ );
+1: 
+1: 		if (SanityManager.DEBUG)
+1: 			SanityManager.ASSERT(container_xlock != null);
+1: 
+1: 		// Try to just get the container thru the transaction.
+1: 		// Need to do this to transition the transaction to active state. 
+1: 		RawContainerHandle containerHdl = tran.openDroppedContainer(
+1: 								work.getContainerId(), 
+1: 								container_xlock);
+1: 
+1: 		// if it can get lock but it is not deleted or has already been
+1: 		// deleted, done work
+1: 		if (containerHdl == null || 
+1: 			containerHdl.getContainerStatus() == RawContainerHandle.NORMAL ||
+1: 			containerHdl.getContainerStatus() == RawContainerHandle.COMMITTED_DROP)
+1: 		{
+1: 			if (containerHdl != null)
+1: 				containerHdl.close();
+1: 			tran.abort();	// release xlock, if any
+1: 
+1: 			if (SanityManager.DEBUG)
+1:             {
+1:                 if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:                 {
+1:                     SanityManager.DEBUG(
+1:                         DaemonService.DaemonTrace, "  aborted " + work);
+1:                 }
+1:             }
+1: 		}	
+1: 		else
+1: 		{
+1: 			// we got an xlock on a dropped container.  Must be committed.
+1: 			// Get rid of the container now.
+1: 			ContainerOperation lop = new
+1: 				ContainerOperation(containerHdl, ContainerOperation.REMOVE);
+1: 
+1: 			// mark the container as pre-dirtied so that if a checkpoint
+1: 			// happens after the log record is sent to the log stream, the
+1: 			// cache cleaning will wait for this change.
+1: 			containerHdl.preDirty(true);
+1: 			try
+1: 			{
+1: 				tran.logAndDo(lop);
+1: 			}
+1: 			finally
+1: 			{
+1: 				// in case logAndDo fail, make sure the container is not
+1: 				// stuck in preDirty state.
+1: 				containerHdl.preDirty(false);
+1: 			}
+1: 
+1: 
+1: 			containerHdl.close();
+1: 			tran.commit();
+1: 
+1: 			if (SanityManager.DEBUG)
+1:             {
+1:                 if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+1:                 {
+1:                     SanityManager.DEBUG(
+1:                         DaemonService.DaemonTrace, "  committed " + work);
+1:                 }
+1:             }
+1: 		}
+1: 
+1: 		return Serviceable.DONE;
+1: 
+1: 	}
+1: 
+1: 
+1: 	/**
+0: 		Open container shared no wait
+1: 	 */
+1: 	private static ContainerHandle openContainerNW(Transaction tran,
+1: 		LockingPolicy rlock, ContainerKey containerId)
+1: 		throws StandardException
+1: 	{
+0: 		ContainerHandle containerHdl = tran.openContainer
+0: 			(containerId, rlock,
+0: 			 ContainerHandle.MODE_FORUPDATE |
+0: 			 ContainerHandle.MODE_LOCK_NOWAIT); 
+1: 
+1: 		return containerHdl;
+1: 	}
+1: 
+1: }
+author:Ken Coar
+-------------------------------------------------------------------------------
+commit:95e7b46
+/////////////////////////////////////////////////////////////////////////
+0: /*
+0: 
+0:    Licensed Materials - Property of IBM
+0:    Cloudscape - Package org.apache.derby.impl.store.raw.data
+0:    (C) Copyright IBM Corp. 1998, 2004. All Rights Reserved.
+0:    US Government Users Restricted Rights - Use, duplication or
+0:    disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+0: 
+0:  */
+0: 
+0: package org.apache.derby.impl.store.raw.data;
+0: 
+0: import org.apache.derby.impl.store.raw.data.BasePage;
+0: import org.apache.derby.impl.store.raw.data.ReclaimSpace;
+0: 
+0: 
+0: import org.apache.derby.iapi.services.daemon.DaemonService;
+0: import org.apache.derby.iapi.services.daemon.Serviceable;
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+0: import org.apache.derby.iapi.error.StandardException;
+0: 
+0: import org.apache.derby.iapi.store.access.TransactionController;
+0: 
+0: import org.apache.derby.iapi.store.raw.ContainerKey;
+0: import org.apache.derby.iapi.store.raw.ContainerHandle;
+0: import org.apache.derby.iapi.store.raw.LockingPolicy;
+0: import org.apache.derby.iapi.store.raw.Page;
+0: import org.apache.derby.iapi.store.raw.PageKey;
+0: import org.apache.derby.iapi.store.raw.RecordHandle;
+0: import org.apache.derby.iapi.store.raw.Transaction;
+0: 
+0: import org.apache.derby.iapi.store.raw.xact.RawTransaction;
+0: import org.apache.derby.iapi.store.raw.data.RawContainerHandle;
+0: 
+0: 
+0: /**
+0: 	This class helps a BaseDataFactory reclaims unused space
+0: 
+0: Space needs to be reclaimed in the following cases:
+0: <BR><NL>
+0: <LI> Row with long columns or overflow row pieces is deleted
+0: <LI> Insertion of a row that has long columns or overflows to other row pieces is rolled back
+0: <LI> Row is updated and the head row or some row pieces shrunk
+0: <LI> Row is updated and some long columns are orphaned because they are updated
+0: <LI> Row is updated and some long columns are created but the update rolled back
+0: <LI> Row is updated and some new row pieces are created but the update rolled back
+0: </NL> <P>
+0: 
+0: We can implement a lot of optimization if we know that btree does not overflow.
+0: However, since that is not the case and Raw Store cannot tell if it is dealing
+0: with a btree page or a heap page, they all have to be treated gingerly.  E.g.,
+0: in heap page, once a head row is deleted (via a delete operation or via a
+0: rollback of insert), all the long rows and long columns can be reclaimed - in
+0: fact, most of the head row can be removed and reclaimed, only a row stub needs
+0: to remain for locking purposes.  But in the btree, a deleted row still needs to
+0: contain the key values so it cannot be cleaned up until the row is purged.
+0: 
+0: <P><B>
+0: Row with long columns or long row is deleted
+0: </B><BR>
+0: 
+0: When Access purge a committed deleted row, the purge operation will see if the
+0: row has overflowed row pieces or if it has long columns.  If it has, then all
+0: the long columns and row pieces are purged before the head row piece can be
+0: purged.  When a row is purged from an overflow page and it is the only row on
+0: the page, then the page is deallocated in the same transaction. Note that
+0: non-overflow pages are removed by Access but overflow pages are removed by Raw
+0: Store.  Note that page removal is done in the same transaction and not post
+0: commit.  This is, in general, dangerous because if the transaction does not
+0: commit for a long time, uncommit deallocated page slows down page allocation
+0: for this container.  However, we know that access only purges committed delete
+0: row in access post commit processing so we know the transaction will tend to
+0: commit relatively fast.  The alternative is to queue up a post commit
+0: ReclaimSpace.PAGE to reclaim the page after the purge commits.  In order to do
+0: that, the time stamp of the page must also be remembered because post commit
+0: work may be queued more than once, but in this case, it can only be done once.
+0: Also, doing the page deallocation post commit adds to the overall cost and
+0: tends to fill up the post commit queue. <BR>
+0: 
+0: This approach is simple but has the drawback that the entire long row and all
+0: the long columns are logged in the purge operation.  The alternative is more
+0: complicated, we can remember all the long columns on the head row piece and
+0: where the row chain starts and clean them up during post commit.  During post
+0: commit, because the head row piece is already purged, there is no need to log
+0: the long column or the long rows, just wipe the page or just reuse the page if
+0: that is the only thing on the page.  The problem with this approach is that we
+0: need to make sure the purging of the head row does indeed commit (the
+0: transaction may commit but the purging may be rolled back due to savepoint).
+0: So, we need to find the head row in the post commit and only when we cannot
+0: find it can we be sure that the purge is committed.  However, in cases where
+0: the page can reuse its record Id (namely in btree), a new row may reuse the
+0: same recordId.  In that case, the post commit can purge the long columns or the
+0: rest of the row piece only if the head piece no longer points to it.  Because
+0: of the complexity of this latter approach, the first simple approach is used.
+0: However, if the performance due to extra logging becomes unbearble, we can
+0: consider implementing the second approach.  
+0: 
+0: <P><B>
+0: Insertion of a row with long column or long row is rolled back.
+0: </B><BR>
+0: 
+0: Insertion can be rolled back with either delete or purge.  If the row is rolled
+0: back with purge, then all the overflow columns pieces and row pieces are also
+0: rolled back with purge.  When a row is purged from an overflow page and it is
+0: the only row on the page, then a post commit ReclaimSpace.PAGE work is queued
+0: by Raw Store to reclaim that page.<BR>
+0: 
+0: If the row is rolled back with delete, then all the overflow columns pieces and
+0: row pieces are also rolled back with delete.  Access will purge the deleted row
+0: in due time, see above.
+0: 
+0: <P><B>
+0: Row is updated and the head row or some row pieces shrunk
+0: </B><BR>
+0: 
+0: Every page that an update operation touches will see if the record on that page
+0: has any reserve space.  It it does, and if the reserve space plus the record
+0: size exceed the mininum record size, then a post commit ROW_RESERVE work will
+0: be queued to reclaim all unnecessary row reserved space for the entire row.
+0: 
+0: <P><B>
+0: Row is updated and old long columns are orphaned
+0: </B><BR>
+0: 
+0: The ground rule is, whether a column is a long column or not before an update
+0: has nothing to do with whether a column will be a long column or not after the
+0: update.  In other words, update can turn a non-long column into a long column,
+0: or it can turn a long column into a non-long column, or a long column can be
+0: updated to another long column and a non-long column can be updated to a
+0: non-long column.  The last case - update of a non-long column to another
+0: non-long column - is only of concern if it shrinks the row piece it is on (see
+0: above).<BR>
+0: 
+0: So update can be looked at as 2 separate problems: A) a column is a long column
+0: before the update and the update will "orphaned" it.  B) a column is a long
+0: column after the update and the rollback of the update will "orphaned" it if it
+0: is rolled back with a delete.  This section deals with problem A, next section
+0: deals with problem B.<BR>
+0: 
+0: Update specifies a set of columns to be updated.  If a row piece contains one
+0: or more columns to be updated, those columns are examined to see if they are
+0: actually long column chains.  If they are, then after the update, those long
+0: column chains will be orphaned.  So before the update happens, a post commit
+0: ReclaimSpace.COLUMN_CHAIN work is queued which contains the head rows id, the
+0: column number, the location of the first piece of the column chain, and the
+0: time stamp of the first page of the column chain. <BR>
+0: 
+0: If the update transaction commits, the post commit work will walk the row until
+0: it finds the column number (note that it may not be on the page where the
+0: update happened because of subsequent row splitting), and if it doesn't point
+0: to the head of the column chain, we know the update operation has indeed
+0: committed (versus rolled back by a savepoint).  If a piece of the the column
+0: chain takes up an entire page, then the entire page can be reclaimed without
+0: first purging the row because the column chain is already orphaned.<BR>
+0: 
+0: We need to page time stamp of the first page of the column chain because if the
+0: post commit ReclaimSpace.COLUMN_CHAIN is queued more than once, as can happen
+0: in repeated rollback to savepoint, then after the first time the column is
+0: reclaimed, the pages in the column chain can be reused.  Therefore, we cannot
+0: reclaim the column chain again.  Since there is no back pointer from the column
+0: chain to the head row, we need the timestamp to tell us if that column chain
+0: has already been touched (reclaimed) or not.
+0: 
+0: <P><B> 
+0: Row is updated with new long columns and update is rolled back.
+0: </B><BR>
+0: 
+0: When the update is rolled back, the new long columns, which got there by
+0: insertion, got rolled back either by delete or by purge.  If they were rolled
+0: back with delete, then they will be orphaned and need to be cleaned up with
+0: post abort work.  Therefore, insertion of long columns due to update must be
+0: rolled back with purge.<BR>
+0: 
+0: This is safe because the moment the rollback of the head row piece happens, the
+0: new long column is orphaned anyway and nobody will be able to get to it.  Since
+0: we don't attempt to share long column pages, we know that nobody else could be
+0: on the page and it is safe to deallocate the page.
+0: 
+0: <P><B>
+0: Row is updated with new long row piece and update is rolled back.
+0: </B><BR>
+0: 
+0: When the update is rolled back, the new long row piece, which got there by
+0: insertion, got rolled back either by delete or by purge.  Like update with new
+0: long row, they should be rolled back with purge.  However, there is a problem
+0: in that the insert log record does not contain the head row handle.  It is
+0: possible that another long row emanating from the same head page overflows to
+0: this page.  That row may since have been deleted and is now in the middle of a
+0: purge, but the purge has not commit.  To the code that is rolling back the
+0: insert (caused by the update that split off a new row piece) the overflow page
+0: looks empty.  If it went ahead and deallocate the page, then the transaction
+0: which purged the row piece on this page won't be able to roll back.  For this
+0: reason, the rollback to insert of a long row piece due to update must be rolled
+0: back with delete.  Furthermore, there is no easy way to lodge a post
+0: termination work to reclaim this deleted row piece so it will be lost forever.
+0: <BR>
+0: 
+0: RESOLVE: need to log the head row's handle in the insert log record, i.e., any
+0: insert due to update of long row or column piece should have the head row's
+0: handle on it so that when the insert is rolled back with purge, and there is no
+0: more row on the page, it can file a post commit to reclaim the page safely.
+0: The post commit reclaim page needs to lock the head row and latch the head page
+0: to make sure the entire row chain is stable.
+0: 
+0: <P><B>
+0: */
+0: public class ReclaimSpaceHelper
+0: {
+0: 	/**
+0: 		IBM Copyright &copy notice.
+0: 	*/
+0: 	public static final String copyrightNotice = org.apache.derby.iapi.reference.Copyright.SHORT_1998_2004;
+0: 	/**
+0: 		Reclaim space based on work.
+0: 	 */
+0: 	public static int reclaimSpace(BaseDataFileFactory dataFactory,
+0: 							RawTransaction tran,
+0: 							ReclaimSpace work) 
+0: 		 throws StandardException
+0: 	{
+0: 	
+0: 		if (work.reclaimWhat() == ReclaimSpace.CONTAINER)
+0: 			return reclaimContainer(dataFactory, tran, work);
+0: 
+0: 		// Else, not reclaiming container. Get a no-wait shared lock on the 
+0: 		// container regardless of how the user transaction had the
+0: 		// container opened. 
+0: 
+0: 		LockingPolicy container_rlock = 
+0: 			tran.newLockingPolicy(LockingPolicy.MODE_RECORD,
+0: 								  TransactionController.ISOLATION_SERIALIZABLE, 
+0: 								  true /* stricter OK */ );
+0: 
+0: 		if (SanityManager.DEBUG)
+0: 			SanityManager.ASSERT(container_rlock != null);
+0: 
+0: 		ContainerHandle containerHdl = 
+0: 			openContainerNW(tran, container_rlock, work.getContainerId());
+0: 
+0: 		if (containerHdl == null)
+0: 		{
+0: 			tran.abort();
+0: 
+0: 			if (SanityManager.DEBUG)
+0:             {
+0:                 if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0:                 {
+0:                     SanityManager.DEBUG(
+0:                         DaemonService.DaemonTrace, " aborted " + work + 
+0:                         " because container is locked or dropped");
+0:                 }
+0:             }
+0: 
+0: 			if (work.incrAttempts() < 3) // retry this for serveral times
+0: 				return Serviceable.REQUEUE;
+0: 			else
+0: 				return Serviceable.DONE;
+0: 		}	
+0: 
+0: 		// At this point, container is opened with IX lock.
+0: 
+0: 		if (work.reclaimWhat() == ReclaimSpace.PAGE)
+0: 		{
+0: 			// Reclaiming a page - called by undo of insert which purged the
+0: 			// last row off an overflow page. It is safe to reclaim the page
+0: 			// without first locking the head row because unlike post commit
+0: 			// work, this is post abort work.  Abort is guarenteed to happen
+0: 			// and to happen only once, if at all.
+0: 			Page p = containerHdl.getPageNoWait(work.getPageId().getPageNumber());
+0: 			if (p != null)
+0: 				containerHdl.removePage(p);
+0: 
+0: 			tran.commit();
+0: 			return Serviceable.DONE;
+0: 		}
+0: 
+0: 		// We are reclaiming row space or long column.  First get an xlock on the
+0: 		// head row piece.
+0: 		RecordHandle headRecord = work.getHeadRowHandle();
+0: 
+0: 		if (!container_rlock.lockRecordForWrite(
+0:                 tran, headRecord, false /* not insert */, false /* nowait */))
+0: 		{
+0: 			// cannot get the row lock, retry
+0: 			tran.abort();
+0: 			if (work.incrAttempts() < 3)
+0: 				return Serviceable.REQUEUE;
+0: 			else
+0: 				return Serviceable.DONE;
+0: 		}
+0: 
+0: 		// The exclusive lock on the head row has been gotten.
+0: 
+0: 		if (work.reclaimWhat() == ReclaimSpace.ROW_RESERVE)
+0: 		{
+0: 			// This row may benefit from compaction.
+0: 			containerHdl.compactRecord(headRecord);
+0: 
+0:             // This work is being done - post commit, there is no user 
+0:             // transaction that depends on the commit being sync'd.  It is safe
+0:             // to commitNoSync() This do as one of 2 things will happen:
+0:             //
+0:             //     1) if any data page associated with this transaction is
+0:             //        moved from cache to disk, then the transaction log
+0:             //        must be sync'd to the log record for that change and
+0:             //        all log records including the commit of this xact must
+0:             //        be sync'd before returning.
+0:             //
+0:             //     2) if the data page is never written then the log record
+0:             //        for the commit may never be written, and the xact will
+0:             //        never make to disk.  This is ok as no subsequent action
+0:             //        depends on this operation being committed.
+0:             //
+0: 			tran.commitNoSync(Transaction.RELEASE_LOCKS);
+0: 
+0: 			return Serviceable.DONE;
+0: 		}
+0: 		else
+0: 		{
+0: 			if (SanityManager.DEBUG)
+0: 				SanityManager.ASSERT(work.reclaimWhat() == ReclaimSpace.COLUMN_CHAIN);
+0: 
+0: 			// Reclaiming a long column chain due to update.  The long column
+0: 			// chain being reclaimed is the before image of the update
+0: 			// operation.  
+0: 			// 
+0: 			long headPageId = ((PageKey)headRecord.getPageId()).getPageNumber();
+0: 			StoredPage headRowPage = 
+0: 				(StoredPage)containerHdl.getPageNoWait(headPageId);
+0: 
+0: 			if (headRowPage == null)
+0: 			{
+0: 				// Cannot get page no wait, try again later.
+0: 				tran.abort();
+0: 				if (work.incrAttempts() < 3)
+0: 					return Serviceable.REQUEUE;
+0: 				else
+0: 					return Serviceable.DONE;
+0: 			}
+0: 
+0: 			try
+0: 			{
+0: 				headRowPage.removeOrphanedColumnChain(work, containerHdl);
+0: 			}
+0: 			finally
+0: 			{
+0: 				headRowPage.unlatch();
+0: 			}
+0: 
+0:             // This work is being done - post commit, there is no user 
+0:             // transaction that depends on the commit being sync'd.  It is safe
+0:             // to commitNoSync() This do as one of 2 things will happen:
+0:             //
+0:             //     1) if any data page associated with this transaction is
+0:             //        moved from cache to disk, then the transaction log
+0:             //        must be sync'd to the log record for that change and
+0:             //        all log records including the commit of this xact must
+0:             //        be sync'd before returning.
+0:             //
+0:             //     2) if the data page is never written then the log record
+0:             //        for the commit may never be written, and the xact will
+0:             //        never make to disk.  This is ok as no subsequent action
+0:             //        depends on this operation being committed.
+0:             //
+0: 			tran.commitNoSync(Transaction.RELEASE_LOCKS);
+0: 
+0: 			return Serviceable.DONE;
+0: 		}
+0: 	}
+0: 
+0: 	private static int reclaimContainer(BaseDataFileFactory dataFactory,
+0: 										RawTransaction tran,
+0: 										ReclaimSpace work) 
+0: 		 throws StandardException
+0: 	{
+0: 		// when we want to reclaim the whole container, gets an exclusive
+0: 		// XLock on the container, wait for the lock.
+0: 
+0: 		LockingPolicy container_xlock = 
+0: 			tran.newLockingPolicy(LockingPolicy.MODE_CONTAINER,
+0: 								  TransactionController.ISOLATION_SERIALIZABLE, 
+0: 								  true /* stricter OK */ );
+0: 
+0: 		if (SanityManager.DEBUG)
+0: 			SanityManager.ASSERT(container_xlock != null);
+0: 
+0: 		// Try to just get the container thru the transaction.
+0: 		// Need to do this to transition the transaction to active state. 
+0: 		RawContainerHandle containerHdl = tran.openDroppedContainer(
+0: 								work.getContainerId(), 
+0: 								container_xlock);
+0: 
+0: 		// if it can get lock but it is not deleted or has already been
+0: 		// deleted, done work
+0: 		if (containerHdl == null || 
+0: 			containerHdl.getContainerStatus() == RawContainerHandle.NORMAL ||
+0: 			containerHdl.getContainerStatus() == RawContainerHandle.COMMITTED_DROP)
+0: 		{
+0: 			if (containerHdl != null)
+0: 				containerHdl.close();
+0: 			tran.abort();	// release xlock, if any
+0: 
+0: 			if (SanityManager.DEBUG)
+0:             {
+0:                 if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0:                 {
+0:                     SanityManager.DEBUG(
+0:                         DaemonService.DaemonTrace, "  aborted " + work);
+0:                 }
+0:             }
+0: 		}	
+0: 		else
+0: 		{
+0: 			// we got an xlock on a dropped container.  Must be committed.
+0: 			// Get rid of the container now.
+0: 			ContainerOperation lop = new
+0: 				ContainerOperation(containerHdl, ContainerOperation.REMOVE);
+0: 
+0: 			// mark the container as pre-dirtied so that if a checkpoint
+0: 			// happens after the log record is sent to the log stream, the
+0: 			// cache cleaning will wait for this change.
+0: 			containerHdl.preDirty(true);
+0: 			try
+0: 			{
+0: 				tran.logAndDo(lop);
+0: 			}
+0: 			finally
+0: 			{
+0: 				// in case logAndDo fail, make sure the container is not
+0: 				// stuck in preDirty state.
+0: 				containerHdl.preDirty(false);
+0: 			}
+0: 
+0: 
+0: 			containerHdl.close();
+0: 			tran.commit();
+0: 
+0: 			if (SanityManager.DEBUG)
+0:             {
+0:                 if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+0:                 {
+0:                     SanityManager.DEBUG(
+0:                         DaemonService.DaemonTrace, "  committed " + work);
+0:                 }
+0:             }
+0: 		}
+0: 
+0: 		return Serviceable.DONE;
+0: 
+0: 	}
+0: 
+0: 
+0: 	/**
+0: 		Open container shared no wait
+0: 	 */
+0: 	private static ContainerHandle openContainerNW(Transaction tran,
+0: 		LockingPolicy rlock, ContainerKey containerId)
+0: 		throws StandardException
+0: 	{
+0: 		ContainerHandle containerHdl = tran.openContainer
+0: 			(containerId, rlock,
+0: 			 ContainerHandle.MODE_FORUPDATE |
+0: 			 ContainerHandle.MODE_LOCK_NOWAIT); 
+0: 
+0: 		return containerHdl;
+0: 	}
+0: 
+0: }
+============================================================================

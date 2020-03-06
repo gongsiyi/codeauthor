@@ -1,0 +1,589 @@
+1:72790dc: /*
+1:72790dc:  * Licensed to the Apache Software Foundation (ASF) under one
+1:72790dc:  * or more contributor license agreements.  See the NOTICE file
+1:72790dc:  * distributed with this work for additional information
+1:72790dc:  * regarding copyright ownership.  The ASF licenses this file
+1:72790dc:  * to you under the Apache License, Version 2.0 (the
+1:72790dc:  * "License"); you may not use this file except in compliance
+1:72790dc:  * with the License.  You may obtain a copy of the License at
+1:72790dc:  *
+1:72790dc:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:72790dc:  *
+1:72790dc:  * Unless required by applicable law or agreed to in writing, software
+1:72790dc:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:72790dc:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:72790dc:  * See the License for the specific language governing permissions and
+1:72790dc:  * limitations under the License.
+1:72790dc:  */
+1:72790dc: package org.apache.cassandra.index.sasi.utils;
+1:72790dc: 
+1:72790dc: import java.io.IOException;
+1:72790dc: import java.util.ArrayList;
+1:72790dc: import java.util.Iterator;
+1:72790dc: import java.util.List;
+1:72790dc: import java.util.PriorityQueue;
+1:72790dc: 
+1:72790dc: import com.google.common.collect.Iterators;
+1:72790dc: import org.apache.cassandra.io.util.FileUtils;
+1:72790dc: 
+1:72790dc: import com.google.common.annotations.VisibleForTesting;
+1:72790dc: 
+1:733d1ee: @SuppressWarnings("resource")
+1:72790dc: public class RangeIntersectionIterator
+1:72790dc: {
+1:72790dc:     protected enum Strategy
+1:72790dc:     {
+1:72790dc:         BOUNCE, LOOKUP, ADAPTIVE
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     public static <K extends Comparable<K>, D extends CombinedValue<K>> Builder<K, D> builder()
+1:72790dc:     {
+1:72790dc:         return builder(Strategy.ADAPTIVE);
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     @VisibleForTesting
+1:72790dc:     protected static <K extends Comparable<K>, D extends CombinedValue<K>> Builder<K, D> builder(Strategy strategy)
+1:72790dc:     {
+1:72790dc:         return new Builder<>(strategy);
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     public static class Builder<K extends Comparable<K>, D extends CombinedValue<K>> extends RangeIterator.Builder<K, D>
+1:72790dc:     {
+1:72790dc:         private final Strategy strategy;
+1:72790dc: 
+1:72790dc:         public Builder(Strategy strategy)
+1:72790dc:         {
+1:72790dc:             super(IteratorType.INTERSECTION);
+1:72790dc:             this.strategy = strategy;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         protected RangeIterator<K, D> buildIterator()
+1:72790dc:         {
+1:72790dc:             // if the range is disjoint we can simply return empty
+1:72790dc:             // iterator of any type, because it's not going to produce any results.
+1:72790dc:             if (statistics.isDisjoint())
+1:72790dc:                 return new BounceIntersectionIterator<>(statistics, new PriorityQueue<RangeIterator<K, D>>(1));
+1:72790dc: 
+1:72790dc:             switch (strategy)
+1:72790dc:             {
+1:72790dc:                 case LOOKUP:
+1:72790dc:                     return new LookupIntersectionIterator<>(statistics, ranges);
+1:72790dc: 
+1:72790dc:                 case BOUNCE:
+1:72790dc:                     return new BounceIntersectionIterator<>(statistics, ranges);
+1:72790dc: 
+1:72790dc:                 case ADAPTIVE:
+1:72790dc:                     return statistics.sizeRatio() <= 0.01d
+1:72790dc:                             ? new LookupIntersectionIterator<>(statistics, ranges)
+1:72790dc:                             : new BounceIntersectionIterator<>(statistics, ranges);
+1:72790dc: 
+1:72790dc:                 default:
+1:72790dc:                     throw new IllegalStateException("Unknown strategy: " + strategy);
+1:72790dc:             }
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private static abstract class AbstractIntersectionIterator<K extends Comparable<K>, D extends CombinedValue<K>> extends RangeIterator<K, D>
+1:72790dc:     {
+1:72790dc:         protected final PriorityQueue<RangeIterator<K, D>> ranges;
+1:72790dc: 
+1:72790dc:         private AbstractIntersectionIterator(Builder.Statistics<K, D> statistics, PriorityQueue<RangeIterator<K, D>> ranges)
+1:72790dc:         {
+1:72790dc:             super(statistics);
+1:72790dc:             this.ranges = ranges;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void close() throws IOException
+1:72790dc:         {
+1:72790dc:             for (RangeIterator<K, D> range : ranges)
+1:72790dc:                 FileUtils.closeQuietly(range);
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     /**
+1:72790dc:      * Iterator which performs intersection of multiple ranges by using bouncing (merge-join) technique to identify
+1:72790dc:      * common elements in the given ranges. Aforementioned "bounce" works as follows: range queue is poll'ed for the
+1:72790dc:      * range with the smallest current token (main loop), that token is used to {@link RangeIterator#skipTo(Comparable)}
+1:72790dc:      * other ranges, if token produced by {@link RangeIterator#skipTo(Comparable)} is equal to current "candidate" token,
+1:72790dc:      * both get merged together and the same operation is repeated for next range from the queue, if returned token
+1:72790dc:      * is not equal than candidate, candidate's range gets put back into the queue and the main loop gets repeated until
+1:72790dc:      * next intersection token is found or at least one iterator runs out of tokens.
+1:72790dc:      *
+1:72790dc:      * This technique is every efficient to jump over gaps in the ranges.
+1:72790dc:      *
+1:72790dc:      * @param <K> The type used to sort ranges.
+1:72790dc:      * @param <D> The container type which is going to be returned by {@link Iterator#next()}.
+1:72790dc:      */
+1:72790dc:     @VisibleForTesting
+1:72790dc:     protected static class BounceIntersectionIterator<K extends Comparable<K>, D extends CombinedValue<K>> extends AbstractIntersectionIterator<K, D>
+1:72790dc:     {
+1:72790dc:         private BounceIntersectionIterator(Builder.Statistics<K, D> statistics, PriorityQueue<RangeIterator<K, D>> ranges)
+1:72790dc:         {
+1:72790dc:             super(statistics, ranges);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         protected D computeNext()
+1:72790dc:         {
+1:56e0177:             List<RangeIterator<K, D>> processed = null;
+1:56e0177: 
+1:72790dc:             while (!ranges.isEmpty())
+1:72790dc:             {
+1:72790dc:                 RangeIterator<K, D> head = ranges.poll();
+1:72790dc: 
+1:72790dc:                 // jump right to the beginning of the intersection or return next element
+1:72790dc:                 if (head.getCurrent().compareTo(getMinimum()) < 0)
+1:72790dc:                     head.skipTo(getMinimum());
+1:72790dc: 
+1:72790dc:                 D candidate = head.hasNext() ? head.next() : null;
+1:72790dc:                 if (candidate == null || candidate.get().compareTo(getMaximum()) > 0)
+1:72790dc:                 {
+1:72790dc:                     ranges.add(head);
+1:72790dc:                     return endOfData();
+1:72790dc:                 }
+1:72790dc: 
+1:56e0177:                 if (processed == null)
+1:56e0177:                     processed = new ArrayList<>();
+1:72790dc: 
+1:72790dc:                 boolean intersectsAll = true, exhausted = false;
+1:72790dc:                 while (!ranges.isEmpty())
+1:72790dc:                 {
+1:72790dc:                     RangeIterator<K, D> range = ranges.poll();
+1:72790dc: 
+1:72790dc:                     // found a range which doesn't overlap with one (or possibly more) other range(s)
+1:72790dc:                     if (!isOverlapping(head, range))
+1:72790dc:                     {
+1:72790dc:                         exhausted = true;
+1:72790dc:                         intersectsAll = false;
+1:72790dc:                         break;
+1:72790dc:                     }
+1:72790dc: 
+1:72790dc:                     D point = range.skipTo(candidate.get());
+1:72790dc: 
+1:72790dc:                     if (point == null) // other range is exhausted
+1:72790dc:                     {
+1:72790dc:                         exhausted = true;
+1:72790dc:                         intersectsAll = false;
+1:72790dc:                         break;
+1:72790dc:                     }
+1:72790dc: 
+1:72790dc:                     processed.add(range);
+1:72790dc: 
+1:72790dc:                     if (candidate.get().equals(point.get()))
+1:72790dc:                     {
+1:72790dc:                         candidate.merge(point);
+1:72790dc:                         // advance skipped range to the next element if any
+1:72790dc:                         Iterators.getNext(range, null);
+1:72790dc:                     }
+1:72790dc:                     else
+1:72790dc:                     {
+1:72790dc:                         intersectsAll = false;
+1:72790dc:                         break;
+1:72790dc:                     }
+1:72790dc:                 }
+1:72790dc: 
+1:72790dc:                 ranges.add(head);
+1:72790dc: 
+1:56e0177:                 ranges.addAll(processed);
+1:56e0177:                 processed.clear();
+1:72790dc: 
+1:72790dc:                 if (exhausted)
+1:72790dc:                     return endOfData();
+1:72790dc: 
+1:72790dc:                 if (intersectsAll)
+1:72790dc:                     return candidate;
+1:72790dc:             }
+1:72790dc: 
+1:72790dc:             return endOfData();
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         protected void performSkipTo(K nextToken)
+1:72790dc:         {
+1:72790dc:             List<RangeIterator<K, D>> skipped = new ArrayList<>();
+1:72790dc: 
+1:72790dc:             while (!ranges.isEmpty())
+1:72790dc:             {
+1:72790dc:                 RangeIterator<K, D> range = ranges.poll();
+1:72790dc:                 range.skipTo(nextToken);
+1:72790dc:                 skipped.add(range);
+1:72790dc:             }
+1:72790dc: 
+1:72790dc:             for (RangeIterator<K, D> range : skipped)
+2:72790dc:                 ranges.add(range);
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     /**
+1:72790dc:      * Iterator which performs a linear scan over a primary range (the smallest of the ranges)
+1:72790dc:      * and O(log(n)) lookup into secondary ranges using values from the primary iterator.
+1:72790dc:      * This technique is efficient when one of the intersection ranges is smaller than others
+1:72790dc:      * e.g. ratio 0.01d (default), in such situation scan + lookup is more efficient comparing
+1:72790dc:      * to "bounce" merge because "bounce" distance is never going to be big.
+1:72790dc:      *
+1:72790dc:      * @param <K> The type used to sort ranges.
+1:72790dc:      * @param <D> The container type which is going to be returned by {@link Iterator#next()}.
+1:72790dc:      */
+1:72790dc:     @VisibleForTesting
+1:72790dc:     protected static class LookupIntersectionIterator<K extends Comparable<K>, D extends CombinedValue<K>> extends AbstractIntersectionIterator<K, D>
+1:72790dc:     {
+1:72790dc:         private final RangeIterator<K, D> smallestIterator;
+1:72790dc: 
+1:72790dc:         private LookupIntersectionIterator(Builder.Statistics<K, D> statistics, PriorityQueue<RangeIterator<K, D>> ranges)
+1:72790dc:         {
+1:72790dc:             super(statistics, ranges);
+1:72790dc: 
+1:72790dc:             smallestIterator = statistics.minRange;
+1:72790dc: 
+1:72790dc:             if (smallestIterator.getCurrent().compareTo(getMinimum()) < 0)
+1:72790dc:                 smallestIterator.skipTo(getMinimum());
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         protected D computeNext()
+1:72790dc:         {
+1:72790dc:             while (smallestIterator.hasNext())
+1:72790dc:             {
+1:72790dc:                 D candidate = smallestIterator.next();
+1:72790dc:                 K token = candidate.get();
+1:72790dc: 
+1:72790dc:                 boolean intersectsAll = true;
+1:72790dc:                 for (RangeIterator<K, D> range : ranges)
+1:72790dc:                 {
+1:72790dc:                     // avoid checking against self, much cheaper than changing queue comparator
+1:72790dc:                     // to compare based on the size and re-populating such queue.
+1:72790dc:                     if (range.equals(smallestIterator))
+1:72790dc:                         continue;
+1:72790dc: 
+1:72790dc:                     // found a range which doesn't overlap with one (or possibly more) other range(s)
+1:72790dc:                     if (!isOverlapping(smallestIterator, range))
+1:72790dc:                         return endOfData();
+1:72790dc: 
+1:72790dc:                     D point = range.skipTo(token);
+1:72790dc: 
+1:72790dc:                     if (point == null) // one of the iterators is exhausted
+1:72790dc:                         return endOfData();
+1:72790dc: 
+1:72790dc:                     if (!point.get().equals(token))
+1:72790dc:                     {
+1:72790dc:                         intersectsAll = false;
+1:72790dc:                         break;
+1:72790dc:                     }
+1:72790dc: 
+1:72790dc:                     candidate.merge(point);
+1:72790dc:                 }
+1:72790dc: 
+1:72790dc:                 if (intersectsAll)
+1:72790dc:                     return candidate;
+1:72790dc:             }
+1:72790dc: 
+1:72790dc:             return endOfData();
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         protected void performSkipTo(K nextToken)
+1:72790dc:         {
+1:72790dc:             smallestIterator.skipTo(nextToken);
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: }
+============================================================================
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:56e0177
+/////////////////////////////////////////////////////////////////////////
+1:             List<RangeIterator<K, D>> processed = null;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 if (processed == null)
+1:                     processed = new ArrayList<>();
+/////////////////////////////////////////////////////////////////////////
+1:                 ranges.addAll(processed);
+1:                 processed.clear();
+author:Jason Brown
+-------------------------------------------------------------------------------
+commit:733d1ee
+/////////////////////////////////////////////////////////////////////////
+1: @SuppressWarnings("resource")
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:72790dc
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.index.sasi.utils;
+1: 
+1: import java.io.IOException;
+1: import java.util.ArrayList;
+1: import java.util.Iterator;
+1: import java.util.List;
+1: import java.util.PriorityQueue;
+1: 
+1: import com.google.common.collect.Iterators;
+1: import org.apache.cassandra.io.util.FileUtils;
+1: 
+1: import com.google.common.annotations.VisibleForTesting;
+1: 
+1: public class RangeIntersectionIterator
+1: {
+1:     protected enum Strategy
+1:     {
+1:         BOUNCE, LOOKUP, ADAPTIVE
+1:     }
+1: 
+1:     public static <K extends Comparable<K>, D extends CombinedValue<K>> Builder<K, D> builder()
+1:     {
+1:         return builder(Strategy.ADAPTIVE);
+1:     }
+1: 
+1:     @VisibleForTesting
+1:     protected static <K extends Comparable<K>, D extends CombinedValue<K>> Builder<K, D> builder(Strategy strategy)
+1:     {
+1:         return new Builder<>(strategy);
+1:     }
+1: 
+1:     public static class Builder<K extends Comparable<K>, D extends CombinedValue<K>> extends RangeIterator.Builder<K, D>
+1:     {
+1:         private final Strategy strategy;
+1: 
+1:         public Builder(Strategy strategy)
+1:         {
+1:             super(IteratorType.INTERSECTION);
+1:             this.strategy = strategy;
+1:         }
+1: 
+1:         protected RangeIterator<K, D> buildIterator()
+1:         {
+1:             // if the range is disjoint we can simply return empty
+1:             // iterator of any type, because it's not going to produce any results.
+1:             if (statistics.isDisjoint())
+1:                 return new BounceIntersectionIterator<>(statistics, new PriorityQueue<RangeIterator<K, D>>(1));
+1: 
+1:             switch (strategy)
+1:             {
+1:                 case LOOKUP:
+1:                     return new LookupIntersectionIterator<>(statistics, ranges);
+1: 
+1:                 case BOUNCE:
+1:                     return new BounceIntersectionIterator<>(statistics, ranges);
+1: 
+1:                 case ADAPTIVE:
+1:                     return statistics.sizeRatio() <= 0.01d
+1:                             ? new LookupIntersectionIterator<>(statistics, ranges)
+1:                             : new BounceIntersectionIterator<>(statistics, ranges);
+1: 
+1:                 default:
+1:                     throw new IllegalStateException("Unknown strategy: " + strategy);
+1:             }
+1:         }
+1:     }
+1: 
+1:     private static abstract class AbstractIntersectionIterator<K extends Comparable<K>, D extends CombinedValue<K>> extends RangeIterator<K, D>
+1:     {
+1:         protected final PriorityQueue<RangeIterator<K, D>> ranges;
+1: 
+1:         private AbstractIntersectionIterator(Builder.Statistics<K, D> statistics, PriorityQueue<RangeIterator<K, D>> ranges)
+1:         {
+1:             super(statistics);
+1:             this.ranges = ranges;
+1:         }
+1: 
+1:         public void close() throws IOException
+1:         {
+1:             for (RangeIterator<K, D> range : ranges)
+1:                 FileUtils.closeQuietly(range);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Iterator which performs intersection of multiple ranges by using bouncing (merge-join) technique to identify
+1:      * common elements in the given ranges. Aforementioned "bounce" works as follows: range queue is poll'ed for the
+1:      * range with the smallest current token (main loop), that token is used to {@link RangeIterator#skipTo(Comparable)}
+1:      * other ranges, if token produced by {@link RangeIterator#skipTo(Comparable)} is equal to current "candidate" token,
+1:      * both get merged together and the same operation is repeated for next range from the queue, if returned token
+1:      * is not equal than candidate, candidate's range gets put back into the queue and the main loop gets repeated until
+1:      * next intersection token is found or at least one iterator runs out of tokens.
+1:      *
+1:      * This technique is every efficient to jump over gaps in the ranges.
+1:      *
+1:      * @param <K> The type used to sort ranges.
+1:      * @param <D> The container type which is going to be returned by {@link Iterator#next()}.
+1:      */
+1:     @VisibleForTesting
+1:     protected static class BounceIntersectionIterator<K extends Comparable<K>, D extends CombinedValue<K>> extends AbstractIntersectionIterator<K, D>
+1:     {
+1:         private BounceIntersectionIterator(Builder.Statistics<K, D> statistics, PriorityQueue<RangeIterator<K, D>> ranges)
+1:         {
+1:             super(statistics, ranges);
+1:         }
+1: 
+1:         protected D computeNext()
+1:         {
+1:             while (!ranges.isEmpty())
+1:             {
+1:                 RangeIterator<K, D> head = ranges.poll();
+1: 
+1:                 // jump right to the beginning of the intersection or return next element
+1:                 if (head.getCurrent().compareTo(getMinimum()) < 0)
+1:                     head.skipTo(getMinimum());
+1: 
+1:                 D candidate = head.hasNext() ? head.next() : null;
+1:                 if (candidate == null || candidate.get().compareTo(getMaximum()) > 0)
+1:                 {
+1:                     ranges.add(head);
+1:                     return endOfData();
+1:                 }
+1: 
+0:                 List<RangeIterator<K, D>> processed = new ArrayList<>();
+1: 
+1:                 boolean intersectsAll = true, exhausted = false;
+1:                 while (!ranges.isEmpty())
+1:                 {
+1:                     RangeIterator<K, D> range = ranges.poll();
+1: 
+1:                     // found a range which doesn't overlap with one (or possibly more) other range(s)
+1:                     if (!isOverlapping(head, range))
+1:                     {
+1:                         exhausted = true;
+1:                         intersectsAll = false;
+1:                         break;
+1:                     }
+1: 
+1:                     D point = range.skipTo(candidate.get());
+1: 
+1:                     if (point == null) // other range is exhausted
+1:                     {
+1:                         exhausted = true;
+1:                         intersectsAll = false;
+1:                         break;
+1:                     }
+1: 
+1:                     processed.add(range);
+1: 
+1:                     if (candidate.get().equals(point.get()))
+1:                     {
+1:                         candidate.merge(point);
+1:                         // advance skipped range to the next element if any
+1:                         Iterators.getNext(range, null);
+1:                     }
+1:                     else
+1:                     {
+1:                         intersectsAll = false;
+1:                         break;
+1:                     }
+1:                 }
+1: 
+1:                 ranges.add(head);
+1: 
+0:                 for (RangeIterator<K, D> range : processed)
+1:                     ranges.add(range);
+1: 
+1:                 if (exhausted)
+1:                     return endOfData();
+1: 
+1:                 if (intersectsAll)
+1:                     return candidate;
+1:             }
+1: 
+1:             return endOfData();
+1:         }
+1: 
+1:         protected void performSkipTo(K nextToken)
+1:         {
+1:             List<RangeIterator<K, D>> skipped = new ArrayList<>();
+1: 
+1:             while (!ranges.isEmpty())
+1:             {
+1:                 RangeIterator<K, D> range = ranges.poll();
+1:                 range.skipTo(nextToken);
+1:                 skipped.add(range);
+1:             }
+1: 
+1:             for (RangeIterator<K, D> range : skipped)
+1:                 ranges.add(range);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Iterator which performs a linear scan over a primary range (the smallest of the ranges)
+1:      * and O(log(n)) lookup into secondary ranges using values from the primary iterator.
+1:      * This technique is efficient when one of the intersection ranges is smaller than others
+1:      * e.g. ratio 0.01d (default), in such situation scan + lookup is more efficient comparing
+1:      * to "bounce" merge because "bounce" distance is never going to be big.
+1:      *
+1:      * @param <K> The type used to sort ranges.
+1:      * @param <D> The container type which is going to be returned by {@link Iterator#next()}.
+1:      */
+1:     @VisibleForTesting
+1:     protected static class LookupIntersectionIterator<K extends Comparable<K>, D extends CombinedValue<K>> extends AbstractIntersectionIterator<K, D>
+1:     {
+1:         private final RangeIterator<K, D> smallestIterator;
+1: 
+1:         private LookupIntersectionIterator(Builder.Statistics<K, D> statistics, PriorityQueue<RangeIterator<K, D>> ranges)
+1:         {
+1:             super(statistics, ranges);
+1: 
+1:             smallestIterator = statistics.minRange;
+1: 
+1:             if (smallestIterator.getCurrent().compareTo(getMinimum()) < 0)
+1:                 smallestIterator.skipTo(getMinimum());
+1:         }
+1: 
+1:         protected D computeNext()
+1:         {
+1:             while (smallestIterator.hasNext())
+1:             {
+1:                 D candidate = smallestIterator.next();
+1:                 K token = candidate.get();
+1: 
+1:                 boolean intersectsAll = true;
+1:                 for (RangeIterator<K, D> range : ranges)
+1:                 {
+1:                     // avoid checking against self, much cheaper than changing queue comparator
+1:                     // to compare based on the size and re-populating such queue.
+1:                     if (range.equals(smallestIterator))
+1:                         continue;
+1: 
+1:                     // found a range which doesn't overlap with one (or possibly more) other range(s)
+1:                     if (!isOverlapping(smallestIterator, range))
+1:                         return endOfData();
+1: 
+1:                     D point = range.skipTo(token);
+1: 
+1:                     if (point == null) // one of the iterators is exhausted
+1:                         return endOfData();
+1: 
+1:                     if (!point.get().equals(token))
+1:                     {
+1:                         intersectsAll = false;
+1:                         break;
+1:                     }
+1: 
+1:                     candidate.merge(point);
+1:                 }
+1: 
+1:                 if (intersectsAll)
+1:                     return candidate;
+1:             }
+1: 
+1:             return endOfData();
+1:         }
+1: 
+1:         protected void performSkipTo(K nextToken)
+1:         {
+1:             smallestIterator.skipTo(nextToken);
+1:         }
+1:     }
+1: }
+============================================================================

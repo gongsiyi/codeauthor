@@ -1,0 +1,1324 @@
+1:eac0369: /*
+6:eac0369: 
+1:345de35:    Derby - Class org.apache.derby.impl.store.access.heap.HeapPostCommit
+1:345de35: 
+1:270a34d:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:270a34d:    contributor license agreements.  See the NOTICE file distributed with
+1:270a34d:    this work for additional information regarding copyright ownership.
+1:270a34d:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:270a34d:    (the "License"); you may not use this file except in compliance with
+1:270a34d:    the License.  You may obtain a copy of the License at
+1:345de35: 
+1:345de35:       http://www.apache.org/licenses/LICENSE-2.0
+1:345de35: 
+1:345de35:    Unless required by applicable law or agreed to in writing, software
+1:345de35:    distributed under the License is distributed on an "AS IS" BASIS,
+1:345de35:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:345de35:    See the License for the specific language governing permissions and
+1:345de35:    limitations under the License.
+1:345de35: 
+2:eac0369:  */
+1:eac0369: 
+1:eac0369: package org.apache.derby.impl.store.access.heap;
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.services.context.ContextManager;
+1:eac0369: import org.apache.derby.iapi.services.daemon.Serviceable;
+1:7e51e9d: import org.apache.derby.shared.common.sanity.SanityManager;
+1:eac0369: import org.apache.derby.iapi.error.StandardException;
+1:eac0369: 
+1:888d12e: import org.apache.derby.iapi.store.access.conglomerate.Conglomerate;
+1:eac0369: import org.apache.derby.iapi.store.access.conglomerate.TransactionManager;
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.store.access.AccessFactory;
+1:eac0369: import org.apache.derby.iapi.store.access.AccessFactoryGlobals;
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.store.access.DynamicCompiledOpenConglomInfo;
+1:eac0369: import org.apache.derby.iapi.store.access.RowUtil;
+1:eac0369: import org.apache.derby.iapi.store.access.TransactionController;
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.store.raw.ContainerHandle;
+1:888d12e: import org.apache.derby.iapi.store.raw.ContainerKey;
+1:eac0369: import org.apache.derby.iapi.store.raw.LockingPolicy;
+1:eac0369: import org.apache.derby.iapi.store.raw.Page;
+1:888d12e: import org.apache.derby.iapi.store.raw.PageKey;
+1:eac0369: import org.apache.derby.iapi.store.raw.RecordHandle;
+1:eac0369: import org.apache.derby.iapi.store.raw.Transaction;
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.reference.SQLState;
+1:eac0369: 
+2:eac0369: /**
+1:eac0369: 
+1:eac0369: The HeapPostCommit class implements the Serviceable protocol.  
+1:eac0369: 
+1:eac0369: In it's role as a Serviceable object, it stores the state necessary to 
+1:eac0369: find a page in a heap that may have committed delete's to reclaim.
+1:eac0369: 
+1:eac0369: It looks up the page described, and reclaims space in the conglomerate.  
+1:eac0369: It first trys to clean up any deleted commits on the page.  It will then 
+1:eac0369: deallocate the page if no rows remain on the page.  All work is done while
+1:eac0369: holding the latch on the page, and locks are never "waited" on while holding
+1:eac0369: this latch.
+1:eac0369: 
+1:eac0369: This implementation uses record level locking to reclaim the space.  
+1:eac0369: For the protocols to work correctly all other heap methods must be 
+1:eac0369: prepared for a record or a page to "disappear" if they don't hold a latch and/or
+1:eac0369: a lock.  An example of the problem case is a scan which does not hold locks
+1:eac0369: on it's current position (group scan works this way), which is positioned
+1:eac0369: on a row deleted by another xact, it must be prepared to continue the 
+1:eac0369: scan after getting an error if the current page/row disapppears.
+1:eac0369: 
+1:eac0369: **/
+1:eac0369: 
+1:eac0369: class HeapPostCommit implements Serviceable
+2:eac0369: {
+1:eac0369:     /**************************************************************************
+1:eac0369:      * Fields of the class
+1:eac0369:      **************************************************************************
+1:eac0369:      */
+1:eac0369: 
+1:eac0369:     private AccessFactory access_factory  = null;
+1:888d12e:     private PageKey       page_key        = null;
+1:eac0369: 
+1:eac0369:     /**************************************************************************
+1:eac0369:      * Constructors for This class:
+1:eac0369:      **************************************************************************
+1:eac0369:      */
+1:eac0369:     HeapPostCommit(
+1:eac0369:     AccessFactory   access_factory,
+1:888d12e:     PageKey         page_key)
+1:eac0369:     {
+1:eac0369:         this.access_factory = access_factory; 
+1:888d12e:         this.page_key       = page_key; 
+2:eac0369:     }
+1:eac0369: 
+1:eac0369:     /**************************************************************************
+1:eac0369:      * Private/Protected methods of This class:
+1:eac0369:      **************************************************************************
+1:eac0369:      */
+1:eac0369: 
+1:eac0369:     /**
+1:888d12e:      * Reclaim space taken of committed deleted rows or aborted inserted rows.
+1:eac0369:      * <p>
+1:eac0369:      * This routine assumes it has been called by an internal transaction which
+1:eac0369:      * has performed no work so far, and that it has an exclusive intent table 
+1:888d12e:      * lock.  It will attempt obtain exclusive row locks on rows marked 
+1:888d12e:      * deleted, where successful those rows can be reclaimed as they must be 
+1:888d12e:      * "committed deleted" or "aborted inserted" rows.
+1:eac0369:      * <p>
+1:eac0369:      * This routine will latch the page and hold the latch due to interface
+1:eac0369:      * requirement from Page.purgeAtSlot.
+1:eac0369:      *
+1:75b112d:      * @param heap_control  The heap, already opened.
+1:75b112d:      * @param pageno        number of page to look for committed deletes.
+1:eac0369:      *
+1:eac0369:      * @see Page#purgeAtSlot
+1:eac0369:      * @exception  StandardException  Standard exception policy.
+1:eac0369:      **/
+1:eac0369:     private final void purgeCommittedDeletes(
+1:eac0369:     HeapController      heap_control,
+1:eac0369:     long                pageno)
+1:eac0369:         throws StandardException
+1:eac0369:     {
+1:eac0369:         // The following can fail either if it can't get the latch or
+1:eac0369:         // somehow the page requested no longer exists. 
+1:eac0369: 	
+1:eac0369: 	//resolve - what will happen if the user page doesnt exist  
+1:eac0369: 
+1:eac0369:         // wait to get the latch on the page 
+1:eac0369:         Page page = heap_control.getUserPageWait(pageno);
+1:888d12e: 
+1:eac0369:         boolean purgingDone = false;
+1:eac0369: 
+1:eac0369:         if (page != null)
+1:eac0369:         {
+1:eac0369:             try
+1:eac0369:             {
+1:eac0369:                 // The number records that can be reclaimed is:
+1:eac0369:                 // total recs - recs_not_deleted
+1:eac0369:                 int num_possible_commit_delete = 
+1:eac0369:                     page.recordCount() - page.nonDeletedRecordCount();
+1:eac0369: 
+1:eac0369:                 if (num_possible_commit_delete > 0)
+1:eac0369:                 {
+1:eac0369:                     // loop backward so that purges which affect the slot table 
+1:eac0369:                     // don't affect the loop (ie. they only move records we 
+1:eac0369:                     // have already looked at).
+1:eac0369:                     for (int slot_no = page.recordCount() - 1; 
+1:eac0369:                          slot_no >= 0; 
+1:eac0369:                          slot_no--) 
+1:eac0369:                     {
+1:eac0369:                         boolean row_is_committed_delete = 
+1:eac0369:                             page.isDeletedAtSlot(slot_no);
+1:eac0369: 
+1:eac0369:                         if (row_is_committed_delete)
+1:eac0369:                         {
+1:eac0369:                             // At this point we only know that the row is
+1:eac0369:                             // deleted, not whether it is committed.
+1:eac0369: 
+1:eac0369:                             // see if we can purge the row, by getting an
+1:eac0369:                             // exclusive lock on the row.  If it is marked
+1:eac0369:                             // deleted and we can get this lock, then it
+1:eac0369:                             // must be a committed delete and we can purge 
+1:eac0369:                             // it.
+1:eac0369: 
+1:eac0369:                             RecordHandle rh =
+1:eac0369:                                 page.fetchFromSlot(
+1:eac0369:                                     (RecordHandle) null,
+1:eac0369:                                     slot_no,
+1:eac0369:                                     RowUtil.EMPTY_ROW,
+1:eac0369:                                     RowUtil.EMPTY_ROW_FETCH_DESCRIPTOR,
+1:eac0369:                                     true);
+1:eac0369: 
+1:eac0369:                             row_is_committed_delete =
+1:eac0369:                                 heap_control.lockRowAtSlotNoWaitExclusive(rh);
+1:eac0369: 
+1:eac0369:                             if (row_is_committed_delete)
+1:eac0369:                             {
+1:eac0369:                                 purgingDone = true;
+1:eac0369: 
+1:eac0369:                                 page.purgeAtSlot(slot_no, 1, false);
+1:eac0369: 
+2:eac0369:                                 if (SanityManager.DEBUG)
+1:eac0369:                                 {
+1:eac0369:                                     if (SanityManager.DEBUG_ON(
+1:eac0369:                                             "verbose_heap_post_commit"))
+1:eac0369:                                     {
+1:eac0369:                                         SanityManager.DEBUG_PRINT(
+1:eac0369:                                             "HeapPostCommit", 
+1:eac0369:                                             "Purging row[" + slot_no + "]" + 
+1:eac0369:                                             "on page:" + pageno + ".\n");
+1:eac0369:                                     }
+1:eac0369:                                 }
+1:eac0369:                             }
+1:eac0369:                         }
+1:eac0369:                     }
+1:eac0369:                 }
+1:eac0369:                 if (page.recordCount() == 0)
+1:eac0369:                 {
+1:eac0369:                     purgingDone = true;
+1:eac0369: 
+1:eac0369:                     // Deallocate the current page with 0 rows on it.
+1:eac0369:                     heap_control.removePage(page);
+1:eac0369: 
+1:eac0369:                     // removePage guarantees to unlatch the page even if an
+1:eac0369:                     // exception is thrown. The page is protected against reuse
+1:eac0369:                     // because removePage locks it with a dealloc lock, so it
+1:eac0369:                     // is OK to release the latch even after a purgeAtSlot is
+1:eac0369:                     // called.
+1:eac0369:                     // @see ContainerHandle#removePage
+1:eac0369: 
+1:eac0369:                     if (SanityManager.DEBUG)
+1:eac0369:                     {
+1:eac0369:                         if (SanityManager.DEBUG_ON("verbose_heap_post_commit"))
+1:eac0369:                         {
+1:eac0369:                             SanityManager.DEBUG_PRINT(
+1:eac0369:                                 "HeapPostCommit", 
+1:888d12e:                                 "Calling Heap removePage().; pagenumber=" +
+1:888d12e:                                 pageno + "\n");
+1:eac0369:                         }
+1:eac0369:                     }
+1:eac0369:                 }
+1:eac0369:             }
+1:eac0369:             finally
+1:eac0369:             {
+1:eac0369:                 // If no purge happened on the page and the page is not
+1:eac0369:                 // removed, feel free to unlatch it.  Otherwise, let
+1:b1043a6:                 // transaction commit take care of it.  The latch must be
+1:b1043a6:                 // held until end transaction in order to insure no other
+1:b1043a6:                 // transaction uses the space freed by the purge, which
+1:b1043a6:                 // would cause a subquent undo of the purge to fail.
+1:eac0369: 				if (!purgingDone)
+1:eac0369:                 {
+1:eac0369:                     page.unlatch();
+1:eac0369:                     page = null;
+1:eac0369:                 }
+1:eac0369:             }
+1:eac0369:         }
+1:eac0369:         else
+1:eac0369:         {
+1:eac0369:             if (SanityManager.DEBUG)
+1:eac0369:             {
+1:eac0369:                 if (SanityManager.DEBUG_ON("verbose_heap_post_commit"))
+1:eac0369:                 {
+1:eac0369:                     SanityManager.DEBUG_PRINT(
+1:eac0369:                         "HeapPostCommit", 
+1:eac0369:                         "Get No Wait returned null. page num = " + 
+1:eac0369:                         pageno + "\n");
+1:eac0369: 
+1:eac0369:                     SanityManager.showTrace(new Throwable());
+1:eac0369:                 }
+1:eac0369:             }
+1:eac0369:         }
+1:eac0369:         return;
+1:eac0369:     }
+1:eac0369: 
+1:eac0369:     /**************************************************************************
+1:eac0369:      * Public Methods implementing the Serviceable interface:
+1:eac0369:      **************************************************************************
+1:eac0369:      */
+1:eac0369: 
+1:eac0369:     /**
+1:eac0369:      * The urgency of this post commit work.
+1:eac0369:      * <p>
+1:eac0369:      * This determines where this Serviceable is put in the post commit 
+1:eac0369:      * queue.  Post commit work in the heap can be safely delayed until there
+1:eac0369:      * is not user work to do.
+1:eac0369:      *
+1:eac0369:      * @return false, this work should not be serviced ASAP
+1:eac0369:      **/
+1:eac0369:     public boolean serviceASAP()
+1:eac0369:     {
+1:eac0369:         return(true);
+1:eac0369:     }
+1:eac0369: 
+1:eac0369: 	// @return true, if this work needs to be done on a user thread immediately
+1:eac0369: 	public boolean serviceImmediately()
+1:eac0369: 	{
+1:eac0369: 		return false;
+1:eac0369: 	}	
+1:eac0369: 
+1:eac0369: 
+1:eac0369:     /**
+1:eac0369:      * perform the work described in the postcommit work.
+1:eac0369:      * <p>
+1:eac0369:      * In this implementation the only work that can be executed by this
+1:eac0369:      * post commit processor is this class itself.
+1:eac0369:      * <p>
+1:eac0369:      *
+1:eac0369:      * @return Returns Serviceable.DONE when work has completed, or
+1:eac0369:      *         returns Serviceable.REQUEUE if work needs to be requeued.
+1:eac0369:      *
+1:eac0369:      * @param contextMgr the context manager started by the post commit daemon
+1:eac0369:      *
+1:eac0369:      * @exception  StandardException  Standard exception policy.
+1:eac0369:      **/
+1:eac0369:     public int performWork(ContextManager contextMgr)
+1:eac0369:         throws StandardException
+1:eac0369:     {
+1:eac0369:         TransactionManager  tc             = (TransactionManager)
+1:eac0369:             this.access_factory.getAndNameTransaction(
+1:eac0369:                 contextMgr, AccessFactoryGlobals.SYS_TRANS_NAME);
+1:eac0369: 
+1:eac0369:         TransactionManager  internal_xact  = tc.getInternalTransaction();
+1:eac0369: 
+1:eac0369:         // only requeue if work was not completed in this try.
+1:eac0369:         boolean             requeue_work = false;
+1:eac0369: 
+1:eac0369:         HeapController      heapcontroller;
+1:eac0369: 
+1:eac0369:         if (SanityManager.DEBUG)
+1:eac0369:         {
+1:eac0369:             if (SanityManager.DEBUG_ON("verbose_heap_post_commit"))
+1:eac0369:                 SanityManager.DEBUG_PRINT(
+1:eac0369:                     "HeapPostCommit", "starting internal xact\n");
+1:eac0369:         }
+1:eac0369: 
+1:eac0369:         try
+1:eac0369:         {
+1:eac0369:             // This call will attempt to open the heap table locked with 
+1:eac0369:             // table level IX mode, preparing to do record level locked space 
+1:eac0369:             // reclamation.  
+1:eac0369:             //
+1:eac0369:             // The call will either succeed immediately, or throw an exception
+1:eac0369:             // which could mean the container does not exist or that the lock
+1:eac0369:             // could not be granted immediately. 
+1:eac0369: 
+1:eac0369: 			//Reversed the fix for 4255:
+1:c05d3df: 			//page reclaimation is done asynchronosly by rawstore daemon
+1:eac0369: 			//not good to WAIT FOR LOCKS , as it can freeze the daemon
+1:c05d3df: 			//If we can not get the lock this reclamation request will be
+1:eac0369: 			//requeued.
+1:eac0369: 
+1:888d12e:             // if does not exist will throw exception, which the code will 
+1:888d12e:             // handle in the same way as it does heap.open failing if trying 
+1:888d12e:             // to open a dropped container.
+1:888d12e: 
+1:c05d3df:             // DERBY-6774, changed to use openByContainerKey which insures
+1:c05d3df:             // that background thread will have a lock on the table before
+1:c05d3df:             // accessing and possibly loading the conglomerate cache.  This
+1:c05d3df:             // insure it waits for in process alter table calls, before 
+1:c05d3df:             // loading the conglomerate cache.
+1:888d12e: 
+1:eac0369:             heapcontroller = (HeapController)
+1:c05d3df:                 Heap.openByContainerKey(
+1:c05d3df:                     page_key.getContainerId(),
+1:eac0369:                     internal_xact,
+1:eac0369:                     internal_xact.getRawStoreXact(),
+1:eac0369:                     false,
+1:eac0369:                     ContainerHandle.MODE_FORUPDATE |
+1:eac0369:                     ContainerHandle.MODE_LOCK_NOWAIT,
+1:eac0369:                     TransactionController.MODE_RECORD,
+1:eac0369:                     internal_xact.getRawStoreXact().newLockingPolicy(
+1:eac0369:                         LockingPolicy.MODE_RECORD,
+1:eac0369:                         TransactionController.ISOLATION_REPEATABLE_READ, true),
+1:c05d3df:                     null,
+1:eac0369:                     (DynamicCompiledOpenConglomInfo) null);
+1:888d12e: 
+1:eac0369:             // We got a table intent lock, all deleted rows we encounter can
+1:eac0369:             // be reclaimed, once an "X" row lock is obtained on them.
+1:888d12e: 
+1:eac0369:             // Process all the rows on the page while holding the latch.
+1:888d12e:             purgeCommittedDeletes(
+1:888d12e:                 heapcontroller, this.page_key.getPageNumber());
+1:eac0369: 
+1:888d12e:         }
+1:eac0369:         catch (StandardException se)
+1:888d12e:         {
+1:c9ef166:             // exception might have occured either because the container got 
+1:888d12e:             // dropped or the lock was not granted.
+1:eac0369:             // It is possible by the time this post commit work gets scheduled 
+1:eac0369:             // that the container has been dropped and that the open container 
+1:eac0369:             // call will return null - in this case just return assuming no 
+1:eac0369:             // work to be done.
+1:eac0369: 
+1:888d12e: 			// If this exception is because lock could not be obtained, 
+1:c9ef166:             // work is requeued.
+1:c9ef166: 			if (se.isLockTimeoutOrDeadlock())
+1:eac0369: 			{
+1:eac0369: 				requeue_work = true;
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369:             // Do not close the controller because that will unlatch the
+1:eac0369:             // page.  Let the commit and destroy do release the latch and
+1:eac0369:             // close the controller.
+1:eac0369:             // heapcontroller.close();
+1:eac0369:         }
+1:eac0369:             
+1:eac0369:         // It is ok to not sync this post work.  If no subsequent log record
+1:eac0369:         // is sync'd to disk then it is ok that this transaction not make
+1:eac0369:         // it to the database.  If any subsequent transaction is sync'd to
+1:eac0369:         // the log file, then this transaction will be sync'd as part of that
+1:eac0369:         // work.
+1:eac0369: 
+1:eac0369:         internal_xact.commitNoSync(Transaction.RELEASE_LOCKS);
+1:eac0369:         internal_xact.destroy();
+1:eac0369: 
+1:eac0369: 
+1:888d12e:         if (SanityManager.DEBUG)
+1:eac0369:         {
+1:eac0369:             if (SanityManager.DEBUG_ON("verbose_heap_post_commit"))
+1:eac0369:             {
+1:eac0369:                 if (requeue_work)
+1:eac0369:                     SanityManager.DEBUG_PRINT(
+1:eac0369:                         "HeapPostCommit", 
+1:888d12e:                         "requeueing on page num = " + 
+1:888d12e:                             this.page_key.getPageNumber());
+1:eac0369:             }
+1:eac0369:         }
+1:eac0369: 
+1:eac0369:         return(requeue_work ? Serviceable.REQUEUE : Serviceable.DONE);
+1:eac0369:     }
+1:eac0369: }
+============================================================================
+author:Mike Matrigali
+-------------------------------------------------------------------------------
+commit:c05d3df
+/////////////////////////////////////////////////////////////////////////
+1: 			//page reclaimation is done asynchronosly by rawstore daemon
+1: 			//If we can not get the lock this reclamation request will be
+1:             // DERBY-6774, changed to use openByContainerKey which insures
+1:             // that background thread will have a lock on the table before
+1:             // accessing and possibly loading the conglomerate cache.  This
+1:             // insure it waits for in process alter table calls, before 
+1:             // loading the conglomerate cache.
+1:                 Heap.openByContainerKey(
+1:                     page_key.getContainerId(),
+/////////////////////////////////////////////////////////////////////////
+1:                     null,
+commit:888d12e
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.store.access.conglomerate.Conglomerate;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.store.raw.ContainerKey;
+1: import org.apache.derby.iapi.store.raw.PageKey;
+/////////////////////////////////////////////////////////////////////////
+1:     private PageKey       page_key        = null;
+/////////////////////////////////////////////////////////////////////////
+1:     PageKey         page_key)
+1:         this.page_key       = page_key; 
+/////////////////////////////////////////////////////////////////////////
+1:      * Reclaim space taken of committed deleted rows or aborted inserted rows.
+1:      * lock.  It will attempt obtain exclusive row locks on rows marked 
+1:      * deleted, where successful those rows can be reclaimed as they must be 
+1:      * "committed deleted" or "aborted inserted" rows.
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                                 "Calling Heap removePage().; pagenumber=" +
+1:                                 pageno + "\n");
+/////////////////////////////////////////////////////////////////////////
+1:             // if does not exist will throw exception, which the code will 
+1:             // handle in the same way as it does heap.open failing if trying 
+1:             // to open a dropped container.
+1: 
+0:             Conglomerate conglom = 
+0:                 internal_xact.findExistingConglomerateFromKey(
+0:                     page_key.getContainerId());
+1: 
+1:             if (SanityManager.DEBUG)
+1:             {
+0:                 // This code can only handle Heap conglomerates.
+0:                 SanityManager.ASSERT(conglom instanceof Heap,
+0:                         "Code expecting PageKey/ContainerKey of a Heap");
+1:             }
+1: 
+0:             Heap heap = (Heap) conglom;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             purgeCommittedDeletes(
+1:                 heapcontroller, this.page_key.getPageNumber());
+1:             // dropped or the lock was not granted.
+1: 			// If this exception is because lock could not be obtained, 
+/////////////////////////////////////////////////////////////////////////
+1:                         "requeueing on page num = " + 
+1:                             this.page_key.getPageNumber());
+commit:c9ef166
+/////////////////////////////////////////////////////////////////////////
+1:             // exception might have occured either because the container got 
+0:             // dropper or the lock was not granted.
+0: 			// If this expcetion is because lock could not be obtained, 
+1:             // work is requeued.
+1: 			if (se.isLockTimeoutOrDeadlock())
+commit:b1043a6
+/////////////////////////////////////////////////////////////////////////
+1:                 // transaction commit take care of it.  The latch must be
+1:                 // held until end transaction in order to insure no other
+1:                 // transaction uses the space freed by the purge, which
+1:                 // would cause a subquent undo of the purge to fail.
+commit:75b112d
+/////////////////////////////////////////////////////////////////////////
+1:      * @param heap_control  The heap, already opened.
+1:      * @param pageno        number of page to look for committed deletes.
+author:Bryan Pendleton
+-------------------------------------------------------------------------------
+commit:7e51e9d
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.shared.common.sanity.SanityManager;
+author:Kristian Waagan
+-------------------------------------------------------------------------------
+commit:fa09146
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+author:Richard N. Hillegas
+-------------------------------------------------------------------------------
+commit:270a34d
+/////////////////////////////////////////////////////////////////////////
+1:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:    contributor license agreements.  See the NOTICE file distributed with
+1:    this work for additional information regarding copyright ownership.
+1:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:    (the "License"); you may not use this file except in compliance with
+1:    the License.  You may obtain a copy of the License at
+author:Oyvind Bakksjo
+-------------------------------------------------------------------------------
+commit:aaea357
+author:Daniel John Debrunner
+-------------------------------------------------------------------------------
+commit:345de35
+/////////////////////////////////////////////////////////////////////////
+1:    Derby - Class org.apache.derby.impl.store.access.heap.HeapPostCommit
+1: 
+0:    Copyright 1997, 2004 The Apache Software Foundation or its licensors, as applicable.
+1: 
+0:    Licensed under the Apache License, Version 2.0 (the "License");
+0:    you may not use this file except in compliance with the License.
+0:    You may obtain a copy of the License at
+1: 
+1:       http://www.apache.org/licenses/LICENSE-2.0
+1: 
+1:    Unless required by applicable law or agreed to in writing, software
+1:    distributed under the License is distributed on an "AS IS" BASIS,
+1:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:    See the License for the specific language governing permissions and
+1:    limitations under the License.
+commit:1f9b9c4
+/////////////////////////////////////////////////////////////////////////
+commit:eac0369
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1: 
+0:    Licensed Materials - Property of IBM
+0:    Cloudscape - Package org.apache.derby.impl.store.access.heap
+0:    (C) Copyright IBM Corp. 1997, 2004. All Rights Reserved.
+0:    US Government Users Restricted Rights - Use, duplication or
+0:    disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+1: 
+1:  */
+1: 
+1: package org.apache.derby.impl.store.access.heap;
+1: 
+1: import org.apache.derby.iapi.services.context.ContextManager;
+1: import org.apache.derby.iapi.services.daemon.Serviceable;
+0: import org.apache.derby.iapi.services.monitor.Monitor;
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+1: import org.apache.derby.iapi.error.StandardException;
+1: 
+1: import org.apache.derby.iapi.store.access.conglomerate.TransactionManager;
+1: 
+1: import org.apache.derby.iapi.store.access.AccessFactory;
+1: import org.apache.derby.iapi.store.access.AccessFactoryGlobals;
+1: 
+0: import org.apache.derby.iapi.store.access.ConglomerateController;
+1: import org.apache.derby.iapi.store.access.DynamicCompiledOpenConglomInfo;
+0: import org.apache.derby.iapi.store.access.Qualifier;
+1: import org.apache.derby.iapi.store.access.RowUtil;
+1: import org.apache.derby.iapi.store.access.TransactionController;
+1: 
+1: import org.apache.derby.iapi.store.raw.ContainerHandle;
+0: import org.apache.derby.iapi.store.raw.FetchDescriptor;
+1: import org.apache.derby.iapi.store.raw.LockingPolicy;
+1: import org.apache.derby.iapi.store.raw.Page;
+1: import org.apache.derby.iapi.store.raw.RecordHandle;
+1: import org.apache.derby.iapi.store.raw.Transaction;
+1: 
+1: import org.apache.derby.iapi.reference.SQLState;
+1: 
+1: /**
+1: 
+1: The HeapPostCommit class implements the Serviceable protocol.  
+1: 
+1: In it's role as a Serviceable object, it stores the state necessary to 
+1: find a page in a heap that may have committed delete's to reclaim.
+1: 
+1: It looks up the page described, and reclaims space in the conglomerate.  
+1: It first trys to clean up any deleted commits on the page.  It will then 
+1: deallocate the page if no rows remain on the page.  All work is done while
+1: holding the latch on the page, and locks are never "waited" on while holding
+1: this latch.
+1: 
+1: This implementation uses record level locking to reclaim the space.  
+1: For the protocols to work correctly all other heap methods must be 
+1: prepared for a record or a page to "disappear" if they don't hold a latch and/or
+1: a lock.  An example of the problem case is a scan which does not hold locks
+1: on it's current position (group scan works this way), which is positioned
+1: on a row deleted by another xact, it must be prepared to continue the 
+1: scan after getting an error if the current page/row disapppears.
+1: 
+1: **/
+1: 
+1: class HeapPostCommit implements Serviceable
+1: {
+1: 	/**
+0: 		IBM Copyright &copy notice.
+1: 	*/
+0: 	public static final String copyrightNotice = org.apache.derby.iapi.reference.Copyright.SHORT_1997_2004;
+1:     /**************************************************************************
+1:      * Fields of the class
+1:      **************************************************************************
+1:      */
+1: 
+1:     private AccessFactory access_factory  = null;
+0:     private Heap          heap            = null;
+0:     private long          page_number     = ContainerHandle.INVALID_PAGE_NUMBER;
+1: 
+1: 
+1:     /**************************************************************************
+1:      * Constructors for This class:
+1:      **************************************************************************
+1:      */
+1:     HeapPostCommit(
+1:     AccessFactory   access_factory,
+0:     Heap            heap,
+0:     long            input_page_number)
+1:     {
+1:         this.access_factory = access_factory; 
+0:         this.heap           = heap; 
+0:         this.page_number    = input_page_number; 
+1:     }
+1: 
+1:     /**************************************************************************
+1:      * Private/Protected methods of This class:
+1:      **************************************************************************
+1:      */
+1: 
+1:     /**
+0:      * Reclaim space taken up by committed deleted rows.
+1:      * <p>
+1:      * This routine assumes it has been called by an internal transaction which
+1:      * has performed no work so far, and that it has an exclusive intent table 
+0:      * lock.  It will attempt obtain exclusive row locks on deleted rows, where
+0:      * successful those rows can be reclaimed as they must be "committed 
+0:      * deleted" rows.
+1:      * <p>
+1:      * This routine will latch the page and hold the latch due to interface
+1:      * requirement from Page.purgeAtSlot.
+1:      *
+0:      * @param open_btree The btree already opened.
+0:      * @param pageno The page number of the page to look for committed deletes.
+1:      *
+1:      * @see Page#purgeAtSlot
+1:      * @exception  StandardException  Standard exception policy.
+1:      **/
+1:     private final void purgeCommittedDeletes(
+1:     HeapController      heap_control,
+1:     long                pageno)
+1:         throws StandardException
+1:     {
+1:         // The following can fail either if it can't get the latch or
+1:         // somehow the page requested no longer exists. 
+1: 	
+1: 	//resolve - what will happen if the user page doesnt exist  
+1: 
+1:         // wait to get the latch on the page 
+1:         Page page = heap_control.getUserPageWait(pageno);
+1:         boolean purgingDone = false;
+1: 
+1:         if (page != null)
+1:         {
+1:             try
+1:             {
+1:                 // The number records that can be reclaimed is:
+1:                 // total recs - recs_not_deleted
+1:                 int num_possible_commit_delete = 
+1:                     page.recordCount() - page.nonDeletedRecordCount();
+1: 
+1:                 if (num_possible_commit_delete > 0)
+1:                 {
+1:                     // loop backward so that purges which affect the slot table 
+1:                     // don't affect the loop (ie. they only move records we 
+1:                     // have already looked at).
+1:                     for (int slot_no = page.recordCount() - 1; 
+1:                          slot_no >= 0; 
+1:                          slot_no--) 
+1:                     {
+1:                         boolean row_is_committed_delete = 
+1:                             page.isDeletedAtSlot(slot_no);
+1: 
+1:                         if (row_is_committed_delete)
+1:                         {
+1:                             // At this point we only know that the row is
+1:                             // deleted, not whether it is committed.
+1: 
+1:                             // see if we can purge the row, by getting an
+1:                             // exclusive lock on the row.  If it is marked
+1:                             // deleted and we can get this lock, then it
+1:                             // must be a committed delete and we can purge 
+1:                             // it.
+1: 
+1:                             RecordHandle rh =
+1:                                 page.fetchFromSlot(
+1:                                     (RecordHandle) null,
+1:                                     slot_no,
+1:                                     RowUtil.EMPTY_ROW,
+1:                                     RowUtil.EMPTY_ROW_FETCH_DESCRIPTOR,
+1:                                     true);
+1: 
+1:                             row_is_committed_delete =
+1:                                 heap_control.lockRowAtSlotNoWaitExclusive(rh);
+1: 
+1:                             if (row_is_committed_delete)
+1:                             {
+1:                                 purgingDone = true;
+1: 
+1:                                 page.purgeAtSlot(slot_no, 1, false);
+1: 
+1:                                 if (SanityManager.DEBUG)
+1:                                 {
+1:                                     if (SanityManager.DEBUG_ON(
+1:                                             "verbose_heap_post_commit"))
+1:                                     {
+1:                                         SanityManager.DEBUG_PRINT(
+1:                                             "HeapPostCommit", 
+1:                                             "Purging row[" + slot_no + "]" + 
+1:                                             "on page:" + pageno + ".\n");
+1:                                     }
+1:                                 }
+1:                             }
+1:                         }
+1:                     }
+1:                 }
+1:                 if (page.recordCount() == 0)
+1:                 {
+1:                     purgingDone = true;
+1: 
+1:                     // Deallocate the current page with 0 rows on it.
+1:                     heap_control.removePage(page);
+1: 
+1:                     // removePage guarantees to unlatch the page even if an
+1:                     // exception is thrown. The page is protected against reuse
+1:                     // because removePage locks it with a dealloc lock, so it
+1:                     // is OK to release the latch even after a purgeAtSlot is
+1:                     // called.
+1:                     // @see ContainerHandle#removePage
+1: 
+1:                     if (SanityManager.DEBUG)
+1:                     {
+1:                         if (SanityManager.DEBUG_ON("verbose_heap_post_commit"))
+1:                         {
+1:                             SanityManager.DEBUG_PRINT(
+1:                                 "HeapPostCommit", 
+0:                                 "Calling Heap removePage().; pagenumber="+pageno+"\n");
+1:                         }
+1:                     }
+1:                 }
+1:             }
+1:             finally
+1:             {
+1:                 // If no purge happened on the page and the page is not
+1:                 // removed, feel free to unlatch it.  Otherwise, let
+0:                 // transaction commit take care of it.
+1: 				if (!purgingDone)
+1:                 {
+1:                     page.unlatch();
+1:                     page = null;
+1:                 }
+1:             }
+1:         }
+1:         else
+1:         {
+1:             if (SanityManager.DEBUG)
+1:             {
+1:                 if (SanityManager.DEBUG_ON("verbose_heap_post_commit"))
+1:                 {
+1:                     SanityManager.DEBUG_PRINT(
+1:                         "HeapPostCommit", 
+1:                         "Get No Wait returned null. page num = " + 
+1:                         pageno + "\n");
+1: 
+1:                     SanityManager.showTrace(new Throwable());
+1:                 }
+1:             }
+1:         }
+1:         return;
+1:     }
+1: 
+1:     /**************************************************************************
+1:      * Public Methods implementing the Serviceable interface:
+1:      **************************************************************************
+1:      */
+1: 
+1:     /**
+1:      * The urgency of this post commit work.
+1:      * <p>
+1:      * This determines where this Serviceable is put in the post commit 
+1:      * queue.  Post commit work in the heap can be safely delayed until there
+1:      * is not user work to do.
+1:      *
+1:      * @return false, this work should not be serviced ASAP
+1:      **/
+1:     public boolean serviceASAP()
+1:     {
+1:         return(true);
+1:     }
+1: 
+1: 	// @return true, if this work needs to be done on a user thread immediately
+1: 	public boolean serviceImmediately()
+1: 	{
+1: 		return false;
+1: 	}	
+1: 
+1: 
+1:     /**
+1:      * perform the work described in the postcommit work.
+1:      * <p>
+1:      * In this implementation the only work that can be executed by this
+1:      * post commit processor is this class itself.
+1:      * <p>
+1:      *
+1:      * @return Returns Serviceable.DONE when work has completed, or
+1:      *         returns Serviceable.REQUEUE if work needs to be requeued.
+1:      *
+1:      * @param contextMgr the context manager started by the post commit daemon
+1:      *
+1:      * @exception  StandardException  Standard exception policy.
+1:      **/
+1:     public int performWork(ContextManager contextMgr)
+1:         throws StandardException
+1:     {
+1:         TransactionManager  tc             = (TransactionManager)
+1:             this.access_factory.getAndNameTransaction(
+1:                 contextMgr, AccessFactoryGlobals.SYS_TRANS_NAME);
+1: 
+1:         TransactionManager  internal_xact  = tc.getInternalTransaction();
+1: 
+1:         // only requeue if work was not completed in this try.
+1:         boolean             requeue_work = false;
+1: 
+1:         HeapController      heapcontroller;
+1: 
+1:         if (SanityManager.DEBUG)
+1:         {
+1:             if (SanityManager.DEBUG_ON("verbose_heap_post_commit"))
+1:                 SanityManager.DEBUG_PRINT(
+1:                     "HeapPostCommit", "starting internal xact\n");
+1:         }
+1: 
+1:         try
+1:         {
+1:             // This call will attempt to open the heap table locked with 
+1:             // table level IX mode, preparing to do record level locked space 
+1:             // reclamation.  
+1:             //
+1:             // The call will either succeed immediately, or throw an exception
+1:             // which could mean the container does not exist or that the lock
+1:             // could not be granted immediately. 
+1: 
+1: 			//Reversed the fix for 4255:
+0: 			//page reclaimation is done asynchronosly by raswstore daemon
+1: 			//not good to WAIT FOR LOCKS , as it can freeze the daemon
+0: 			//If we can not get the lock this reclamation request will 
+1: 			//requeued.
+1: 
+1:             heapcontroller = (HeapController)
+0:                 heap.open(
+1:                     internal_xact,
+1:                     internal_xact.getRawStoreXact(),
+1:                     false,
+1:                     ContainerHandle.MODE_FORUPDATE |
+1:                     ContainerHandle.MODE_LOCK_NOWAIT,
+1:                     TransactionController.MODE_RECORD,
+1:                     internal_xact.getRawStoreXact().newLockingPolicy(
+1:                         LockingPolicy.MODE_RECORD,
+1:                         TransactionController.ISOLATION_REPEATABLE_READ, true),
+0:                     heap,
+1:                     (DynamicCompiledOpenConglomInfo) null);
+1: 
+1:             // We got a table intent lock, all deleted rows we encounter can
+1:             // be reclaimed, once an "X" row lock is obtained on them.
+1: 
+1:             // Process all the rows on the page while holding the latch.
+0:             purgeCommittedDeletes(heapcontroller, this.page_number);
+1: 
+1:         }
+1:         catch (StandardException se)
+1:         {
+0:             // exception might have occured either container got dropper or lock not granted.
+1:             // It is possible by the time this post commit work gets scheduled 
+1:             // that the container has been dropped and that the open container 
+1:             // call will return null - in this case just return assuming no 
+1:             // work to be done.
+1: 
+0: 			//If this expcetion is because lock could not be obtained , work is requeued.
+0: 			if (se.getMessageId().equals(SQLState.LOCK_TIMEOUT) || 
+0: 				se.getMessageId().equals(SQLState.DEADLOCK))
+1: 			{
+1: 				requeue_work = true;
+1: 			}
+1: 
+1:             // Do not close the controller because that will unlatch the
+1:             // page.  Let the commit and destroy do release the latch and
+1:             // close the controller.
+1:             // heapcontroller.close();
+1:         }
+1:             
+1:         // It is ok to not sync this post work.  If no subsequent log record
+1:         // is sync'd to disk then it is ok that this transaction not make
+1:         // it to the database.  If any subsequent transaction is sync'd to
+1:         // the log file, then this transaction will be sync'd as part of that
+1:         // work.
+1: 
+1:         internal_xact.commitNoSync(Transaction.RELEASE_LOCKS);
+1:         internal_xact.destroy();
+1: 
+1: 
+1:         if (SanityManager.DEBUG)
+1:         {
+1:             if (SanityManager.DEBUG_ON("verbose_heap_post_commit"))
+1:             {
+1:                 if (requeue_work)
+1:                     SanityManager.DEBUG_PRINT(
+1:                         "HeapPostCommit", 
+0:                         "requeueing on page num = " + page_number);
+1:             }
+1:         }
+1: 
+1:         return(requeue_work ? Serviceable.REQUEUE : Serviceable.DONE);
+1:     }
+1: }
+1: 
+author:Ken Coar
+-------------------------------------------------------------------------------
+commit:95e7b46
+/////////////////////////////////////////////////////////////////////////
+0: /*
+0: 
+0:    Licensed Materials - Property of IBM
+0:    Cloudscape - Package org.apache.derby.impl.store.access.heap
+0:    (C) Copyright IBM Corp. 1997, 2004. All Rights Reserved.
+0:    US Government Users Restricted Rights - Use, duplication or
+0:    disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+0: 
+0:  */
+0: 
+0: package org.apache.derby.impl.store.access.heap;
+0: 
+0: import org.apache.derby.iapi.services.context.ContextManager;
+0: import org.apache.derby.iapi.services.daemon.Serviceable;
+0: import org.apache.derby.iapi.services.monitor.Monitor;
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+0: import org.apache.derby.iapi.error.StandardException;
+0: 
+0: import org.apache.derby.iapi.store.access.conglomerate.TransactionManager;
+0: 
+0: import org.apache.derby.iapi.store.access.AccessFactory;
+0: import org.apache.derby.iapi.store.access.AccessFactoryGlobals;
+0: 
+0: import org.apache.derby.iapi.store.access.ConglomerateController;
+0: import org.apache.derby.iapi.store.access.DynamicCompiledOpenConglomInfo;
+0: import org.apache.derby.iapi.store.access.Qualifier;
+0: import org.apache.derby.iapi.store.access.RowUtil;
+0: import org.apache.derby.iapi.store.access.TransactionController;
+0: 
+0: import org.apache.derby.iapi.store.raw.ContainerHandle;
+0: import org.apache.derby.iapi.store.raw.FetchDescriptor;
+0: import org.apache.derby.iapi.store.raw.LockingPolicy;
+0: import org.apache.derby.iapi.store.raw.Page;
+0: import org.apache.derby.iapi.store.raw.RecordHandle;
+0: import org.apache.derby.iapi.store.raw.Transaction;
+0: 
+0: import org.apache.derby.iapi.reference.SQLState;
+0: 
+0: /**
+0: 
+0: The HeapPostCommit class implements the Serviceable protocol.  
+0: 
+0: In it's role as a Serviceable object, it stores the state necessary to 
+0: find a page in a heap that may have committed delete's to reclaim.
+0: 
+0: It looks up the page described, and reclaims space in the conglomerate.  
+0: It first trys to clean up any deleted commits on the page.  It will then 
+0: deallocate the page if no rows remain on the page.  All work is done while
+0: holding the latch on the page, and locks are never "waited" on while holding
+0: this latch.
+0: 
+0: This implementation uses record level locking to reclaim the space.  
+0: For the protocols to work correctly all other heap methods must be 
+0: prepared for a record or a page to "disappear" if they don't hold a latch and/or
+0: a lock.  An example of the problem case is a scan which does not hold locks
+0: on it's current position (group scan works this way), which is positioned
+0: on a row deleted by another xact, it must be prepared to continue the 
+0: scan after getting an error if the current page/row disapppears.
+0: 
+0: **/
+0: 
+0: class HeapPostCommit implements Serviceable
+0: {
+0: 	/**
+0: 		IBM Copyright &copy notice.
+0: 	*/
+0: 	public static final String copyrightNotice = org.apache.derby.iapi.reference.Copyright.SHORT_1997_2004;
+0:     /**************************************************************************
+0:      * Fields of the class
+0:      **************************************************************************
+0:      */
+0: 
+0:     private AccessFactory access_factory  = null;
+0:     private Heap          heap            = null;
+0:     private long          page_number     = ContainerHandle.INVALID_PAGE_NUMBER;
+0: 
+0: 
+0:     /**************************************************************************
+0:      * Constructors for This class:
+0:      **************************************************************************
+0:      */
+0:     HeapPostCommit(
+0:     AccessFactory   access_factory,
+0:     Heap            heap,
+0:     long            input_page_number)
+0:     {
+0:         this.access_factory = access_factory; 
+0:         this.heap           = heap; 
+0:         this.page_number    = input_page_number; 
+0:     }
+0: 
+0:     /**************************************************************************
+0:      * Private/Protected methods of This class:
+0:      **************************************************************************
+0:      */
+0: 
+0:     /**
+0:      * Reclaim space taken up by committed deleted rows.
+0:      * <p>
+0:      * This routine assumes it has been called by an internal transaction which
+0:      * has performed no work so far, and that it has an exclusive intent table 
+0:      * lock.  It will attempt obtain exclusive row locks on deleted rows, where
+0:      * successful those rows can be reclaimed as they must be "committed 
+0:      * deleted" rows.
+0:      * <p>
+0:      * This routine will latch the page and hold the latch due to interface
+0:      * requirement from Page.purgeAtSlot.
+0:      *
+0:      * @param open_btree The btree already opened.
+0:      * @param pageno The page number of the page to look for committed deletes.
+0:      *
+0:      * @see Page#purgeAtSlot
+0:      * @exception  StandardException  Standard exception policy.
+0:      **/
+0:     private final void purgeCommittedDeletes(
+0:     HeapController      heap_control,
+0:     long                pageno)
+0:         throws StandardException
+0:     {
+0:         // The following can fail either if it can't get the latch or
+0:         // somehow the page requested no longer exists. 
+0: 	
+0: 	//resolve - what will happen if the user page doesnt exist  
+0: 
+0:         // wait to get the latch on the page 
+0:         Page page = heap_control.getUserPageWait(pageno);
+0:         boolean purgingDone = false;
+0: 
+0:         if (page != null)
+0:         {
+0:             try
+0:             {
+0:                 // The number records that can be reclaimed is:
+0:                 // total recs - recs_not_deleted
+0:                 int num_possible_commit_delete = 
+0:                     page.recordCount() - page.nonDeletedRecordCount();
+0: 
+0:                 if (num_possible_commit_delete > 0)
+0:                 {
+0:                     // loop backward so that purges which affect the slot table 
+0:                     // don't affect the loop (ie. they only move records we 
+0:                     // have already looked at).
+0:                     for (int slot_no = page.recordCount() - 1; 
+0:                          slot_no >= 0; 
+0:                          slot_no--) 
+0:                     {
+0:                         boolean row_is_committed_delete = 
+0:                             page.isDeletedAtSlot(slot_no);
+0: 
+0:                         if (row_is_committed_delete)
+0:                         {
+0:                             // At this point we only know that the row is
+0:                             // deleted, not whether it is committed.
+0: 
+0:                             // see if we can purge the row, by getting an
+0:                             // exclusive lock on the row.  If it is marked
+0:                             // deleted and we can get this lock, then it
+0:                             // must be a committed delete and we can purge 
+0:                             // it.
+0: 
+0:                             RecordHandle rh =
+0:                                 page.fetchFromSlot(
+0:                                     (RecordHandle) null,
+0:                                     slot_no,
+0:                                     RowUtil.EMPTY_ROW,
+0:                                     RowUtil.EMPTY_ROW_FETCH_DESCRIPTOR,
+0:                                     true);
+0: 
+0:                             row_is_committed_delete =
+0:                                 heap_control.lockRowAtSlotNoWaitExclusive(rh);
+0: 
+0:                             if (row_is_committed_delete)
+0:                             {
+0:                                 purgingDone = true;
+0: 
+0:                                 page.purgeAtSlot(slot_no, 1, false);
+0: 
+0:                                 if (SanityManager.DEBUG)
+0:                                 {
+0:                                     if (SanityManager.DEBUG_ON(
+0:                                             "verbose_heap_post_commit"))
+0:                                     {
+0:                                         SanityManager.DEBUG_PRINT(
+0:                                             "HeapPostCommit", 
+0:                                             "Purging row[" + slot_no + "]" + 
+0:                                             "on page:" + pageno + ".\n");
+0:                                     }
+0:                                 }
+0:                             }
+0:                         }
+0:                     }
+0:                 }
+0:                 if (page.recordCount() == 0)
+0:                 {
+0:                     purgingDone = true;
+0: 
+0:                     // Deallocate the current page with 0 rows on it.
+0:                     heap_control.removePage(page);
+0: 
+0:                     // removePage guarantees to unlatch the page even if an
+0:                     // exception is thrown. The page is protected against reuse
+0:                     // because removePage locks it with a dealloc lock, so it
+0:                     // is OK to release the latch even after a purgeAtSlot is
+0:                     // called.
+0:                     // @see ContainerHandle#removePage
+0: 
+0:                     if (SanityManager.DEBUG)
+0:                     {
+0:                         if (SanityManager.DEBUG_ON("verbose_heap_post_commit"))
+0:                         {
+0:                             SanityManager.DEBUG_PRINT(
+0:                                 "HeapPostCommit", 
+0:                                 "Calling Heap removePage().; pagenumber="+pageno+"\n");
+0:                         }
+0:                     }
+0:                 }
+0:             }
+0:             finally
+0:             {
+0:                 // If no purge happened on the page and the page is not
+0:                 // removed, feel free to unlatch it.  Otherwise, let
+0:                 // transaction commit take care of it.
+0: 				if (!purgingDone)
+0:                 {
+0:                     page.unlatch();
+0:                     page = null;
+0:                 }
+0:             }
+0:         }
+0:         else
+0:         {
+0:             if (SanityManager.DEBUG)
+0:             {
+0:                 if (SanityManager.DEBUG_ON("verbose_heap_post_commit"))
+0:                 {
+0:                     SanityManager.DEBUG_PRINT(
+0:                         "HeapPostCommit", 
+0:                         "Get No Wait returned null. page num = " + 
+0:                         pageno + "\n");
+0: 
+0:                     SanityManager.showTrace(new Throwable());
+0:                 }
+0:             }
+0:         }
+0:         return;
+0:     }
+0: 
+0:     /**************************************************************************
+0:      * Public Methods implementing the Serviceable interface:
+0:      **************************************************************************
+0:      */
+0: 
+0:     /**
+0:      * The urgency of this post commit work.
+0:      * <p>
+0:      * This determines where this Serviceable is put in the post commit 
+0:      * queue.  Post commit work in the heap can be safely delayed until there
+0:      * is not user work to do.
+0:      *
+0:      * @return false, this work should not be serviced ASAP
+0:      **/
+0:     public boolean serviceASAP()
+0:     {
+0:         return(true);
+0:     }
+0: 
+0: 	// @return true, if this work needs to be done on a user thread immediately
+0: 	public boolean serviceImmediately()
+0: 	{
+0: 		return false;
+0: 	}	
+0: 
+0: 
+0:     /**
+0:      * perform the work described in the postcommit work.
+0:      * <p>
+0:      * In this implementation the only work that can be executed by this
+0:      * post commit processor is this class itself.
+0:      * <p>
+0:      *
+0:      * @return Returns Serviceable.DONE when work has completed, or
+0:      *         returns Serviceable.REQUEUE if work needs to be requeued.
+0:      *
+0:      * @param contextMgr the context manager started by the post commit daemon
+0:      *
+0:      * @exception  StandardException  Standard exception policy.
+0:      **/
+0:     public int performWork(ContextManager contextMgr)
+0:         throws StandardException
+0:     {
+0:         TransactionManager  tc             = (TransactionManager)
+0:             this.access_factory.getAndNameTransaction(
+0:                 contextMgr, AccessFactoryGlobals.SYS_TRANS_NAME);
+0: 
+0:         TransactionManager  internal_xact  = tc.getInternalTransaction();
+0: 
+0:         // only requeue if work was not completed in this try.
+0:         boolean             requeue_work = false;
+0: 
+0:         HeapController      heapcontroller;
+0: 
+0:         if (SanityManager.DEBUG)
+0:         {
+0:             if (SanityManager.DEBUG_ON("verbose_heap_post_commit"))
+0:                 SanityManager.DEBUG_PRINT(
+0:                     "HeapPostCommit", "starting internal xact\n");
+0:         }
+0: 
+0:         try
+0:         {
+0:             // This call will attempt to open the heap table locked with 
+0:             // table level IX mode, preparing to do record level locked space 
+0:             // reclamation.  
+0:             //
+0:             // The call will either succeed immediately, or throw an exception
+0:             // which could mean the container does not exist or that the lock
+0:             // could not be granted immediately. 
+0: 
+0: 			//Reversed the fix for 4255:
+0: 			//page reclaimation is done asynchronosly by raswstore daemon
+0: 			//not good to WAIT FOR LOCKS , as it can freeze the daemon
+0: 			//If we can not get the lock this reclamation request will 
+0: 			//requeued.
+0: 
+0:             heapcontroller = (HeapController)
+0:                 heap.open(
+0:                     internal_xact,
+0:                     internal_xact.getRawStoreXact(),
+0:                     false,
+0:                     ContainerHandle.MODE_FORUPDATE |
+0:                     ContainerHandle.MODE_LOCK_NOWAIT,
+0:                     TransactionController.MODE_RECORD,
+0:                     internal_xact.getRawStoreXact().newLockingPolicy(
+0:                         LockingPolicy.MODE_RECORD,
+0:                         TransactionController.ISOLATION_REPEATABLE_READ, true),
+0:                     heap,
+0:                     (DynamicCompiledOpenConglomInfo) null);
+0: 
+0:             // We got a table intent lock, all deleted rows we encounter can
+0:             // be reclaimed, once an "X" row lock is obtained on them.
+0: 
+0:             // Process all the rows on the page while holding the latch.
+0:             purgeCommittedDeletes(heapcontroller, this.page_number);
+0: 
+0:         }
+0:         catch (StandardException se)
+0:         {
+0:             // exception might have occured either container got dropper or lock not granted.
+0:             // It is possible by the time this post commit work gets scheduled 
+0:             // that the container has been dropped and that the open container 
+0:             // call will return null - in this case just return assuming no 
+0:             // work to be done.
+0: 
+0: 			//If this expcetion is because lock could not be obtained , work is requeued.
+0: 			if (se.getMessageId().equals(SQLState.LOCK_TIMEOUT) || 
+0: 				se.getMessageId().equals(SQLState.DEADLOCK))
+0: 			{
+0: 				requeue_work = true;
+0: 			}
+0: 
+0:             // Do not close the controller because that will unlatch the
+0:             // page.  Let the commit and destroy do release the latch and
+0:             // close the controller.
+0:             // heapcontroller.close();
+0:         }
+0:             
+0:         // It is ok to not sync this post work.  If no subsequent log record
+0:         // is sync'd to disk then it is ok that this transaction not make
+0:         // it to the database.  If any subsequent transaction is sync'd to
+0:         // the log file, then this transaction will be sync'd as part of that
+0:         // work.
+0: 
+0:         internal_xact.commitNoSync(Transaction.RELEASE_LOCKS);
+0:         internal_xact.destroy();
+0: 
+0: 
+0:         if (SanityManager.DEBUG)
+0:         {
+0:             if (SanityManager.DEBUG_ON("verbose_heap_post_commit"))
+0:             {
+0:                 if (requeue_work)
+0:                     SanityManager.DEBUG_PRINT(
+0:                         "HeapPostCommit", 
+0:                         "requeueing on page num = " + page_number);
+0:             }
+0:         }
+0: 
+0:         return(requeue_work ? Serviceable.REQUEUE : Serviceable.DONE);
+0:     }
+0: }
+0: 
+============================================================================

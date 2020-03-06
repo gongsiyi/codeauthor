@@ -1,0 +1,3452 @@
+3:456a2ba: /**
+1:456a2ba:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:456a2ba:  * contributor license agreements.  See the NOTICE file distributed with
+1:456a2ba:  * this work for additional information regarding copyright ownership.
+1:456a2ba:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:456a2ba:  * (the "License"); you may not use this file except in compliance with
+1:456a2ba:  * the License.  You may obtain a copy of the License at
+7:456a2ba:  *
+1:456a2ba:  *      http://www.apache.org/licenses/LICENSE-2.0
+1:456a2ba:  *
+1:456a2ba:  * Unless required by applicable law or agreed to in writing, software
+1:456a2ba:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:456a2ba:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:456a2ba:  * See the License for the specific language governing permissions and
+1:456a2ba:  * limitations under the License.
+3:456a2ba:  */
+1:1aab71b: package org.apache.activemq.store.kahadb.disk.page;
+1:456a2ba: 
+1:456a2ba: import java.io.ByteArrayInputStream;
+1:456a2ba: import java.io.ByteArrayOutputStream;
+1:456a2ba: import java.io.DataInputStream;
+1:456a2ba: import java.io.DataOutputStream;
+1:456a2ba: import java.io.File;
+1:456a2ba: import java.io.FileInputStream;
+1:456a2ba: import java.io.FileOutputStream;
+1:456a2ba: import java.io.IOException;
+1:456a2ba: import java.io.InterruptedIOException;
+1:456a2ba: import java.io.RandomAccessFile;
+1:456a2ba: import java.util.ArrayList;
+1:456a2ba: import java.util.Arrays;
+1:456a2ba: import java.util.Collection;
+1:aa3ab12: import java.util.Collections;
+1:456a2ba: import java.util.Iterator;
+1:456a2ba: import java.util.LinkedHashMap;
+1:456a2ba: import java.util.Map;
+1:456a2ba: import java.util.Map.Entry;
+1:456a2ba: import java.util.Properties;
+1:456a2ba: import java.util.TreeMap;
+1:456a2ba: import java.util.concurrent.CountDownLatch;
+1:456a2ba: import java.util.concurrent.atomic.AtomicBoolean;
+1:456a2ba: import java.util.concurrent.atomic.AtomicLong;
+1:456a2ba: import java.util.zip.Adler32;
+1:456a2ba: import java.util.zip.Checksum;
+1:456a2ba: 
+1:1aab71b: import org.apache.activemq.store.kahadb.disk.util.Sequence;
+1:1aab71b: import org.apache.activemq.store.kahadb.disk.util.SequenceSet;
+1:ef619b6: import org.apache.activemq.util.DataByteArrayOutputStream;
+1:ef619b6: import org.apache.activemq.util.IOExceptionSupport;
+1:ef619b6: import org.apache.activemq.util.IOHelper;
+1:ef619b6: import org.apache.activemq.util.IntrospectionSupport;
+1:ef619b6: import org.apache.activemq.util.LFUCache;
+1:ef619b6: import org.apache.activemq.util.LRUCache;
+1:ef619b6: import org.apache.activemq.util.RecoverableRandomAccessFile;
+1:aa3ab12: import org.slf4j.Logger;
+1:aa3ab12: import org.slf4j.LoggerFactory;
+1:456a2ba: 
+1:456a2ba: /**
+1:456a2ba:  * A PageFile provides you random access to fixed sized disk pages. This object is not thread safe and therefore access to it should
+1:456a2ba:  * be externally synchronized.
+1:aa3ab12:  * <p/>
+1:456a2ba:  * The file has 3 parts:
+1:456a2ba:  * Metadata Space: 4k : Reserved metadata area. Used to store persistent config about the file.
+1:456a2ba:  * Recovery Buffer Space: Page Size * 1000 : This is a redo log used to prevent partial page writes from making the file inconsistent
+1:456a2ba:  * Page Space: The pages in the page file.
+1:456a2ba:  */
+1:456a2ba: public class PageFile {
+1:456a2ba: 
+1:456a2ba:     private static final String PAGEFILE_SUFFIX = ".data";
+1:456a2ba:     private static final String RECOVERY_FILE_SUFFIX = ".redo";
+1:456a2ba:     private static final String FREE_FILE_SUFFIX = ".free";
+1:456a2ba: 
+1:456a2ba:     // 4k Default page size.
+1:cdba931:     public static final int DEFAULT_PAGE_SIZE = Integer.getInteger("defaultPageSize", 1024*4);
+1:cdba931:     public static final int DEFAULT_WRITE_BATCH_SIZE = Integer.getInteger("defaultWriteBatchSize", 1000);
+1:cdba931:     public static final int DEFAULT_PAGE_CACHE_SIZE = Integer.getInteger("defaultPageCacheSize", 100);;
+1:456a2ba: 
+1:aa3ab12:     private static final int RECOVERY_FILE_HEADER_SIZE = 1024 * 4;
+1:aa3ab12:     private static final int PAGE_FILE_HEADER_SIZE = 1024 * 4;
+1:cdba931: 
+1:456a2ba:     // Recovery header is (long offset)
+1:8bf987b:     private static final Logger LOG = LoggerFactory.getLogger(PageFile.class);
+1:456a2ba: 
+1:456a2ba:     // A PageFile will use a couple of files in this directory
+1:ef619b6:     private final File directory;
+1:456a2ba:     // And the file names in that directory will be based on this name.
+1:456a2ba:     private final String name;
+1:456a2ba: 
+1:456a2ba:     // File handle used for reading pages..
+1:582af3e:     private RecoverableRandomAccessFile readFile;
+1:456a2ba:     // File handle used for writing pages..
+1:582af3e:     private RecoverableRandomAccessFile writeFile;
+1:456a2ba:     // File handle used for writing pages..
+1:582af3e:     private RecoverableRandomAccessFile recoveryFile;
+1:456a2ba: 
+1:456a2ba:     // The size of pages
+1:456a2ba:     private int pageSize = DEFAULT_PAGE_SIZE;
+1:456a2ba: 
+1:456a2ba:     // The minimum number of space allocated to the recovery file in number of pages.
+1:456a2ba:     private int recoveryFileMinPageCount = 1000;
+1:456a2ba:     // The max size that we let the recovery file grow to.. ma exceed the max, but the file will get resize
+1:456a2ba:     // to this max size as soon as  possible.
+1:456a2ba:     private int recoveryFileMaxPageCount = 10000;
+1:456a2ba:     // The number of pages in the current recovery buffer
+1:456a2ba:     private int recoveryPageCount;
+1:456a2ba: 
+1:ef619b6:     private final AtomicBoolean loaded = new AtomicBoolean();
+1:19c4316:     // The number of pages we are aiming to write every time we
+1:19c4316:     // write to disk.
+1:deea2d1:     int writeBatchSize = DEFAULT_WRITE_BATCH_SIZE;
+1:456a2ba: 
+1:456a2ba:     // We keep a cache of pages recently used?
+1:d6ad7c7:     private Map<Long, Page> pageCache;
+1:456a2ba:     // The cache of recently used pages.
+1:aa3ab12:     private boolean enablePageCaching = true;
+1:456a2ba:     // How many pages will we keep in the cache?
+1:2b10259:     private int pageCacheSize = DEFAULT_PAGE_CACHE_SIZE;
+1:456a2ba: 
+1:456a2ba:     // Should first log the page write to the recovery buffer? Avoids partial
+1:456a2ba:     // page write failures..
+1:aa3ab12:     private boolean enableRecoveryFile = true;
+1:456a2ba:     // Will we sync writes to disk. Ensures that data will not be lost after a checkpoint()
+1:aa3ab12:     private boolean enableDiskSyncs = true;
+1:456a2ba:     // Will writes be done in an async thread?
+1:aa3ab12:     private boolean enabledWriteThread = false;
+1:456a2ba: 
+1:456a2ba:     // These are used if enableAsyncWrites==true
+1:ef619b6:     private final AtomicBoolean stopWriter = new AtomicBoolean();
+1:456a2ba:     private Thread writerThread;
+1:456a2ba:     private CountDownLatch checkpointLatch;
+1:456a2ba: 
+1:456a2ba:     // Keeps track of writes that are being written to disk.
+1:ef619b6:     private final TreeMap<Long, PageWrite> writes = new TreeMap<Long, PageWrite>();
+1:456a2ba: 
+1:456a2ba:     // Keeps track of free pages.
+1:456a2ba:     private final AtomicLong nextFreePageId = new AtomicLong();
+1:456a2ba:     private SequenceSet freeList = new SequenceSet();
+1:456a2ba: 
+1:ef619b6:     private final AtomicLong nextTxid = new AtomicLong();
+1:456a2ba: 
+1:456a2ba:     // Persistent settings stored in the page file.
+1:456a2ba:     private MetaData metaData;
+1:456a2ba: 
+1:ef619b6:     private final ArrayList<File> tmpFilesForRemoval = new ArrayList<File>();
+1:cdba931: 
+1:aa3ab12:     private boolean useLFRUEviction = false;
+1:aa3ab12:     private float LFUEvictionFactor = 0.2f;
+1:cdba931: 
+1:456a2ba:     /**
+1:456a2ba:      * Use to keep track of updated pages which have not yet been committed.
+1:456a2ba:      */
+1:456a2ba:     static class PageWrite {
+1:456a2ba:         Page page;
+1:456a2ba:         byte[] current;
+1:456a2ba:         byte[] diskBound;
+1:d1e7d69:         long currentLocation = -1;
+1:d1e7d69:         long diskBoundLocation = -1;
+1:40ae055:         File tmpFile;
+1:40ae055:         int length;
+1:456a2ba: 
+1:456a2ba:         public PageWrite(Page page, byte[] data) {
+1:aa3ab12:             this.page = page;
+1:aa3ab12:             current = data;
+1:456a2ba:         }
+1:b39ab78: 
+1:d1e7d69:         public PageWrite(Page page, long currentLocation, int length, File tmpFile) {
+1:40ae055:             this.page = page;
+1:40ae055:             this.currentLocation = currentLocation;
+1:40ae055:             this.tmpFile = tmpFile;
+1:40ae055:             this.length = length;
+1:b39ab78:         }
+1:19c4316: 
+1:456a2ba:         public void setCurrent(Page page, byte[] data) {
+1:aa3ab12:             this.page = page;
+1:aa3ab12:             current = data;
+2:aa3ab12:             currentLocation = -1;
+1:40ae055:             diskBoundLocation = -1;
+1:19c4316:         }
+1:456a2ba: 
+1:d1e7d69:         public void setCurrentLocation(Page page, long location, int length) {
+1:40ae055:             this.page = page;
+1:40ae055:             this.currentLocation = location;
+1:40ae055:             this.length = length;
+1:40ae055:             this.current = null;
+1:456a2ba:         }
+1:456a2ba: 
+1:ef619b6:         @Override
+1:456a2ba:         public String toString() {
+1:aa3ab12:             return "[PageWrite:" + page.getPageId() + "-" + page.getType() + "]";
+1:456a2ba:         }
+1:456a2ba: 
+1:456a2ba:         @SuppressWarnings("unchecked")
+1:456a2ba:         public Page getPage() {
+1:456a2ba:             return page;
+1:456a2ba:         }
+1:456a2ba: 
+1:40ae055:         public byte[] getDiskBound() throws IOException {
+1:40ae055:             if (diskBound == null && diskBoundLocation != -1) {
+1:40ae055:                 diskBound = new byte[length];
+1:12b26b6:                 try(RandomAccessFile file = new RandomAccessFile(tmpFile, "r")) {
+1:12b26b6:                     file.seek(diskBoundLocation);
+1:12b26b6:                     file.read(diskBound);
+1:12b26b6:                 }
+1:40ae055:                 diskBoundLocation = -1;
+1:aa3ab12:             }
+1:40ae055:             return diskBound;
+1:aa3ab12:         }
+1:2b10259: 
+1:456a2ba:         void begin() {
+1:aa3ab12:             if (currentLocation != -1) {
+1:aa3ab12:                 diskBoundLocation = currentLocation;
+1:aa3ab12:             } else {
+1:456a2ba:                 diskBound = current;
+1:aa3ab12:             }
+1:456a2ba:             current = null;
+1:cdba931:             currentLocation = -1;
+1:456a2ba:         }
+1:456a2ba: 
+1:456a2ba:         /**
+1:456a2ba:          * @return true if there is no pending writes to do.
+1:456a2ba:          */
+1:456a2ba:         boolean done() {
+1:40ae055:             diskBoundLocation = -1;
+1:aa3ab12:             diskBound = null;
+1:40ae055:             return current == null || currentLocation == -1;
+1:456a2ba:         }
+1:456a2ba: 
+1:5cf4d83:         boolean isDone() {
+1:40ae055:             return diskBound == null && diskBoundLocation == -1 && current == null && currentLocation == -1;
+1:456a2ba:         }
+1:aa3ab12:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * The MetaData object hold the persistent data associated with a PageFile object.
+1:456a2ba:      */
+1:456a2ba:     public static class MetaData {
+1:456a2ba: 
+1:456a2ba:         String fileType;
+1:456a2ba:         String fileTypeVersion;
+1:456a2ba: 
+1:aa3ab12:         long metaDataTxId = -1;
+1:456a2ba:         int pageSize;
+1:456a2ba:         boolean cleanShutdown;
+1:456a2ba:         long lastTxId;
+1:456a2ba:         long freePages;
+1:456a2ba: 
+1:456a2ba:         public String getFileType() {
+1:456a2ba:             return fileType;
+1:456a2ba:         }
+1:2b10259: 
+1:456a2ba:         public void setFileType(String fileType) {
+1:456a2ba:             this.fileType = fileType;
+1:456a2ba:         }
+1:e11ece1: 
+1:456a2ba:         public String getFileTypeVersion() {
+1:456a2ba:             return fileTypeVersion;
+1:456a2ba:         }
+1:aa3ab12: 
+1:456a2ba:         public void setFileTypeVersion(String version) {
+1:456a2ba:             this.fileTypeVersion = version;
+1:456a2ba:         }
+1:aa3ab12: 
+1:456a2ba:         public long getMetaDataTxId() {
+1:456a2ba:             return metaDataTxId;
+1:456a2ba:         }
+1:aa3ab12: 
+1:456a2ba:         public void setMetaDataTxId(long metaDataTxId) {
+1:456a2ba:             this.metaDataTxId = metaDataTxId;
+1:456a2ba:         }
+1:aa3ab12: 
+1:456a2ba:         public int getPageSize() {
+1:456a2ba:             return pageSize;
+1:456a2ba:         }
+1:aa3ab12: 
+1:456a2ba:         public void setPageSize(int pageSize) {
+1:456a2ba:             this.pageSize = pageSize;
+1:456a2ba:         }
+1:aa3ab12: 
+1:456a2ba:         public boolean isCleanShutdown() {
+1:456a2ba:             return cleanShutdown;
+1:456a2ba:         }
+1:aa3ab12: 
+1:456a2ba:         public void setCleanShutdown(boolean cleanShutdown) {
+1:456a2ba:             this.cleanShutdown = cleanShutdown;
+1:456a2ba:         }
+1:aa3ab12: 
+1:456a2ba:         public long getLastTxId() {
+1:456a2ba:             return lastTxId;
+1:456a2ba:         }
+1:456a2ba: 
+1:456a2ba:         public void setLastTxId(long lastTxId) {
+1:456a2ba:             this.lastTxId = lastTxId;
+1:456a2ba:         }
+1:456a2ba: 
+1:456a2ba:         public long getFreePages() {
+1:456a2ba:             return freePages;
+1:456a2ba:         }
+1:456a2ba: 
+1:456a2ba:         public void setFreePages(long value) {
+1:456a2ba:             this.freePages = value;
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public Transaction tx() {
+1:456a2ba:         assertLoaded();
+1:456a2ba:         return new Transaction(this);
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * Creates a PageFile in the specified directory who's data files are named by name.
+1:456a2ba:      */
+1:456a2ba:     public PageFile(File directory, String name) {
+1:456a2ba:         this.directory = directory;
+1:456a2ba:         this.name = name;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * Deletes the files used by the PageFile object.  This method can only be used when this object is not loaded.
+1:0bbc0ac:      *
+1:aa3ab12:      * @throws IOException           if the files cannot be deleted.
+1:aa3ab12:      * @throws IllegalStateException if this PageFile is loaded
+1:456a2ba:      */
+1:456a2ba:     public void delete() throws IOException {
+1:aa3ab12:         if (loaded.get()) {
+1:456a2ba:             throw new IllegalStateException("Cannot delete page file data when the page file is loaded");
+1:456a2ba:         }
+1:456a2ba:         delete(getMainPageFile());
+1:456a2ba:         delete(getFreeFile());
+1:456a2ba:         delete(getRecoveryFile());
+1:456a2ba:     }
+1:456a2ba: 
+1:5f7fc14:     public void archive() throws IOException {
+1:aa3ab12:         if (loaded.get()) {
+1:5f7fc14:             throw new IllegalStateException("Cannot delete page file data when the page file is loaded");
+1:456a2ba:         }
+1:5f7fc14:         long timestamp = System.currentTimeMillis();
+1:5f7fc14:         archive(getMainPageFile(), String.valueOf(timestamp));
+1:5f7fc14:         archive(getFreeFile(), String.valueOf(timestamp));
+1:5f7fc14:         archive(getRecoveryFile(), String.valueOf(timestamp));
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * @param file
+8:456a2ba:      * @throws IOException
+1:456a2ba:      */
+1:456a2ba:     private void delete(File file) throws IOException {
+1:cdba931:         if (file.exists() && !file.delete()) {
+1:cdba931:             throw new IOException("Could not delete: " + file.getPath());
+1:456a2ba:         }
+1:e11ece1:     }
+1:456a2ba: 
+1:5f7fc14:     private void archive(File file, String suffix) throws IOException {
+2:aa3ab12:         if (file.exists()) {
+1:5f7fc14:             File archive = new File(file.getPath() + "-" + suffix);
+1:aa3ab12:             if (!file.renameTo(archive)) {
+1:5f7fc14:                 throw new IOException("Could not archive: " + file.getPath() + " to " + file.getPath());
+1:aa3ab12:             }
+5:aa3ab12:         }
+1:aa3ab12:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * Loads the page file so that it can be accessed for read/write purposes.  This allocates OS resources.  If this is the
+1:456a2ba:      * first time the page file is loaded, then this creates the page file in the file system.
+1:456a2ba:      *
+1:aa3ab12:      * @throws IOException           If the page file cannot be loaded. This could be cause the existing page file is corrupt is a bad version or if
+1:aa3ab12:      *                               there was a disk error.
+1:aa3ab12:      * @throws IllegalStateException If the page file was already loaded.
+1:456a2ba:      */
+1:456a2ba:     public void load() throws IOException, IllegalStateException {
+1:456a2ba:         if (loaded.compareAndSet(false, true)) {
+1:456a2ba: 
+1:aa3ab12:             if (enablePageCaching) {
+1:aa3ab12:                 if (isUseLFRUEviction()) {
+1:aa3ab12:                     pageCache = Collections.synchronizedMap(new LFUCache<Long, Page>(pageCacheSize, getLFUEvictionFactor()));
+1:aa3ab12:                 } else {
+1:aa3ab12:                     pageCache = Collections.synchronizedMap(new LRUCache<Long, Page>(pageCacheSize, pageCacheSize, 0.75f, true));
+1:456a2ba:                 }
+1:456a2ba:             }
+1:456a2ba: 
+1:456a2ba:             File file = getMainPageFile();
+1:456a2ba:             IOHelper.mkdirs(file.getParentFile());
+1:42bf6e9:             writeFile = new RecoverableRandomAccessFile(file, "rw", false);
+1:582af3e:             readFile = new RecoverableRandomAccessFile(file, "r");
+1:456a2ba: 
+1:456a2ba:             if (readFile.length() > 0) {
+1:456a2ba:                 // Load the page size setting cause that can't change once the file is created.
+1:456a2ba:                 loadMetaData();
+1:456a2ba:                 pageSize = metaData.getPageSize();
+1:456a2ba:             } else {
+1:456a2ba:                 // Store the page size setting cause that can't change once the file is created.
+1:456a2ba:                 metaData = new MetaData();
+1:456a2ba:                 metaData.setFileType(PageFile.class.getName());
+1:456a2ba:                 metaData.setFileTypeVersion("1");
+1:456a2ba:                 metaData.setPageSize(getPageSize());
+1:456a2ba:                 metaData.setCleanShutdown(true);
+1:456a2ba:                 metaData.setFreePages(-1);
+1:456a2ba:                 metaData.setLastTxId(0);
+1:456a2ba:                 storeMetaData();
+1:456a2ba:             }
+1:456a2ba: 
+1:bb4a2f7:             if (enableRecoveryFile) {
+1:582af3e:                 recoveryFile = new RecoverableRandomAccessFile(getRecoveryFile(), "rw");
+1:456a2ba:             }
+1:456a2ba: 
+1:38d85be:             boolean needsFreePageRecovery = false;
+1:38d85be: 
+1:aa3ab12:             if (metaData.isCleanShutdown()) {
+1:aa3ab12:                 nextTxid.set(metaData.getLastTxId() + 1);
+1:aa3ab12:                 if (metaData.getFreePages() > 0) {
+1:456a2ba:                     loadFreeList();
+1:456a2ba:                 }
+1:456a2ba:             } else {
+1:c94b407:                 LOG.debug(toString() + ", Recovering page file...");
+1:456a2ba:                 nextTxid.set(redoRecoveryUpdates());
+1:38d85be:                 needsFreePageRecovery = true;
+1:38d85be:             }
+1:456a2ba: 
+1:38d85be:             if (writeFile.length() < PAGE_FILE_HEADER_SIZE) {
+1:38d85be:                 writeFile.setLength(PAGE_FILE_HEADER_SIZE);
+1:38d85be:             }
+1:38d85be:             nextFreePageId.set((writeFile.length() - PAGE_FILE_HEADER_SIZE) / pageSize);
+1:38d85be: 
+1:38d85be:             if (needsFreePageRecovery) {
+1:38d85be:                 // Scan all to find the free pages after nextFreePageId is set
+1:456a2ba:                 freeList = new SequenceSet();
+1:cdba931:                 for (Iterator<Page> i = tx().iterator(true); i.hasNext(); ) {
+1:cdba931:                     Page page = i.next();
+1:aa3ab12:                     if (page.getType() == Page.PAGE_FREE_TYPE) {
+1:456a2ba:                         freeList.add(page.getPageId());
+1:456a2ba:                     }
+1:456a2ba:                 }
+1:456a2ba:             }
+1:456a2ba: 
+1:456a2ba:             metaData.setCleanShutdown(false);
+1:456a2ba:             storeMetaData();
+1:456a2ba:             getFreeFile().delete();
+1:456a2ba:             startWriter();
+1:456a2ba:         } else {
+1:cdba931:             throw new IllegalStateException("Cannot load the page file when it is already loaded.");
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * Unloads a previously loaded PageFile.  This deallocates OS related resources like file handles.
+1:456a2ba:      * once unloaded, you can no longer use the page file to read or write Pages.
+1:456a2ba:      *
+1:aa3ab12:      * @throws IOException           if there was a disk error occurred while closing the down the page file.
+1:aa3ab12:      * @throws IllegalStateException if the PageFile is not loaded
+1:456a2ba:      */
+1:456a2ba:     public void unload() throws IOException {
+1:456a2ba:         if (loaded.compareAndSet(true, false)) {
+1:456a2ba:             flush();
+1:456a2ba:             try {
+1:456a2ba:                 stopWriter();
+1:456a2ba:             } catch (InterruptedException e) {
+2:456a2ba:                 throw new InterruptedIOException();
+1:456a2ba:             }
+1:456a2ba: 
+1:aa3ab12:             if (freeList.isEmpty()) {
+1:456a2ba:                 metaData.setFreePages(0);
+1:456a2ba:             } else {
+1:456a2ba:                 storeFreeList();
+1:456a2ba:                 metaData.setFreePages(freeList.size());
+1:456a2ba:             }
+1:456a2ba: 
+1:aa3ab12:             metaData.setLastTxId(nextTxid.get() - 1);
+1:456a2ba:             metaData.setCleanShutdown(true);
+1:456a2ba:             storeMetaData();
+1:456a2ba: 
+1:456a2ba:             if (readFile != null) {
+1:456a2ba:                 readFile.close();
+1:456a2ba:                 readFile = null;
+1:456a2ba:                 writeFile.close();
+1:aa3ab12:                 writeFile = null;
+1:456a2ba:                 if (enableRecoveryFile) {
+1:456a2ba:                     recoveryFile.close();
+1:aa3ab12:                     recoveryFile = null;
+1:456a2ba:                 }
+1:456a2ba:                 freeList.clear();
+1:aa3ab12:                 if (pageCache != null) {
+1:aa3ab12:                     pageCache = null;
+1:456a2ba:                 }
+1:aa3ab12:                 synchronized (writes) {
+1:456a2ba:                     writes.clear();
+1:456a2ba:                 }
+1:456a2ba:             }
+1:456a2ba:         } else {
+1:456a2ba:             throw new IllegalStateException("Cannot unload the page file when it is not loaded");
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public boolean isLoaded() {
+1:456a2ba:         return loaded.get();
+1:456a2ba:     }
+1:456a2ba: 
+1:c5a8b2c:     public void allowIOResumption() {
+1:c5a8b2c:         loaded.set(true);
+1:c5a8b2c:     }
+1:c5a8b2c: 
+1:456a2ba:     /**
+1:456a2ba:      * Flush and sync all write buffers to disk.
+1:456a2ba:      *
+1:aa3ab12:      * @throws IOException If an disk error occurred.
+1:456a2ba:      */
+1:456a2ba:     public void flush() throws IOException {
+1:456a2ba: 
+1:aa3ab12:         if (enabledWriteThread && stopWriter.get()) {
+1:456a2ba:             throw new IOException("Page file already stopped: checkpointing is not allowed");
+1:456a2ba:         }
+1:456a2ba: 
+1:456a2ba:         // Setup a latch that gets notified when all buffered writes hits the disk.
+1:456a2ba:         CountDownLatch checkpointLatch;
+1:aa3ab12:         synchronized (writes) {
+1:aa3ab12:             if (writes.isEmpty()) {
+1:456a2ba:                 return;
+1:456a2ba:             }
+1:aa3ab12:             if (enabledWriteThread) {
+1:aa3ab12:                 if (this.checkpointLatch == null) {
+1:456a2ba:                     this.checkpointLatch = new CountDownLatch(1);
+1:456a2ba:                 }
+1:456a2ba:                 checkpointLatch = this.checkpointLatch;
+1:456a2ba:                 writes.notify();
+1:456a2ba:             } else {
+1:456a2ba:                 writeBatch();
+1:456a2ba:                 return;
+1:456a2ba:             }
+1:456a2ba:         }
+1:456a2ba:         try {
+1:456a2ba:             checkpointLatch.await();
+1:456a2ba:         } catch (InterruptedException e) {
+1:cdba931:             InterruptedIOException ioe = new InterruptedIOException();
+1:cdba931:             ioe.initCause(e);
+1:cdba931:             throw ioe;
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba: 
+1:456a2ba:     @Override
+1:456a2ba:     public String toString() {
+1:aa3ab12:         return "Page File: " + getMainPageFile();
+1:456a2ba:     }
+1:456a2ba: 
+2:456a2ba:     ///////////////////////////////////////////////////////////////////
+1:456a2ba:     // Private Implementation Methods
+1:456a2ba:     ///////////////////////////////////////////////////////////////////
+1:456a2ba:     private File getMainPageFile() {
+1:aa3ab12:         return new File(directory, IOHelper.toFileSystemSafeName(name) + PAGEFILE_SUFFIX);
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public File getFreeFile() {
+1:aa3ab12:         return new File(directory, IOHelper.toFileSystemSafeName(name) + FREE_FILE_SUFFIX);
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public File getRecoveryFile() {
+1:aa3ab12:         return new File(directory, IOHelper.toFileSystemSafeName(name) + RECOVERY_FILE_SUFFIX);
+1:456a2ba:     }
+1:456a2ba: 
+1:40ae055:     public long toOffset(long pageId) {
+1:aa3ab12:         return PAGE_FILE_HEADER_SIZE + (pageId * pageSize);
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     private void loadMetaData() throws IOException {
+1:456a2ba: 
+1:456a2ba:         ByteArrayInputStream is;
+1:456a2ba:         MetaData v1 = new MetaData();
+1:456a2ba:         MetaData v2 = new MetaData();
+1:456a2ba:         try {
+1:456a2ba:             Properties p = new Properties();
+1:aa3ab12:             byte[] d = new byte[PAGE_FILE_HEADER_SIZE / 2];
+1:456a2ba:             readFile.seek(0);
+1:456a2ba:             readFile.readFully(d);
+1:456a2ba:             is = new ByteArrayInputStream(d);
+1:456a2ba:             p.load(is);
+1:456a2ba:             IntrospectionSupport.setProperties(v1, p);
+1:456a2ba:         } catch (IOException e) {
+1:456a2ba:             v1 = null;
+1:456a2ba:         }
+1:456a2ba: 
+1:456a2ba:         try {
+1:456a2ba:             Properties p = new Properties();
+1:aa3ab12:             byte[] d = new byte[PAGE_FILE_HEADER_SIZE / 2];
+1:aa3ab12:             readFile.seek(PAGE_FILE_HEADER_SIZE / 2);
+1:456a2ba:             readFile.readFully(d);
+1:456a2ba:             is = new ByteArrayInputStream(d);
+1:456a2ba:             p.load(is);
+1:456a2ba:             IntrospectionSupport.setProperties(v2, p);
+1:456a2ba:         } catch (IOException e) {
+1:456a2ba:             v2 = null;
+1:456a2ba:         }
+1:456a2ba: 
+1:aa3ab12:         if (v1 == null && v2 == null) {
+1:456a2ba:             throw new IOException("Could not load page file meta data");
+1:456a2ba:         }
+1:456a2ba: 
+1:aa3ab12:         if (v1 == null || v1.metaDataTxId < 0) {
+1:456a2ba:             metaData = v2;
+1:aa3ab12:         } else if (v2 == null || v1.metaDataTxId < 0) {
+1:456a2ba:             metaData = v1;
+1:aa3ab12:         } else if (v1.metaDataTxId == v2.metaDataTxId) {
+1:456a2ba:             metaData = v1; // use the first since the 2nd could be a partial..
+1:456a2ba:         } else {
+1:456a2ba:             metaData = v2; // use the second cause the first is probably a partial.
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     private void storeMetaData() throws IOException {
+1:456a2ba:         // Convert the metadata into a property format
+1:456a2ba:         metaData.metaDataTxId++;
+1:456a2ba:         Properties p = new Properties();
+1:456a2ba:         IntrospectionSupport.getProperties(metaData, p, null);
+1:456a2ba: 
+1:456a2ba:         ByteArrayOutputStream os = new ByteArrayOutputStream(PAGE_FILE_HEADER_SIZE);
+1:456a2ba:         p.store(os, "");
+1:aa3ab12:         if (os.size() > PAGE_FILE_HEADER_SIZE / 2) {
+1:cdba931:             throw new IOException("Configuation is larger than: " + PAGE_FILE_HEADER_SIZE / 2);
+1:456a2ba:         }
+1:456a2ba:         // Fill the rest with space...
+1:aa3ab12:         byte[] filler = new byte[(PAGE_FILE_HEADER_SIZE / 2) - os.size()];
+1:aa3ab12:         Arrays.fill(filler, (byte) ' ');
+1:456a2ba:         os.write(filler);
+1:456a2ba:         os.flush();
+1:456a2ba: 
+1:456a2ba:         byte[] d = os.toByteArray();
+1:456a2ba: 
+1:456a2ba:         // So we don't loose it.. write it 2 times...
+1:456a2ba:         writeFile.seek(0);
+1:456a2ba:         writeFile.write(d);
+1:ef619b6:         writeFile.sync();
+1:aa3ab12:         writeFile.seek(PAGE_FILE_HEADER_SIZE / 2);
+1:456a2ba:         writeFile.write(d);
+1:ef619b6:         writeFile.sync();
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     private void storeFreeList() throws IOException {
+1:456a2ba:         FileOutputStream os = new FileOutputStream(getFreeFile());
+1:456a2ba:         DataOutputStream dos = new DataOutputStream(os);
+1:456a2ba:         SequenceSet.Marshaller.INSTANCE.writePayload(freeList, dos);
+1:456a2ba:         dos.close();
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     private void loadFreeList() throws IOException {
+1:456a2ba:         freeList.clear();
+1:456a2ba:         FileInputStream is = new FileInputStream(getFreeFile());
+1:456a2ba:         DataInputStream dis = new DataInputStream(is);
+1:456a2ba:         freeList = SequenceSet.Marshaller.INSTANCE.readPayload(dis);
+1:456a2ba:         dis.close();
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     ///////////////////////////////////////////////////////////////////
+1:456a2ba:     // Property Accessors
+1:456a2ba:     ///////////////////////////////////////////////////////////////////
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * Is the recovery buffer used to double buffer page writes.  Enabled by default.
+1:456a2ba:      *
+1:456a2ba:      * @return is the recovery buffer enabled.
+1:456a2ba:      */
+1:456a2ba:     public boolean isEnableRecoveryFile() {
+1:456a2ba:         return enableRecoveryFile;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * Sets if the recovery buffer uses to double buffer page writes.  Enabled by default.  Disabling this
+1:456a2ba:      * may potentially cause partial page writes which can lead to page file corruption.
+1:456a2ba:      */
+1:456a2ba:     public void setEnableRecoveryFile(boolean doubleBuffer) {
+1:c059425:         assertNotLoaded();
+1:456a2ba:         this.enableRecoveryFile = doubleBuffer;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * @return Are page writes synced to disk?
+1:456a2ba:      */
+1:c059425:     public boolean isEnableDiskSyncs() {
+1:c059425:         return enableDiskSyncs;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * Allows you enable syncing writes to disk.
+1:456a2ba:      */
+1:c059425:     public void setEnableDiskSyncs(boolean syncWrites) {
+2:456a2ba:         assertNotLoaded();
+1:c059425:         this.enableDiskSyncs = syncWrites;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * @return the page size
+1:456a2ba:      */
+1:456a2ba:     public int getPageSize() {
+1:456a2ba:         return this.pageSize;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * @return the amount of content data that a page can hold.
+1:456a2ba:      */
+1:456a2ba:     public int getPageContentSize() {
+1:aa3ab12:         return this.pageSize - Page.PAGE_HEADER_SIZE;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * Configures the page size used by the page file.  By default it is 4k.  Once a page file is created on disk,
+1:456a2ba:      * subsequent loads of that file will use the original pageSize.  Once the PageFile is loaded, this setting
+1:456a2ba:      * can no longer be changed.
+1:456a2ba:      *
+1:456a2ba:      * @param pageSize the pageSize to set
+1:aa3ab12:      * @throws IllegalStateException once the page file is loaded.
+1:456a2ba:      */
+1:456a2ba:     public void setPageSize(int pageSize) throws IllegalStateException {
+1:456a2ba:         assertNotLoaded();
+1:456a2ba:         this.pageSize = pageSize;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * @return true if read page caching is enabled
+1:456a2ba:      */
+1:456a2ba:     public boolean isEnablePageCaching() {
+1:456a2ba:         return this.enablePageCaching;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:e11ece1:      * @param enablePageCaching allows you to enable read page caching
+1:456a2ba:      */
+1:456a2ba:     public void setEnablePageCaching(boolean enablePageCaching) {
+1:456a2ba:         assertNotLoaded();
+1:456a2ba:         this.enablePageCaching = enablePageCaching;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * @return the maximum number of pages that will get stored in the read page cache.
+1:456a2ba:      */
+1:456a2ba:     public int getPageCacheSize() {
+1:456a2ba:         return this.pageCacheSize;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:e11ece1:      * @param pageCacheSize Sets the maximum number of pages that will get stored in the read page cache.
+1:456a2ba:      */
+1:456a2ba:     public void setPageCacheSize(int pageCacheSize) {
+1:456a2ba:         assertNotLoaded();
+1:456a2ba:         this.pageCacheSize = pageCacheSize;
+1:456a2ba:     }
+1:456a2ba: 
+1:c059425:     public boolean isEnabledWriteThread() {
+1:c059425:         return enabledWriteThread;
+1:456a2ba:     }
+1:456a2ba: 
+1:c059425:     public void setEnableWriteThread(boolean enableAsyncWrites) {
+1:456a2ba:         assertNotLoaded();
+1:c059425:         this.enabledWriteThread = enableAsyncWrites;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public long getDiskSize() throws IOException {
+1:456a2ba:         return toOffset(nextFreePageId.get());
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * @return the number of pages allocated in the PageFile
+1:456a2ba:      */
+1:456a2ba:     public long getPageCount() {
+1:456a2ba:         return nextFreePageId.get();
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public int getRecoveryFileMinPageCount() {
+1:456a2ba:         return recoveryFileMinPageCount;
+1:456a2ba:     }
+1:456a2ba: 
+1:e11ece1:     public long getFreePageCount() {
+1:e11ece1:         assertLoaded();
+1:2b10259:         return freeList.rangeSize();
+1:bb4a2f7:     }
+1:456a2ba: 
+1:456a2ba:     public void setRecoveryFileMinPageCount(int recoveryFileMinPageCount) {
+1:456a2ba:         assertNotLoaded();
+1:456a2ba:         this.recoveryFileMinPageCount = recoveryFileMinPageCount;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public int getRecoveryFileMaxPageCount() {
+1:456a2ba:         return recoveryFileMaxPageCount;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public void setRecoveryFileMaxPageCount(int recoveryFileMaxPageCount) {
+1:456a2ba:         assertNotLoaded();
+1:456a2ba:         this.recoveryFileMaxPageCount = recoveryFileMaxPageCount;
+1:456a2ba:     }
+1:456a2ba: 
+1:c059425:     public int getWriteBatchSize() {
+1:c059425:         return writeBatchSize;
+1:c059425:     }
+1:c059425: 
+1:c059425:     public void setWriteBatchSize(int writeBatchSize) {
+1:c059425:         this.writeBatchSize = writeBatchSize;
+1:c059425:     }
+1:c059425: 
+1:aa3ab12:     public float getLFUEvictionFactor() {
+1:aa3ab12:         return LFUEvictionFactor;
+1:456a2ba:     }
+1:456a2ba: 
+1:aa3ab12:     public void setLFUEvictionFactor(float LFUEvictionFactor) {
+1:aa3ab12:         this.LFUEvictionFactor = LFUEvictionFactor;
+1:bb4a2f7:     }
+1:456a2ba: 
+1:aa3ab12:     public boolean isUseLFRUEviction() {
+1:aa3ab12:         return useLFRUEviction;
+1:f0af62f:     }
+1:456a2ba: 
+1:aa3ab12:     public void setUseLFRUEviction(boolean useLFRUEviction) {
+1:aa3ab12:         this.useLFRUEviction = useLFRUEviction;
+1:aa3ab12:     }
+1:456a2ba: 
+1:c059425:     ///////////////////////////////////////////////////////////////////
+1:456a2ba:     // Package Protected Methods exposed to Transaction
+1:456a2ba:     ///////////////////////////////////////////////////////////////////
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * @throws IllegalStateException if the page file is not loaded.
+1:456a2ba:      */
+1:456a2ba:     void assertLoaded() throws IllegalStateException {
+1:aa3ab12:         if (!loaded.get()) {
+1:456a2ba:             throw new IllegalStateException("PageFile is not loaded");
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     void assertNotLoaded() throws IllegalStateException {
+1:aa3ab12:         if (loaded.get()) {
+1:456a2ba:             throw new IllegalStateException("PageFile is loaded");
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * Allocates a block of free pages that you can write data to.
+1:456a2ba:      *
+1:456a2ba:      * @param count the number of sequential pages to allocate
+1:456a2ba:      * @return the first page of the sequential set.
+1:aa3ab12:      * @throws IOException           If an disk error occurred.
+1:aa3ab12:      * @throws IllegalStateException if the PageFile is not loaded
+1:456a2ba:      */
+1:456a2ba:     <T> Page<T> allocate(int count) throws IOException {
+1:456a2ba:         assertLoaded();
+1:456a2ba:         if (count <= 0) {
+1:456a2ba:             throw new IllegalArgumentException("The allocation count must be larger than zero");
+1:456a2ba:         }
+1:456a2ba: 
+1:456a2ba:         Sequence seq = freeList.removeFirstSequence(count);
+1:456a2ba: 
+1:456a2ba:         // We may need to create new free pages...
+1:456a2ba:         if (seq == null) {
+1:456a2ba: 
+1:456a2ba:             Page<T> first = null;
+1:456a2ba:             int c = count;
+1:456a2ba: 
+1:cdba931:             // Perform the id's only once....
+1:cdba931:             long pageId = nextFreePageId.getAndAdd(count);
+1:cdba931:             long writeTxnId = nextTxid.getAndAdd(count);
+1:456a2ba: 
+1:cdba931:             while (c-- > 0) {
+1:cdba931:                 Page<T> page = new Page<T>(pageId++);
+1:cdba931:                 page.makeFree(writeTxnId++);
+1:456a2ba: 
+1:456a2ba:                 if (first == null) {
+1:456a2ba:                     first = page;
+1:456a2ba:                 }
+1:456a2ba: 
+1:456a2ba:                 addToCache(page);
+1:456a2ba:                 DataByteArrayOutputStream out = new DataByteArrayOutputStream(pageSize);
+1:456a2ba:                 page.write(out);
+1:456a2ba:                 write(page, out.getData());
+1:456a2ba: 
+1:456a2ba:                 // LOG.debug("allocate writing: "+page.getPageId());
+1:456a2ba:             }
+1:456a2ba: 
+1:456a2ba:             return first;
+1:456a2ba:         }
+1:456a2ba: 
+1:456a2ba:         Page<T> page = new Page<T>(seq.getFirst());
+1:456a2ba:         page.makeFree(0);
+1:456a2ba:         // LOG.debug("allocated: "+page.getPageId());
+1:456a2ba:         return page;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     long getNextWriteTransactionId() {
+1:456a2ba:         return nextTxid.incrementAndGet();
+1:456a2ba:     }
+1:456a2ba: 
+1:4bace21:     synchronized void readPage(long pageId, byte[] data) throws IOException {
+1:456a2ba:         readFile.seek(toOffset(pageId));
+1:456a2ba:         readFile.readFully(data);
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public void freePage(long pageId) {
+1:456a2ba:         freeList.add(pageId);
+1:bf59b7d:         removeFromCache(pageId);
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     @SuppressWarnings("unchecked")
+1:456a2ba:     private <T> void write(Page<T> page, byte[] data) throws IOException {
+1:456a2ba:         final PageWrite write = new PageWrite(page, data);
+1:aa3ab12:         Entry<Long, PageWrite> entry = new Entry<Long, PageWrite>() {
+1:ef619b6:             @Override
+1:456a2ba:             public Long getKey() {
+1:456a2ba:                 return write.getPage().getPageId();
+1:456a2ba:             }
+1:456a2ba: 
+1:ef619b6:             @Override
+1:456a2ba:             public PageWrite getValue() {
+1:456a2ba:                 return write;
+1:456a2ba:             }
+1:456a2ba: 
+1:ef619b6:             @Override
+1:456a2ba:             public PageWrite setValue(PageWrite value) {
+1:456a2ba:                 return null;
+1:456a2ba:             }
+1:456a2ba:         };
+1:456a2ba:         Entry<Long, PageWrite>[] entries = new Map.Entry[]{entry};
+1:456a2ba:         write(Arrays.asList(entries));
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     void write(Collection<Map.Entry<Long, PageWrite>> updates) throws IOException {
+1:aa3ab12:         synchronized (writes) {
+1:aa3ab12:             if (enabledWriteThread) {
+1:aa3ab12:                 while (writes.size() >= writeBatchSize && !stopWriter.get()) {
+1:180b0ec:                     try {
+1:180b0ec:                         writes.wait();
+1:180b0ec:                     } catch (InterruptedException e) {
+1:180b0ec:                         Thread.currentThread().interrupt();
+1:180b0ec:                         throw new InterruptedIOException();
+1:180b0ec:                     }
+1:180b0ec:                 }
+1:180b0ec:             }
+1:180b0ec: 
+1:40ae055:             boolean longTx = false;
+1:456a2ba: 
+1:456a2ba:             for (Map.Entry<Long, PageWrite> entry : updates) {
+1:456a2ba:                 Long key = entry.getKey();
+1:456a2ba:                 PageWrite value = entry.getValue();
+1:456a2ba:                 PageWrite write = writes.get(key);
+1:aa3ab12:                 if (write == null) {
+1:456a2ba:                     writes.put(key, value);
+1:456a2ba:                 } else {
+1:40ae055:                     if (value.currentLocation != -1) {
+1:40ae055:                         write.setCurrentLocation(value.page, value.currentLocation, value.length);
+1:40ae055:                         write.tmpFile = value.tmpFile;
+1:40ae055:                         longTx = true;
+1:40ae055:                     } else {
+1:456a2ba:                         write.setCurrent(value.page, value.current);
+1:456a2ba:                     }
+1:456a2ba:                 }
+1:456a2ba:             }
+1:456a2ba: 
+1:456a2ba:             // Once we start approaching capacity, notify the writer to start writing
+1:40ae055:             // sync immediately for long txs
+1:aa3ab12:             if (longTx || canStartWriteBatch()) {
+1:456a2ba: 
+1:aa3ab12:                 if (enabledWriteThread) {
+1:456a2ba:                     writes.notify();
+1:456a2ba:                 } else {
+1:456a2ba:                     writeBatch();
+1:456a2ba:                 }
+1:456a2ba:             }
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     private boolean canStartWriteBatch() {
+1:aa3ab12:         int capacityUsed = ((writes.size() * 100) / writeBatchSize);
+1:aa3ab12:         if (enabledWriteThread) {
+1:456a2ba:             // The constant 10 here controls how soon write batches start going to disk..
+1:456a2ba:             // would be nice to figure out how to auto tune that value.  Make to small and
+1:456a2ba:             // we reduce through put because we are locking the write mutex too often doing writes
+1:aa3ab12:             return capacityUsed >= 10 || checkpointLatch != null;
+1:456a2ba:         } else {
+1:aa3ab12:             return capacityUsed >= 80 || checkpointLatch != null;
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     ///////////////////////////////////////////////////////////////////
+1:456a2ba:     // Cache Related operations
+1:456a2ba:     ///////////////////////////////////////////////////////////////////
+1:456a2ba:     @SuppressWarnings("unchecked")
+1:456a2ba:     <T> Page<T> getFromCache(long pageId) {
+1:aa3ab12:         synchronized (writes) {
+1:456a2ba:             PageWrite pageWrite = writes.get(pageId);
+1:aa3ab12:             if (pageWrite != null) {
+1:456a2ba:                 return pageWrite.page;
+1:456a2ba:             }
+1:456a2ba:         }
+1:456a2ba: 
+1:456a2ba:         Page<T> result = null;
+1:456a2ba:         if (enablePageCaching) {
+1:456a2ba:             result = pageCache.get(pageId);
+1:456a2ba:         }
+1:456a2ba:         return result;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     void addToCache(Page page) {
+1:456a2ba:         if (enablePageCaching) {
+1:456a2ba:             pageCache.put(page.getPageId(), page);
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:bf59b7d:     void removeFromCache(long pageId) {
+1:456a2ba:         if (enablePageCaching) {
+1:456a2ba:             pageCache.remove(pageId);
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     ///////////////////////////////////////////////////////////////////
+1:456a2ba:     // Internal Double write implementation follows...
+1:456a2ba:     ///////////////////////////////////////////////////////////////////
+1:456a2ba: 
+1:456a2ba:     private void pollWrites() {
+1:456a2ba:         try {
+1:aa3ab12:             while (!stopWriter.get()) {
+1:456a2ba:                 // Wait for a notification...
+1:aa3ab12:                 synchronized (writes) {
+1:180b0ec:                     writes.notifyAll();
+1:180b0ec: 
+1:456a2ba:                     // If there is not enough to write, wait for a notification...
+1:aa3ab12:                     while (writes.isEmpty() && checkpointLatch == null && !stopWriter.get()) {
+1:456a2ba:                         writes.wait(100);
+1:456a2ba:                     }
+1:456a2ba: 
+1:aa3ab12:                     if (writes.isEmpty()) {
+1:456a2ba:                         releaseCheckpointWaiter();
+1:456a2ba:                     }
+1:456a2ba:                 }
+1:456a2ba:                 writeBatch();
+1:456a2ba:             }
+1:456a2ba:         } catch (Throwable e) {
+1:cdba931:             LOG.info("An exception was raised while performing poll writes", e);
+1:456a2ba:         } finally {
+1:456a2ba:             releaseCheckpointWaiter();
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     private void writeBatch() throws IOException {
+1:456a2ba: 
+1:456a2ba:         CountDownLatch checkpointLatch;
+1:456a2ba:         ArrayList<PageWrite> batch;
+1:aa3ab12:         synchronized (writes) {
+1:456a2ba:             // If there is not enough to write, wait for a notification...
+1:456a2ba: 
+1:456a2ba:             batch = new ArrayList<PageWrite>(writes.size());
+1:456a2ba:             // build a write batch from the current write cache.
+1:456a2ba:             for (PageWrite write : writes.values()) {
+1:456a2ba:                 batch.add(write);
+1:456a2ba:                 // Move the current write to the diskBound write, this lets folks update the
+1:456a2ba:                 // page again without blocking for this write.
+1:456a2ba:                 write.begin();
+1:40ae055:                 if (write.diskBound == null && write.diskBoundLocation == -1) {
+1:a19e27a:                     batch.remove(write);
+1:456a2ba:                 }
+1:456a2ba:             }
+1:456a2ba: 
+1:456a2ba:             // Grab on to the existing checkpoint latch cause once we do this write we can
+1:456a2ba:             // release the folks that were waiting for those writes to hit disk.
+1:456a2ba:             checkpointLatch = this.checkpointLatch;
+1:aa3ab12:             this.checkpointLatch = null;
+1:456a2ba:         }
+1:330f0ce: 
+2:aa3ab12:         try {
+1:b39ab78: 
+1:330f0ce:             // First land the writes in the recovery file
+1:330f0ce:             if (enableRecoveryFile) {
+1:330f0ce:                 Checksum checksum = new Adler32();
+1:330f0ce: 
+1:330f0ce:                 recoveryFile.seek(RECOVERY_FILE_HEADER_SIZE);
+1:330f0ce: 
+1:330f0ce:                 for (PageWrite w : batch) {
+1:330f0ce:                     try {
+1:330f0ce:                         checksum.update(w.getDiskBound(), 0, pageSize);
+1:330f0ce:                     } catch (Throwable t) {
+1:330f0ce:                         throw IOExceptionSupport.create("Cannot create recovery file. Reason: " + t, t);
+1:330f0ce:                     }
+1:330f0ce:                     recoveryFile.writeLong(w.page.getPageId());
+1:330f0ce:                     recoveryFile.write(w.getDiskBound(), 0, pageSize);
+1:330f0ce:                 }
+1:330f0ce: 
+1:330f0ce:                 // Can we shrink the recovery buffer??
+1:330f0ce:                 if (recoveryPageCount > recoveryFileMaxPageCount) {
+1:330f0ce:                     int t = Math.max(recoveryFileMinPageCount, batch.size());
+1:330f0ce:                     recoveryFile.setLength(recoveryFileSizeForPages(t));
+1:330f0ce:                 }
+1:330f0ce: 
+1:330f0ce:                 // Record the page writes in the recovery buffer.
+1:330f0ce:                 recoveryFile.seek(0);
+1:330f0ce:                 // Store the next tx id...
+1:330f0ce:                 recoveryFile.writeLong(nextTxid.get());
+1:330f0ce:                 // Store the checksum for thw write batch so that on recovery we
+1:330f0ce:                 // know if we have a consistent
+1:330f0ce:                 // write batch on disk.
+1:330f0ce:                 recoveryFile.writeLong(checksum.getValue());
+1:330f0ce:                 // Write the # of pages that will follow
+1:330f0ce:                 recoveryFile.writeInt(batch.size());
+1:330f0ce: 
+1:330f0ce:                 if (enableDiskSyncs) {
+1:330f0ce:                     recoveryFile.sync();
+1:330f0ce:                 }
+1:330f0ce:             }
+1:c5a8b2c: 
+1:b39ab78:             for (PageWrite w : batch) {
+1:b39ab78:                 writeFile.seek(toOffset(w.page.getPageId()));
+1:b39ab78:                 writeFile.write(w.getDiskBound(), 0, pageSize);
+1:b39ab78:                 w.done();
+1:b39ab78:             }
+1:330f0ce: 
+1:b39ab78:             if (enableDiskSyncs) {
+1:ef619b6:                 writeFile.sync();
+1:456a2ba:             }
+1:b39ab78: 
+1:c5a8b2c:         } catch (IOException ioError) {
+1:c5a8b2c:             LOG.info("Unexpected io error on pagefile write of " + batch.size() + " pages.", ioError);
+1:c5a8b2c:             // any subsequent write needs to be prefaced with a considered call to redoRecoveryUpdates
+1:c5a8b2c:             // to ensure disk image is self consistent
+1:c5a8b2c:             loaded.set(false);
+1:c5a8b2c:             throw  ioError;
+1:aa3ab12:         } finally {
+1:aa3ab12:             synchronized (writes) {
+1:b39ab78:                 for (PageWrite w : batch) {
+1:aa3ab12:                     // If there are no more pending writes, then remove it from
+1:aa3ab12:                     // the write cache.
+1:aa3ab12:                     if (w.isDone()) {
+1:456a2ba:                         writes.remove(w.page.getPageId());
+1:aa3ab12:                         if (w.tmpFile != null && tmpFilesForRemoval.contains(w.tmpFile)) {
+1:aa3ab12:                             if (!w.tmpFile.delete()) {
+1:aa3ab12:                                 throw new IOException("Can't delete temporary KahaDB transaction file:" + w.tmpFile);
+1:456a2ba:                             }
+1:aa3ab12:                             tmpFilesForRemoval.remove(w.tmpFile);
+1:456a2ba:                         }
+1:456a2ba:                     }
+1:456a2ba:                 }
+1:456a2ba:             }
+1:b39ab78: 
+1:aa3ab12:             if (checkpointLatch != null) {
+1:456a2ba:                 checkpointLatch.countDown();
+1:456a2ba:             }
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:6994ecb:     public void removeTmpFile(File file) {
+1:6994ecb:         tmpFilesForRemoval.add(file);
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     private long recoveryFileSizeForPages(int pageCount) {
+1:aa3ab12:         return RECOVERY_FILE_HEADER_SIZE + ((pageSize + 8) * pageCount);
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     private void releaseCheckpointWaiter() {
+1:aa3ab12:         if (checkpointLatch != null) {
+1:456a2ba:             checkpointLatch.countDown();
+1:aa3ab12:             checkpointLatch = null;
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * Inspects the recovery buffer and re-applies any
+1:456a2ba:      * partially applied page writes.
+1:456a2ba:      *
+1:456a2ba:      * @return the next transaction id that can be used.
+1:456a2ba:      */
+1:456a2ba:     private long redoRecoveryUpdates() throws IOException {
+1:aa3ab12:         if (!enableRecoveryFile) {
+1:456a2ba:             return 0;
+1:456a2ba:         }
+1:aa3ab12:         recoveryPageCount = 0;
+1:456a2ba: 
+1:456a2ba:         // Are we initializing the recovery file?
+1:aa3ab12:         if (recoveryFile.length() == 0) {
+1:456a2ba:             // Write an empty header..
+1:456a2ba:             recoveryFile.write(new byte[RECOVERY_FILE_HEADER_SIZE]);
+1:456a2ba:             // Preallocate the minium size for better performance.
+1:456a2ba:             recoveryFile.setLength(recoveryFileSizeForPages(recoveryFileMinPageCount));
+1:456a2ba:             return 0;
+1:456a2ba:         }
+1:456a2ba: 
+1:456a2ba:         // How many recovery pages do we have in the recovery buffer?
+1:b39ab78:         recoveryFile.seek(0);
+1:10e57c9:         long nextTxId = recoveryFile.readLong();
+1:10e57c9:         long expectedChecksum = recoveryFile.readLong();
+1:10e57c9:         int pageCounter = recoveryFile.readInt();
+1:456a2ba: 
+2:456a2ba:         recoveryFile.seek(RECOVERY_FILE_HEADER_SIZE);
+1:b39ab78:         Checksum checksum = new Adler32();
+1:456a2ba:         LinkedHashMap<Long, byte[]> batch = new LinkedHashMap<Long, byte[]>();
+1:456a2ba:         try {
+1:456a2ba:             for (int i = 0; i < pageCounter; i++) {
+1:456a2ba:                 long offset = recoveryFile.readLong();
+1:aa3ab12:                 byte[] data = new byte[pageSize];
+1:aa3ab12:                 if (recoveryFile.read(data, 0, pageSize) != pageSize) {
+1:456a2ba:                     // Invalid recovery record, Could not fully read the data". Probably due to a partial write to the recovery buffer
+1:456a2ba:                     return nextTxId;
+1:456a2ba:                 }
+1:456a2ba:                 checksum.update(data, 0, pageSize);
+1:456a2ba:                 batch.put(offset, data);
+1:456a2ba:             }
+1:456a2ba:         } catch (Exception e) {
+1:456a2ba:             // If an error occurred it was cause the redo buffer was not full written out correctly.. so don't redo it.
+1:456a2ba:             // as the pages should still be consistent.
+1:456a2ba:             LOG.debug("Redo buffer was not fully intact: ", e);
+1:456a2ba:             return nextTxId;
+1:456a2ba:         }
+1:456a2ba: 
+1:456a2ba:         recoveryPageCount = pageCounter;
+1:456a2ba: 
+1:456a2ba:         // If the checksum is not valid then the recovery buffer was partially written to disk.
+1:aa3ab12:         if (checksum.getValue() != expectedChecksum) {
+1:456a2ba:             return nextTxId;
+1:456a2ba:         }
+1:456a2ba: 
+1:456a2ba:         // Re-apply all the writes in the recovery buffer.
+1:456a2ba:         for (Map.Entry<Long, byte[]> e : batch.entrySet()) {
+1:c94b407:             writeFile.seek(toOffset(e.getKey()));
+1:456a2ba:             writeFile.write(e.getValue());
+1:456a2ba:         }
+1:456a2ba: 
+1:456a2ba:         // And sync it to disk
+1:ef619b6:         writeFile.sync();
+1:456a2ba:         return nextTxId;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     private void startWriter() {
+1:aa3ab12:         synchronized (writes) {
+1:aa3ab12:             if (enabledWriteThread) {
+1:456a2ba:                 stopWriter.set(false);
+1:456a2ba:                 writerThread = new Thread("KahaDB Page Writer") {
+1:456a2ba:                     @Override
+1:456a2ba:                     public void run() {
+1:456a2ba:                         pollWrites();
+1:456a2ba:                     }
+1:456a2ba:                 };
+1:456a2ba:                 writerThread.setPriority(Thread.MAX_PRIORITY);
+1:039a15f:                 writerThread.setDaemon(true);
+1:456a2ba:                 writerThread.start();
+1:456a2ba:             }
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     private void stopWriter() throws InterruptedException {
+1:aa3ab12:         if (enabledWriteThread) {
+1:456a2ba:             stopWriter.set(true);
+1:456a2ba:             writerThread.join();
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public File getFile() {
+1:456a2ba:         return getMainPageFile();
+1:19c4316:     }
+1:19c4316: 
+1:40ae055:     public File getDirectory() {
+1:40ae055:         return directory;
+1:456a2ba:     }
+1:456a2ba: }
+============================================================================
+author:gtully
+-------------------------------------------------------------------------------
+commit:42bf6e9
+/////////////////////////////////////////////////////////////////////////
+1:             writeFile = new RecoverableRandomAccessFile(file, "rw", false);
+commit:c5a8b2c
+/////////////////////////////////////////////////////////////////////////
+1:     public void allowIOResumption() {
+1:         loaded.set(true);
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         } catch (IOException ioError) {
+1:             LOG.info("Unexpected io error on pagefile write of " + batch.size() + " pages.", ioError);
+1:             // any subsequent write needs to be prefaced with a considered call to redoRecoveryUpdates
+1:             // to ensure disk image is self consistent
+1:             loaded.set(false);
+1:             throw  ioError;
+commit:330f0ce
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:             // First land the writes in the recovery file
+1:             if (enableRecoveryFile) {
+1:                 Checksum checksum = new Adler32();
+1: 
+1:                 recoveryFile.seek(RECOVERY_FILE_HEADER_SIZE);
+1: 
+1:                 for (PageWrite w : batch) {
+1:                     try {
+1:                         checksum.update(w.getDiskBound(), 0, pageSize);
+1:                     } catch (Throwable t) {
+1:                         throw IOExceptionSupport.create("Cannot create recovery file. Reason: " + t, t);
+1:                     }
+1:                     recoveryFile.writeLong(w.page.getPageId());
+1:                     recoveryFile.write(w.getDiskBound(), 0, pageSize);
+1:                 }
+1: 
+1:                 // Can we shrink the recovery buffer??
+1:                 if (recoveryPageCount > recoveryFileMaxPageCount) {
+1:                     int t = Math.max(recoveryFileMinPageCount, batch.size());
+1:                     recoveryFile.setLength(recoveryFileSizeForPages(t));
+1:                 }
+1: 
+1:                 // Record the page writes in the recovery buffer.
+1:                 recoveryFile.seek(0);
+1:                 // Store the next tx id...
+1:                 recoveryFile.writeLong(nextTxid.get());
+1:                 // Store the checksum for thw write batch so that on recovery we
+1:                 // know if we have a consistent
+1:                 // write batch on disk.
+1:                 recoveryFile.writeLong(checksum.getValue());
+1:                 // Write the # of pages that will follow
+1:                 recoveryFile.writeInt(batch.size());
+1: 
+1:                 if (enableDiskSyncs) {
+1:                     recoveryFile.sync();
+1:                 }
+1:             }
+1: 
+author:Christopher L. Shannon (cshannon)
+-------------------------------------------------------------------------------
+commit:38d85be
+/////////////////////////////////////////////////////////////////////////
+1:             boolean needsFreePageRecovery = false;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 needsFreePageRecovery = true;
+1:             }
+1:             if (writeFile.length() < PAGE_FILE_HEADER_SIZE) {
+1:                 writeFile.setLength(PAGE_FILE_HEADER_SIZE);
+1:             }
+1:             nextFreePageId.set((writeFile.length() - PAGE_FILE_HEADER_SIZE) / pageSize);
+1: 
+1:             if (needsFreePageRecovery) {
+1:                 // Scan all to find the free pages after nextFreePageId is set
+/////////////////////////////////////////////////////////////////////////
+commit:12b26b6
+/////////////////////////////////////////////////////////////////////////
+1:                 try(RandomAccessFile file = new RandomAccessFile(tmpFile, "r")) {
+1:                     file.seek(diskBoundLocation);
+1:                     file.read(diskBound);
+1:                 }
+author:Timothy Bish
+-------------------------------------------------------------------------------
+commit:b39ab78
+/////////////////////////////////////////////////////////////////////////
+0:         // First land the writes in the recovery file
+1:             Checksum checksum = new Adler32();
+1: 
+1: 
+1:             for (PageWrite w : batch) {
+/////////////////////////////////////////////////////////////////////////
+0:             // Can we shrink the recovery buffer??
+0:             if (recoveryPageCount > recoveryFileMaxPageCount) {
+0:                 int t = Math.max(recoveryFileMinPageCount, batch.size());
+0:                 recoveryFile.setLength(recoveryFileSizeForPages(t));
+1:             }
+1: 
+0:             // Record the page writes in the recovery buffer.
+1:             recoveryFile.seek(0);
+0:             // Store the next tx id...
+0:             recoveryFile.writeLong(nextTxid.get());
+0:             // Store the checksum for thw write batch so that on recovery we
+0:             // know if we have a consistent
+0:             // write batch on disk.
+0:             recoveryFile.writeLong(checksum.getValue());
+0:             // Write the # of pages that will follow
+0:             recoveryFile.writeInt(batch.size());
+1: 
+1:             if (enableDiskSyncs) {
+0:                 recoveryFile.sync();
+1:             }
+1:             for (PageWrite w : batch) {
+1:                 writeFile.seek(toOffset(w.page.getPageId()));
+1:                 writeFile.write(w.getDiskBound(), 0, pageSize);
+1:                 w.done();
+commit:4141d6a
+/////////////////////////////////////////////////////////////////////////
+0:                     recoveryFile.sync();
+commit:ef619b6
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.activemq.util.DataByteArrayOutputStream;
+1: import org.apache.activemq.util.IOExceptionSupport;
+1: import org.apache.activemq.util.IOHelper;
+1: import org.apache.activemq.util.IntrospectionSupport;
+1: import org.apache.activemq.util.LFUCache;
+1: import org.apache.activemq.util.LRUCache;
+1: import org.apache.activemq.util.RecoverableRandomAccessFile;
+/////////////////////////////////////////////////////////////////////////
+1:     private final File directory;
+/////////////////////////////////////////////////////////////////////////
+1:     private final AtomicBoolean loaded = new AtomicBoolean();
+/////////////////////////////////////////////////////////////////////////
+1:     private final AtomicBoolean stopWriter = new AtomicBoolean();
+1:     private final TreeMap<Long, PageWrite> writes = new TreeMap<Long, PageWrite>();
+1:     private final AtomicLong nextTxid = new AtomicLong();
+1:     private final ArrayList<File> tmpFilesForRemoval = new ArrayList<File>();
+/////////////////////////////////////////////////////////////////////////
+1:     @Override
+/////////////////////////////////////////////////////////////////////////
+1:         writeFile.sync();
+1:         writeFile.sync();
+/////////////////////////////////////////////////////////////////////////
+1:             @Override
+1:             @Override
+1:             @Override
+/////////////////////////////////////////////////////////////////////////
+1:                     writeFile.sync();
+1:                 writeFile.sync();
+/////////////////////////////////////////////////////////////////////////
+0:         writeFile.sync();
+commit:97b12c7
+/////////////////////////////////////////////////////////////////////////
+0:         writeFile.getFD().sync();
+0:         writeFile.getFD().sync();
+/////////////////////////////////////////////////////////////////////////
+0:                     recoveryFile.getFD().sync();
+0:                 writeFile.getFD().sync();
+/////////////////////////////////////////////////////////////////////////
+0:         writeFile.getFD().sync();
+commit:c50b6c3
+/////////////////////////////////////////////////////////////////////////
+0:         writeFile.getChannel().force(false);
+0:         writeFile.getChannel().force(false);
+/////////////////////////////////////////////////////////////////////////
+0:                 	recoveryFile.getChannel().force(false);
+0:                 writeFile.getChannel().force(false);
+/////////////////////////////////////////////////////////////////////////
+0:         writeFile.getChannel().force(false);
+author:Dejan Bosanac
+-------------------------------------------------------------------------------
+commit:582af3e
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.activemq.util.*;
+/////////////////////////////////////////////////////////////////////////
+1:     private RecoverableRandomAccessFile readFile;
+1:     private RecoverableRandomAccessFile writeFile;
+1:     private RecoverableRandomAccessFile recoveryFile;
+/////////////////////////////////////////////////////////////////////////
+0:             writeFile = new RecoverableRandomAccessFile(file, "rw");
+1:             readFile = new RecoverableRandomAccessFile(file, "r");
+/////////////////////////////////////////////////////////////////////////
+1:                 recoveryFile = new RecoverableRandomAccessFile(getRecoveryFile(), "rw");
+author:Hiram R. Chirino
+-------------------------------------------------------------------------------
+commit:c5cf038
+commit:1aab71b
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.activemq.store.kahadb.disk.page;
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.activemq.util.DataByteArrayOutputStream;
+0: import org.apache.activemq.util.IOExceptionSupport;
+0: import org.apache.activemq.util.IOHelper;
+0: import org.apache.activemq.util.IntrospectionSupport;
+0: import org.apache.activemq.util.LFUCache;
+0: import org.apache.activemq.util.LRUCache;
+1: import org.apache.activemq.store.kahadb.disk.util.Sequence;
+1: import org.apache.activemq.store.kahadb.disk.util.SequenceSet;
+commit:715010a
+commit:0bbc0ac
+/////////////////////////////////////////////////////////////////////////
+1:  * 
+commit:10e57c9
+/////////////////////////////////////////////////////////////////////////
+1:         long nextTxId = recoveryFile.readLong();
+1:         long expectedChecksum = recoveryFile.readLong();
+1:         int pageCounter = recoveryFile.readInt();
+commit:180b0ec
+/////////////////////////////////////////////////////////////////////////
+0:             if( enabledWriteThread  ) {
+0:                 while( writes.size() >= writeBatchSize && !stopWriter.get() ) {
+1:                     try {
+1:                         writes.wait();
+1:                     } catch (InterruptedException e) {
+1:                         Thread.currentThread().interrupt();
+1:                         throw new InterruptedIOException();
+1:                     }
+1:                 }
+1:             }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:                 synchronized( writes ) {  
+1:                     writes.notifyAll();
+1:                     
+0:                     while( writes.isEmpty() && checkpointLatch==null && !stopWriter.get() ) {
+commit:c059425
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     private boolean enableDiskSyncs=true;
+0:     private boolean enabledWriteThread=false;
+/////////////////////////////////////////////////////////////////////////
+0:         if( enabledWriteThread && stopWriter.get() ) {
+/////////////////////////////////////////////////////////////////////////
+0:             if( enabledWriteThread ) {
+/////////////////////////////////////////////////////////////////////////
+1:     public boolean isEnableDiskSyncs() {
+1:         return enableDiskSyncs;
+1:     public void setEnableDiskSyncs(boolean syncWrites) {
+1:         this.enableDiskSyncs = syncWrites;
+/////////////////////////////////////////////////////////////////////////
+1:     public boolean isEnabledWriteThread() {
+1:         return enabledWriteThread;
+1:     public void setEnableWriteThread(boolean enableAsyncWrites) {
+1:         this.enabledWriteThread = enableAsyncWrites;
+/////////////////////////////////////////////////////////////////////////
+1: 	public int getWriteBatchSize() {
+1: 		return writeBatchSize;
+1: 	}
+1: 
+1: 	public void setWriteBatchSize(int writeBatchSize) {
+1:         assertNotLoaded();
+1: 		this.writeBatchSize = writeBatchSize;
+1: 	}
+1: 
+1: 	///////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:                 if( enabledWriteThread  ) {
+/////////////////////////////////////////////////////////////////////////
+0:         if( enabledWriteThread ) {
+/////////////////////////////////////////////////////////////////////////
+0:             if (enableDiskSyncs) {
+/////////////////////////////////////////////////////////////////////////
+0:         if( enableDiskSyncs ) {
+/////////////////////////////////////////////////////////////////////////
+0:             if( enabledWriteThread ) {
+/////////////////////////////////////////////////////////////////////////
+0:         if( enabledWriteThread ) {
+/////////////////////////////////////////////////////////////////////////
+commit:19c4316
+/////////////////////////////////////////////////////////////////////////
+1:     // The number of pages we are aiming to write every time we 
+1:     // write to disk.
+0:     int writeBatchSize = 1000;
+/////////////////////////////////////////////////////////////////////////
+0: 		int capacityUsed = ((writes.size() * 100)/writeBatchSize);
+/////////////////////////////////////////////////////////////////////////
+0: 	public int getWriteBatchSize() {
+0: 		return writeBatchSize;
+1: 	}
+1: 
+0: 	public void setWriteBatchSize(int writeBatchSize) {
+0: 		this.writeBatchSize = writeBatchSize;
+1: 	}
+1: 
+commit:456a2ba
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *      http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+0: package org.apache.kahadb.page;
+1: 
+1: import java.io.ByteArrayInputStream;
+1: import java.io.ByteArrayOutputStream;
+1: import java.io.DataInputStream;
+1: import java.io.DataOutputStream;
+1: import java.io.File;
+1: import java.io.FileInputStream;
+1: import java.io.FileOutputStream;
+1: import java.io.IOException;
+1: import java.io.InterruptedIOException;
+1: import java.io.RandomAccessFile;
+0: import java.nio.channels.FileLock;
+0: import java.nio.channels.OverlappingFileLockException;
+1: import java.util.ArrayList;
+1: import java.util.Arrays;
+1: import java.util.Collection;
+0: import java.util.HashMap;
+1: import java.util.Iterator;
+1: import java.util.LinkedHashMap;
+1: import java.util.Map;
+1: import java.util.Properties;
+1: import java.util.TreeMap;
+1: import java.util.Map.Entry;
+1: import java.util.concurrent.CountDownLatch;
+0: import java.util.concurrent.TimeUnit;
+1: import java.util.concurrent.atomic.AtomicBoolean;
+1: import java.util.concurrent.atomic.AtomicLong;
+1: import java.util.zip.Adler32;
+1: import java.util.zip.Checksum;
+1: 
+0: import org.apache.commons.logging.Log;
+0: import org.apache.commons.logging.LogFactory;
+0: import org.apache.kahadb.util.DataByteArrayOutputStream;
+0: import org.apache.kahadb.util.IOExceptionSupport;
+0: import org.apache.kahadb.util.IOHelper;
+0: import org.apache.kahadb.util.IntrospectionSupport;
+0: import org.apache.kahadb.util.LRUCache;
+0: import org.apache.kahadb.util.Sequence;
+0: import org.apache.kahadb.util.SequenceSet;
+1: 
+1: /**
+1:  * A PageFile provides you random access to fixed sized disk pages. This object is not thread safe and therefore access to it should 
+1:  * be externally synchronized.
+1:  * 
+1:  * The file has 3 parts:
+1:  * Metadata Space: 4k : Reserved metadata area. Used to store persistent config about the file.
+1:  * Recovery Buffer Space: Page Size * 1000 : This is a redo log used to prevent partial page writes from making the file inconsistent
+1:  * Page Space: The pages in the page file.
+1:  * 
+0:  * @version $Revision$
+1:  */
+1: public class PageFile {
+1:     
+1:     private static final String PAGEFILE_SUFFIX = ".data";
+1:     private static final String RECOVERY_FILE_SUFFIX = ".redo";
+1:     private static final String FREE_FILE_SUFFIX = ".free";
+1:     
+1:     // 4k Default page size.
+0:     public static final int DEFAULT_PAGE_SIZE = Integer.parseInt(System.getProperty("defaultPageSize", ""+1024*4)); 
+0:     private static final int RECOVERY_FILE_HEADER_SIZE=1024*4;
+0:     private static final int PAGE_FILE_HEADER_SIZE=1024*4;
+1: 
+1:     // Recovery header is (long offset)
+0:     private static final Log LOG = LogFactory.getLog(PageFile.class);
+1: 
+1:     // A PageFile will use a couple of files in this directory
+0:     private File directory;
+1:     // And the file names in that directory will be based on this name.
+1:     private final String name;
+1:     
+1:     // File handle used for reading pages..
+0:     private RandomAccessFile readFile;
+1:     // File handle used for writing pages..
+0:     private RandomAccessFile writeFile;
+1:     // File handle used for writing pages..
+0:     private RandomAccessFile recoveryFile;
+1: 
+1:     // The size of pages
+1:     private int pageSize = DEFAULT_PAGE_SIZE;
+1:     
+1:     // The minimum number of space allocated to the recovery file in number of pages.
+1:     private int recoveryFileMinPageCount = 1000;
+1:     // The max size that we let the recovery file grow to.. ma exceed the max, but the file will get resize 
+1:     // to this max size as soon as  possible.
+1:     private int recoveryFileMaxPageCount = 10000;
+1:     // The number of pages in the current recovery buffer
+1:     private int recoveryPageCount;
+1: 
+0:     private AtomicBoolean loaded = new AtomicBoolean();
+1: 
+1:     // We keep a cache of pages recently used?
+0:     private LRUCache<Long, Page> pageCache;
+1:     // The cache of recently used pages.
+0:     private boolean enablePageCaching=true;
+1:     // How many pages will we keep in the cache?
+0:     private int pageCacheSize = 100;
+1:     
+1:     // Should first log the page write to the recovery buffer? Avoids partial
+1:     // page write failures..
+0:     private boolean enableRecoveryFile=true;
+1:     // Will we sync writes to disk. Ensures that data will not be lost after a checkpoint()
+0:     private boolean enableSyncedWrites=true;
+1:     // Will writes be done in an async thread?
+0:     private boolean enableAsyncWrites=false;
+1: 
+1:     // These are used if enableAsyncWrites==true 
+0:     private AtomicBoolean stopWriter = new AtomicBoolean();
+1:     private Thread writerThread;
+1:     private CountDownLatch checkpointLatch;
+1: 
+1:     // Keeps track of writes that are being written to disk.
+0:     private TreeMap<Long, PageWrite> writes=new TreeMap<Long, PageWrite>();
+1: 
+1:     // Keeps track of free pages.
+1:     private final AtomicLong nextFreePageId = new AtomicLong();
+1:     private SequenceSet freeList = new SequenceSet();
+1:     
+0:     private AtomicLong nextTxid = new AtomicLong();
+1:     
+1:     // Persistent settings stored in the page file. 
+1:     private MetaData metaData;
+1:     
+1:     /**
+1:      * Use to keep track of updated pages which have not yet been committed.
+1:      */
+1:     static class PageWrite {
+1:         Page page;
+1:         byte[] current;
+1:         byte[] diskBound;
+1: 
+1:         public PageWrite(Page page, byte[] data) {
+0:             this.page=page;
+0:             current=data;
+1:         }
+1:                 
+1:         public void setCurrent(Page page, byte[] data) {
+0:             this.page=page;
+0:             current=data;
+1:         }
+1: 
+1:         @Override
+1:         public String toString() {
+0:             return "[PageWrite:"+page.getPageId()+"]";
+1:         }
+1: 
+1:         @SuppressWarnings("unchecked")
+1:         public Page getPage() {
+1:             return page;
+1:         }
+1:         
+1:         void begin() {
+1:             diskBound = current;
+1:             current = null;
+1:         }
+1:         
+1:         /**
+1:          * @return true if there is no pending writes to do.
+1:          */
+1:         boolean done() {
+0:             diskBound=null;
+0:             return current == null;
+1:         }
+1: 
+1:     }
+1:     
+1:     /**
+1:      * The MetaData object hold the persistent data associated with a PageFile object. 
+1:      */
+1:     public static class MetaData {
+1:         
+1:         String fileType;
+1:         String fileTypeVersion;
+1:         
+0:         long metaDataTxId=-1;
+1:         int pageSize;
+1:         boolean cleanShutdown;
+1:         long lastTxId;
+1:         long freePages;
+1:         
+1:         public String getFileType() {
+1:             return fileType;
+1:         }
+1:         public void setFileType(String fileType) {
+1:             this.fileType = fileType;
+1:         }
+1:         public String getFileTypeVersion() {
+1:             return fileTypeVersion;
+1:         }
+1:         public void setFileTypeVersion(String version) {
+1:             this.fileTypeVersion = version;
+1:         }
+1:         public long getMetaDataTxId() {
+1:             return metaDataTxId;
+1:         }
+1:         public void setMetaDataTxId(long metaDataTxId) {
+1:             this.metaDataTxId = metaDataTxId;
+1:         }
+1:         public int getPageSize() {
+1:             return pageSize;
+1:         }
+1:         public void setPageSize(int pageSize) {
+1:             this.pageSize = pageSize;
+1:         }
+1:         public boolean isCleanShutdown() {
+1:             return cleanShutdown;
+1:         }
+1:         public void setCleanShutdown(boolean cleanShutdown) {
+1:             this.cleanShutdown = cleanShutdown;
+1:         }
+1:         public long getLastTxId() {
+1:             return lastTxId;
+1:         }
+1:         public void setLastTxId(long lastTxId) {
+1:             this.lastTxId = lastTxId;
+1:         }
+1:         public long getFreePages() {
+1:             return freePages;
+1:         }
+1:         public void setFreePages(long value) {
+1:             this.freePages = value;
+1:         }
+1:     }
+1: 
+1:     public Transaction tx() {
+1:         assertLoaded();
+1:         return new Transaction(this);
+1:     }
+1:     
+1:     /**
+1:      * Creates a PageFile in the specified directory who's data files are named by name.
+1:      * 
+0:      * @param directory
+0:      * @param name
+1:      */
+1:     public PageFile(File directory, String name) {
+1:         this.directory = directory;
+1:         this.name = name;
+1:     }
+1:     
+1:     /**
+1:      * Deletes the files used by the PageFile object.  This method can only be used when this object is not loaded.
+1:      * 
+1:      * @throws IOException 
+0:      *         if the files cannot be deleted.
+0:      * @throws IllegalStateException 
+0:      *         if this PageFile is loaded
+1:      */
+1:     public void delete() throws IOException {
+0:         if( loaded.get() ) {
+1:             throw new IllegalStateException("Cannot delete page file data when the page file is loaded");
+1:         }
+1:         delete(getMainPageFile());
+1:         delete(getFreeFile());
+1:         delete(getRecoveryFile());
+1:     }
+1: 
+1:     /**
+1:      * @param file
+1:      * @throws IOException
+1:      */
+1:     private void delete(File file) throws IOException {
+0:         if( file.exists() ) {
+0:             if( !file.delete() ) {
+0:                 throw new IOException("Could not delete: "+file.getPath());
+1:             }
+1:         }
+1:     }
+1:     
+1:     /**
+1:      * Loads the page file so that it can be accessed for read/write purposes.  This allocates OS resources.  If this is the 
+1:      * first time the page file is loaded, then this creates the page file in the file system.
+1:      * 
+1:      * @throws IOException
+0:      *         If the page file cannot be loaded. This could be cause the existing page file is corrupt is a bad version or if 
+0:      *         there was a disk error.
+0:      * @throws IllegalStateException 
+0:      *         If the page file was already loaded.
+1:      */
+1:     public void load() throws IOException, IllegalStateException {
+1:         if (loaded.compareAndSet(false, true)) {
+1:             
+0:             if( enablePageCaching ) {
+0:                 pageCache = new LRUCache<Long, Page>(pageCacheSize, pageCacheSize, 0.75f, true);
+1:             }
+1:             
+1:             File file = getMainPageFile();
+1:             IOHelper.mkdirs(file.getParentFile());
+0:             writeFile = new RandomAccessFile(file, "rw");
+0:             readFile = new RandomAccessFile(file, "r");
+1:             
+1:             if (readFile.length() > 0) {
+1:                 // Load the page size setting cause that can't change once the file is created.
+1:                 loadMetaData();
+1:                 pageSize = metaData.getPageSize();
+1:             } else {
+1:                 // Store the page size setting cause that can't change once the file is created.
+1:                 metaData = new MetaData();
+1:                 metaData.setFileType(PageFile.class.getName());
+1:                 metaData.setFileTypeVersion("1");
+1:                 metaData.setPageSize(getPageSize());
+1:                 metaData.setCleanShutdown(true);
+1:                 metaData.setFreePages(-1);
+1:                 metaData.setLastTxId(0);
+1:                 storeMetaData();
+1:             }
+1: 
+0:             if( enableRecoveryFile ) {
+0:                 recoveryFile = new RandomAccessFile(getRecoveryFile(), "rw");
+1:             }
+1:             
+0:             if(  metaData.isCleanShutdown() ) {
+0:                 nextTxid.set(metaData.getLastTxId()+1);
+0:                 if( metaData.getFreePages()>0 ) {
+1:                     loadFreeList();
+1:                 } 
+1:             } else {
+0:                 LOG.debug("Recovering page file...");
+1:                 nextTxid.set(redoRecoveryUpdates());
+1:                 
+0:                 // Scan all to find the free pages.
+1:                 freeList = new SequenceSet();
+0:                 for (Iterator i = tx().iterator(true); i.hasNext();) {
+0:                     Page page = (Page)i.next();
+0:                     if( page.getType() == Page.PAGE_FREE_TYPE ) {
+1:                         freeList.add(page.getPageId());
+1:                     }
+1:                 }
+1:                 
+1:             }
+1:             
+1:             metaData.setCleanShutdown(false);
+1:             storeMetaData();
+1:             getFreeFile().delete();
+1:             
+0:             if( writeFile.length() < PAGE_FILE_HEADER_SIZE) {
+0:                 writeFile.setLength(PAGE_FILE_HEADER_SIZE);
+1:             }
+0:             nextFreePageId.set((writeFile.length()-PAGE_FILE_HEADER_SIZE)/pageSize);
+1:             startWriter();
+1:                 
+1:         } else {
+0:             throw new IllegalStateException("Cannot load the page file when it is allready loaded.");
+1:         }
+1:     }
+1: 
+1: 
+1:     /**
+1:      * Unloads a previously loaded PageFile.  This deallocates OS related resources like file handles.
+1:      * once unloaded, you can no longer use the page file to read or write Pages.
+1:      * 
+1:      * @throws IOException
+0:      *         if there was a disk error occurred while closing the down the page file.
+0:      * @throws IllegalStateException
+0:      *         if the PageFile is not loaded
+1:      */
+1:     public void unload() throws IOException {
+1:         if (loaded.compareAndSet(true, false)) {
+1:             flush();
+1:             try {
+1:                 stopWriter();
+1:             } catch (InterruptedException e) {
+1:                 throw new InterruptedIOException();
+1:             }
+1:             
+0:             if( freeList.isEmpty() ) {
+1:                 metaData.setFreePages(0);
+1:             } else {
+1:                 storeFreeList();
+1:                 metaData.setFreePages(freeList.size());
+1:             }
+1:             
+0:             metaData.setLastTxId( nextTxid.get()-1 );
+1:             metaData.setCleanShutdown(true);
+1:             storeMetaData();
+1:             
+1:             if (readFile != null) {
+1:                 readFile.close();
+1:                 readFile = null;
+1:                 writeFile.close();
+0:                 writeFile=null;
+0:                 if( enableRecoveryFile ) {
+1:                     recoveryFile.close();
+0:                     recoveryFile=null;
+1:                 }
+1:                 freeList.clear();
+0:                 if( pageCache!=null ) {
+0:                     pageCache=null;
+1:                 }
+0:                 synchronized(writes) {
+1:                     writes.clear();
+1:                 }
+1:             }
+1:         } else {
+1:             throw new IllegalStateException("Cannot unload the page file when it is not loaded");
+1:         }
+1:     }
+1:         
+1:     public boolean isLoaded() {
+1:         return loaded.get();
+1:     }
+1: 
+1:     /**
+1:      * Flush and sync all write buffers to disk.
+1:      * 
+1:      * @throws IOException
+0:      *         If an disk error occurred.
+1:      */
+1:     public void flush() throws IOException {
+1: 
+0:         if( enableAsyncWrites && stopWriter.get() ) {
+1:             throw new IOException("Page file already stopped: checkpointing is not allowed");
+1:         }
+1:         
+1:         // Setup a latch that gets notified when all buffered writes hits the disk.
+1:         CountDownLatch checkpointLatch;
+0:         synchronized( writes ) {
+0:             if( writes.isEmpty()) {                
+1:                 return;
+1:             }
+0:             if( enableAsyncWrites ) {
+0:                 if( this.checkpointLatch == null ) {
+1:                     this.checkpointLatch = new CountDownLatch(1);
+1:                 }
+1:                 checkpointLatch = this.checkpointLatch;
+1:                 writes.notify();
+1:             } else {
+1:                 writeBatch();
+1:                 return;
+1:             }
+1:         }
+1:         try {
+1:             checkpointLatch.await();        
+1:         } catch (InterruptedException e) {
+1:             throw new InterruptedIOException();
+1:         }
+1:     }
+1: 
+1:     
+1:     public String toString() {
+0:         return "Page File: "+getMainPageFile();
+1:     }
+1:     
+1:     ///////////////////////////////////////////////////////////////////
+1:     // Private Implementation Methods
+1:     ///////////////////////////////////////////////////////////////////
+1:     private File getMainPageFile() {
+0:         return new File(directory, IOHelper.toFileSystemSafeName(name)+PAGEFILE_SUFFIX);
+1:     }
+1:     
+1:     public File getFreeFile() {
+0:         return new File(directory, IOHelper.toFileSystemSafeName(name)+FREE_FILE_SUFFIX);
+1:     } 
+1: 
+1:     public File getRecoveryFile() {
+0:         return new File(directory, IOHelper.toFileSystemSafeName(name)+RECOVERY_FILE_SUFFIX);
+1:     } 
+1: 
+0:     private long toOffset(long pageId) {
+0:         return PAGE_FILE_HEADER_SIZE+(pageId*pageSize);
+1:     }
+1: 
+1:     private void loadMetaData() throws IOException {
+1: 
+1:         ByteArrayInputStream is;
+1:         MetaData v1 = new MetaData();
+1:         MetaData v2 = new MetaData();
+1:         try {
+1:             Properties p = new Properties();
+0:             byte[] d = new byte[PAGE_FILE_HEADER_SIZE/2];
+1:             readFile.seek(0);
+1:             readFile.readFully(d);
+1:             is = new ByteArrayInputStream(d);
+1:             p.load(is);
+1:             IntrospectionSupport.setProperties(v1, p);
+1:         } catch (IOException e) {
+1:             v1 = null;
+1:         }
+1:         
+1:         try {
+1:             Properties p = new Properties();
+0:             byte[] d = new byte[PAGE_FILE_HEADER_SIZE/2];
+0:             readFile.seek(PAGE_FILE_HEADER_SIZE/2);
+1:             readFile.readFully(d);
+1:             is = new ByteArrayInputStream(d);
+1:             p.load(is);
+1:             IntrospectionSupport.setProperties(v2, p);
+1:         } catch (IOException e) {
+1:             v2 = null;
+1:         }
+1:         
+0:         if( v1==null && v2==null ) {
+1:             throw new IOException("Could not load page file meta data");
+1:         } 
+1:         
+0:         if( v1 == null || v1.metaDataTxId<0 ) {
+1:             metaData = v2;
+0:         } else if( v2==null || v1.metaDataTxId<0 ) {
+1:             metaData = v1;
+0:         } else if( v1.metaDataTxId==v2.metaDataTxId ) {
+1:             metaData = v1; // use the first since the 2nd could be a partial..
+1:         } else {
+1:             metaData = v2; // use the second cause the first is probably a partial.
+1:         }
+1:     }
+1:     
+1:     private void storeMetaData() throws IOException {
+1:         // Convert the metadata into a property format
+1:         metaData.metaDataTxId++;
+1:         Properties p = new Properties();
+1:         IntrospectionSupport.getProperties(metaData, p, null);
+1:         
+1:         ByteArrayOutputStream os = new ByteArrayOutputStream(PAGE_FILE_HEADER_SIZE);
+1:         p.store(os, "");
+0:         if( os.size() > PAGE_FILE_HEADER_SIZE/2) { 
+0:             throw new IOException("Configuation is to larger than: "+PAGE_FILE_HEADER_SIZE/2);
+1:         }
+1:         // Fill the rest with space...
+0:         byte[] filler = new byte[(PAGE_FILE_HEADER_SIZE/2)-os.size()];
+0:         Arrays.fill(filler, (byte)' ');
+1:         os.write(filler);
+1:         os.flush();
+1:         
+1:         byte[] d = os.toByteArray();
+1: 
+1:         // So we don't loose it.. write it 2 times...
+1:         writeFile.seek(0);
+1:         writeFile.write(d);
+0:         writeFile.getFD().sync();
+0:         writeFile.seek(PAGE_FILE_HEADER_SIZE/2);
+1:         writeFile.write(d);
+0:         writeFile.getFD().sync();
+1:     }
+1: 
+1:     private void storeFreeList() throws IOException {
+1:         FileOutputStream os = new FileOutputStream(getFreeFile());
+1:         DataOutputStream dos = new DataOutputStream(os);
+1:         SequenceSet.Marshaller.INSTANCE.writePayload(freeList, dos);
+1:         dos.close();
+1:     }
+1: 
+1:     private void loadFreeList() throws IOException {
+1:         freeList.clear();
+1:         FileInputStream is = new FileInputStream(getFreeFile());
+1:         DataInputStream dis = new DataInputStream(is);
+1:         freeList = SequenceSet.Marshaller.INSTANCE.readPayload(dis);
+1:         dis.close();
+1:     }
+1:     
+1:     ///////////////////////////////////////////////////////////////////
+1:     // Property Accessors 
+1:     ///////////////////////////////////////////////////////////////////
+1:     
+1:     /**
+1:      * Is the recovery buffer used to double buffer page writes.  Enabled by default.
+1:      * 
+1:      * @return is the recovery buffer enabled.
+1:      */
+1:     public boolean isEnableRecoveryFile() {
+1:         return enableRecoveryFile;
+1:     }
+1: 
+1:     /**
+1:      * Sets if the recovery buffer uses to double buffer page writes.  Enabled by default.  Disabling this
+1:      * may potentially cause partial page writes which can lead to page file corruption.
+1:      */
+1:     public void setEnableRecoveryFile(boolean doubleBuffer) {
+1:         assertNotLoaded();
+1:         this.enableRecoveryFile = doubleBuffer;
+1:     }
+1: 
+1:     /**
+1:      * @return Are page writes synced to disk?
+1:      */
+0:     public boolean isEnableSyncedWrites() {
+0:         return enableSyncedWrites;
+1:     }
+1: 
+1:     /**
+1:      * Allows you enable syncing writes to disk.
+0:      * @param syncWrites
+1:      */
+0:     public void setEnableSyncedWrites(boolean syncWrites) {
+1:         assertNotLoaded();
+0:         this.enableSyncedWrites = syncWrites;
+1:     }
+1:     
+1:     /**
+1:      * @return the page size
+1:      */
+1:     public int getPageSize() {
+1:         return this.pageSize;
+1:     }
+1: 
+1:     /**
+1:      * @return the amount of content data that a page can hold.
+1:      */
+1:     public int getPageContentSize() {
+0:         return this.pageSize-Page.PAGE_HEADER_SIZE;
+1:     }
+1:     
+1:     /**
+1:      * Configures the page size used by the page file.  By default it is 4k.  Once a page file is created on disk,
+1:      * subsequent loads of that file will use the original pageSize.  Once the PageFile is loaded, this setting
+1:      * can no longer be changed.
+1:      * 
+1:      * @param pageSize the pageSize to set
+0:      * @throws IllegalStateException
+0:      *         once the page file is loaded.
+1:      */
+1:     public void setPageSize(int pageSize) throws IllegalStateException {
+1:         assertNotLoaded();
+1:         this.pageSize = pageSize;
+1:     }
+1:     
+1:     /**
+1:      * @return true if read page caching is enabled
+1:      */
+1:     public boolean isEnablePageCaching() {
+1:         return this.enablePageCaching;
+1:     }
+1: 
+1:     /**
+0:      * @param allows you to enable read page caching
+1:      */
+1:     public void setEnablePageCaching(boolean enablePageCaching) {
+1:         assertNotLoaded();
+1:         this.enablePageCaching = enablePageCaching;
+1:     }
+1: 
+1:     /**
+1:      * @return the maximum number of pages that will get stored in the read page cache.
+1:      */
+1:     public int getPageCacheSize() {
+1:         return this.pageCacheSize;
+1:     }
+1: 
+1:     /**
+0:      * @param Sets the maximum number of pages that will get stored in the read page cache.
+1:      */
+1:     public void setPageCacheSize(int pageCacheSize) {
+1:         assertNotLoaded();
+1:         this.pageCacheSize = pageCacheSize;
+1:     }
+1: 
+0:     public boolean isEnableAsyncWrites() {
+0:         return enableAsyncWrites;
+1:     }
+1: 
+0:     public void setEnableAsyncWrites(boolean enableAsyncWrites) {
+1:         assertNotLoaded();
+0:         this.enableAsyncWrites = enableAsyncWrites;
+1:     }
+1: 
+1:     public long getDiskSize() throws IOException {
+1:         return toOffset(nextFreePageId.get());
+1:     }
+1:     
+1:     /**
+1:      * @return the number of pages allocated in the PageFile
+1:      */
+1:     public long getPageCount() {
+1:         return nextFreePageId.get();
+1:     }
+1: 
+1:     public int getRecoveryFileMinPageCount() {
+1:         return recoveryFileMinPageCount;
+1:     }
+1: 
+1:     public void setRecoveryFileMinPageCount(int recoveryFileMinPageCount) {
+1:         assertNotLoaded();
+1:         this.recoveryFileMinPageCount = recoveryFileMinPageCount;
+1:     }
+1: 
+1:     public int getRecoveryFileMaxPageCount() {
+1:         return recoveryFileMaxPageCount;
+1:     }
+1: 
+1:     public void setRecoveryFileMaxPageCount(int recoveryFileMaxPageCount) {
+1:         assertNotLoaded();
+1:         this.recoveryFileMaxPageCount = recoveryFileMaxPageCount;
+1:     }
+1: 
+1:     ///////////////////////////////////////////////////////////////////
+1:     // Package Protected Methods exposed to Transaction
+1:     ///////////////////////////////////////////////////////////////////
+1: 
+1:     /**
+1:      * @throws IllegalStateException if the page file is not loaded.
+1:      */
+1:     void assertLoaded() throws IllegalStateException {
+0:         if( !loaded.get() ) {
+1:             throw new IllegalStateException("PageFile is not loaded");
+1:         }
+1:     }
+1:     void assertNotLoaded() throws IllegalStateException {
+0:         if( loaded.get() ) {
+1:             throw new IllegalStateException("PageFile is loaded");
+1:         }
+1:     }
+1:         
+1:     /** 
+1:      * Allocates a block of free pages that you can write data to.
+1:      * 
+1:      * @param count the number of sequential pages to allocate
+1:      * @return the first page of the sequential set. 
+1:      * @throws IOException
+0:      *         If an disk error occurred.
+0:      * @throws IllegalStateException
+0:      *         if the PageFile is not loaded
+1:      */
+1:     <T> Page<T> allocate(int count) throws IOException {
+1:         assertLoaded();
+1:         if (count <= 0) {
+1:             throw new IllegalArgumentException("The allocation count must be larger than zero");
+1:         }
+1: 
+1:         Sequence seq = freeList.removeFirstSequence(count);
+1: 
+1:         // We may need to create new free pages...
+1:         if (seq == null) {
+1: 
+1:             Page<T> first = null;
+1:             int c = count;
+0:             while (c > 0) {
+0:                 Page<T> page = new Page<T>(nextFreePageId.getAndIncrement());
+0:                 page.makeFree(getNextWriteTransactionId());
+1: 
+1:                 if (first == null) {
+1:                     first = page;
+1:                 }
+1: 
+1:                 addToCache(page);
+1:                 DataByteArrayOutputStream out = new DataByteArrayOutputStream(pageSize);
+1:                 page.write(out);
+1:                 write(page, out.getData());
+1: 
+1:                 // LOG.debug("allocate writing: "+page.getPageId());
+0:                 c--;
+1:             }
+1: 
+1:             return first;
+1:         }
+1: 
+1:         Page<T> page = new Page<T>(seq.getFirst());
+1:         page.makeFree(0);
+1:         // LOG.debug("allocated: "+page.getPageId());
+1:         return page;
+1:     }
+1: 
+1:     long getNextWriteTransactionId() {
+1:         return nextTxid.incrementAndGet();
+1:     }
+1: 
+0:     void readPage(long pageId, byte[] data) throws IOException {
+1:         readFile.seek(toOffset(pageId));
+1:         readFile.readFully(data);
+1:     }
+1: 
+1:     public void freePage(long pageId) {
+1:         freeList.add(pageId);
+0:         if( enablePageCaching ) {
+1:             pageCache.remove(pageId);
+1:         }
+1:     }
+1:     
+1:     @SuppressWarnings("unchecked")
+1:     private <T> void write(Page<T> page, byte[] data) throws IOException {
+1:         final PageWrite write = new PageWrite(page, data);
+0:         Entry<Long, PageWrite> entry = new Entry<Long, PageWrite>(){
+1:             public Long getKey() {
+1:                 return write.getPage().getPageId();
+1:             }
+1:             public PageWrite getValue() {
+1:                 return write;
+1:             }
+1:             public PageWrite setValue(PageWrite value) {
+1:                 return null;
+1:             }
+1:         };
+1:         Entry<Long, PageWrite>[] entries = new Map.Entry[]{entry};
+1:         write(Arrays.asList(entries));
+1:     }
+1: 
+1:     void write(Collection<Map.Entry<Long, PageWrite>> updates) throws IOException {
+0:         synchronized( writes ) {
+1:             
+1:             for (Map.Entry<Long, PageWrite> entry : updates) {
+1:                 Long key = entry.getKey();
+1:                 PageWrite value = entry.getValue();
+1:                 PageWrite write = writes.get(key);
+0:                 if( write==null ) {
+1:                     writes.put(key, value);
+1:                 } else {
+1:                     write.setCurrent(value.page, value.current);
+1:                 }
+1:             }
+1:             
+1:             // Once we start approaching capacity, notify the writer to start writing
+0:             if( canStartWriteBatch() ) {
+0:                 if( enableAsyncWrites  ) {
+1:                     writes.notify();
+1:                 } else {
+1:                     writeBatch();
+1:                 }
+1:             }
+1:         }            
+1:     }
+1:     
+1:     private boolean canStartWriteBatch() {
+0:         int capacityUsed = ((writes.size() * 100)/1000);
+0:         if( enableAsyncWrites ) {
+1:             // The constant 10 here controls how soon write batches start going to disk..
+1:             // would be nice to figure out how to auto tune that value.  Make to small and
+1:             // we reduce through put because we are locking the write mutex too often doing writes
+0:             return capacityUsed >= 10 || checkpointLatch!=null;
+1:         } else {
+0:             return capacityUsed >= 80 || checkpointLatch!=null;
+1:         }
+1:     }
+1: 
+1:     ///////////////////////////////////////////////////////////////////
+1:     // Cache Related operations
+1:     ///////////////////////////////////////////////////////////////////
+1:     @SuppressWarnings("unchecked")
+1:     <T> Page<T> getFromCache(long pageId) {
+0:         synchronized(writes) {
+1:             PageWrite pageWrite = writes.get(pageId);
+0:             if( pageWrite != null ) {
+1:                 return pageWrite.page;
+1:             }
+1:         }
+1: 
+1:         Page<T> result = null;
+1:         if (enablePageCaching) {
+1:             result = pageCache.get(pageId);
+1:         }
+1:         return result;
+1:     }
+1: 
+1:     void addToCache(Page page) {
+1:         if (enablePageCaching) {
+1:             pageCache.put(page.getPageId(), page);
+1:         }
+1:     }
+1: 
+0:     void removeFromCache(Page page) {
+1:         if (enablePageCaching) {
+0:             pageCache.remove(page.getPageId());
+1:         }
+1:     }
+1: 
+1:     ///////////////////////////////////////////////////////////////////
+1:     // Internal Double write implementation follows...
+1:     ///////////////////////////////////////////////////////////////////
+1:     /**
+1:      * 
+1:      */
+1:     private void pollWrites() {
+1:         try {
+0:             while( !stopWriter.get() ) {
+1:                 // Wait for a notification...
+0:                 synchronized( writes ) {   
+1:                     // If there is not enough to write, wait for a notification...
+0:                     while( !canStartWriteBatch() && !stopWriter.get() ) {
+1:                         writes.wait(100);
+1:                     }
+1:                     
+0:                     if( writes.isEmpty() ) {
+1:                         releaseCheckpointWaiter();
+1:                     }
+1:                 }
+1:                 writeBatch();
+1:             }
+1:         } catch (Throwable e) {
+0:             e.printStackTrace();
+1:         } finally {
+1:             releaseCheckpointWaiter();
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * 
+0:      * @param timeout
+0:      * @param unit
+0:      * @return true if there are still pending writes to do.
+0:      * @throws InterruptedException 
+1:      * @throws IOException 
+1:      */
+1:     private void writeBatch() throws IOException {
+1:             
+1:         CountDownLatch checkpointLatch;
+1:         ArrayList<PageWrite> batch;
+0:         synchronized( writes ) {
+1:             // If there is not enough to write, wait for a notification...
+1: 
+1:             batch = new ArrayList<PageWrite>(writes.size());
+1:             // build a write batch from the current write cache. 
+1:             for (PageWrite write : writes.values()) {
+1:                 batch.add(write);
+1:                 // Move the current write to the diskBound write, this lets folks update the 
+1:                 // page again without blocking for this write.
+1:                 write.begin();
+1:             }
+1: 
+1:             // Grab on to the existing checkpoint latch cause once we do this write we can 
+1:             // release the folks that were waiting for those writes to hit disk.
+1:             checkpointLatch = this.checkpointLatch;
+0:             this.checkpointLatch=null;
+1:         }
+1:         
+1:  
+1:        if (enableRecoveryFile) {
+1:            
+0:            // Using Adler-32 instead of CRC-32 because it's much faster and it's 
+0:            // weakness for short messages with few hundred bytes is not a factor in this case since we know 
+0:            // our write batches are going to much larger.
+0:            Checksum checksum = new Adler32();
+0:            for (PageWrite w : batch) {
+0:                checksum.update(w.diskBound, 0, pageSize);
+1:            }
+1:            
+0:            // Can we shrink the recovery buffer??
+0:            if( recoveryPageCount > recoveryFileMaxPageCount ) {
+0:                int t = Math.max(recoveryFileMinPageCount, batch.size());
+0:                recoveryFile.setLength(recoveryFileSizeForPages(t));
+1:            }
+1:            
+0:             // Record the page writes in the recovery buffer.
+0:             recoveryFile.seek(0);
+0:             // Store the next tx id...
+0:             recoveryFile.writeLong(nextTxid.get());
+0:             // Store the checksum for thw write batch so that on recovery we know if we have a consistent 
+0:             // write batch on disk.
+0:             recoveryFile.writeLong(checksum.getValue());
+0:             // Write the # of pages that will follow
+0:             recoveryFile.writeInt(batch.size());
+1:             
+1:             
+0:             // Write the pages.
+1:             recoveryFile.seek(RECOVERY_FILE_HEADER_SIZE);
+0:             for (PageWrite w : batch) {
+0:                 recoveryFile.writeLong(w.page.getPageId());
+0:                 recoveryFile.write(w.diskBound, 0, pageSize);
+1:             }
+1:             
+0:             if (enableSyncedWrites) {
+0:                 // Sync to make sure recovery buffer writes land on disk..
+0:                 recoveryFile.getFD().sync();
+1:             }
+1:             
+0:             recoveryPageCount = batch.size();
+1:         }
+1:        
+1:         
+0:         for (PageWrite w : batch) {
+0:             writeFile.seek(toOffset(w.page.getPageId()));
+0:             writeFile.write(w.diskBound, 0, pageSize);
+1:         }
+1:         
+0:         // Sync again
+0:         if( enableSyncedWrites ) {
+0:             writeFile.getFD().sync();
+1:         }
+1:         
+0:         synchronized( writes ) {
+0:             for (PageWrite w : batch) {
+0:                 // If there are no more pending writes, then remove it from the write cache.
+0:                 if( w.done() ) {
+1:                     writes.remove(w.page.getPageId());
+1:                 }
+1:             }
+1:         }
+1:         
+0:         if( checkpointLatch!=null ) {
+1:             checkpointLatch.countDown();
+1:         }
+1:     }
+1: 
+1:     private long recoveryFileSizeForPages(int pageCount) {
+0:         return RECOVERY_FILE_HEADER_SIZE+((pageSize+8)*pageCount);
+1:     }
+1: 
+1:     private void releaseCheckpointWaiter() {
+0:         if( checkpointLatch!=null ) {
+1:             checkpointLatch.countDown();
+0:             checkpointLatch=null;
+1:         }
+1:     }       
+1:     
+1:     /**
+1:      * Inspects the recovery buffer and re-applies any 
+1:      * partially applied page writes.
+1:      * 
+1:      * @return the next transaction id that can be used.
+1:      * @throws IOException
+1:      */
+1:     private long redoRecoveryUpdates() throws IOException {
+0:         if( !enableRecoveryFile ) {
+1:             return 0;
+1:         }
+0:         recoveryPageCount=0;
+1:         
+1:         // Are we initializing the recovery file?
+0:         if( recoveryFile.length() == 0 ) {
+1:             // Write an empty header..
+1:             recoveryFile.write(new byte[RECOVERY_FILE_HEADER_SIZE]);
+1:             // Preallocate the minium size for better performance.
+1:             recoveryFile.setLength(recoveryFileSizeForPages(recoveryFileMinPageCount));
+1:             return 0;
+1:         }
+1:         
+1:         // How many recovery pages do we have in the recovery buffer?
+0:         recoveryFile.seek(0);
+0:         long nextTxId = readFile.readLong();
+0:         long expectedChecksum = readFile.readLong();
+0:         int pageCounter = readFile.readInt();
+1:         
+1:         recoveryFile.seek(RECOVERY_FILE_HEADER_SIZE);
+0:         Checksum checksum = new Adler32();
+1:         LinkedHashMap<Long, byte[]> batch = new LinkedHashMap<Long, byte[]>();
+1:         try {
+1:             for (int i = 0; i < pageCounter; i++) {
+1:                 long offset = recoveryFile.readLong();
+0:                 byte []data = new byte[pageSize];
+0:                 if( recoveryFile.read(data, 0, pageSize) != pageSize ) {
+1:                     // Invalid recovery record, Could not fully read the data". Probably due to a partial write to the recovery buffer
+1:                     return nextTxId;
+1:                 }
+1:                 checksum.update(data, 0, pageSize);
+1:                 batch.put(offset, data);
+1:             }
+1:         } catch (Exception e) {
+1:             // If an error occurred it was cause the redo buffer was not full written out correctly.. so don't redo it. 
+1:             // as the pages should still be consistent.
+1:             LOG.debug("Redo buffer was not fully intact: ", e);
+1:             return nextTxId;
+1:         }
+1:         
+1:         recoveryPageCount = pageCounter;
+1:         
+1:         // If the checksum is not valid then the recovery buffer was partially written to disk.
+0:         if( checksum.getValue() != expectedChecksum ) {
+1:             return nextTxId;
+1:         }
+1:         
+1:         // Re-apply all the writes in the recovery buffer.
+1:         for (Map.Entry<Long, byte[]> e : batch.entrySet()) {
+0:             writeFile.seek(e.getKey());
+0:             e.getValue();
+1:             writeFile.write(e.getValue());
+1:         }
+1:         
+1:         // And sync it to disk
+0:         writeFile.getFD().sync();
+1:         return nextTxId;
+1:     }
+1: 
+1:     private void startWriter() {
+0:         synchronized( writes ) {
+0:             if( enableAsyncWrites ) {
+1:                 stopWriter.set(false);
+1:                 writerThread = new Thread("KahaDB Page Writer") {
+1:                     @Override
+1:                     public void run() {
+1:                         pollWrites();
+1:                     }
+1:                 };
+1:                 writerThread.setPriority(Thread.MAX_PRIORITY);
+1:                 writerThread.start();
+1:             }
+1:         }
+1:     }
+1:  
+1:     private void stopWriter() throws InterruptedException {
+0:         if( enableAsyncWrites ) {
+1:             stopWriter.set(true);
+1:             writerThread.join();
+1:         }
+1:     }
+1: 
+1: 	public File getFile() {
+1: 		return getMainPageFile();
+1: 	}
+1: 
+1: }
+author:Timothy A. Bish
+-------------------------------------------------------------------------------
+commit:4bace21
+/////////////////////////////////////////////////////////////////////////
+0: import java.io.ByteArrayInputStream;
+0: import java.io.ByteArrayOutputStream;
+0: import java.io.DataInputStream;
+0: import java.io.DataOutputStream;
+0: import java.io.File;
+0: import java.io.FileInputStream;
+0: import java.io.FileOutputStream;
+0: import java.io.IOException;
+0: import java.io.InterruptedIOException;
+0: import java.io.RandomAccessFile;
+/////////////////////////////////////////////////////////////////////////
+1:     synchronized void readPage(long pageId, byte[] data) throws IOException {
+commit:cdba931
+/////////////////////////////////////////////////////////////////////////
+1:     public static final int DEFAULT_PAGE_SIZE = Integer.getInteger("defaultPageSize", 1024*4);
+1:     public static final int DEFAULT_WRITE_BATCH_SIZE = Integer.getInteger("defaultWriteBatchSize", 1000);
+1:     public static final int DEFAULT_PAGE_CACHE_SIZE = Integer.getInteger("defaultPageCacheSize", 100);;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:     // The max size that we let the recovery file grow to.. ma exceed the max, but the file will get resize
+0:     // The number of pages we are aiming to write every time we
+/////////////////////////////////////////////////////////////////////////
+0:     // These are used if enableAsyncWrites==true
+/////////////////////////////////////////////////////////////////////////
+0:     // Persistent settings stored in the page file.
+/////////////////////////////////////////////////////////////////////////
+0:             current = null;
+1:             currentLocation = -1;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         if (file.exists() && !file.delete()) {
+1:             throw new IOException("Could not delete: " + file.getPath());
+/////////////////////////////////////////////////////////////////////////
+1:                 for (Iterator<Page> i = tx().iterator(true); i.hasNext(); ) {
+1:                     Page page = i.next();
+/////////////////////////////////////////////////////////////////////////
+1:             throw new IllegalStateException("Cannot load the page file when it is already loaded.");
+/////////////////////////////////////////////////////////////////////////
+1:             InterruptedIOException ioe = new InterruptedIOException();
+1:             ioe.initCause(e);
+1:             throw ioe;
+/////////////////////////////////////////////////////////////////////////
+1:             throw new IOException("Configuation is larger than: " + PAGE_FILE_HEADER_SIZE / 2);
+/////////////////////////////////////////////////////////////////////////
+0:     // Property Accessors
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:             // Perform the id's only once....
+1:             long pageId = nextFreePageId.getAndAdd(count);
+1:             long writeTxnId = nextTxid.getAndAdd(count);
+1: 
+1:             while (c-- > 0) {
+1:                 Page<T> page = new Page<T>(pageId++);
+1:                 page.makeFree(writeTxnId++);
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:             LOG.info("An exception was raised while performing poll writes", e);
+/////////////////////////////////////////////////////////////////////////
+0:             // If an error occurred it was cause the redo buffer was not full written out correctly.. so don't redo it.
+author:Gary Tully
+-------------------------------------------------------------------------------
+commit:bb4a2f7
+/////////////////////////////////////////////////////////////////////////
+1:         if (enableRecoveryFile) {
+0:             recoveryFile.seek(RECOVERY_FILE_HEADER_SIZE);
+1:         }
+/////////////////////////////////////////////////////////////////////////
+0:                 if (enableRecoveryFile) {
+0:                     recoveryFile.getFD().sync();
+1:                 }
+commit:d1e7d69
+/////////////////////////////////////////////////////////////////////////
+1:         long currentLocation = -1;
+1:         long diskBoundLocation = -1;
+/////////////////////////////////////////////////////////////////////////
+1:         public PageWrite(Page page, long currentLocation, int length, File tmpFile) {
+/////////////////////////////////////////////////////////////////////////
+1:         public void setCurrentLocation(Page page, long location, int length) {
+/////////////////////////////////////////////////////////////////////////
+0:                 file.read(diskBound);
+commit:bf59b7d
+/////////////////////////////////////////////////////////////////////////
+0:             return "[PageWrite:"+page.getPageId()+ "-" + page.getType()  + "]";
+/////////////////////////////////////////////////////////////////////////
+1:         removeFromCache(pageId);
+/////////////////////////////////////////////////////////////////////////
+1:     void removeFromCache(long pageId) {
+0:             pageCache.remove(pageId);
+commit:2b10259
+/////////////////////////////////////////////////////////////////////////
+0:     public static final int DEFAULT_PAGE_CACHE_SIZE = Integer.parseInt(System.getProperty("defaultPageCacheSize", ""+100));;
+/////////////////////////////////////////////////////////////////////////
+1:     private int pageCacheSize = DEFAULT_PAGE_CACHE_SIZE;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         return freeList.rangeSize();
+commit:e11ece1
+/////////////////////////////////////////////////////////////////////////
+1:      * @param enablePageCaching allows you to enable read page caching
+/////////////////////////////////////////////////////////////////////////
+1:      * @param pageCacheSize Sets the maximum number of pages that will get stored in the read page cache.
+/////////////////////////////////////////////////////////////////////////
+1:     public long getFreePageCount() {
+1:         assertLoaded();
+0:         return freeList.size();
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+commit:426a3a1
+/////////////////////////////////////////////////////////////////////////
+0:             checkpointLatch.await();
+commit:c94b407
+/////////////////////////////////////////////////////////////////////////
+1:                 LOG.debug(toString() + ", Recovering page file...");
+/////////////////////////////////////////////////////////////////////////
+1:             writeFile.seek(toOffset(e.getKey()));
+commit:039a15f
+/////////////////////////////////////////////////////////////////////////
+1:                 writerThread.setDaemon(true);
+commit:deea2d1
+/////////////////////////////////////////////////////////////////////////
+0:     public static final int DEFAULT_WRITE_BATCH_SIZE = Integer.parseInt(System.getProperty("defaultWriteBatchSize", ""+1000));
+/////////////////////////////////////////////////////////////////////////
+1:     int writeBatchSize = DEFAULT_WRITE_BATCH_SIZE;
+commit:f0af62f
+/////////////////////////////////////////////////////////////////////////
+0:             int size = writes.size();
+0:             long start = System.currentTimeMillis();
+0:             long end = System.currentTimeMillis();
+0:             if( end-start > 100 ) {
+0:                 LOG.warn("KahaDB PageFile flush: " + size + " queued writes, latch wait took "+(end-start));
+1:             }
+author:Robert Davies
+-------------------------------------------------------------------------------
+commit:aa3ab12
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.ArrayList;
+0: import java.util.Arrays;
+0: import java.util.Collection;
+1: import java.util.Collections;
+0: import java.util.Iterator;
+0: import java.util.LinkedHashMap;
+0: import java.util.Map;
+0: import java.util.Properties;
+0: import java.util.TreeMap;
+0: import org.apache.kahadb.util.DataByteArrayOutputStream;
+0: import org.apache.kahadb.util.IOExceptionSupport;
+0: import org.apache.kahadb.util.IOHelper;
+0: import org.apache.kahadb.util.IntrospectionSupport;
+0: import org.apache.kahadb.util.LFUCache;
+0: import org.apache.kahadb.util.LRUCache;
+0: import org.apache.kahadb.util.Sequence;
+0: import org.apache.kahadb.util.SequenceSet;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+0:  * A PageFile provides you random access to fixed sized disk pages. This object is not thread safe and therefore access to it should
+1:  * <p/>
+1: 
+1: 
+0:     public static final int DEFAULT_PAGE_SIZE = Integer.parseInt(System.getProperty("defaultPageSize", "" + 1024 * 4));
+0:     public static final int DEFAULT_WRITE_BATCH_SIZE = Integer.parseInt(System.getProperty("defaultWriteBatchSize", "" + 1000));
+0:     public static final int DEFAULT_PAGE_CACHE_SIZE = Integer.parseInt(System.getProperty("defaultPageCacheSize", "" + 100));
+0:     ;
+1:     private static final int RECOVERY_FILE_HEADER_SIZE = 1024 * 4;
+1:     private static final int PAGE_FILE_HEADER_SIZE = 1024 * 4;
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     private boolean enablePageCaching = true;
+1:     private boolean enableRecoveryFile = true;
+1:     private boolean enableDiskSyncs = true;
+1:     private boolean enabledWriteThread = false;
+/////////////////////////////////////////////////////////////////////////
+0:     private TreeMap<Long, PageWrite> writes = new TreeMap<Long, PageWrite>();
+1: 
+1: 
+1:     private boolean useLFRUEviction = false;
+1:     private float LFUEvictionFactor = 0.2f;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             this.page = page;
+1:             current = data;
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:             this.page = page;
+1:             current = data;
+/////////////////////////////////////////////////////////////////////////
+1:             return "[PageWrite:" + page.getPageId() + "-" + page.getType() + "]";
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:             if (currentLocation != -1) {
+1:                 diskBoundLocation = currentLocation;
+1:                 currentLocation = -1;
+0:                 current = null;
+1:             } else {
+0:                 diskBound = current;
+0:                 current = null;
+1:                 currentLocation = -1;
+1:             }
+0: 
+1:             diskBound = null;
+0: 
+0: 
+0:      * The MetaData object hold the persistent data associated with a PageFile object.
+0: 
+0: 
+1:         long metaDataTxId = -1;
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+/////////////////////////////////////////////////////////////////////////
+0: 
+0: 
+0:      *
+1:      * @throws IOException           if the files cannot be deleted.
+1:      * @throws IllegalStateException if this PageFile is loaded
+1:         if (loaded.get()) {
+0: 
+1:         if (loaded.get()) {
+/////////////////////////////////////////////////////////////////////////
+1:         if (file.exists()) {
+0:             if (!file.delete()) {
+0:                 throw new IOException("Could not delete: " + file.getPath());
+0: 
+1:         if (file.exists()) {
+1:             if (!file.renameTo(archive)) {
+0: 
+0:      * Loads the page file so that it can be accessed for read/write purposes.  This allocates OS resources.  If this is the
+0:      *
+1:      * @throws IOException           If the page file cannot be loaded. This could be cause the existing page file is corrupt is a bad version or if
+1:      *                               there was a disk error.
+1:      * @throws IllegalStateException If the page file was already loaded.
+0: 
+1:             if (enablePageCaching) {
+1:                 if (isUseLFRUEviction()) {
+1:                     pageCache = Collections.synchronizedMap(new LFUCache<Long, Page>(pageCacheSize, getLFUEvictionFactor()));
+1:                 } else {
+1:                     pageCache = Collections.synchronizedMap(new LRUCache<Long, Page>(pageCacheSize, pageCacheSize, 0.75f, true));
+1:                 }
+0: 
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:             if (enableRecoveryFile) {
+0: 
+1:             if (metaData.isCleanShutdown()) {
+1:                 nextTxid.set(metaData.getLastTxId() + 1);
+1:                 if (metaData.getFreePages() > 0) {
+1:                 }
+0: 
+0:                 for (Iterator i = tx().iterator(true); i.hasNext(); ) {
+0:                     Page page = (Page) i.next();
+1:                     if (page.getType() == Page.PAGE_FREE_TYPE) {
+0: 
+0: 
+0: 
+0:             if (writeFile.length() < PAGE_FILE_HEADER_SIZE) {
+0:             nextFreePageId.set((writeFile.length() - PAGE_FILE_HEADER_SIZE) / pageSize);
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:      *
+1:      * @throws IOException           if there was a disk error occurred while closing the down the page file.
+1:      * @throws IllegalStateException if the PageFile is not loaded
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:             if (freeList.isEmpty()) {
+0: 
+1:             metaData.setLastTxId(nextTxid.get() - 1);
+0: 
+1:                 writeFile = null;
+0:                 if (enableRecoveryFile) {
+1:                     recoveryFile = null;
+1:                 if (pageCache != null) {
+1:                     pageCache = null;
+1:                 synchronized (writes) {
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:      *
+1:      * @throws IOException If an disk error occurred.
+1:         if (enabledWriteThread && stopWriter.get()) {
+0: 
+1:         synchronized (writes) {
+1:             if (writes.isEmpty()) {
+1:             if (enabledWriteThread) {
+1:                 if (this.checkpointLatch == null) {
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:         return "Page File: " + getMainPageFile();
+0: 
+1:         return new File(directory, IOHelper.toFileSystemSafeName(name) + PAGEFILE_SUFFIX);
+0: 
+1:         return new File(directory, IOHelper.toFileSystemSafeName(name) + FREE_FILE_SUFFIX);
+1:     }
+1:         return new File(directory, IOHelper.toFileSystemSafeName(name) + RECOVERY_FILE_SUFFIX);
+1:     }
+1:         return PAGE_FILE_HEADER_SIZE + (pageId * pageSize);
+/////////////////////////////////////////////////////////////////////////
+1:             byte[] d = new byte[PAGE_FILE_HEADER_SIZE / 2];
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:             byte[] d = new byte[PAGE_FILE_HEADER_SIZE / 2];
+1:             readFile.seek(PAGE_FILE_HEADER_SIZE / 2);
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:         if (v1 == null && v2 == null) {
+1:         }
+0: 
+1:         if (v1 == null || v1.metaDataTxId < 0) {
+1:         } else if (v2 == null || v1.metaDataTxId < 0) {
+1:         } else if (v1.metaDataTxId == v2.metaDataTxId) {
+0: 
+0: 
+1:         if (os.size() > PAGE_FILE_HEADER_SIZE / 2) {
+0:             throw new IOException("Configuation is to larger than: " + PAGE_FILE_HEADER_SIZE / 2);
+1:         byte[] filler = new byte[(PAGE_FILE_HEADER_SIZE / 2) - os.size()];
+1:         Arrays.fill(filler, (byte) ' ');
+0: 
+1:         writeFile.seek(PAGE_FILE_HEADER_SIZE / 2);
+/////////////////////////////////////////////////////////////////////////
+0: 
+0: 
+0:      *
+/////////////////////////////////////////////////////////////////////////
+0: 
+/////////////////////////////////////////////////////////////////////////
+1:         return this.pageSize - Page.PAGE_HEADER_SIZE;
+0: 
+0:      *
+1:      * @throws IllegalStateException once the page file is loaded.
+0: 
+/////////////////////////////////////////////////////////////////////////
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:     public int getWriteBatchSize() {
+0:         return writeBatchSize;
+1:     }
+0:     public void setWriteBatchSize(int writeBatchSize) {
+0:         this.writeBatchSize = writeBatchSize;
+1:     }
+1:     public float getLFUEvictionFactor() {
+1:         return LFUEvictionFactor;
+1:     }
+0: 
+1:     public void setLFUEvictionFactor(float LFUEvictionFactor) {
+1:         this.LFUEvictionFactor = LFUEvictionFactor;
+1:     }
+0: 
+1:     public boolean isUseLFRUEviction() {
+1:         return useLFRUEviction;
+1:     }
+0: 
+1:     public void setUseLFRUEviction(boolean useLFRUEviction) {
+1:         this.useLFRUEviction = useLFRUEviction;
+1:     }
+0: 
+0:     ///////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         if (!loaded.get()) {
+0: 
+1:         if (loaded.get()) {
+0: 
+0:     /**
+0:      *
+0:      * @return the first page of the sequential set.
+1:      * @throws IOException           If an disk error occurred.
+1:      * @throws IllegalStateException if the PageFile is not loaded
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:         Entry<Long, PageWrite> entry = new Entry<Long, PageWrite>() {
+0: 
+0: 
+/////////////////////////////////////////////////////////////////////////
+1:         synchronized (writes) {
+1:             if (enabledWriteThread) {
+1:                 while (writes.size() >= writeBatchSize && !stopWriter.get()) {
+/////////////////////////////////////////////////////////////////////////
+1:                 if (write == null) {
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:             if (longTx || canStartWriteBatch()) {
+1:                 if (enabledWriteThread) {
+0:         }
+0: 
+1:         int capacityUsed = ((writes.size() * 100) / writeBatchSize);
+1:         if (enabledWriteThread) {
+1:             return capacityUsed >= 10 || checkpointLatch != null;
+1:             return capacityUsed >= 80 || checkpointLatch != null;
+/////////////////////////////////////////////////////////////////////////
+1:         synchronized (writes) {
+1:             if (pageWrite != null) {
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:      *
+1:             while (!stopWriter.get()) {
+1:                 synchronized (writes) {
+0: 
+1:                     while (writes.isEmpty() && checkpointLatch == null && !stopWriter.get()) {
+0: 
+1:                     if (writes.isEmpty()) {
+/////////////////////////////////////////////////////////////////////////
+0:     private void writeBatch() throws IOException {
+0:         CountDownLatch checkpointLatch;
+0:         ArrayList<PageWrite> batch;
+1:         synchronized (writes) {
+/////////////////////////////////////////////////////////////////////////
+1:             this.checkpointLatch = null;
+0:         }
+0:         Checksum checksum = new Adler32();
+0:         recoveryFile.seek(RECOVERY_FILE_HEADER_SIZE);
+0:         for (PageWrite w : batch) {
+0:             if (enableRecoveryFile) {
+1:                 try {
+0:                     checksum.update(w.getDiskBound(), 0, pageSize);
+0:                 } catch (Throwable t) {
+0:                     throw IOExceptionSupport.create("Cannot create recovery file. Reason: " + t, t);
+0:                 }
+0:                 recoveryFile.writeLong(w.page.getPageId());
+0:                 recoveryFile.write(w.getDiskBound(), 0, pageSize);
+0:             }
+0:             writeFile.seek(toOffset(w.page.getPageId()));
+0:             writeFile.write(w.getDiskBound(), 0, pageSize);
+0:             w.done();
+0:         }
+1:         try {
+0:             if (enableRecoveryFile) {
+0:                 // Can we shrink the recovery buffer??
+0:                 if (recoveryPageCount > recoveryFileMaxPageCount) {
+0:                     int t = Math.max(recoveryFileMinPageCount, batch.size());
+0:                     recoveryFile.setLength(recoveryFileSizeForPages(t));
+0:                 }
+0:                 // Record the page writes in the recovery buffer.
+0:                 recoveryFile.seek(0);
+0:                 // Store the next tx id...
+0:                 recoveryFile.writeLong(nextTxid.get());
+0:                 // Store the checksum for thw write batch so that on recovery we
+0:                 // know if we have a consistent
+0:                 // write batch on disk.
+0:                 recoveryFile.writeLong(checksum.getValue());
+0:                 // Write the # of pages that will follow
+0:                 recoveryFile.writeInt(batch.size());
+0:             }
+0:             if (enableDiskSyncs) {
+0:                 // Sync to make sure recovery buffer writes land on disk..
+0:                 recoveryFile.getFD().sync();
+0:                 writeFile.getFD().sync();
+0:             }
+1:         } finally {
+1:             synchronized (writes) {
+0:                 for (PageWrite w : batch) {
+1:                     // If there are no more pending writes, then remove it from
+1:                     // the write cache.
+1:                     if (w.isDone()) {
+0:                         writes.remove(w.page.getPageId());
+1:                         if (w.tmpFile != null && tmpFilesForRemoval.contains(w.tmpFile)) {
+1:                             if (!w.tmpFile.delete()) {
+1:                                 throw new IOException("Can't delete temporary KahaDB transaction file:" + w.tmpFile);
+0:                             }
+1:                             tmpFilesForRemoval.remove(w.tmpFile);
+0:                         }
+0:                     }
+0:                 }
+0:             }
+1:             if (checkpointLatch != null) {
+0:                 checkpointLatch.countDown();
+0:             }
+0:         }
+0:     }
+1:         return RECOVERY_FILE_HEADER_SIZE + ((pageSize + 8) * pageCount);
+1:         if (checkpointLatch != null) {
+1:             checkpointLatch = null;
+0:     }
+0: 
+0:      * Inspects the recovery buffer and re-applies any
+0:      *
+1:         if (!enableRecoveryFile) {
+1:         recoveryPageCount = 0;
+0: 
+1:         if (recoveryFile.length() == 0) {
+0: 
+0: 
+1:                 byte[] data = new byte[pageSize];
+1:                 if (recoveryFile.read(data, 0, pageSize) != pageSize) {
+/////////////////////////////////////////////////////////////////////////
+0: 
+0: 
+1:         if (checksum.getValue() != expectedChecksum) {
+0: 
+0: 
+1:         synchronized (writes) {
+1:             if (enabledWriteThread) {
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:         if (enabledWriteThread) {
+0:     public File getFile() {
+0:         return getMainPageFile();
+0:     }
+author:Bosanac Dejan
+-------------------------------------------------------------------------------
+commit:5f7fc14
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.kahadb.util.*;
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+0: 
+0: import java.io.*;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     
+1:     public void archive() throws IOException {
+0:         if( loaded.get() ) {
+1:             throw new IllegalStateException("Cannot delete page file data when the page file is loaded");
+0:         }
+1:         long timestamp = System.currentTimeMillis();
+1:         archive(getMainPageFile(), String.valueOf(timestamp));
+1:         archive(getFreeFile(), String.valueOf(timestamp));
+1:         archive(getRecoveryFile(), String.valueOf(timestamp));
+0:     }
+/////////////////////////////////////////////////////////////////////////
+1:     private void archive(File file, String suffix) throws IOException {
+0:         if( file.exists() ) {
+1:             File archive = new File(file.getPath() + "-" + suffix);
+0:             if( !file.renameTo(archive) ) {
+1:                 throw new IOException("Could not archive: " + file.getPath() + " to " + file.getPath());
+0:             }
+0:         }
+0:     }
+0:     
+commit:6994ecb
+/////////////////////////////////////////////////////////////////////////
+0:     private ArrayList<File> tmpFilesForRemoval = new ArrayList<File>();
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:                          if (w.tmpFile != null && tmpFilesForRemoval.contains(w.tmpFile)) {
+0:                              if (!w.tmpFile.delete()) {
+0:                                  throw new IOException("Can't delete temporary KahaDB transaction file:" + w.tmpFile);
+0:                              }
+0:                              tmpFilesForRemoval.remove(w.tmpFile);
+0:                          }
+/////////////////////////////////////////////////////////////////////////
+1:     public void removeTmpFile(File file) {
+1:         tmpFilesForRemoval.add(file);
+0:     }
+0: 
+commit:40ae055
+/////////////////////////////////////////////////////////////////////////
+0:         int currentLocation = -1;
+0:         int diskBoundLocation = -1;
+1:         File tmpFile;
+1:         int length;
+0: 
+0:         public PageWrite(Page page, int currentLocation, int length, File tmpFile) {
+1:             this.page = page;
+1:             this.currentLocation = currentLocation;
+1:             this.tmpFile = tmpFile;
+1:             this.length = length;
+0:         }
+0:             currentLocation = -1;
+1:             diskBoundLocation = -1;
+0:         }
+0: 
+0:         public void setCurrentLocation(Page page, int location, int length) {
+1:             this.page = page;
+1:             this.currentLocation = location;
+1:             this.length = length;
+1:             this.current = null;
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:         public byte[] getDiskBound() throws IOException {
+1:             if (diskBound == null && diskBoundLocation != -1) {
+1:                 diskBound = new byte[length];
+0:                 RandomAccessFile file = new RandomAccessFile(tmpFile, "r");
+0:                 file.seek(diskBoundLocation);
+0:                 int readNum = file.read(diskBound);
+0:                 file.close();
+1:                 diskBoundLocation = -1;
+0:             }
+1:             return diskBound;
+0:         }
+0:            if (currentLocation != -1) {
+0:               diskBoundLocation = currentLocation;
+0:               currentLocation = -1;
+0:               current = null;
+0:            }  else {
+0:               diskBound = current;
+0:               current = null;
+0:               currentLocation = -1;
+0:            }
+1:             diskBoundLocation = -1;
+1:             return current == null || currentLocation == -1;
+1:             return diskBound == null && diskBoundLocation == -1 && current == null && currentLocation == -1;
+/////////////////////////////////////////////////////////////////////////
+1:     public long toOffset(long pageId) {
+/////////////////////////////////////////////////////////////////////////
+1:             boolean longTx = false;
+0: 
+/////////////////////////////////////////////////////////////////////////
+1:                     if (value.currentLocation != -1) {
+1:                         write.setCurrentLocation(value.page, value.currentLocation, value.length);
+1:                         write.tmpFile = value.tmpFile;
+1:                         longTx = true;
+1:                     } else {
+0:                         write.setCurrent(value.page, value.current);
+0:                     }
+1:             // sync immediately for long txs
+0:             if( longTx || canStartWriteBatch() ) {
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:      private void writeBatch() throws IOException {
+0: 
+0:          CountDownLatch checkpointLatch;
+0:          ArrayList<PageWrite> batch;
+0:          synchronized( writes ) {
+0:                 // Move the current write to the diskBound write, this lets folks update the
+1:                 if (write.diskBound == null && write.diskBoundLocation == -1) {
+0:             // Grab on to the existing checkpoint latch cause once we do this write we can
+0:          }
+0:          Checksum checksum = new Adler32();
+0:          recoveryFile.seek(RECOVERY_FILE_HEADER_SIZE);
+0:          for (PageWrite w : batch) {
+0:              if (enableRecoveryFile) {
+0:                  try {
+0:                      checksum.update(w.getDiskBound(), 0, pageSize);
+0:                  } catch (Throwable t) {
+0:                      throw IOExceptionSupport.create("Cannot create recovery file. Reason: " + t, t);
+0:                  }
+0:                  recoveryFile.writeLong(w.page.getPageId());
+0:                  recoveryFile.write(w.getDiskBound(), 0, pageSize);
+0:              }
+0:              writeFile.seek(toOffset(w.page.getPageId()));
+0:              writeFile.write(w.getDiskBound(), 0, pageSize);
+0:              w.done();
+0:          }
+0:          try {
+0:              if (enableRecoveryFile) {
+0:                  // Can we shrink the recovery buffer??
+0:                  if (recoveryPageCount > recoveryFileMaxPageCount) {
+0:                      int t = Math.max(recoveryFileMinPageCount, batch.size());
+0:                      recoveryFile.setLength(recoveryFileSizeForPages(t));
+0:                  }
+0:                  // Record the page writes in the recovery buffer.
+0:                  recoveryFile.seek(0);
+0:                  // Store the next tx id...
+0:                  recoveryFile.writeLong(nextTxid.get());
+0:                  // Store the checksum for thw write batch so that on recovery we
+0:                  // know if we have a consistent
+0:                  // write batch on disk.
+0:                  recoveryFile.writeLong(checksum.getValue());
+0:                  // Write the # of pages that will follow
+0:                  recoveryFile.writeInt(batch.size());
+0:              }
+0:              if (enableDiskSyncs) {
+0:                  // Sync to make sure recovery buffer writes land on disk..
+0:                  recoveryFile.getFD().sync();
+0:                  writeFile.getFD().sync();
+0:              }
+0:          } finally {
+0:              synchronized (writes) {
+0:                  for (PageWrite w : batch) {
+0:                      // If there are no more pending writes, then remove it from
+0:                      // the write cache.
+0:                      if (w.isDone()) {
+0:                          writes.remove(w.page.getPageId());
+0:                      }
+0:                  }
+0:              }
+0:              if (checkpointLatch != null) {
+0:                  checkpointLatch.countDown();
+0:              }
+0:          }
+0:      }
+/////////////////////////////////////////////////////////////////////////
+1:     public File getDirectory() {
+1:         return directory;
+0:     }
+commit:8bf987b
+/////////////////////////////////////////////////////////////////////////
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+/////////////////////////////////////////////////////////////////////////
+1:     private static final Logger LOG = LoggerFactory.getLogger(PageFile.class);
+commit:d6ad7c7
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.*;
+/////////////////////////////////////////////////////////////////////////
+1:     private Map<Long, Page> pageCache;
+/////////////////////////////////////////////////////////////////////////
+0:                 pageCache = Collections.synchronizedMap(new LRUCache<Long, Page>(pageCacheSize, pageCacheSize, 0.75f, true));
+commit:5cf4d83
+/////////////////////////////////////////////////////////////////////////
+0:         
+1:         boolean isDone() {
+0:             return diskBound == null && current == null;
+0:         }
+/////////////////////////////////////////////////////////////////////////
+0:             for (PageWrite write : writes.values()) {
+/////////////////////////////////////////////////////////////////////////
+0:        try {
+0:             if (enableRecoveryFile) {
+0: 
+0:                 // Using Adler-32 instead of CRC-32 because it's much faster and
+0:                 // it's
+0:                 // weakness for short messages with few hundred bytes is not a
+0:                 // factor in this case since we know
+0:                 // our write batches are going to much larger.
+0:                 Checksum checksum = new Adler32();
+0:                 for (PageWrite w : batch) {
+0:                     try {
+0:                         checksum.update(w.diskBound, 0, pageSize);
+0:                     } catch (Throwable t) {
+0:                         throw IOExceptionSupport.create(
+0:                                 "Cannot create recovery file. Reason: " + t, t);
+0:                     }
+0:                 }
+0: 
+0:                 // Can we shrink the recovery buffer??
+0:                 if (recoveryPageCount > recoveryFileMaxPageCount) {
+0:                     int t = Math.max(recoveryFileMinPageCount, batch.size());
+0:                     recoveryFile.setLength(recoveryFileSizeForPages(t));
+0:                 }
+0: 
+0:                 // Record the page writes in the recovery buffer.
+0:                 recoveryFile.seek(0);
+0:                 // Store the next tx id...
+0:                 recoveryFile.writeLong(nextTxid.get());
+0:                 // Store the checksum for thw write batch so that on recovery we
+0:                 // know if we have a consistent
+0:                 // write batch on disk.
+0:                 recoveryFile.writeLong(checksum.getValue());
+0:                 // Write the # of pages that will follow
+0:                 recoveryFile.writeInt(batch.size());
+0: 
+0:                 // Write the pages.
+0:                 recoveryFile.seek(RECOVERY_FILE_HEADER_SIZE);
+0: 
+0:                 for (PageWrite w : batch) {
+0:                     recoveryFile.writeLong(w.page.getPageId());
+0:                     recoveryFile.write(w.diskBound, 0, pageSize);
+0:                 }
+0: 
+0:                 if (enableDiskSyncs) {
+0:                     // Sync to make sure recovery buffer writes land on disk..
+0:                     recoveryFile.getFD().sync();
+0:                 }
+0: 
+0:                 recoveryPageCount = batch.size();
+0: 
+0:             for (PageWrite w : batch) {
+0:                 writeFile.seek(toOffset(w.page.getPageId()));
+0:                 writeFile.write(w.diskBound, 0, pageSize);
+0:                 w.done();
+0:             }
+0: 
+0:             // Sync again
+0:                 writeFile.getFD().sync();
+0: 
+0:         } finally {
+0:             synchronized (writes) {
+0:                 for (PageWrite w : batch) {
+0:                     // If there are no more pending writes, then remove it from
+0:                     // the write cache.
+0:                     if (w.isDone()) {
+0:                         writes.remove(w.page.getPageId());
+0:                     }
+0:             
+0:             if( checkpointLatch!=null ) {
+0:                 checkpointLatch.countDown();
+0:             }
+commit:a19e27a
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.kahadb.util.IOExceptionSupport;
+/////////////////////////////////////////////////////////////////////////
+0:            diskBound = current;
+0:            current = null;
+/////////////////////////////////////////////////////////////////////////
+0:             // build a write batch from the current write cache.
+0:             Iterator<Long> it = writes.keySet().iterator();
+0:             while (it.hasNext()) {
+0:                 Long key = it.next();
+0:                 PageWrite write = writes.get(key);
+0:                 if (write.diskBound == null) {
+1:                     batch.remove(write);
+0:                 }
+/////////////////////////////////////////////////////////////////////////
+0:                try {
+0:                    checksum.update(w.diskBound, 0, pageSize);
+0:                } catch (Throwable t) {
+0:                    throw IOExceptionSupport.create("Cannot create recovery file. Reason: " + t, t);
+0:                }
+============================================================================

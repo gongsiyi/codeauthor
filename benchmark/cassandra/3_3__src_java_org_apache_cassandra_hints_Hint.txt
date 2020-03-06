@@ -1,0 +1,292 @@
+1:96d41f0: /*
+1:96d41f0:  * Licensed to the Apache Software Foundation (ASF) under one
+1:96d41f0:  * or more contributor license agreements.  See the NOTICE file
+1:96d41f0:  * distributed with this work for additional information
+1:96d41f0:  * regarding copyright ownership.  The ASF licenses this file
+1:96d41f0:  * to you under the Apache License, Version 2.0 (the
+1:96d41f0:  * "License"); you may not use this file except in compliance
+1:96d41f0:  * with the License.  You may obtain a copy of the License at
+1:96d41f0:  *
+1:96d41f0:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:96d41f0:  *
+1:96d41f0:  * Unless required by applicable law or agreed to in writing, software
+1:96d41f0:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:96d41f0:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:96d41f0:  * See the License for the specific language governing permissions and
+1:96d41f0:  * limitations under the License.
+1:96d41f0:  */
+1:96d41f0: package org.apache.cassandra.hints;
+1:96d41f0: 
+1:96d41f0: import java.io.IOException;
+1:96d41f0: import java.util.*;
+1:96d41f0: import java.util.concurrent.TimeUnit;
+1:96d41f0: 
+1:96d41f0: import org.apache.cassandra.db.*;
+1:96d41f0: import org.apache.cassandra.io.IVersionedSerializer;
+1:96d41f0: import org.apache.cassandra.io.util.DataInputPlus;
+1:96d41f0: import org.apache.cassandra.io.util.DataOutputPlus;
+1:96d41f0: 
+1:53a177a: import static org.apache.cassandra.db.TypeSizes.sizeof;
+1:649a106: import static org.apache.cassandra.db.TypeSizes.sizeofUnsignedVInt;
+1:53a177a: 
+1:96d41f0: /**
+1:96d41f0:  * Encapsulates the hinted mutation, its creation time, and the gc grace seconds param for each table involved.
+1:96d41f0:  *
+1:96d41f0:  * - Why do we need to track hint creation time?
+1:96d41f0:  * - We must exclude updates for tables that have been truncated after hint's creation, otherwise the result is data corruption.
+1:96d41f0:  *
+1:96d41f0:  * - Why do we need to track gc grace seconds?
+1:96d41f0:  * - Hints can stay in storage for a while before being applied, and without recording gc grace seconds (+ creation time),
+1:96d41f0:  *   if we apply the mutation blindly, we risk resurrecting a deleted value, a tombstone for which had been already
+1:96d41f0:  *   compacted away while the hint was in storage.
+1:96d41f0:  *
+1:96d41f0:  *   We also look at the smallest current value of the gcgs param for each affected table when applying the hint, and use
+1:96d41f0:  *   creation time + min(recorded gc gs, current gcgs + current gc grace) as the overall hint expiration time.
+1:96d41f0:  *   This allows now to safely reduce gc gs on tables without worrying that an applied old hint might resurrect any data.
+1:96d41f0:  */
+1:96d41f0: public final class Hint
+1:96d41f0: {
+1:96d41f0:     public static final Serializer serializer = new Serializer();
+1:96d41f0: 
+1:96d41f0:     final Mutation mutation;
+1:96d41f0:     final long creationTime;  // time of hint creation (in milliseconds)
+1:96d41f0:     final int gcgs; // the smallest gc gs of all involved tables
+1:96d41f0: 
+1:96d41f0:     private Hint(Mutation mutation, long creationTime, int gcgs)
+1:96d41f0:     {
+1:96d41f0:         this.mutation = mutation;
+1:96d41f0:         this.creationTime = creationTime;
+1:96d41f0:         this.gcgs = gcgs;
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     /**
+1:96d41f0:      * @param mutation the hinted mutation
+1:96d41f0:      * @param creationTime time of this hint's creation (in milliseconds since epoch)
+1:96d41f0:      */
+1:96d41f0:     public static Hint create(Mutation mutation, long creationTime)
+1:96d41f0:     {
+1:96d41f0:         return new Hint(mutation, creationTime, mutation.smallestGCGS());
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     /**
+1:96d41f0:      * @param mutation the hinted mutation
+1:96d41f0:      * @param creationTime time of this hint's creation (in milliseconds since epoch)
+1:96d41f0:      * @param gcgs the smallest gcgs of all tables involved at the time of hint creation (in seconds)
+1:96d41f0:      */
+1:96d41f0:     public static Hint create(Mutation mutation, long creationTime, int gcgs)
+1:96d41f0:     {
+1:96d41f0:         return new Hint(mutation, creationTime, gcgs);
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     /**
+1:96d41f0:      * Applies the contained mutation unless it's expired, filtering out any updates for truncated tables
+1:96d41f0:      */
+1:96d41f0:     void apply()
+1:96d41f0:     {
+1:96d41f0:         if (!isLive())
+1:96d41f0:             return;
+1:96d41f0: 
+1:96d41f0:         // filter out partition update for table that have been truncated since hint's creation
+1:96d41f0:         Mutation filtered = mutation;
+1:96d41f0:         for (UUID id : mutation.getColumnFamilyIds())
+1:96d41f0:             if (creationTime <= SystemKeyspace.getTruncatedAt(id))
+1:96d41f0:                 filtered = filtered.without(id);
+1:96d41f0: 
+1:96d41f0:         if (!filtered.isEmpty())
+1:96d41f0:             filtered.apply();
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     /**
+1:96d41f0:      * @return calculates whether or not it is safe to apply the hint without risking to resurrect any deleted data
+1:96d41f0:      */
+1:96d41f0:     boolean isLive()
+1:96d41f0:     {
+1:96d41f0:         int smallestGCGS = Math.min(gcgs, mutation.smallestGCGS());
+1:96d41f0:         long expirationTime = creationTime + TimeUnit.SECONDS.toMillis(smallestGCGS);
+1:96d41f0:         return expirationTime > System.currentTimeMillis();
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     static final class Serializer implements IVersionedSerializer<Hint>
+1:96d41f0:     {
+1:96d41f0:         public long serializedSize(Hint hint, int version)
+1:96d41f0:         {
+1:53a177a:             long size = sizeof(hint.creationTime);
+1:649a106:             size += sizeofUnsignedVInt(hint.gcgs);
+1:96d41f0:             size += Mutation.serializer.serializedSize(hint.mutation, version);
+1:96d41f0:             return size;
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         public void serialize(Hint hint, DataOutputPlus out, int version) throws IOException
+1:96d41f0:         {
+1:96d41f0:             out.writeLong(hint.creationTime);
+1:649a106:             out.writeUnsignedVInt(hint.gcgs);
+1:96d41f0:             Mutation.serializer.serialize(hint.mutation, out, version);
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         public Hint deserialize(DataInputPlus in, int version) throws IOException
+1:96d41f0:         {
+1:96d41f0:             long creationTime = in.readLong();
+1:649a106:             int gcgs = (int) in.readUnsignedVInt();
+1:96d41f0:             return new Hint(Mutation.serializer.deserialize(in, version), creationTime, gcgs);
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: }
+============================================================================
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:649a106
+/////////////////////////////////////////////////////////////////////////
+1: import static org.apache.cassandra.db.TypeSizes.sizeofUnsignedVInt;
+/////////////////////////////////////////////////////////////////////////
+1:             size += sizeofUnsignedVInt(hint.gcgs);
+/////////////////////////////////////////////////////////////////////////
+1:             out.writeUnsignedVInt(hint.gcgs);
+1:             int gcgs = (int) in.readUnsignedVInt();
+author:Stefania Alborghetti
+-------------------------------------------------------------------------------
+commit:53a177a
+/////////////////////////////////////////////////////////////////////////
+1: import static org.apache.cassandra.db.TypeSizes.sizeof;
+0: import static org.apache.cassandra.db.TypeSizes.sizeofVInt;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             long size = sizeof(hint.creationTime);
+0:             size += sizeofVInt(hint.gcgs);
+/////////////////////////////////////////////////////////////////////////
+0:             out.writeVInt(hint.gcgs);
+0:             int gcgs = (int) in.readVInt();
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:96d41f0
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.hints;
+1: 
+1: import java.io.IOException;
+1: import java.util.*;
+1: import java.util.concurrent.TimeUnit;
+1: 
+1: import org.apache.cassandra.db.*;
+1: import org.apache.cassandra.io.IVersionedSerializer;
+1: import org.apache.cassandra.io.util.DataInputPlus;
+1: import org.apache.cassandra.io.util.DataOutputPlus;
+1: 
+1: /**
+1:  * Encapsulates the hinted mutation, its creation time, and the gc grace seconds param for each table involved.
+1:  *
+1:  * - Why do we need to track hint creation time?
+1:  * - We must exclude updates for tables that have been truncated after hint's creation, otherwise the result is data corruption.
+1:  *
+1:  * - Why do we need to track gc grace seconds?
+1:  * - Hints can stay in storage for a while before being applied, and without recording gc grace seconds (+ creation time),
+1:  *   if we apply the mutation blindly, we risk resurrecting a deleted value, a tombstone for which had been already
+1:  *   compacted away while the hint was in storage.
+1:  *
+1:  *   We also look at the smallest current value of the gcgs param for each affected table when applying the hint, and use
+1:  *   creation time + min(recorded gc gs, current gcgs + current gc grace) as the overall hint expiration time.
+1:  *   This allows now to safely reduce gc gs on tables without worrying that an applied old hint might resurrect any data.
+1:  */
+1: public final class Hint
+1: {
+1:     public static final Serializer serializer = new Serializer();
+1: 
+1:     final Mutation mutation;
+1:     final long creationTime;  // time of hint creation (in milliseconds)
+1:     final int gcgs; // the smallest gc gs of all involved tables
+1: 
+1:     private Hint(Mutation mutation, long creationTime, int gcgs)
+1:     {
+1:         this.mutation = mutation;
+1:         this.creationTime = creationTime;
+1:         this.gcgs = gcgs;
+1:     }
+1: 
+1:     /**
+1:      * @param mutation the hinted mutation
+1:      * @param creationTime time of this hint's creation (in milliseconds since epoch)
+1:      */
+1:     public static Hint create(Mutation mutation, long creationTime)
+1:     {
+1:         return new Hint(mutation, creationTime, mutation.smallestGCGS());
+1:     }
+1: 
+1:     /**
+1:      * @param mutation the hinted mutation
+1:      * @param creationTime time of this hint's creation (in milliseconds since epoch)
+1:      * @param gcgs the smallest gcgs of all tables involved at the time of hint creation (in seconds)
+1:      */
+1:     public static Hint create(Mutation mutation, long creationTime, int gcgs)
+1:     {
+1:         return new Hint(mutation, creationTime, gcgs);
+1:     }
+1: 
+1:     /**
+1:      * Applies the contained mutation unless it's expired, filtering out any updates for truncated tables
+1:      */
+1:     void apply()
+1:     {
+1:         if (!isLive())
+1:             return;
+1: 
+1:         // filter out partition update for table that have been truncated since hint's creation
+1:         Mutation filtered = mutation;
+1:         for (UUID id : mutation.getColumnFamilyIds())
+1:             if (creationTime <= SystemKeyspace.getTruncatedAt(id))
+1:                 filtered = filtered.without(id);
+1: 
+1:         if (!filtered.isEmpty())
+1:             filtered.apply();
+1:     }
+1: 
+1:     /**
+1:      * @return calculates whether or not it is safe to apply the hint without risking to resurrect any deleted data
+1:      */
+1:     boolean isLive()
+1:     {
+1:         int smallestGCGS = Math.min(gcgs, mutation.smallestGCGS());
+1:         long expirationTime = creationTime + TimeUnit.SECONDS.toMillis(smallestGCGS);
+1:         return expirationTime > System.currentTimeMillis();
+1:     }
+1: 
+1:     static final class Serializer implements IVersionedSerializer<Hint>
+1:     {
+1:         public long serializedSize(Hint hint, int version)
+1:         {
+0:             long size = TypeSizes.sizeof(hint.creationTime);
+0:             size += TypeSizes.sizeof(hint.gcgs);
+1:             size += Mutation.serializer.serializedSize(hint.mutation, version);
+1:             return size;
+1:         }
+1: 
+1:         public void serialize(Hint hint, DataOutputPlus out, int version) throws IOException
+1:         {
+1:             out.writeLong(hint.creationTime);
+0:             out.writeInt(hint.gcgs);
+1:             Mutation.serializer.serialize(hint.mutation, out, version);
+1:         }
+1: 
+1:         public Hint deserialize(DataInputPlus in, int version) throws IOException
+1:         {
+1:             long creationTime = in.readLong();
+0:             int gcgs = in.readInt();
+1:             return new Hint(Mutation.serializer.deserialize(in, version), creationTime, gcgs);
+1:         }
+1:     }
+1: }
+============================================================================

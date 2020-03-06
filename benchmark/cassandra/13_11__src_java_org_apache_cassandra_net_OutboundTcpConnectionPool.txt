@@ -1,0 +1,1362 @@
+1:07cf56f: /*
+1:066ef58:  * Licensed to the Apache Software Foundation (ASF) under one
+1:066ef58:  * or more contributor license agreements.  See the NOTICE file
+1:066ef58:  * distributed with this work for additional information
+1:066ef58:  * regarding copyright ownership.  The ASF licenses this file
+1:066ef58:  * to you under the Apache License, Version 2.0 (the
+1:066ef58:  * "License"); you may not use this file except in compliance
+1:066ef58:  * with the License.  You may obtain a copy of the License at
+1:066ef58:  *
+1:066ef58:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:066ef58:  *
+1:066ef58:  * Unless required by applicable law or agreed to in writing, software
+1:066ef58:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:066ef58:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:066ef58:  * See the License for the specific language governing permissions and
+1:066ef58:  * limitations under the License.
+2:066ef58:  */
+1:066ef58: package org.apache.cassandra.net;
+1:69cedbf: 
+1:066ef58: import java.io.IOException;
+1:b767bf7: import java.net.InetAddress;
+1:21aef92: import java.net.InetSocketAddress;
+1:fa70ed5: import java.net.Socket;
+1:21aef92: import java.nio.channels.SocketChannel;
+1:05bacae: import java.util.concurrent.CountDownLatch;
+1:05bacae: import java.util.concurrent.TimeUnit;
+1:07cdfd0: 
+1:52b6edc: import org.apache.cassandra.concurrent.Stage;
+1:cba4087: import org.apache.cassandra.config.Config;
+1:fa70ed5: import org.apache.cassandra.config.DatabaseDescriptor;
+1:db4da73: import org.apache.cassandra.db.SystemKeyspace;
+1:fa70ed5: import org.apache.cassandra.locator.IEndpointSnitch;
+1:69cedbf: import org.apache.cassandra.metrics.ConnectionMetrics;
+1:fa70ed5: import org.apache.cassandra.security.SSLFactory;
+1:fa70ed5: import org.apache.cassandra.utils.FBUtilities;
+1:2fd3268: 
+1:7dfef3e: public class OutboundTcpConnectionPool
+1:580ac7d: {
+1:144644b:     public static final long LARGE_MESSAGE_THRESHOLD =
+1:ebd0ae8:             Long.getLong(Config.PROPERTY_PREFIX + "otcp_large_message_threshold", 1024 * 64);
+1:144644b: 
+1:fa70ed5:     // pointer for the real Address.
+1:fa70ed5:     private final InetAddress id;
+1:05bacae:     private final CountDownLatch started;
+1:144644b:     public final OutboundTcpConnection smallMessages;
+1:144644b:     public final OutboundTcpConnection largeMessages;
+1:9a6ee93:     public final OutboundTcpConnection gossipMessages;
+1:9a6ee93: 
+1:c6867c2:     // pointer to the reset Address.
+1:c6867c2:     private InetAddress resetEndpoint;
+1:69cedbf:     private ConnectionMetrics metrics;
+1:144644b: 
+1:d43b9ce:     // back-pressure state linked to this connection:
+1:d43b9ce:     private final BackPressureState backPressureState;
+1:d43b9ce: 
+1:d43b9ce:     OutboundTcpConnectionPool(InetAddress remoteEp, BackPressureState backPressureState)
+1:32e7323:     {
+1:fa70ed5:         id = remoteEp;
+1:c6867c2:         resetEndpoint = SystemKeyspace.getPreferredIP(remoteEp);
+1:05bacae:         started = new CountDownLatch(1);
+1:db4da73: 
+1:c26bd91:         smallMessages = new OutboundTcpConnection(this, "Small");
+1:c26bd91:         largeMessages = new OutboundTcpConnection(this, "Large");
+1:c26bd91:         gossipMessages = new OutboundTcpConnection(this, "Gossip");
+1:d43b9ce: 
+1:d43b9ce:         this.backPressureState = backPressureState;
+1:32e7323:     }
+1:05bacae: 
+1:0162447:     /**
+1:580ac7d:      * returns the appropriate connection based on message type.
+1:32e7323:      * returns null if a connection could not be established.
+1:9b892b1:      */
+1:5a6f0b8:     OutboundTcpConnection getConnection(MessageOut msg)
+1:32e7323:     {
+1:9a6ee93:         if (Stage.GOSSIP == msg.getStage())
+1:9a6ee93:             return gossipMessages;
+1:144644b:         return msg.payloadSize(smallMessages.getTargetVersion()) > LARGE_MESSAGE_THRESHOLD
+1:144644b:                ? largeMessages
+1:144644b:                : smallMessages;
+1:32e7323:     }
+1:144644b: 
+1:d43b9ce:     public BackPressureState getBackPressureState()
+1:d43b9ce:     {
+1:d43b9ce:         return backPressureState;
+1:d43b9ce:     }
+1:d43b9ce: 
+1:c82a9d9:     void reset()
+1:32e7323:     {
+1:9a6ee93:         for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages, gossipMessages })
+1:db87052:             conn.closeSocket(false);
+1:c82a9d9:     }
+1:144644b: 
+1:c82a9d9:     public void resetToNewerVersion(int version)
+1:c82a9d9:     {
+1:9a6ee93:         for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages, gossipMessages })
+1:c82a9d9:         {
+1:c82a9d9:             if (version > conn.getTargetVersion())
+1:c82a9d9:                 conn.softCloseSocket();
+1:69cedbf:         }
+1:c82a9d9:     }
+1:69cedbf: 
+1:9b892b1:     /**
+1:0162447:      * reconnect to @param remoteEP (after the current message backlog is exhausted).
+1:0162447:      * Used by Ec2MultiRegionSnitch to force nodes in the same region to communicate over their private IPs.
+1:0162447:      * @param remoteEP
+1:0162447:      */
+1:7dfef3e:     public void reset(InetAddress remoteEP)
+1:32e7323:     {
+1:db4da73:         SystemKeyspace.updatePreferredIP(id, remoteEP);
+1:c6867c2:         resetEndpoint = remoteEP;
+1:9a6ee93:         for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages, gossipMessages })
+1:c82a9d9:             conn.softCloseSocket();
+1:07cdfd0: 
+1:69cedbf:         // release previous metrics and create new one with reset address
+1:69cedbf:         metrics.release();
+1:c6867c2:         metrics = new ConnectionMetrics(resetEndpoint, this);
+1:69cedbf:     }
+1:69cedbf: 
+1:69cedbf:     public long getTimeouts()
+1:69cedbf:     {
+1:8896a70:        return metrics.timeouts.getCount();
+1:69cedbf:     }
+1:69cedbf: 
+1:69cedbf: 
+1:69cedbf:     public void incrementTimeout()
+1:69cedbf:     {
+1:69cedbf:         metrics.timeouts.mark();
+1:32e7323:     }
+1:07cdfd0: 
+1:fa70ed5:     public Socket newSocket() throws IOException
+1:69cedbf:     {
+1:d881024:         return newSocket(endPoint());
+1:d881024:     }
+1:d881024: 
+1:6a4d106:     @SuppressWarnings("resource") // Closing the socket will close the underlying channel.
+1:d881024:     public static Socket newSocket(InetAddress endpoint) throws IOException
+1:d881024:     {
+1:fa70ed5:         // zero means 'bind on any available port.'
+1:d881024:         if (isEncryptedChannel(endpoint))
+1:32e7323:         {
+2:cba4087:             if (Config.getOutboundBindAny())
+1:d881024:                 return SSLFactory.getSocket(DatabaseDescriptor.getServerEncryptionOptions(), endpoint, DatabaseDescriptor.getSSLStoragePort());
+1:0074d64:             else
+1:d881024:                 return SSLFactory.getSocket(DatabaseDescriptor.getServerEncryptionOptions(), endpoint, DatabaseDescriptor.getSSLStoragePort(), FBUtilities.getLocalAddress(), 0);
+1:32e7323:         }
+1:ea3b8da:         else
+1:0074d64:         {
+1:a55fd76:             SocketChannel channel = SocketChannel.open();
+1:a55fd76:             if (!Config.getOutboundBindAny())
+1:a55fd76:                 channel.bind(new InetSocketAddress(FBUtilities.getLocalAddress(), 0));
+1:a55fd76:             channel.connect(new InetSocketAddress(endpoint, DatabaseDescriptor.getStoragePort()));
+1:a55fd76:             return channel.socket();
+1:32e7323:         }
+1:32e7323:     }
+1:07cdfd0: 
+1:998fe96:     public InetAddress endPoint()
+1:ea3b8da:     {
+1:59bd0e7:         if (id.equals(FBUtilities.getBroadcastAddress()))
+1:59bd0e7:             return FBUtilities.getLocalAddress();
+1:c6867c2:         return resetEndpoint;
+1:580ac7d:     }
+1:2fd3268: 
+1:d881024:     public static boolean isEncryptedChannel(InetAddress address)
+1:b4eae7c:     {
+1:d881024:         IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
+1:8495560:         switch (DatabaseDescriptor.getServerEncryptionOptions().internode_encryption)
+1:32e7323:         {
+1:fa70ed5:             case none:
+1:fa70ed5:                 return false; // if nothing needs to be encrypted then return immediately.
+1:fa70ed5:             case all:
+1:fa70ed5:                 break;
+1:fa70ed5:             case dc:
+1:d881024:                 if (snitch.getDatacenter(address).equals(snitch.getDatacenter(FBUtilities.getBroadcastAddress())))
+1:fa70ed5:                     return false;
+1:fa70ed5:                 break;
+1:fa70ed5:             case rack:
+1:fa70ed5:                 // for rack then check if the DC's are the same.
+1:d881024:                 if (snitch.getRack(address).equals(snitch.getRack(FBUtilities.getBroadcastAddress()))
+1:d881024:                         && snitch.getDatacenter(address).equals(snitch.getDatacenter(FBUtilities.getBroadcastAddress())))
+1:fa70ed5:                     return false;
+1:fa70ed5:                 break;
+1:360d355:         }
+1:fa70ed5:         return true;
+1:360d355:     }
+1:3d3d93c: 
+1:05bacae:     public void start()
+1:05bacae:     {
+1:144644b:         smallMessages.start();
+1:144644b:         largeMessages.start();
+1:9a6ee93:         gossipMessages.start();
+1:144644b: 
+1:69cedbf:         metrics = new ConnectionMetrics(id, this);
+1:05bacae: 
+1:05bacae:         started.countDown();
+1:05bacae:     }
+1:05bacae: 
+1:05bacae:     public void waitForStarted()
+1:05bacae:     {
+1:05bacae:         if (started.getCount() == 0)
+1:05bacae:             return;
+1:05bacae: 
+1:05bacae:         boolean error = false;
+1:05bacae:         try
+1:05bacae:         {
+1:05bacae:             if (!started.await(1, TimeUnit.MINUTES))
+1:05bacae:                 error = true;
+1:05bacae:         }
+1:05bacae:         catch (InterruptedException e)
+1:05bacae:         {
+1:05bacae:             Thread.currentThread().interrupt();
+1:05bacae:             error = true;
+1:05bacae:         }
+1:05bacae:         if (error)
+1:05bacae:             throw new IllegalStateException(String.format("Connections to %s are not started!", id.getHostAddress()));
+1:05bacae:     }
+1:05bacae: 
+1:3d3d93c:     public void close()
+1:3d3d93c:     {
+1:3d3d93c:         // these null guards are simply for tests
+1:144644b:         if (largeMessages != null)
+1:144644b:             largeMessages.closeSocket(true);
+1:144644b:         if (smallMessages != null)
+1:144644b:             smallMessages.closeSocket(true);
+1:9a6ee93:         if (gossipMessages != null)
+1:9a6ee93:             gossipMessages.closeSocket(true);
+1:05bacae: 
+1:3d3d93c:         metrics.release();
+1:3d3d93c:     }
+2:360d355: }
+============================================================================
+author:Sergio Bossa
+-------------------------------------------------------------------------------
+commit:d43b9ce
+/////////////////////////////////////////////////////////////////////////
+1:     // back-pressure state linked to this connection:
+1:     private final BackPressureState backPressureState;
+1: 
+1:     OutboundTcpConnectionPool(InetAddress remoteEp, BackPressureState backPressureState)
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         this.backPressureState = backPressureState;
+/////////////////////////////////////////////////////////////////////////
+1:     public BackPressureState getBackPressureState()
+1:     {
+1:         return backPressureState;
+1:     }
+1: 
+author:Tyler Hobbs
+-------------------------------------------------------------------------------
+commit:c26bd91
+/////////////////////////////////////////////////////////////////////////
+1:         smallMessages = new OutboundTcpConnection(this, "Small");
+1:         largeMessages = new OutboundTcpConnection(this, "Large");
+1:         gossipMessages = new OutboundTcpConnection(this, "Gossip");
+commit:ebd0ae8
+/////////////////////////////////////////////////////////////////////////
+1:             Long.getLong(Config.PROPERTY_PREFIX + "otcp_large_message_threshold", 1024 * 64);
+author:Benjamin Lerer
+-------------------------------------------------------------------------------
+commit:6a4d106
+/////////////////////////////////////////////////////////////////////////
+1:     @SuppressWarnings("resource") // Closing the socket will close the underlying channel.
+commit:ac7e279
+/////////////////////////////////////////////////////////////////////////
+0:     // Closing the socket will close the underlying channel.
+0:     @SuppressWarnings("resource")
+author:Yuki Morishita
+-------------------------------------------------------------------------------
+commit:0967825
+commit:a55fd76
+/////////////////////////////////////////////////////////////////////////
+1:             SocketChannel channel = SocketChannel.open();
+1:             if (!Config.getOutboundBindAny())
+1:                 channel.bind(new InetSocketAddress(FBUtilities.getLocalAddress(), 0));
+1:             channel.connect(new InetSocketAddress(endpoint, DatabaseDescriptor.getStoragePort()));
+1:             return channel.socket();
+commit:c6867c2
+/////////////////////////////////////////////////////////////////////////
+1:     // pointer to the reset Address.
+1:     private InetAddress resetEndpoint;
+1:         resetEndpoint = SystemKeyspace.getPreferredIP(remoteEp);
+/////////////////////////////////////////////////////////////////////////
+1:         resetEndpoint = remoteEP;
+1:         metrics = new ConnectionMetrics(resetEndpoint, this);
+/////////////////////////////////////////////////////////////////////////
+1:         return resetEndpoint;
+commit:d881024
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         return newSocket(endPoint());
+1:     }
+1: 
+1:     public static Socket newSocket(InetAddress endpoint) throws IOException
+1:     {
+1:         if (isEncryptedChannel(endpoint))
+1:                 return SSLFactory.getSocket(DatabaseDescriptor.getServerEncryptionOptions(), endpoint, DatabaseDescriptor.getSSLStoragePort());
+1:                 return SSLFactory.getSocket(DatabaseDescriptor.getServerEncryptionOptions(), endpoint, DatabaseDescriptor.getSSLStoragePort(), FBUtilities.getLocalAddress(), 0);
+0:             Socket socket = SocketChannel.open(new InetSocketAddress(endpoint, DatabaseDescriptor.getStoragePort())).socket();
+/////////////////////////////////////////////////////////////////////////
+1:     public static boolean isEncryptedChannel(InetAddress address)
+1:         IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
+/////////////////////////////////////////////////////////////////////////
+1:                 if (snitch.getDatacenter(address).equals(snitch.getDatacenter(FBUtilities.getBroadcastAddress())))
+1:                 if (snitch.getRack(address).equals(snitch.getRack(FBUtilities.getBroadcastAddress()))
+1:                         && snitch.getDatacenter(address).equals(snitch.getDatacenter(FBUtilities.getBroadcastAddress())))
+commit:901a54a
+/////////////////////////////////////////////////////////////////////////
+0:             if (Config.getOutboundBindAny() && !socket.isBound())
+commit:3d3d93c
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:    public void close()
+1:     {
+1:         // these null guards are simply for tests
+0:         if (ackCon != null)
+0:             ackCon.closeSocket();
+0:         if (cmdCon != null)
+0:             cmdCon.closeSocket();
+1:         metrics.release();
+1:     }
+commit:69cedbf
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.metrics.ConnectionMetrics;
+/////////////////////////////////////////////////////////////////////////
+1:     private ConnectionMetrics metrics;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         metrics = new ConnectionMetrics(id, this);
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         // release previous metrics and create new one with reset address
+1:         metrics.release();
+0:         metrics = new ConnectionMetrics(resetedEndpoint, this);
+1:     }
+1: 
+1:     public long getTimeouts()
+1:     {
+0:        return metrics.timeouts.count();
+1:     }
+1: 
+0:     public long getRecentTimeouts()
+1:     {
+0:         return metrics.getRecentTimeout();
+1:     }
+1: 
+1:     public void incrementTimeout()
+1:     {
+1:         metrics.timeouts.mark();
+commit:21aef92
+/////////////////////////////////////////////////////////////////////////
+1: import java.net.InetSocketAddress;
+1: import java.nio.channels.SocketChannel;
+/////////////////////////////////////////////////////////////////////////
+0:             Socket socket = SocketChannel.open(new InetSocketAddress(endPoint(), DatabaseDescriptor.getStoragePort())).socket();
+0:                 socket.bind(new InetSocketAddress(FBUtilities.getLocalAddress(), 0));
+0:             return socket;
+author:Jason Brown
+-------------------------------------------------------------------------------
+commit:9a6ee93
+/////////////////////////////////////////////////////////////////////////
+1:     public final OutboundTcpConnection gossipMessages;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         gossipMessages = new OutboundTcpConnection(this);
+/////////////////////////////////////////////////////////////////////////
+1:         if (Stage.GOSSIP == msg.getStage())
+1:             return gossipMessages;
+/////////////////////////////////////////////////////////////////////////
+1:         for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages, gossipMessages })
+1:         for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages, gossipMessages })
+/////////////////////////////////////////////////////////////////////////
+1:         for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages, gossipMessages })
+/////////////////////////////////////////////////////////////////////////
+1:         gossipMessages.start();
+/////////////////////////////////////////////////////////////////////////
+1:         if (gossipMessages != null)
+1:             gossipMessages.closeSocket(true);
+commit:05bacae
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.CountDownLatch;
+1: import java.util.concurrent.TimeUnit;
+/////////////////////////////////////////////////////////////////////////
+1:     private final CountDownLatch started;
+/////////////////////////////////////////////////////////////////////////
+1:         started = new CountDownLatch(1);
+/////////////////////////////////////////////////////////////////////////
+1:     
+1:     public void start()
+1:     {
+0:         cmdCon.start();
+0:         ackCon.start();
+0:         metrics = new ConnectionMetrics(id, this);
+1:         
+1:         started.countDown();
+1:     }
+1:     
+1:     public void waitForStarted()
+1:     {
+1:         if (started.getCount() == 0)
+1:             return;
+1: 
+1:         boolean error = false;
+1:         try
+1:         {
+1:             if (!started.await(1, TimeUnit.MINUTES))
+1:                 error = true;
+1:         }
+1:         catch (InterruptedException e)
+1:         {
+1:             Thread.currentThread().interrupt();
+1:             error = true;
+1:         }
+1:         if (error)
+1:             throw new IllegalStateException(String.format("Connections to %s are not started!", id.getHostAddress()));
+1:     }
+1: 
+0:     public void close()
+1:         
+commit:998fe96
+/////////////////////////////////////////////////////////////////////////
+1:     public InetAddress endPoint()
+author:Ariel Weisberg
+-------------------------------------------------------------------------------
+commit:144644b
+/////////////////////////////////////////////////////////////////////////
+1:     public static final long LARGE_MESSAGE_THRESHOLD =
+0:             Long.getLong(Config.PROPERTY_PREFIX + "OTCP_LARGE_MESSAGE_THRESHOLD", 1024 * 64);
+1: 
+1:     public final OutboundTcpConnection smallMessages;
+1:     public final OutboundTcpConnection largeMessages;
+/////////////////////////////////////////////////////////////////////////
+0:         smallMessages = new OutboundTcpConnection(this);
+0:         largeMessages = new OutboundTcpConnection(this);
+/////////////////////////////////////////////////////////////////////////
+1:         return msg.payloadSize(smallMessages.getTargetVersion()) > LARGE_MESSAGE_THRESHOLD
+1:                ? largeMessages
+1:                : smallMessages;
+0:         for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages })
+0:         for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages })
+/////////////////////////////////////////////////////////////////////////
+0:         for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages })
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         smallMessages.start();
+1:         largeMessages.start();
+1: 
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         if (largeMessages != null)
+1:             largeMessages.closeSocket(true);
+1:         if (smallMessages != null)
+1:             smallMessages.closeSocket(true);
+1: 
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:8896a70
+/////////////////////////////////////////////////////////////////////////
+1:        return metrics.timeouts.getCount();
+author:Vijay Parthasarathy
+-------------------------------------------------------------------------------
+commit:db4da73
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.SystemKeyspace;
+/////////////////////////////////////////////////////////////////////////
+0:         resetedEndpoint = SystemKeyspace.getPreferredIP(remoteEp);
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         SystemKeyspace.updatePreferredIP(id, remoteEP);
+commit:db87052
+/////////////////////////////////////////////////////////////////////////
+1:             conn.closeSocket(false);
+/////////////////////////////////////////////////////////////////////////
+0:             ackCon.closeSocket(true);
+0:             cmdCon.closeSocket(true);
+commit:11d1414
+/////////////////////////////////////////////////////////////////////////
+0:             con.closeSocket(false);
+commit:8495560
+/////////////////////////////////////////////////////////////////////////
+0:                 return SSLFactory.getSocket(DatabaseDescriptor.getServerEncryptionOptions(), endPoint(), DatabaseDescriptor.getSSLStoragePort());
+0:                 return SSLFactory.getSocket(DatabaseDescriptor.getServerEncryptionOptions(), endPoint(), DatabaseDescriptor.getSSLStoragePort(), FBUtilities.getLocalAddress(), 0);
+/////////////////////////////////////////////////////////////////////////
+1:         switch (DatabaseDescriptor.getServerEncryptionOptions().internode_encryption)
+commit:0074d64
+/////////////////////////////////////////////////////////////////////////
+0:         for (OutboundTcpConnection con : new OutboundTcpConnection[] { cmdCon, ackCon })
+0:             con.softCloseSocket();
+/////////////////////////////////////////////////////////////////////////
+1:         else 
+1:         {
+commit:defe66a
+/////////////////////////////////////////////////////////////////////////
+0:         reset();
+/////////////////////////////////////////////////////////////////////////
+0:         else {
+commit:ea3b8da
+/////////////////////////////////////////////////////////////////////////
+0:         for (OutboundTcpConnection con : new OutboundTcpConnection[] { cmdCon, ackCon })
+0:             con.softCloseSocket();
+/////////////////////////////////////////////////////////////////////////
+1:         else 
+1:         {
+commit:b4eae7c
+/////////////////////////////////////////////////////////////////////////
+0:         for (OutboundTcpConnection con : new OutboundTcpConnection[] { cmdCon, ackCon })
+0:             con.softCloseSocket();
+/////////////////////////////////////////////////////////////////////////
+0:         else 
+1:         {
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:59bd0e7
+/////////////////////////////////////////////////////////////////////////
+1:         if (id.equals(FBUtilities.getBroadcastAddress()))
+1:             return FBUtilities.getLocalAddress();
+commit:07cdfd0
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: 
+commit:2fd3268
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: 
+/////////////////////////////////////////////////////////////////////////
+0: 
+0: 
+commit:5a6e2b0
+/////////////////////////////////////////////////////////////////////////
+0:     private final IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
+commit:07cf56f
+/////////////////////////////////////////////////////////////////////////
+1: /*
+/////////////////////////////////////////////////////////////////////////
+commit:e36b213
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:c82a9d9
+/////////////////////////////////////////////////////////////////////////
+1:     void reset()
+0:         for (OutboundTcpConnection conn : new OutboundTcpConnection[] { cmdCon, ackCon })
+0:             conn.closeSocket();
+1:     }
+0: 
+1:     public void resetToNewerVersion(int version)
+1:     {
+0:         for (OutboundTcpConnection conn : new OutboundTcpConnection[] { cmdCon, ackCon })
+1:         {
+1:             if (version > conn.getTargetVersion())
+1:                 conn.softCloseSocket();
+1:         }
+/////////////////////////////////////////////////////////////////////////
+0:         for (OutboundTcpConnection conn : new OutboundTcpConnection[] { cmdCon, ackCon })
+1:             conn.softCloseSocket();
+commit:5a6f0b8
+/////////////////////////////////////////////////////////////////////////
+1:     OutboundTcpConnection getConnection(MessageOut msg)
+0:         Stage stage = msg.getStage();
+commit:5b4a7f2
+commit:9a6d0c7
+commit:0162447
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:     /**
+1:      * reconnect to @param remoteEP (after the current message backlog is exhausted).
+1:      * Used by Ec2MultiRegionSnitch to force nodes in the same region to communicate over their private IPs.
+1:      * @param remoteEP
+1:      */
+commit:365f20b
+/////////////////////////////////////////////////////////////////////////
+0:         return stage == Stage.REQUEST_RESPONSE || stage == Stage.INTERNAL_RESPONSE || stage == Stage.GOSSIP
+0:                ? ackCon
+0:                : cmdCon;
+commit:a7c8b91
+/////////////////////////////////////////////////////////////////////////
+0:     public final OutboundTcpConnection cmdCon;
+0:     public final OutboundTcpConnection ackCon;
+commit:087cc84
+/////////////////////////////////////////////////////////////////////////
+0:         cmdCon = new OutboundTcpConnection(remoteEp);
+0:         cmdCon.start();
+0:         ackCon = new OutboundTcpConnection(remoteEp);
+0:         ackCon.start();
+commit:52b6edc
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.concurrent.Stage;
+/////////////////////////////////////////////////////////////////////////
+0:         Stage stage = msg.getMessageType();
+0:         return stage == Stage.RESPONSE || stage == Stage.GOSSIP ? ackCon : cmdCon;
+commit:5dbdf3a
+/////////////////////////////////////////////////////////////////////////
+0:     private final OutboundTcpConnection cmdCon;
+0:     private final OutboundTcpConnection ackCon;
+0:          cmdCon = new OutboundTcpConnection(remoteEp);
+0:          ackCon = new OutboundTcpConnection(remoteEp);                                             
+0:     OutboundTcpConnection getConnection(Message msg)
+0:         return msg.getMessageType().equals(StageManager.RESPONSE_STAGE) || msg.getMessageType().equals(StageManager.GOSSIP_STAGE)
+0:                ? ackCon
+0:                : cmdCon;
+0:             con.closeSocket();
+commit:9c7e277
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:                 ackCon = new OutboundTcpConnection(this, remoteEp_);
+0:                 ackCon.start();
+/////////////////////////////////////////////////////////////////////////
+0:                 cmdCon = new OutboundTcpConnection(this, remoteEp_);
+0:                 cmdCon.start();
+/////////////////////////////////////////////////////////////////////////
+commit:32e7323
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.log4j.Logger;
+0: 
+0:     private static Logger logger = Logger.getLogger(OutboundTcpConnectionPool.class);
+0: 
+0:     private final int OPEN_RETRY_DELAY = 100; // ms between retries
+0: 
+0:     private long lastFailedAttempt = Long.MIN_VALUE;
+0:     OutboundTcpConnectionPool(InetAddress remoteEp)
+1:      * returns null if a connection could not be established.
+/////////////////////////////////////////////////////////////////////////
+1:             {
+0:                 if (System.currentTimeMillis() < lastFailedAttempt + OPEN_RETRY_DELAY)
+0:                     return null;
+0:                 try
+1:                 {
+0:                     ackCon = new OutboundTcpConnection(this, remoteEp_);
+1:                 }
+0:                 catch (IOException e)
+1:                 {
+0:                     lastFailedAttempt = System.currentTimeMillis();
+0:                     if (logger.isDebugEnabled())
+0:                         logger.debug("unable to connect to " + remoteEp_, e);
+1:                 }
+1:             }
+1:             {
+0:                 if (System.currentTimeMillis() < lastFailedAttempt + OPEN_RETRY_DELAY)
+0:                     return null;
+0:                 try
+1:                 {
+0:                     cmdCon = new OutboundTcpConnection(this, remoteEp_);
+1:                 }
+0:                 catch (IOException e)
+1:                 {
+0:                     lastFailedAttempt = System.currentTimeMillis();
+0:                     if (logger.isDebugEnabled())
+0:                         logger.debug("unable to connect to " + remoteEp_, e);
+1:                 }
+1:             }
+commit:5b52240
+/////////////////////////////////////////////////////////////////////////
+0:         if (StageManager.RESPONSE_STAGE.equals(msg.getMessageType())
+0:             || StageManager.GOSSIP_STAGE.equals(msg.getMessageType()))
+commit:592976b
+/////////////////////////////////////////////////////////////////////////
+0: class OutboundTcpConnectionPool
+0:     private OutboundTcpConnection cmdCon;
+0:     private OutboundTcpConnection ackCon;
+0:     // TODO localEp is ignored, get rid of it
+0:     OutboundTcpConnectionPool(InetAddress localEp, InetAddress remoteEp)
+0:     private OutboundTcpConnection newCon()
+0:         return new OutboundTcpConnection(this, localEp_, remoteEp_);
+0:     synchronized OutboundTcpConnection getConnection(Message msg)
+/////////////////////////////////////////////////////////////////////////
+0:         for (OutboundTcpConnection con : new OutboundTcpConnection[] { cmdCon, ackCon })
+commit:6b5d8bf
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.concurrent.StageManager;
+/////////////////////////////////////////////////////////////////////////
+0:         if (StageManager.RESPONSE_STAGE.equals(msg.getMessageType()))
+commit:4aff8fa
+/////////////////////////////////////////////////////////////////////////
+commit:580ac7d
+/////////////////////////////////////////////////////////////////////////
+0:     private TcpConnection cmdCon;
+0:     private TcpConnection ackCon;
+0:     TcpConnectionManager(InetAddress localEp, InetAddress remoteEp)
+1:     }
+0: 
+0:     private TcpConnection newCon() throws IOException
+1:     {
+0:         TcpConnection con = new TcpConnection(this, localEp_, remoteEp_);
+0:         con.inUse_ = true;
+0:         return con;
+1:      * returns the appropriate connection based on message type.
+0:     synchronized TcpConnection getConnection(Message msg) throws IOException
+0:         if (MessagingService.responseStage_.equals(msg.getMessageType()))
+0:             if (ackCon == null)
+0:                 ackCon = newCon();
+0:             return ackCon;
+0:         else
+0:             if (cmdCon == null)
+0:                 cmdCon = newCon();
+0:             return cmdCon;
+0:     synchronized void shutdown()
+0:         for (TcpConnection con : new TcpConnection[] { cmdCon, ackCon })
+0:             if (con != null)
+0:                 con.closeSocket();
+0:     synchronized void destroy(TcpConnection con)
+0:         assert con != null;
+0:         if (cmdCon == con)
+0:             cmdCon = null;
+0:         else
+0:             assert ackCon == con;
+0:             ackCon = null;
+commit:b767bf7
+/////////////////////////////////////////////////////////////////////////
+1: import java.net.InetAddress;
+/////////////////////////////////////////////////////////////////////////
+0:     private InetAddress localEp_;
+0:     private InetAddress remoteEp_;
+0:     TcpConnectionManager(int initialSize, int growthFactor, int maxSize, InetAddress localEp, InetAddress remoteEp)
+/////////////////////////////////////////////////////////////////////////
+0:     InetAddress getLocalEndPoint()
+0:     InetAddress getRemoteEndPoint()
+commit:9b892b1
+/////////////////////////////////////////////////////////////////////////
+0:     // TODO! this whole thing is a giant no-op, since "contains" only relies on TcpConnection.equals, which
+0:     // is true for any (local, remote) pairs.  So there is only ever at most one TcpConnection per Manager!
+1:     /**
+0:      * returns the least loaded connection to remoteEp, creating a new connection if necessary
+1:      */
+/////////////////////////////////////////////////////////////////////////
+0:             if (!contains(connection))
+/////////////////////////////////////////////////////////////////////////
+0:                 connection.closeSocket();
+/////////////////////////////////////////////////////////////////////////
+commit:0a8f465
+/////////////////////////////////////////////////////////////////////////
+0:             if ((least != null && least.pending() == 0) || allConnections_.size() == maxSize_)
+0:             {
+0:             if (connection != null && !contains(connection))
+/////////////////////////////////////////////////////////////////////////
+0:                 if (connection != null)
+/////////////////////////////////////////////////////////////////////////
+0:             connection = (allConnections_.size() > 0) ? allConnections_.get(0) : null;
+/////////////////////////////////////////////////////////////////////////
+0:             if (contains(connection))
+0:             if (allConnections_.size() < maxSize_)
+/////////////////////////////////////////////////////////////////////////
+0:             while (allConnections_.size() > 0)
+/////////////////////////////////////////////////////////////////////////
+0:             for (TcpConnection connection : allConnections_)
+commit:360d355
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:         remoteEp_ = remoteEp;
+0:         isShut_ = false;
+0:         lastTimeUsed_ = System.currentTimeMillis();
+0:         allConnections_ = new ArrayList<TcpConnection>();
+0: 
+0:             if (allConnections_.isEmpty())
+0:             {
+0: 
+0: 
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:                 {
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:     protected TcpConnection getLeastLoaded()
+0:     {
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:         lock_.lock();
+0:         try
+0:         {
+0:             allConnections_.remove(connection);
+1:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+1:         }
+0: 
+0: 
+0:     {
+0: 
+0:     {
+0:             if ( contains(connection) )
+0:                 return;
+0: 
+0:             {
+0:                 allConnections_.add(connection);
+0:             {
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:     {
+0:                 TcpConnection connection = allConnections_.remove(0);
+/////////////////////////////////////////////////////////////////////////
+0:         lock_.lock();
+0:         try
+0:         {
+0:             return allConnections_.size();
+1:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+1:         }
+0: 
+0: 
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:         lock_.lock();
+0:         try
+0:         {
+0:             return allConnections_.contains(connection);
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:         }
+commit:dc79416
+/////////////////////////////////////////////////////////////////////////
+0:     List<TcpConnection> getConnections()
+0:     {
+0:         return allConnections_;
+0:     }
+commit:d7e4924
+/////////////////////////////////////////////////////////////////////////
+commit:066ef58
+/////////////////////////////////////////////////////////////////////////
+0: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+0: 
+1: package org.apache.cassandra.net;
+0: 
+1: import java.io.IOException;
+0: import java.util.*;
+0: import java.util.concurrent.*;
+0: import java.util.concurrent.locks.*;
+0: 
+0: import org.apache.log4j.Logger;
+0: /**
+0:  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+1:  */
+0: 
+0: class TcpConnectionManager
+0: {
+0:     private Lock lock_ = new ReentrantLock();
+0:     private List<TcpConnection> allConnections_;
+0:     private EndPoint localEp_;
+0:     private EndPoint remoteEp_;
+0:     private int initialSize_;
+0:     private int growthFactor_;
+0:     private int maxSize_;
+0:     private long lastTimeUsed_;
+0:     private boolean isShut_;
+0:     
+0:     private int inUse_;
+0: 
+0:     TcpConnectionManager(int initialSize, int growthFactor, int maxSize, EndPoint localEp, EndPoint remoteEp)
+0:     {
+0:         initialSize_ = initialSize;
+0:         growthFactor_ = growthFactor;
+0:         maxSize_ = maxSize;
+0:         localEp_ = localEp;
+0:         remoteEp_ = remoteEp;     
+0:         isShut_ = false;                
+0:         lastTimeUsed_ = System.currentTimeMillis();        
+0:         allConnections_ = new Vector<TcpConnection>(); 
+0:     }
+0:     
+0:     TcpConnection getConnection() throws IOException
+0:     {
+0:         lock_.lock();
+0:         try
+0:         {
+0:             if (allConnections_.isEmpty()) 
+0:             {                
+0:                 TcpConnection conn = new TcpConnection(this, localEp_, remoteEp_);
+0:                 addToPool(conn);
+0:                 conn.inUse_ = true;
+0:                 incUsed();
+0:                 return conn;
+0:             }
+0:             
+0:             TcpConnection least = getLeastLoaded();
+0:             
+0:             if ( (least != null && least.pending() == 0) || allConnections_.size() == maxSize_) {
+0:                 least.inUse_ = true;
+0:                 incUsed();
+0:                 return least;
+0:             }
+0:                                     
+0:             TcpConnection connection = new TcpConnection(this, localEp_, remoteEp_);
+0:             if ( connection != null && !contains(connection) )
+0:             {
+0:                 addToPool(connection);
+0:                 connection.inUse_ = true;
+0:                 incUsed();
+0:                 return connection;
+0:             }
+0:             else
+0:             {
+0:                 if ( connection != null )
+0:                 {                
+0:                     connection.closeSocket();
+0:                 }
+0:                 return getLeastLoaded();
+0:             }
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:         }
+0:     }
+0:     
+0:     protected TcpConnection getLeastLoaded() 
+0:     {  
+0:         TcpConnection connection = null;
+0:         lock_.lock();
+0:         try
+0:         {
+0:             Collections.sort(allConnections_);
+0:             connection = (allConnections_.size() > 0 ) ? allConnections_.get(0) : null;
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:         }
+0:         return connection;
+0:     }
+0:     
+0:     void removeConnection(TcpConnection connection)
+0:     {
+0:         allConnections_.remove(connection);        
+0:     }
+0:     
+0:     void incUsed()
+0:     {
+0:         inUse_++;
+0:     }
+0:     
+0:     void decUsed()
+0:     {        
+0:         inUse_--;
+0:     }
+0:     
+0:     int getConnectionsInUse()
+0:     {
+0:         return inUse_;
+0:     }
+0: 
+0:     void addToPool(TcpConnection connection)
+0:     { 
+0:         
+0:         if ( contains(connection) )
+0:             return;
+0:         
+0:         lock_.lock();
+0:         try
+0:         {
+0:             if ( allConnections_.size() < maxSize_ )
+0:             {                 
+0:                 allConnections_.add(connection);                
+0:             }
+0:             else
+0:             {                
+0:                 connection.closeSocket();
+0:             }
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:         }
+0:     }
+0:     
+0:     void shutdown()
+0:     {    
+0:         lock_.lock();
+0:         try
+0:         {
+0:             while ( allConnections_.size() > 0 )
+0:             {
+0:                 TcpConnection connection = allConnections_.remove(0);                        
+0:                 connection.closeSocket();
+0:             }
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:         }
+0:         isShut_ = true;
+0:     }
+0: 
+0:     int getPoolSize()
+0:     {
+0:         return allConnections_.size();
+0:     }
+0: 
+0:     EndPoint getLocalEndPoint()
+0:     {
+0:         return localEp_;
+0:     }
+0:     
+0:     EndPoint getRemoteEndPoint()
+0:     {
+0:         return remoteEp_;
+0:     }
+0:     
+0:     int getPendingWrites()
+0:     {
+0:         int total = 0;
+0:         lock_.lock();
+0:         try
+0:         {
+0:             for ( TcpConnection connection : allConnections_ )
+0:             {
+0:                 total += connection.pending();
+0:             }
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:         }
+0:         return total;
+0:     }
+0:     
+0:     boolean contains(TcpConnection connection)
+0:     {
+0:         return allConnections_.contains(connection);
+0:     }
+0: }
+commit:71739ef
+author:Brandon Williams
+-------------------------------------------------------------------------------
+commit:cba4087
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.config.Config;
+/////////////////////////////////////////////////////////////////////////
+1:             if (Config.getOutboundBindAny())
+0:                 return SSLFactory.getSocket(DatabaseDescriptor.getEncryptionOptions(), endPoint(), DatabaseDescriptor.getSSLStoragePort());
+0:             else
+0:                 return SSLFactory.getSocket(DatabaseDescriptor.getEncryptionOptions(), endPoint(), DatabaseDescriptor.getSSLStoragePort(), FBUtilities.getLocalAddress(), 0);
+1:             if (Config.getOutboundBindAny())
+0:                 return new Socket(endPoint(), DatabaseDescriptor.getStoragePort());
+0:             else
+0:                 return new Socket(endPoint(), DatabaseDescriptor.getStoragePort(), FBUtilities.getLocalAddress(), 0);
+commit:fa70ed5
+/////////////////////////////////////////////////////////////////////////
+0: import java.io.IOException;
+1: import java.net.Socket;
+1: import org.apache.cassandra.config.DatabaseDescriptor;
+1: import org.apache.cassandra.locator.IEndpointSnitch;
+1: import org.apache.cassandra.security.SSLFactory;
+1: import org.apache.cassandra.utils.FBUtilities;
+0:     private IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
+1:     // pointer for the real Address.
+1:     private final InetAddress id;
+0:     // pointer to the reseted Address.
+0:     private InetAddress resetedEndpoint;
+1:         id = remoteEp;
+0:         cmdCon = new OutboundTcpConnection(this);
+0:         ackCon = new OutboundTcpConnection(this);
+/////////////////////////////////////////////////////////////////////////
+0:         resetedEndpoint = remoteEP;
+0:         reset();
+0:     }
+0:     
+1:     public Socket newSocket() throws IOException
+0:     {
+1:         // zero means 'bind on any available port.'
+0:         if (isEncryptedChannel())
+0:         {
+0:             return SSLFactory.getSocket(DatabaseDescriptor.getEncryptionOptions(), endPoint(), DatabaseDescriptor.getSSLStoragePort(), FBUtilities.getLocalAddress(), 0);
+0:         }
+0:         else {
+0:             return new Socket(endPoint(), DatabaseDescriptor.getStoragePort(), FBUtilities.getLocalAddress(), 0);
+0:         }
+0:     }
+0:     
+0:     InetAddress endPoint()
+0:     {
+0:         return resetedEndpoint == null ? id : resetedEndpoint;
+0:     }
+0:     
+0:     boolean isEncryptedChannel()
+0:     {
+0:         switch (DatabaseDescriptor.getEncryptionOptions().internode_encryption)
+0:         {
+1:             case none:
+1:                 return false; // if nothing needs to be encrypted then return immediately.
+1:             case all:
+1:                 break;
+1:             case dc:
+0:                 if (snitch.getDatacenter(id).equals(snitch.getDatacenter(FBUtilities.getBroadcastAddress())))
+1:                     return false;
+1:                 break;
+1:             case rack:
+1:                 // for rack then check if the DC's are the same.
+0:                 if (snitch.getRack(id).equals(snitch.getRack(FBUtilities.getBroadcastAddress()))
+0:                         && snitch.getDatacenter(id).equals(snitch.getDatacenter(FBUtilities.getBroadcastAddress())))
+1:                     return false;
+1:                 break;
+0:         }
+1:         return true;
+commit:c715b6d
+/////////////////////////////////////////////////////////////////////////
+0:         ackCon.closeSocket();
+0:         cmdCon.closeSocket();
+commit:7dfef3e
+/////////////////////////////////////////////////////////////////////////
+1: public class OutboundTcpConnectionPool
+/////////////////////////////////////////////////////////////////////////
+0:     
+1:     public void reset(InetAddress remoteEP)
+0:     {
+0:         ackCon.setEndPoint(remoteEP);
+0:         ackCon.write(OutboundTcpConnection.CLOSE_SENTINEL);
+0:         cmdCon.setEndPoint(remoteEP);
+0:         cmdCon.write(OutboundTcpConnection.CLOSE_SENTINEL);
+0:     }
+author:Gary Dusbabek
+-------------------------------------------------------------------------------
+commit:0095f0c
+/////////////////////////////////////////////////////////////////////////
+commit:d6d4a4f
+/////////////////////////////////////////////////////////////////////////
+0:     synchronized void reset()
+0:         cmdCon = null;
+0:         ackCon = null;
+author:Prashant Malik
+-------------------------------------------------------------------------------
+commit:1f91e99
+/////////////////////////////////////////////////////////////////////////
+0: /**
+0:  * Licensed to the Apache Software Foundation (ASF) under one
+0:  * or more contributor license agreements.  See the NOTICE file
+0:  * distributed with this work for additional information
+0:  * regarding copyright ownership.  The ASF licenses this file
+0:  * to you under the Apache License, Version 2.0 (the
+0:  * "License"); you may not use this file except in compliance
+0:  * with the License.  You may obtain a copy of the License at
+0:  *
+0:  *     http://www.apache.org/licenses/LICENSE-2.0
+0:  *
+0:  * Unless required by applicable law or agreed to in writing, software
+0:  * distributed under the License is distributed on an "AS IS" BASIS,
+0:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+0:  * See the License for the specific language governing permissions and
+0:  * limitations under the License.
+0:  */
+0: 
+0: package org.apache.cassandra.net;
+0: 
+0: import java.io.IOException;
+0: import java.util.*;
+0: import java.util.concurrent.*;
+0: import java.util.concurrent.locks.*;
+0: 
+0: import org.apache.log4j.Logger;
+0: /**
+0:  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+0:  */
+0: 
+0: class TcpConnectionManager
+0: {
+0:     private Lock lock_ = new ReentrantLock();
+0:     private List<TcpConnection> allConnections_;
+0:     private EndPoint localEp_;
+0:     private EndPoint remoteEp_;
+0:     private int initialSize_;
+0:     private int growthFactor_;
+0:     private int maxSize_;
+0:     private long lastTimeUsed_;
+0:     private boolean isShut_;
+0:     
+0:     private int inUse_;
+0: 
+0:     TcpConnectionManager(int initialSize, int growthFactor, int maxSize, EndPoint localEp, EndPoint remoteEp)
+0:     {
+0:         initialSize_ = initialSize;
+0:         growthFactor_ = growthFactor;
+0:         maxSize_ = maxSize;
+0:         localEp_ = localEp;
+0:         remoteEp_ = remoteEp;     
+0:         isShut_ = false;                
+0:         lastTimeUsed_ = System.currentTimeMillis();        
+0:         allConnections_ = new Vector<TcpConnection>(); 
+0:     }
+0:     
+0:     TcpConnection getConnection() throws IOException
+0:     {
+0:         lock_.lock();
+0:         try
+0:         {
+0:             if (allConnections_.isEmpty()) 
+0:             {                
+0:                 TcpConnection conn = new TcpConnection(this, localEp_, remoteEp_);
+0:                 addToPool(conn);
+0:                 conn.inUse_ = true;
+0:                 incUsed();
+0:                 return conn;
+0:             }
+0:             
+0:             TcpConnection least = getLeastLoaded();
+0:             
+0:             if ( (least != null && least.pending() == 0) || allConnections_.size() == maxSize_) {
+0:                 least.inUse_ = true;
+0:                 incUsed();
+0:                 return least;
+0:             }
+0:                                     
+0:             TcpConnection connection = new TcpConnection(this, localEp_, remoteEp_);
+0:             if ( connection != null && !contains(connection) )
+0:             {
+0:                 addToPool(connection);
+0:                 connection.inUse_ = true;
+0:                 incUsed();
+0:                 return connection;
+0:             }
+0:             else
+0:             {
+0:                 if ( connection != null )
+0:                 {                
+0:                     connection.closeSocket();
+0:                 }
+0:                 return getLeastLoaded();
+0:             }
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:         }
+0:     }
+0:     
+0:     protected TcpConnection getLeastLoaded() 
+0:     {  
+0:         TcpConnection connection = null;
+0:         lock_.lock();
+0:         try
+0:         {
+0:             Collections.sort(allConnections_);
+0:             connection = (allConnections_.size() > 0 ) ? allConnections_.get(0) : null;
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:         }
+0:         return connection;
+0:     }
+0:     
+0:     void removeConnection(TcpConnection connection)
+0:     {
+0:         allConnections_.remove(connection);        
+0:     }
+0:     
+0:     void incUsed()
+0:     {
+0:         inUse_++;
+0:     }
+0:     
+0:     void decUsed()
+0:     {        
+0:         inUse_--;
+0:     }
+0:     
+0:     int getConnectionsInUse()
+0:     {
+0:         return inUse_;
+0:     }
+0: 
+0:     void addToPool(TcpConnection connection)
+0:     { 
+0:         
+0:         if ( contains(connection) )
+0:             return;
+0:         
+0:         lock_.lock();
+0:         try
+0:         {
+0:             if ( allConnections_.size() < maxSize_ )
+0:             {                 
+0:                 allConnections_.add(connection);                
+0:             }
+0:             else
+0:             {                
+0:                 connection.closeSocket();
+0:             }
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:         }
+0:     }
+0:     
+0:     void shutdown()
+0:     {    
+0:         lock_.lock();
+0:         try
+0:         {
+0:             while ( allConnections_.size() > 0 )
+0:             {
+0:                 TcpConnection connection = allConnections_.remove(0);                        
+0:                 connection.closeSocket();
+0:             }
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:         }
+0:         isShut_ = true;
+0:     }
+0: 
+0:     int getPoolSize()
+0:     {
+0:         return allConnections_.size();
+0:     }
+0: 
+0:     EndPoint getLocalEndPoint()
+0:     {
+0:         return localEp_;
+0:     }
+0:     
+0:     EndPoint getRemoteEndPoint()
+0:     {
+0:         return remoteEp_;
+0:     }
+0:     
+0:     int getPendingWrites()
+0:     {
+0:         int total = 0;
+0:         lock_.lock();
+0:         try
+0:         {
+0:             for ( TcpConnection connection : allConnections_ )
+0:             {
+0:                 total += connection.pending();
+0:             }
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:         }
+0:         return total;
+0:     }
+0:     
+0:     boolean contains(TcpConnection connection)
+0:     {
+0:         return allConnections_.contains(connection);
+0:     }
+0: }
+============================================================================

@@ -1,0 +1,634 @@
+1:1cdd095: /*
+1:1cdd095:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:1cdd095:  * contributor license agreements.  See the NOTICE file distributed with
+1:1cdd095:  * this work for additional information regarding copyright ownership.
+1:1cdd095:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:1cdd095:  * (the "License"); you may not use this file except in compliance with
+1:1cdd095:  * the License.  You may obtain a copy of the License at
+1:1cdd095:  *
+1:1cdd095:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:1cdd095:  *
+1:1cdd095:  * Unless required by applicable law or agreed to in writing, software
+1:1cdd095:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:1cdd095:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:1cdd095:  * See the License for the specific language governing permissions and
+1:1cdd095:  * limitations under the License.
+1:1cdd095:  */
+1:1cdd095: 
+1:ec9035c: package org.apache.mahout.math.neighborhood;
+2:ec9035c: 
+1:ec9035c: import java.util.Collections;
+1:ec9035c: import java.util.Iterator;
+1:ec9035c: import java.util.List;
+1:ec9035c: 
+1:ec9035c: import com.google.common.base.Function;
+1:ec9035c: import com.google.common.base.Preconditions;
+1:ec9035c: import com.google.common.collect.HashMultiset;
+1:ec9035c: import com.google.common.collect.Iterators;
+1:ec9035c: import com.google.common.collect.Lists;
+1:ec9035c: import com.google.common.collect.Multiset;
+1:ec9035c: import org.apache.lucene.util.PriorityQueue;
+1:ec9035c: import org.apache.mahout.common.distance.DistanceMeasure;
+1:ec9035c: import org.apache.mahout.math.Matrix;
+1:ec9035c: import org.apache.mahout.math.Vector;
+1:ec9035c: import org.apache.mahout.math.random.RandomProjector;
+1:ec9035c: import org.apache.mahout.math.random.WeightedThing;
+1:ec9035c: import org.apache.mahout.math.stats.OnlineSummarizer;
+1:ec9035c: 
+1:ec9035c: /**
+1:ec9035c:  * Implements a Searcher that uses locality sensitivity hash as a first pass approximation
+1:ec9035c:  * to estimate distance without floating point math.  The clever bit about this implementation
+1:ec9035c:  * is that it does an adaptive cutoff for the cutoff on the bitwise distance.  Making this
+1:ec9035c:  * cutoff adaptive means that we only needs to make a single pass through the data.
+1:ec9035c:  */
+1:335a993: public class LocalitySensitiveHashSearch extends UpdatableSearcher {
+1:ec9035c:   /**
+1:ec9035c:    * Number of bits in the locality sensitive hash. 64 bits fix neatly into a long.
+1:ec9035c:    */
+1:ec9035c:   private static final int BITS = 64;
+1:ec9035c: 
+1:ec9035c:   /**
+1:ec9035c:    * Bit mask for the computed hash. Currently, it's 0xffffffffffff.
+1:ec9035c:    */
+1:ec9035c:   private static final long BIT_MASK = -1L;
+1:ec9035c: 
+1:ec9035c:   /**
+1:ec9035c:    * The maximum Hamming distance between two hashes that the hash limit can grow back to.
+1:ec9035c:    * It starts at BITS and decreases as more points than are needed are added to the candidate priority queue.
+1:ec9035c:    * But, after the observed distribution of distances becomes too good (we're seeing less than some percentage of the
+1:ec9035c:    * total number of points; using the hash strategy somewhere less than 25%) the limit is increased to compute
+1:ec9035c:    * more distances.
+1:ec9035c:    * This is because
+1:ec9035c:    */
+1:ec9035c:   private static final int MAX_HASH_LIMIT = 32;
+1:ec9035c: 
+1:ec9035c:   /**
+1:ec9035c:    * Minimum number of points with a given Hamming from the query that must be observed to consider raising the minimum
+1:ec9035c:    * distance for a candidate.
+1:ec9035c:    */
+1:ec9035c:   private static final int MIN_DISTRIBUTION_COUNT = 10;
+1:ec9035c: 
+1:335a993:   private final Multiset<HashedVector> trainingVectors = HashMultiset.create();
+1:ec9035c: 
+1:ec9035c:   /**
+1:ec9035c:    * This matrix of BITS random vectors is used to compute the Locality Sensitive Hash
+1:ec9035c:    * we compute the dot product with these vectors using a matrix multiplication and then use just
+1:ec9035c:    * sign of each result as one bit in the hash
+1:ec9035c:    */
+1:ec9035c:   private Matrix projection;
+1:ec9035c: 
+1:ec9035c:   /**
+1:ec9035c:    * The search size determines how many top results we retain.  We do this because the hash distance
+1:ec9035c:    * isn't guaranteed to be entirely monotonic with respect to the real distance.  To the extent that
+1:ec9035c:    * actual distance is well approximated by hash distance, then the searchSize can be decreased to
+1:ec9035c:    * roughly the number of results that you want.
+1:ec9035c:    */
+1:ec9035c:   private int searchSize;
+1:ec9035c: 
+1:ec9035c:   /**
+1:ec9035c:    * Controls how the hash limit is raised. 0 means use minimum of distribution, 1 means use first quartile.
+1:ec9035c:    * Intermediate values indicate an interpolation should be used. Negative values mean to never increase.
+1:ec9035c:    */
+1:ec9035c:   private double hashLimitStrategy = 0.9;
+1:ec9035c: 
+1:ec9035c:   /**
+1:ec9035c:    * Number of evaluations of the full distance between two points that was required.
+1:ec9035c:    */
+1:ec9035c:   private int distanceEvaluations = 0;
+1:ec9035c: 
+1:ec9035c:   /**
+1:ec9035c:    * Whether the projection matrix was initialized. This has to be deferred until the size of the vectors is known,
+1:ec9035c:    * effectively until the first vector is added.
+1:ec9035c:    */
+1:ec9035c:   private boolean initialized = false;
+1:ec9035c: 
+1:ec9035c:   public LocalitySensitiveHashSearch(DistanceMeasure distanceMeasure, int searchSize) {
+1:ec9035c:     super(distanceMeasure);
+1:ec9035c:     this.searchSize = searchSize;
+1:ec9035c:     this.projection = null;
+1:ec9035c:   }
+1:ec9035c: 
+1:ec9035c:   private void initialize(int numDimensions) {
+1:ec9035c:     if (initialized) {
+1:ec9035c:       return;
+1:ec9035c:     }
+1:ec9035c:     initialized = true;
+1:ec9035c:     projection = RandomProjector.generateBasisNormal(BITS, numDimensions);
+1:ec9035c:   }
+1:ec9035c: 
+1:ec9035c:   private PriorityQueue<WeightedThing<Vector>> searchInternal(Vector query) {
+1:ec9035c:     long queryHash = HashedVector.computeHash64(query, projection);
+1:ec9035c: 
+1:ec9035c:     // We keep an approximation of the closest vectors here.
+1:ec9035c:     PriorityQueue<WeightedThing<Vector>> top = Searcher.getCandidateQueue(getSearchSize());
+1:ec9035c: 
+1:ec9035c:     // We scan the vectors using bit counts as an approximation of the dot product so we can do as few
+1:ec9035c:     // full distance computations as possible.  Our goal is to only do full distance computations for
+1:ec9035c:     // vectors with hash distance at most as large as the searchSize biggest hash distance seen so far.
+1:ec9035c: 
+1:ec9035c:     OnlineSummarizer[] distribution = new OnlineSummarizer[BITS + 1];
+1:ec9035c:     for (int i = 0; i < BITS + 1; i++) {
+1:ec9035c:       distribution[i] = new OnlineSummarizer();
+1:ec9035c:     }
+1:ec9035c: 
+1:335a993:     distanceEvaluations = 0;
+1:335a993:     
+1:335a993:     // We keep the counts of the hash distances here.  This lets us accurately
+1:335a993:     // judge what hash distance cutoff we should use.
+1:335a993:     int[] hashCounts = new int[BITS + 1];
+1:335a993:     
+1:ec9035c:     // Maximum number of different bits to still consider a vector a candidate for nearest neighbor.
+1:ec9035c:     // Starts at the maximum number of bits, but decreases and can increase.
+1:ec9035c:     int hashLimit = BITS;
+1:ec9035c:     int limitCount = 0;
+1:ec9035c:     double distanceLimit = Double.POSITIVE_INFINITY;
+1:ec9035c: 
+1:ec9035c:     // In this loop, we have the invariants that:
+1:ec9035c:     //
+1:ec9035c:     // limitCount = sum_{i<hashLimit} hashCount[i]
+1:ec9035c:     // and
+1:ec9035c:     // limitCount >= searchSize && limitCount - hashCount[hashLimit-1] < searchSize
+1:ec9035c:     for (HashedVector vector : trainingVectors) {
+1:ec9035c:       // This computes the Hamming Distance between the vector's hash and the query's hash.
+1:ec9035c:       // The result is correlated with the angle between the vectors.
+1:ec9035c:       int bitDot = vector.hammingDistance(queryHash);
+1:ec9035c:       if (bitDot <= hashLimit) {
+1:ec9035c:         distanceEvaluations++;
+1:ec9035c: 
+1:ec9035c:         double distance = distanceMeasure.distance(query, vector);
+1:ec9035c:         distribution[bitDot].add(distance);
+1:ec9035c: 
+1:ec9035c:         if (distance < distanceLimit) {
+1:ec9035c:           top.insertWithOverflow(new WeightedThing<Vector>(vector, distance));
+1:ec9035c:           if (top.size() == searchSize) {
+1:ec9035c:             distanceLimit = top.top().getWeight();
+1:ec9035c:           }
+1:ec9035c: 
+1:ec9035c:           hashCounts[bitDot]++;
+1:ec9035c:           limitCount++;
+1:ec9035c:           while (hashLimit > 0 && limitCount - hashCounts[hashLimit - 1] > searchSize) {
+1:ec9035c:             hashLimit--;
+1:ec9035c:             limitCount -= hashCounts[hashLimit];
+1:ec9035c:           }
+1:ec9035c: 
+1:ec9035c:           if (hashLimitStrategy >= 0) {
+1:ec9035c:             while (hashLimit < MAX_HASH_LIMIT && distribution[hashLimit].getCount() > MIN_DISTRIBUTION_COUNT
+1:ec9035c:                 && ((1 - hashLimitStrategy) * distribution[hashLimit].getQuartile(0)
+1:ec9035c:                 + hashLimitStrategy * distribution[hashLimit].getQuartile(1)) < distanceLimit) {
+1:ec9035c:               limitCount += hashCounts[hashLimit];
+1:ec9035c:               hashLimit++;
+1:ec9035c:             }
+1:ec9035c:           }
+1:ec9035c:         }
+1:ec9035c:       }
+1:ec9035c:     }
+1:ec9035c:     return top;
+1:ec9035c:   }
+1:ec9035c: 
+1:ec9035c:   @Override
+1:ec9035c:   public List<WeightedThing<Vector>> search(Vector query, int limit) {
+1:ec9035c:     PriorityQueue<WeightedThing<Vector>> top = searchInternal(query);
+1:25efc43:     List<WeightedThing<Vector>> results = Lists.newArrayListWithExpectedSize(top.size());
+1:25efc43:     while (top.size() != 0) {
+1:ec9035c:       WeightedThing<Vector> wv = top.pop();
+1:87c15be:       results.add(new WeightedThing<>(((HashedVector) wv.getValue()).getVector(), wv.getWeight()));
+1:ec9035c:     }
+1:ec9035c:     Collections.reverse(results);
+1:25efc43:     if (limit < results.size()) {
+1:25efc43:       results = results.subList(0, limit);
+1:25efc43:     }
+1:ec9035c:     return results;
+1:ec9035c:   }
+1:ec9035c: 
+1:ec9035c:   /**
+1:ec9035c:    * Returns the closest vector to the query.
+1:ec9035c:    * When only one the nearest vector is needed, use this method, NOT search(query, limit) because
+1:ec9035c:    * it's faster (less overhead).
+1:ec9035c:    * This is nearly the same as search().
+1:ec9035c:    *
+1:ec9035c:    * @param query the vector to search for
+1:ec9035c:    * @param differentThanQuery if true, returns the closest vector different than the query (this
+1:ec9035c:    *                           only matters if the query is among the searched vectors), otherwise,
+1:ec9035c:    *                           returns the closest vector to the query (even the same vector).
+1:ec9035c:    * @return the weighted vector closest to the query
+1:ec9035c:    */
+1:ec9035c:   @Override
+1:ec9035c:   public WeightedThing<Vector> searchFirst(Vector query, boolean differentThanQuery) {
+1:ec9035c:     // We get the top searchSize neighbors.
+1:ec9035c:     PriorityQueue<WeightedThing<Vector>> top = searchInternal(query);
+1:ec9035c:     // We then cut the number down to just the best 2.
+1:ec9035c:     while (top.size() > 2) {
+1:ec9035c:       top.pop();
+1:ec9035c:     }
+1:ec9035c:     // If there are fewer than 2 results, we just return the one we have.
+1:ec9035c:     if (top.size() < 2) {
+1:ec9035c:       return removeHash(top.pop());
+1:ec9035c:     }
+1:ec9035c:     // There are exactly 2 results.
+1:ec9035c:     WeightedThing<Vector> secondBest = top.pop();
+1:ec9035c:     WeightedThing<Vector> best = top.pop();
+1:ec9035c:     // If the best result is the same as the query, but we don't want to return the query.
+1:ec9035c:     if (differentThanQuery && best.getValue().equals(query)) {
+1:ec9035c:       best = secondBest;
+1:ec9035c:     }
+1:ec9035c:     return removeHash(best);
+1:ec9035c:   }
+1:ec9035c: 
+1:335a993:   protected static WeightedThing<Vector> removeHash(WeightedThing<Vector> input) {
+1:87c15be:     return new WeightedThing<>(((HashedVector) input.getValue()).getVector(), input.getWeight());
+1:ec9035c:   }
+1:ec9035c: 
+1:ec9035c:   @Override
+1:ec9035c:   public void add(Vector vector) {
+1:ec9035c:     initialize(vector.size());
+1:ec9035c:     trainingVectors.add(new HashedVector(vector, projection, HashedVector.INVALID_INDEX, BIT_MASK));
+1:ec9035c:   }
+1:ec9035c: 
+1:335a993:   @Override
+1:ec9035c:   public int size() {
+1:ec9035c:     return trainingVectors.size();
+1:ec9035c:   }
+1:ec9035c: 
+1:ec9035c:   public int getSearchSize() {
+1:ec9035c:     return searchSize;
+1:ec9035c:   }
+1:ec9035c: 
+1:ec9035c:   public void setSearchSize(int size) {
+1:ec9035c:     searchSize = size;
+1:ec9035c:   }
+1:ec9035c: 
+1:ec9035c:   public void setRaiseHashLimitStrategy(double strategy) {
+1:ec9035c:     hashLimitStrategy = strategy;
+1:ec9035c:   }
+1:ec9035c: 
+1:ec9035c:   /**
+1:ec9035c:    * This is only for testing.
+1:ec9035c:    * @return the number of times the actual distance between two vectors was computed.
+1:ec9035c:    */
+1:ec9035c:   public int resetEvaluationCount() {
+1:ec9035c:     int result = distanceEvaluations;
+2:ec9035c:     distanceEvaluations = 0;
+1:ec9035c:     return result;
+1:ec9035c:   }
+1:ec9035c: 
+1:ec9035c:   @Override
+1:ec9035c:   public Iterator<Vector> iterator() {
+1:ec9035c:     return Iterators.transform(trainingVectors.iterator(), new Function<HashedVector, Vector>() {
+1:ec9035c:       @Override
+1:ec9035c:       public Vector apply(org.apache.mahout.math.neighborhood.HashedVector input) {
+1:ec9035c:         Preconditions.checkNotNull(input);
+1:ec9035c:         //noinspection ConstantConditions
+1:ec9035c:         return input.getVector();
+1:ec9035c:       }
+1:ec9035c:     });
+1:ec9035c:   }
+1:ec9035c: 
+1:ec9035c:   @Override
+1:ec9035c:   public boolean remove(Vector v, double epsilon) {
+1:ec9035c:     return trainingVectors.remove(new HashedVector(v, projection, HashedVector.INVALID_INDEX, BIT_MASK));
+1:ec9035c:   }
+1:ec9035c: 
+1:ec9035c:   @Override
+1:ec9035c:   public void clear() {
+1:ec9035c:     trainingVectors.clear();
+1:ec9035c:   }
+1:ec9035c: }
+============================================================================
+author:pferrel
+-------------------------------------------------------------------------------
+commit:b988c49
+author:Suneel Marthi
+-------------------------------------------------------------------------------
+commit:87c15be
+/////////////////////////////////////////////////////////////////////////
+1:       results.add(new WeightedThing<>(((HashedVector) wv.getValue()).getVector(), wv.getWeight()));
+/////////////////////////////////////////////////////////////////////////
+1:     return new WeightedThing<>(((HashedVector) input.getValue()).getVector(), input.getWeight());
+author:frankscholten
+-------------------------------------------------------------------------------
+commit:1a42d85
+author:sslavic
+-------------------------------------------------------------------------------
+commit:25efc43
+/////////////////////////////////////////////////////////////////////////
+1:     List<WeightedThing<Vector>> results = Lists.newArrayListWithExpectedSize(top.size());
+1:     while (top.size() != 0) {
+1:     if (limit < results.size()) {
+1:       results = results.subList(0, limit);
+1:     }
+author:Sean R. Owen
+-------------------------------------------------------------------------------
+commit:1cdd095
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: 
+commit:335a993
+/////////////////////////////////////////////////////////////////////////
+1: public class LocalitySensitiveHashSearch extends UpdatableSearcher {
+/////////////////////////////////////////////////////////////////////////
+1:   private final Multiset<HashedVector> trainingVectors = HashMultiset.create();
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     distanceEvaluations = 0;
+1:     
+1:     // We keep the counts of the hash distances here.  This lets us accurately
+1:     // judge what hash distance cutoff we should use.
+1:     int[] hashCounts = new int[BITS + 1];
+1:     
+/////////////////////////////////////////////////////////////////////////
+1:   protected static WeightedThing<Vector> removeHash(WeightedThing<Vector> input) {
+/////////////////////////////////////////////////////////////////////////
+1:   @Override
+author:dfilimon
+-------------------------------------------------------------------------------
+commit:ec9035c
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.mahout.math.neighborhood;
+1: 
+1: import java.util.Collections;
+1: import java.util.Iterator;
+1: import java.util.List;
+1: 
+1: import com.google.common.base.Function;
+1: import com.google.common.base.Preconditions;
+1: import com.google.common.collect.HashMultiset;
+1: import com.google.common.collect.Iterators;
+1: import com.google.common.collect.Lists;
+1: import com.google.common.collect.Multiset;
+1: import org.apache.lucene.util.PriorityQueue;
+1: import org.apache.mahout.common.distance.DistanceMeasure;
+1: import org.apache.mahout.math.Matrix;
+1: import org.apache.mahout.math.Vector;
+1: import org.apache.mahout.math.random.RandomProjector;
+1: import org.apache.mahout.math.random.WeightedThing;
+1: import org.apache.mahout.math.stats.OnlineSummarizer;
+1: 
+1: /**
+1:  * Implements a Searcher that uses locality sensitivity hash as a first pass approximation
+1:  * to estimate distance without floating point math.  The clever bit about this implementation
+1:  * is that it does an adaptive cutoff for the cutoff on the bitwise distance.  Making this
+1:  * cutoff adaptive means that we only needs to make a single pass through the data.
+1:  */
+0: public class LocalitySensitiveHashSearch extends UpdatableSearcher implements Iterable<Vector> {
+1:   /**
+1:    * Number of bits in the locality sensitive hash. 64 bits fix neatly into a long.
+1:    */
+1:   private static final int BITS = 64;
+1: 
+1:   /**
+1:    * Bit mask for the computed hash. Currently, it's 0xffffffffffff.
+1:    */
+1:   private static final long BIT_MASK = -1L;
+1: 
+1:   /**
+1:    * The maximum Hamming distance between two hashes that the hash limit can grow back to.
+1:    * It starts at BITS and decreases as more points than are needed are added to the candidate priority queue.
+1:    * But, after the observed distribution of distances becomes too good (we're seeing less than some percentage of the
+1:    * total number of points; using the hash strategy somewhere less than 25%) the limit is increased to compute
+1:    * more distances.
+1:    * This is because
+1:    */
+1:   private static final int MAX_HASH_LIMIT = 32;
+1: 
+1:   /**
+1:    * Minimum number of points with a given Hamming from the query that must be observed to consider raising the minimum
+1:    * distance for a candidate.
+1:    */
+1:   private static final int MIN_DISTRIBUTION_COUNT = 10;
+1: 
+0:   private Multiset<HashedVector> trainingVectors = HashMultiset.create();
+1: 
+1:   /**
+1:    * This matrix of BITS random vectors is used to compute the Locality Sensitive Hash
+1:    * we compute the dot product with these vectors using a matrix multiplication and then use just
+1:    * sign of each result as one bit in the hash
+1:    */
+1:   private Matrix projection;
+1: 
+1:   /**
+1:    * The search size determines how many top results we retain.  We do this because the hash distance
+1:    * isn't guaranteed to be entirely monotonic with respect to the real distance.  To the extent that
+1:    * actual distance is well approximated by hash distance, then the searchSize can be decreased to
+1:    * roughly the number of results that you want.
+1:    */
+1:   private int searchSize;
+1: 
+1:   /**
+1:    * Controls how the hash limit is raised. 0 means use minimum of distribution, 1 means use first quartile.
+1:    * Intermediate values indicate an interpolation should be used. Negative values mean to never increase.
+1:    */
+1:   private double hashLimitStrategy = 0.9;
+1: 
+1:   /**
+1:    * Number of evaluations of the full distance between two points that was required.
+1:    */
+1:   private int distanceEvaluations = 0;
+1: 
+1:   /**
+1:    * Whether the projection matrix was initialized. This has to be deferred until the size of the vectors is known,
+1:    * effectively until the first vector is added.
+1:    */
+1:   private boolean initialized = false;
+1: 
+1:   public LocalitySensitiveHashSearch(DistanceMeasure distanceMeasure, int searchSize) {
+1:     super(distanceMeasure);
+1:     this.searchSize = searchSize;
+1:     this.projection = null;
+1:   }
+1: 
+1:   private void initialize(int numDimensions) {
+1:     if (initialized) {
+1:       return;
+1:     }
+1:     initialized = true;
+1:     projection = RandomProjector.generateBasisNormal(BITS, numDimensions);
+1:   }
+1: 
+1:   private PriorityQueue<WeightedThing<Vector>> searchInternal(Vector query) {
+1:     long queryHash = HashedVector.computeHash64(query, projection);
+1: 
+1:     // We keep an approximation of the closest vectors here.
+1:     PriorityQueue<WeightedThing<Vector>> top = Searcher.getCandidateQueue(getSearchSize());
+1: 
+0:     // We keep the counts of the hash distances here.  This lets us accurately
+0:     // judge what hash distance cutoff we should use.
+0:     int[] hashCounts = new int[BITS + 1];
+1: 
+1:     // We scan the vectors using bit counts as an approximation of the dot product so we can do as few
+1:     // full distance computations as possible.  Our goal is to only do full distance computations for
+1:     // vectors with hash distance at most as large as the searchSize biggest hash distance seen so far.
+1: 
+1:     OnlineSummarizer[] distribution = new OnlineSummarizer[BITS + 1];
+1:     for (int i = 0; i < BITS + 1; i++) {
+1:       distribution[i] = new OnlineSummarizer();
+1:     }
+1: 
+1:     // Maximum number of different bits to still consider a vector a candidate for nearest neighbor.
+1:     // Starts at the maximum number of bits, but decreases and can increase.
+1:     int hashLimit = BITS;
+1:     int limitCount = 0;
+1:     double distanceLimit = Double.POSITIVE_INFINITY;
+1:     distanceEvaluations = 0;
+1: 
+1:     // In this loop, we have the invariants that:
+1:     //
+1:     // limitCount = sum_{i<hashLimit} hashCount[i]
+1:     // and
+1:     // limitCount >= searchSize && limitCount - hashCount[hashLimit-1] < searchSize
+1:     for (HashedVector vector : trainingVectors) {
+1:       // This computes the Hamming Distance between the vector's hash and the query's hash.
+1:       // The result is correlated with the angle between the vectors.
+1:       int bitDot = vector.hammingDistance(queryHash);
+1:       if (bitDot <= hashLimit) {
+1:         distanceEvaluations++;
+1: 
+1:         double distance = distanceMeasure.distance(query, vector);
+1:         distribution[bitDot].add(distance);
+1: 
+1:         if (distance < distanceLimit) {
+1:           top.insertWithOverflow(new WeightedThing<Vector>(vector, distance));
+1:           if (top.size() == searchSize) {
+1:             distanceLimit = top.top().getWeight();
+1:           }
+1: 
+1:           hashCounts[bitDot]++;
+1:           limitCount++;
+1:           while (hashLimit > 0 && limitCount - hashCounts[hashLimit - 1] > searchSize) {
+1:             hashLimit--;
+1:             limitCount -= hashCounts[hashLimit];
+1:           }
+1: 
+1:           if (hashLimitStrategy >= 0) {
+1:             while (hashLimit < MAX_HASH_LIMIT && distribution[hashLimit].getCount() > MIN_DISTRIBUTION_COUNT
+1:                 && ((1 - hashLimitStrategy) * distribution[hashLimit].getQuartile(0)
+1:                 + hashLimitStrategy * distribution[hashLimit].getQuartile(1)) < distanceLimit) {
+1:               limitCount += hashCounts[hashLimit];
+1:               hashLimit++;
+1:             }
+1:           }
+1:         }
+1:       }
+1:     }
+1:     return top;
+1:   }
+1: 
+1:   @Override
+1:   public List<WeightedThing<Vector>> search(Vector query, int limit) {
+1:     PriorityQueue<WeightedThing<Vector>> top = searchInternal(query);
+0:     List<WeightedThing<Vector>> results = Lists.newArrayListWithExpectedSize(limit);
+0:     while (limit > 0 && top.size() != 0) {
+1:       WeightedThing<Vector> wv = top.pop();
+0:       results.add(new WeightedThing<Vector>(((HashedVector) wv.getValue()).getVector(), wv.getWeight()));
+1:     }
+1:     Collections.reverse(results);
+1:     return results;
+1:   }
+1: 
+1:   /**
+1:    * Returns the closest vector to the query.
+1:    * When only one the nearest vector is needed, use this method, NOT search(query, limit) because
+1:    * it's faster (less overhead).
+1:    * This is nearly the same as search().
+1:    *
+1:    * @param query the vector to search for
+1:    * @param differentThanQuery if true, returns the closest vector different than the query (this
+1:    *                           only matters if the query is among the searched vectors), otherwise,
+1:    *                           returns the closest vector to the query (even the same vector).
+1:    * @return the weighted vector closest to the query
+1:    */
+1:   @Override
+1:   public WeightedThing<Vector> searchFirst(Vector query, boolean differentThanQuery) {
+1:     // We get the top searchSize neighbors.
+1:     PriorityQueue<WeightedThing<Vector>> top = searchInternal(query);
+1:     // We then cut the number down to just the best 2.
+1:     while (top.size() > 2) {
+1:       top.pop();
+1:     }
+1:     // If there are fewer than 2 results, we just return the one we have.
+1:     if (top.size() < 2) {
+1:       return removeHash(top.pop());
+1:     }
+1:     // There are exactly 2 results.
+1:     WeightedThing<Vector> secondBest = top.pop();
+1:     WeightedThing<Vector> best = top.pop();
+1:     // If the best result is the same as the query, but we don't want to return the query.
+1:     if (differentThanQuery && best.getValue().equals(query)) {
+1:       best = secondBest;
+1:     }
+1:     return removeHash(best);
+1:   }
+1: 
+0:   protected WeightedThing<Vector> removeHash(WeightedThing<Vector> input) {
+0:     return new WeightedThing<Vector>(((HashedVector) input.getValue()).getVector(), input.getWeight());
+1:   }
+1: 
+1:   @Override
+1:   public void add(Vector vector) {
+1:     initialize(vector.size());
+1:     trainingVectors.add(new HashedVector(vector, projection, HashedVector.INVALID_INDEX, BIT_MASK));
+1:   }
+1: 
+1:   public int size() {
+1:     return trainingVectors.size();
+1:   }
+1: 
+1:   public int getSearchSize() {
+1:     return searchSize;
+1:   }
+1: 
+1:   public void setSearchSize(int size) {
+1:     searchSize = size;
+1:   }
+1: 
+1:   public void setRaiseHashLimitStrategy(double strategy) {
+1:     hashLimitStrategy = strategy;
+1:   }
+1: 
+1:   /**
+1:    * This is only for testing.
+1:    * @return the number of times the actual distance between two vectors was computed.
+1:    */
+1:   public int resetEvaluationCount() {
+1:     int result = distanceEvaluations;
+1:     distanceEvaluations = 0;
+1:     return result;
+1:   }
+1: 
+1:   @Override
+1:   public Iterator<Vector> iterator() {
+1:     return Iterators.transform(trainingVectors.iterator(), new Function<HashedVector, Vector>() {
+1:       @Override
+1:       public Vector apply(org.apache.mahout.math.neighborhood.HashedVector input) {
+1:         Preconditions.checkNotNull(input);
+1:         //noinspection ConstantConditions
+1:         return input.getVector();
+1:       }
+1:     });
+1:   }
+1: 
+1:   @Override
+1:   public boolean remove(Vector v, double epsilon) {
+1:     return trainingVectors.remove(new HashedVector(v, projection, HashedVector.INVALID_INDEX, BIT_MASK));
+1:   }
+1: 
+1:   @Override
+1:   public void clear() {
+1:     trainingVectors.clear();
+1:   }
+1: }
+============================================================================

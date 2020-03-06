@@ -1,0 +1,420 @@
+1:a7895cf: /*
+1:a7895cf:  * Licensed to the Apache Software Foundation (ASF) under one
+1:a7895cf:  * or more contributor license agreements.  See the NOTICE file
+1:a7895cf:  * distributed with this work for additional information
+1:a7895cf:  * regarding copyright ownership.  The ASF licenses this file
+1:a7895cf:  * to you under the Apache License, Version 2.0 (the
+1:a7895cf:  * "License"); you may not use this file except in compliance
+1:a7895cf:  * with the License.  You may obtain a copy of the License at
+1:a7895cf:  *
+1:a7895cf:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:a7895cf:  *
+1:a7895cf:  * Unless required by applicable law or agreed to in writing, software
+1:a7895cf:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:a7895cf:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:a7895cf:  * See the License for the specific language governing permissions and
+1:a7895cf:  * limitations under the License.
+1:a7895cf:  */
+1:a7895cf: package org.apache.cassandra.service;
+2:a7895cf: 
+1:a7895cf: import java.net.InetAddress;
+1:a7895cf: import java.util.Arrays;
+1:a7895cf: import java.util.Collection;
+1:a7895cf: import java.util.Collections;
+1:a7895cf: import java.util.concurrent.TimeUnit;
+1:a7895cf: 
+1:a7895cf: import com.google.common.annotations.VisibleForTesting;
+1:a7895cf: import org.slf4j.Logger;
+1:a7895cf: import org.slf4j.LoggerFactory;
+1:a7895cf: 
+1:a7895cf: import io.netty.channel.EventLoopGroup;
+1:a7895cf: import io.netty.channel.epoll.Epoll;
+1:a7895cf: import io.netty.channel.epoll.EpollEventLoopGroup;
+1:a7895cf: import io.netty.channel.nio.NioEventLoopGroup;
+1:a7895cf: import io.netty.util.concurrent.EventExecutor;
+1:a7895cf: import org.apache.cassandra.config.DatabaseDescriptor;
+1:f00e7a7: import org.apache.cassandra.metrics.AuthMetrics;
+1:a7895cf: import org.apache.cassandra.metrics.ClientMetrics;
+1:a7895cf: import org.apache.cassandra.transport.RequestThreadPoolExecutor;
+1:a7895cf: import org.apache.cassandra.transport.Server;
+1:a7895cf: 
+1:a7895cf: /**
+1:a7895cf:  * Handles native transport server lifecycle and associated resources. Lazily initialized.
+1:a7895cf:  */
+1:a7895cf: public class NativeTransportService
+3:a7895cf: {
+1:a7895cf: 
+1:a7895cf:     private static final Logger logger = LoggerFactory.getLogger(NativeTransportService.class);
+1:a7895cf: 
+1:a7895cf:     private Collection<Server> servers = Collections.emptyList();
+1:a7895cf: 
+1:a7895cf:     private boolean initialized = false;
+1:a7895cf:     private EventLoopGroup workerGroup;
+1:a7895cf:     private EventExecutor eventExecutorGroup;
+1:a7895cf: 
+1:a7895cf:     /**
+1:a7895cf:      * Creates netty thread pools and event loops.
+1:a7895cf:      */
+1:a7895cf:     @VisibleForTesting
+1:a7895cf:     synchronized void initialize()
+1:a7895cf:     {
+1:a7895cf:         if (initialized)
+1:a7895cf:             return;
+1:a7895cf: 
+1:a7895cf:         // prepare netty resources
+1:a7895cf:         eventExecutorGroup = new RequestThreadPoolExecutor();
+1:a7895cf: 
+1:a7895cf:         if (useEpoll())
+1:a7895cf:         {
+1:a7895cf:             workerGroup = new EpollEventLoopGroup();
+1:a7895cf:             logger.info("Netty using native Epoll event loop");
+3:a7895cf:         }
+1:a7895cf:         else
+1:a7895cf:         {
+1:a7895cf:             workerGroup = new NioEventLoopGroup();
+1:a7895cf:             logger.info("Netty using Java NIO event loop");
+1:a7895cf:         }
+1:a7895cf: 
+1:a7895cf:         int nativePort = DatabaseDescriptor.getNativeTransportPort();
+1:a7895cf:         int nativePortSSL = DatabaseDescriptor.getNativeTransportPortSSL();
+1:a7895cf:         InetAddress nativeAddr = DatabaseDescriptor.getRpcAddress();
+1:a7895cf: 
+1:a7895cf:         org.apache.cassandra.transport.Server.Builder builder = new org.apache.cassandra.transport.Server.Builder()
+1:a7895cf:                                                                 .withEventExecutor(eventExecutorGroup)
+1:a7895cf:                                                                 .withEventLoopGroup(workerGroup)
+1:a7895cf:                                                                 .withHost(nativeAddr);
+1:a7895cf: 
+1:a7895cf:         if (!DatabaseDescriptor.getClientEncryptionOptions().enabled)
+1:a7895cf:         {
+1:a7895cf:             servers = Collections.singleton(builder.withSSL(false).withPort(nativePort).build());
+1:a7895cf:         }
+1:a7895cf:         else
+1:a7895cf:         {
+1:a7895cf:             if (nativePort != nativePortSSL)
+1:a7895cf:             {
+1:a7895cf:                 // user asked for dedicated ssl port for supporting both non-ssl and ssl connections
+1:a7895cf:                 servers = Collections.unmodifiableList(
+1:a7895cf:                                                       Arrays.asList(
+1:a7895cf:                                                                    builder.withSSL(false).withPort(nativePort).build(),
+1:a7895cf:                                                                    builder.withSSL(true).withPort(nativePortSSL).build()
+1:a7895cf:                                                       )
+1:a7895cf:                 );
+1:a7895cf:             }
+1:a7895cf:             else
+1:a7895cf:             {
+1:a7895cf:                 // ssl only mode using configured native port
+1:a7895cf:                 servers = Collections.singleton(builder.withSSL(true).withPort(nativePort).build());
+1:a7895cf:             }
+1:a7895cf:         }
+1:a7895cf: 
+1:a7895cf:         // register metrics
+1:a7895cf:         ClientMetrics.instance.addCounter("connectedNativeClients", () ->
+1:a7895cf:         {
+1:a7895cf:             int ret = 0;
+1:a7895cf:             for (Server server : servers)
+1:a7895cf:                 ret += server.getConnectedClients();
+1:a7895cf:             return ret;
+1:a7895cf:         });
+1:a7895cf: 
+1:f00e7a7:         AuthMetrics.init();
+1:f00e7a7: 
+1:a7895cf:         initialized = true;
+1:a7895cf:     }
+1:a7895cf: 
+1:a7895cf:     /**
+1:a7895cf:      * Starts native transport servers.
+1:a7895cf:      */
+1:a7895cf:     public void start()
+1:a7895cf:     {
+1:a7895cf:         initialize();
+1:a7895cf:         servers.forEach(Server::start);
+1:a7895cf:     }
+1:a7895cf: 
+1:a7895cf:     /**
+1:a7895cf:      * Stops currently running native transport servers.
+1:a7895cf:      */
+1:a7895cf:     public void stop()
+1:a7895cf:     {
+1:a7895cf:         servers.forEach(Server::stop);
+1:a7895cf:     }
+1:a7895cf: 
+1:a7895cf:     /**
+1:a7895cf:      * Ultimately stops servers and closes all resources.
+1:a7895cf:      */
+1:a7895cf:     public void destroy()
+1:a7895cf:     {
+1:a7895cf:         stop();
+1:a7895cf:         servers = Collections.emptyList();
+1:a7895cf: 
+1:a7895cf:         // shutdown executors used by netty for native transport server
+1:85ed48a:         workerGroup.shutdownGracefully(3, 5, TimeUnit.SECONDS).awaitUninterruptibly();
+1:a7895cf: 
+1:a7895cf:         // shutdownGracefully not implemented yet in RequestThreadPoolExecutor
+1:a7895cf:         eventExecutorGroup.shutdown();
+1:a7895cf:     }
+1:a7895cf: 
+1:a7895cf:     /**
+1:a7895cf:      * @return intend to use epoll bassed event looping
+1:a7895cf:      */
+1:a7895cf:     public static boolean useEpoll()
+1:a7895cf:     {
+1:7dccb31:         final boolean enableEpoll = Boolean.parseBoolean(System.getProperty("cassandra.native.epoll.enabled", "true"));
+1:a7895cf:         return enableEpoll && Epoll.isAvailable();
+1:a7895cf:     }
+1:a7895cf: 
+1:a7895cf:     /**
+1:a7895cf:      * @return true in case native transport server is running
+1:a7895cf:      */
+1:a7895cf:     public boolean isRunning()
+1:a7895cf:     {
+1:a7895cf:         for (Server server : servers)
+1:a7895cf:             if (server.isRunning()) return true;
+1:a7895cf:         return false;
+1:a7895cf:     }
+1:a7895cf: 
+1:a7895cf:     @VisibleForTesting
+1:a7895cf:     EventLoopGroup getWorkerGroup()
+1:a7895cf:     {
+1:a7895cf:         return workerGroup;
+1:a7895cf:     }
+1:a7895cf: 
+1:a7895cf:     @VisibleForTesting
+1:a7895cf:     EventExecutor getEventExecutor()
+1:a7895cf:     {
+1:a7895cf:         return eventExecutorGroup;
+1:a7895cf:     }
+1:a7895cf: 
+1:a7895cf:     @VisibleForTesting
+1:a7895cf:     Collection<Server> getServers()
+1:a7895cf:     {
+1:a7895cf:         return servers;
+1:a7895cf:     }
+1:a7895cf: }
+============================================================================
+author:Alex Petrov
+-------------------------------------------------------------------------------
+commit:85ed48a
+/////////////////////////////////////////////////////////////////////////
+1:         workerGroup.shutdownGracefully(3, 5, TimeUnit.SECONDS).awaitUninterruptibly();
+commit:f07a406
+/////////////////////////////////////////////////////////////////////////
+0:         workerGroup.shutdownGracefully(3, 5, TimeUnit.SECONDS).awaitUninterruptibly();
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:7dccb31
+/////////////////////////////////////////////////////////////////////////
+1:         final boolean enableEpoll = Boolean.parseBoolean(System.getProperty("cassandra.native.epoll.enabled", "true"));
+commit:087264f
+/////////////////////////////////////////////////////////////////////////
+author:Soumava Ghosh
+-------------------------------------------------------------------------------
+commit:f00e7a7
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.metrics.AuthMetrics;
+/////////////////////////////////////////////////////////////////////////
+1:         AuthMetrics.init();
+1: 
+author:Stefan Podkowinski
+-------------------------------------------------------------------------------
+commit:a7895cf
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.service;
+1: 
+1: import java.net.InetAddress;
+1: import java.util.Arrays;
+1: import java.util.Collection;
+1: import java.util.Collections;
+1: import java.util.concurrent.TimeUnit;
+1: 
+1: import com.google.common.annotations.VisibleForTesting;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import io.netty.channel.EventLoopGroup;
+1: import io.netty.channel.epoll.Epoll;
+1: import io.netty.channel.epoll.EpollEventLoopGroup;
+1: import io.netty.channel.nio.NioEventLoopGroup;
+1: import io.netty.util.concurrent.EventExecutor;
+0: import io.netty.util.concurrent.Future;
+1: import org.apache.cassandra.config.DatabaseDescriptor;
+1: import org.apache.cassandra.metrics.ClientMetrics;
+1: import org.apache.cassandra.transport.RequestThreadPoolExecutor;
+1: import org.apache.cassandra.transport.Server;
+1: 
+1: /**
+1:  * Handles native transport server lifecycle and associated resources. Lazily initialized.
+1:  */
+1: public class NativeTransportService
+1: {
+1: 
+1:     private static final Logger logger = LoggerFactory.getLogger(NativeTransportService.class);
+1: 
+1:     private Collection<Server> servers = Collections.emptyList();
+1: 
+1:     private boolean initialized = false;
+1:     private EventLoopGroup workerGroup;
+1:     private EventExecutor eventExecutorGroup;
+1: 
+1:     /**
+1:      * Creates netty thread pools and event loops.
+1:      */
+1:     @VisibleForTesting
+1:     synchronized void initialize()
+1:     {
+1:         if (initialized)
+1:             return;
+1: 
+1:         // prepare netty resources
+1:         eventExecutorGroup = new RequestThreadPoolExecutor();
+1: 
+1:         if (useEpoll())
+1:         {
+1:             workerGroup = new EpollEventLoopGroup();
+1:             logger.info("Netty using native Epoll event loop");
+1:         }
+1:         else
+1:         {
+1:             workerGroup = new NioEventLoopGroup();
+1:             logger.info("Netty using Java NIO event loop");
+1:         }
+1: 
+1:         int nativePort = DatabaseDescriptor.getNativeTransportPort();
+1:         int nativePortSSL = DatabaseDescriptor.getNativeTransportPortSSL();
+1:         InetAddress nativeAddr = DatabaseDescriptor.getRpcAddress();
+1: 
+1:         org.apache.cassandra.transport.Server.Builder builder = new org.apache.cassandra.transport.Server.Builder()
+1:                                                                 .withEventExecutor(eventExecutorGroup)
+1:                                                                 .withEventLoopGroup(workerGroup)
+1:                                                                 .withHost(nativeAddr);
+1: 
+1:         if (!DatabaseDescriptor.getClientEncryptionOptions().enabled)
+1:         {
+1:             servers = Collections.singleton(builder.withSSL(false).withPort(nativePort).build());
+1:         }
+1:         else
+1:         {
+1:             if (nativePort != nativePortSSL)
+1:             {
+1:                 // user asked for dedicated ssl port for supporting both non-ssl and ssl connections
+1:                 servers = Collections.unmodifiableList(
+1:                                                       Arrays.asList(
+1:                                                                    builder.withSSL(false).withPort(nativePort).build(),
+1:                                                                    builder.withSSL(true).withPort(nativePortSSL).build()
+1:                                                       )
+1:                 );
+1:             }
+1:             else
+1:             {
+1:                 // ssl only mode using configured native port
+1:                 servers = Collections.singleton(builder.withSSL(true).withPort(nativePort).build());
+1:             }
+1:         }
+1: 
+1:         // register metrics
+1:         ClientMetrics.instance.addCounter("connectedNativeClients", () ->
+1:         {
+1:             int ret = 0;
+1:             for (Server server : servers)
+1:                 ret += server.getConnectedClients();
+1:             return ret;
+1:         });
+1: 
+1:         initialized = true;
+1:     }
+1: 
+1:     /**
+1:      * Starts native transport servers.
+1:      */
+1:     public void start()
+1:     {
+1:         initialize();
+1:         servers.forEach(Server::start);
+1:     }
+1: 
+1:     /**
+1:      * Stops currently running native transport servers.
+1:      */
+1:     public void stop()
+1:     {
+1:         servers.forEach(Server::stop);
+1:     }
+1: 
+1:     /**
+1:      * Ultimately stops servers and closes all resources.
+1:      */
+1:     public void destroy()
+1:     {
+1:         stop();
+1:         servers = Collections.emptyList();
+1: 
+1:         // shutdown executors used by netty for native transport server
+0:         Future<?> wgStop = workerGroup.shutdownGracefully(0, 0, TimeUnit.SECONDS);
+1: 
+0:         try
+1:         {
+0:             wgStop.await(5000);
+1:         }
+0:         catch (InterruptedException e1)
+1:         {
+0:             Thread.currentThread().interrupt();
+1:         }
+1: 
+1:         // shutdownGracefully not implemented yet in RequestThreadPoolExecutor
+1:         eventExecutorGroup.shutdown();
+1:     }
+1: 
+1:     /**
+1:      * @return intend to use epoll bassed event looping
+1:      */
+1:     public static boolean useEpoll()
+1:     {
+0:         final boolean enableEpoll = Boolean.valueOf(System.getProperty("cassandra.native.epoll.enabled", "true"));
+1:         return enableEpoll && Epoll.isAvailable();
+1:     }
+1: 
+1:     /**
+1:      * @return true in case native transport server is running
+1:      */
+1:     public boolean isRunning()
+1:     {
+1:         for (Server server : servers)
+1:             if (server.isRunning()) return true;
+1:         return false;
+1:     }
+1: 
+1:     @VisibleForTesting
+1:     EventLoopGroup getWorkerGroup()
+1:     {
+1:         return workerGroup;
+1:     }
+1: 
+1:     @VisibleForTesting
+1:     EventExecutor getEventExecutor()
+1:     {
+1:         return eventExecutorGroup;
+1:     }
+1: 
+1:     @VisibleForTesting
+1:     Collection<Server> getServers()
+1:     {
+1:         return servers;
+1:     }
+1: }
+============================================================================

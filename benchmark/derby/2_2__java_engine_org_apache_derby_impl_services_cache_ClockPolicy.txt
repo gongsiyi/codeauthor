@@ -1,0 +1,1708 @@
+1:7a816cb: /*
+26:7a816cb: 
+1:7a816cb:    Derby - Class org.apache.derby.impl.services.cache.ClockPolicy
+1:7a816cb: 
+1:7a816cb:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:7a816cb:    contributor license agreements.  See the NOTICE file distributed with
+1:7a816cb:    this work for additional information regarding copyright ownership.
+1:7a816cb:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:7a816cb:    (the "License"); you may not use this file except in compliance with
+1:7a816cb:    the License.  You may obtain a copy of the License at
+1:7a816cb: 
+1:7a816cb:       http://www.apache.org/licenses/LICENSE-2.0
+1:7a816cb: 
+1:7a816cb:    Unless required by applicable law or agreed to in writing, software
+1:7a816cb:    distributed under the License is distributed on an "AS IS" BASIS,
+1:7a816cb:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:7a816cb:    See the License for the specific language governing permissions and
+1:7a816cb:    limitations under the License.
+1:7a816cb: 
+5:7a816cb:  */
+1:6a317f0: 
+1:7a816cb: package org.apache.derby.impl.services.cache;
+1:7a816cb: 
+1:7a816cb: import java.util.ArrayList;
+1:d8bdc4c: import java.util.concurrent.atomic.AtomicBoolean;
+1:6a317f0: import java.util.concurrent.atomic.AtomicInteger;
+1:7a816cb: import org.apache.derby.iapi.error.StandardException;
+1:7a816cb: import org.apache.derby.iapi.services.cache.Cacheable;
+1:7e51e9d: import org.apache.derby.shared.common.sanity.SanityManager;
+1:7a816cb: 
+5:7a816cb: /**
+1:7a816cb:  * Implementation of a replacement policy which uses the clock algorithm. All
+1:7a816cb:  * the cache entries are stored in a circular buffer, called the clock. There
+1:7a816cb:  * is also a clock hand which points to one of the entries in the clock. Each
+1:7a816cb:  * time an entry is accessed, it is marked as recently used. If a new entry is
+1:7a816cb:  * inserted into the cache and the cache is full, the clock hand is moved until
+1:7a816cb:  * it is over a not recently used entry, and that entry is evicted to make
+1:7a816cb:  * space for the new entry. Each time the clock hand sweeps over a recently
+1:7a816cb:  * used entry, it is marked as not recently used, and it will be a candidate
+1:7a816cb:  * for removal the next time the clock hand sweeps over it, unless it has been
+1:7a816cb:  * marked as recently used in the meantime.
+1:d8bdc4c:  *
+1:7a816cb:  * <p>
+5:7a816cb:  *
+1:7a816cb:  * To allow concurrent access from multiple threads, the methods in this class
+1:7a816cb:  * need to synchronize on a number of different objects:
+1:7a816cb:  *
+1:7a816cb:  * <ul>
+1:7a816cb:  *
+1:7a816cb:  * <li><code>CacheEntry</code> objects must be locked before they can be
+1:7a816cb:  * used</li>
+1:7a816cb:  *
+1:7a816cb:  * <li>accesses to the clock structure (circular buffer + clock hand) should be
+1:7a816cb:  * synchronized on the <code>ArrayList</code> representing the circular
+1:7a816cb:  * buffer</li>
+1:7a816cb:  *
+1:7a816cb:  * <li>accesses to individual <code>Holder</code> objects in the clock
+1:7a816cb:  * structure should be protected by synchronizing on the holder</li>
+1:7a816cb:  *
+1:7a816cb:  * </ul>
+1:7a816cb:  *
+1:7a816cb:  * To avoid deadlocks, we need to ensure that all threads obtain
+1:7a816cb:  * synchronization locks in the same order. <code>CacheEntry</code>'s class
+1:7a816cb:  * javadoc dictates the order when locking <code>CacheEntry</code>
+1:7a816cb:  * objects. Additionally, we require that no thread should obtain any other
+1:7a816cb:  * synchronization locks while it is holding a synchronization lock on the
+1:7a816cb:  * clock structure or on a <code>Holder</code> object. The threads are however
+1:7a816cb:  * allowed to obtain synchronization locks on the clock structure or on a
+1:7a816cb:  * holder while they are locking one or more <code>CacheEntry</code> objects.
+1:7a816cb:  */
+1:7a816cb: final class ClockPolicy implements ReplacementPolicy {
+1:7a816cb: 
+1:0b57378:     /**
+1:0b57378:      * The minimum number of items to check before we decide to give up
+1:0b57378:      * looking for evictable entries when rotating the clock.
+1:0b57378:      */
+1:0b57378:     private static final int MIN_ITEMS_TO_CHECK = 20;
+1:0b57378: 
+1:086dee2:     /**
+1:086dee2:      * How large part of the clock to look at before giving up in
+1:086dee2:      * {@code rotateClock()}.
+1:086dee2:      */
+1:086dee2:     private static final float MAX_ROTATION = 0.2f;
+1:086dee2: 
+1:086dee2:     /**
+1:086dee2:      * How large part of the clock to look at before giving up finding
+1:086dee2:      * an evictable entry in {@code shrinkMe()}.
+1:086dee2:      */
+1:086dee2:     private static final float PART_OF_CLOCK_FOR_SHRINK = 0.1f;
+1:086dee2: 
+1:7a816cb:     /** The cache manager for which this replacement policy is used. */
+1:7a816cb:     private final ConcurrentCache cacheManager;
+1:7a816cb: 
+1:7a816cb:     /**
+1:7a816cb:      * The maximum size of the cache. When this size is exceeded, entries must
+1:7a816cb:      * be evicted before new ones are inserted.
+1:7a816cb:      */
+1:7a816cb:     private final int maxSize;
+1:7a816cb: 
+1:7a816cb:     /**
+1:7a816cb:      * The circular clock buffer which holds all the entries in the
+1:7a816cb:      * cache. Accesses to <code>clock</code> and <code>hand</code> must be
+1:7a816cb:      * synchronized on <code>clock</code>.
+1:7a816cb:      */
+1:d7a1ddd:     private final ArrayList<Holder> clock;
+1:7a816cb: 
+1:7a816cb:     /** The current position of the clock hand. */
+1:7a816cb:     private int hand;
+1:7a816cb: 
+1:7a816cb:     /**
+1:6a317f0:      * The number of free entries. This is the number of objects that have been
+1:6a317f0:      * removed from the cache and whose entries are free to be reused without
+1:6a317f0:      * eviction.
+1:6a317f0:      */
+1:6a317f0:     private final AtomicInteger freeEntries = new AtomicInteger();
+1:6a317f0: 
+1:6a317f0:     /**
+1:2d09c33:      * Tells whether there currently is a thread in the {@code doShrink()}
+1:2d09c33:      * method. If this variable is {@code true} a call to {@code doShrink()}
+1:2d09c33:      * will be a no-op.
+1:d8bdc4c:      */
+1:d8bdc4c:     private final AtomicBoolean isShrinking = new AtomicBoolean();
+1:d8bdc4c: 
+1:d8bdc4c:     /**
+1:7a816cb:      * Create a new <code>ClockPolicy</code> instance.
+1:7a816cb:      *
+1:7a816cb:      * @param cacheManager the cache manager that requests this policy
+1:d7a1ddd:      * @param initialSize the initial capacity of the cache
+1:7a816cb:      * @param maxSize the maximum size of the cache
+1:7a816cb:      */
+1:d7a1ddd:     ClockPolicy(ConcurrentCache cacheManager, int initialSize, int maxSize) {
+1:7a816cb:         this.cacheManager = cacheManager;
+1:7a816cb:         this.maxSize = maxSize;
+1:d7a1ddd:         clock = new ArrayList<Holder>(initialSize);
+25:7a816cb:     }
+1:d8bdc4c: 
+1:86ee0a0:     @Override
+1:6da88fc:     public int size() {
+1:6da88fc:         synchronized (clock) {
+1:6da88fc:             return clock.size();
+1:6da88fc:         }
+1:86ee0a0:     }
+1:86ee0a0: 
+1:d8bdc4c:     /**
+1:7a816cb:      * Insert an entry into the cache. If the maximum size is exceeded, evict a
+1:7a816cb:      * <em>not recently used</em> object from the cache. If there are no
+1:7a816cb:      * entries available for reuse, increase the size of the cache.
+1:d8bdc4c:      *
+1:7a816cb:      * @param entry the entry to insert (must be locked)
+1:7a816cb:      * @exception StandardException if an error occurs when inserting the entry
+1:d8bdc4c:      */
+1:0b57378:     public void insertEntry(CacheEntry entry) throws StandardException {
+1:d8bdc4c: 
+1:d8bdc4c:         final int size;
+1:d8bdc4c:         synchronized (clock) {
+1:d8bdc4c:             size = clock.size();
+1:d8bdc4c:             if (size < maxSize) {
+1:6a317f0:                 if (freeEntries.get() == 0) {
+1:6a317f0:                     // We have not reached the maximum size yet, and there's no
+1:6a317f0:                     // free entry to reuse. Make room by growing.
+1:0b57378:                     clock.add(new Holder(entry));
+1:0b57378:                     return;
+1:6a317f0:                 }
+1:6a317f0:             }
+1:6a317f0:         }
+1:651fa21: 
+1:d8bdc4c:         if (size > maxSize) {
+1:d8bdc4c:             // Maximum size is exceeded. Shrink the clock in the background
+1:d8bdc4c:             // cleaner, if we have one; otherwise, shrink it in the current
+1:d8bdc4c:             // thread.
+1:d8bdc4c:             BackgroundCleaner cleaner = cacheManager.getBackgroundCleaner();
+1:d8bdc4c:             if (cleaner != null) {
+1:d8bdc4c:                 cleaner.scheduleShrink();
+1:d8bdc4c:             } else {
+1:d8bdc4c:                 doShrink();
+1:d8bdc4c:             }
+1:d8bdc4c:         }
+1:d8bdc4c: 
+1:d8bdc4c:         // Rotate the clock hand (look at up to 20% of the cache) and try to
+1:d8bdc4c:         // find free space for the entry. Only allow evictions if the cache
+1:d8bdc4c:         // has reached its maximum size. Otherwise, we only look for invalid
+1:d8bdc4c:         // entries and rather grow the cache than evict valid entries.
+1:086dee2:         Holder h = rotateClock(entry, size >= maxSize);
+1:651fa21: 
+1:0b57378:         if (h == null) {
+1:0b57378:             // didn't find a victim, so we need to grow
+1:0b57378:             synchronized (clock) {
+1:0b57378:                 clock.add(new Holder(entry));
+1:0b57378:             }
+1:651fa21:         }
+1:7a816cb:     }
+1:6a317f0: 
+1:7a816cb:     /**
+1:7a816cb:      * Holder class which represents an entry in the cache. It maintains a
+1:7a816cb:      * <code>recentlyUsed</code> required by the clock algorithm. The class
+1:7a816cb:      * also implements the <code>Callback</code> interface, so that
+1:7a816cb:      * <code>ConcurrentCache</code> can notify the clock policy about events
+1:7a816cb:      * relevant to the clock algorithm.
+1:7a816cb:      */
+1:6a317f0:     private class Holder implements Callback {
+1:7a816cb:         /**
+1:7a816cb:          * Flag indicating whether or not this entry has been accessed
+1:7a816cb:          * recently. Should only be accessed/modified when the current thread
+1:7a816cb:          * has locked the <code>CacheEntry</code> object stored in the
+1:7a816cb:          * <code>entry</code> field.
+1:7a816cb:          */
+1:7a816cb:         boolean recentlyUsed;
+1:7a816cb: 
+1:7a816cb:         /**
+1:7a816cb:          * Reference to the <code>CacheEntry</code> object held by this
+1:7a816cb:          * object. The reference should only be accessed when the thread owns
+1:7a816cb:          * the monitor on this holder. A thread is only allowed to change the
+1:7a816cb:          * reference if it also has locked the entry that the reference points
+1:7a816cb:          * to (if the reference is non-null). This ensures that no other thread
+1:7a816cb:          * can disassociate a holder from its entry while the entry is locked,
+1:7a816cb:          * even though the monitor on the holder has been released.
+1:7a816cb:          */
+1:7a816cb:         private CacheEntry entry;
+1:7a816cb: 
+1:7a816cb:         /**
+1:7a816cb:          * Cacheable object from a removed object. If this object is non-null,
+1:7a816cb:          * <code>entry</code> must be <code>null</code> (which means that the
+1:7a816cb:          * holder is not associated with any object in the cache).
+1:7a816cb:          */
+1:7a816cb:         private Cacheable freedCacheable;
+1:7a816cb: 
+1:d8bdc4c:         /**
+1:d8bdc4c:          * Flag which tells whether this holder has been evicted from the
+1:d8bdc4c:          * clock. If it has been evicted, it can't be reused when a new entry
+1:d8bdc4c:          * is inserted. Only the owner of this holder's monitor is allowed to
+1:d8bdc4c:          * access this variable.
+1:d8bdc4c:          */
+1:d8bdc4c:         private boolean evicted;
+1:d8bdc4c: 
+1:7a816cb:         Holder(CacheEntry e) {
+1:7a816cb:             entry = e;
+1:7a816cb:             e.setCallback(this);
+1:7a816cb:         }
+1:7a816cb: 
+1:7a816cb:         /**
+1:7a816cb:          * Mark this entry as recently used. Caller must have locked
+1:7a816cb:          * <code>entry</code>.
+1:7a816cb:          */
+1:7a816cb:         public void access() {
+1:7a816cb:             recentlyUsed = true;
+1:7a816cb:         }
+1:7a816cb: 
+1:7a816cb:         /**
+1:7a816cb:          * Mark this object as free and reusable. Caller must have locked
+1:7a816cb:          * <code>entry</code>.
+1:7a816cb:          */
+1:7a816cb:         public synchronized void free() {
+1:7a816cb:             freedCacheable = entry.getCacheable();
+1:7a816cb:             entry = null;
+1:7a816cb:             recentlyUsed = false;
+1:6a317f0:             // let others know that a free entry is available
+1:6a317f0:             int free = freeEntries.incrementAndGet();
+1:d8bdc4c:             if (SanityManager.DEBUG) {
+1:6a317f0:                 SanityManager.ASSERT(
+1:6a317f0:                     free > 0,
+1:6a317f0:                     "freeEntries should be greater than 0, but is " + free);
+1:d8bdc4c:             }
+1:d8bdc4c:         }
+1:d8bdc4c: 
+1:d8bdc4c:         /**
+1:7a816cb:          * Associate this holder with the specified entry if the holder is free
+1:7a816cb:          * (that is, not associated with any other entry).
+1:7a816cb:          *
+1:7a816cb:          * @param e the entry to associate the holder with (it must be locked
+1:7a816cb:          * by the current thread)
+1:7a816cb:          * @return <code>true</code> if the holder has been associated with the
+1:d8bdc4c:          * specified entry, <code>false</code> if someone else has taken it or
+1:d8bdc4c:          * the holder has been evicted from the clock
+1:d8bdc4c:          */
+1:7a816cb:         synchronized boolean takeIfFree(CacheEntry e) {
+1:d8bdc4c:             if (entry == null && !evicted) {
+1:7a816cb:                 // the holder is free - take it!
+1:6a317f0:                 int free = freeEntries.decrementAndGet();
+1:d8bdc4c:                 if (SanityManager.DEBUG) {
+1:6a317f0:                     SanityManager.ASSERT(
+1:6a317f0:                         free >= 0, "freeEntries is negative: " + free);
+1:d8bdc4c:                 }
+1:7a816cb:                 e.setCacheable(freedCacheable);
+1:7a816cb:                 e.setCallback(this);
+1:7a816cb:                 entry = e;
+1:7a816cb:                 freedCacheable = null;
+1:7a816cb:                 return true;
+1:6a317f0:             }
+1:7a816cb:             // someone else has taken it
+1:7a816cb:             return false;
+1:6a317f0:         }
+1:d8bdc4c: 
+1:7a816cb:         /**
+1:7a816cb:          * Returns the entry that is currently associated with this holder.
+1:7a816cb:          *
+1:7a816cb:          * @return the associated entry
+1:7a816cb:          */
+1:7a816cb:         synchronized CacheEntry getEntry() {
+1:7a816cb:             return entry;
+1:7a816cb:         }
+1:d8bdc4c: 
+1:7a816cb:         /**
+1:7a816cb:          * Switch which entry the holder is associated with. Will be called
+1:7a816cb:          * when we evict an entry to make room for a new one. When this method
+1:7a816cb:          * is called, the current thread must have locked both the entry that
+1:7a816cb:          * is evicted and the entry that is inserted.
+1:7a816cb:          *
+1:7a816cb:          * @param e the entry to associate this holder with
+1:7a816cb:          */
+1:7a816cb:         synchronized void switchEntry(CacheEntry e) {
+1:7a816cb:             e.setCallback(this);
+1:7a816cb:             e.setCacheable(entry.getCacheable());
+1:7a816cb:             entry = e;
+1:7a816cb:         }
+1:d8bdc4c: 
+1:d8bdc4c:         /**
+1:d8bdc4c:          * Evict this holder from the clock if it is not associated with an
+1:d8bdc4c:          * entry.
+1:d8bdc4c:          *
+1:d8bdc4c:          * @return <code>true</code> if the holder was successfully evicted,
+1:d8bdc4c:          * <code>false</code> otherwise
+1:d8bdc4c:          */
+1:d8bdc4c:         synchronized boolean evictIfFree() {
+1:d8bdc4c:             if (entry == null && !evicted) {
+1:d8bdc4c:                 int free = freeEntries.decrementAndGet();
+1:d8bdc4c:                 if (SanityManager.DEBUG) {
+1:d8bdc4c:                     SanityManager.ASSERT(
+1:d8bdc4c:                         free >= 0, "freeEntries is negative: " + free);
+1:d8bdc4c:                 }
+1:d8bdc4c:                 evicted = true;
+1:d8bdc4c:                 return true;
+1:d8bdc4c:             }
+1:d8bdc4c:             return false;
+1:d8bdc4c:         }
+1:d8bdc4c: 
+1:d8bdc4c:         /**
+1:d8bdc4c:          * Mark this holder as evicted from the clock, effectively preventing
+1:d8bdc4c:          * reuse of the holder. Calling thread must have locked the holder's
+1:d8bdc4c:          * entry.
+1:d8bdc4c:          */
+1:d8bdc4c:         synchronized void setEvicted() {
+1:d8bdc4c:             if (SanityManager.DEBUG) {
+1:d8bdc4c:                 SanityManager.ASSERT(!evicted, "Already evicted");
+1:d8bdc4c:             }
+1:d8bdc4c:             evicted = true;
+1:d8bdc4c:             entry = null;
+1:d8bdc4c:         }
+1:d8bdc4c: 
+1:d8bdc4c:         /**
+1:d8bdc4c:          * Check whether this holder has been evicted from the clock.
+1:d8bdc4c:          *
+1:d8bdc4c:          * @return <code>true</code> if it has been evicted, <code>false</code>
+1:d8bdc4c:          * otherwise
+1:d8bdc4c:          */
+1:d8bdc4c:         synchronized boolean isEvicted() {
+1:d8bdc4c:             return evicted;
+1:d8bdc4c:         }
+1:7a816cb:     }
+1:d8bdc4c: 
+1:7a816cb:     /**
+1:7a816cb:      * Get the holder under the clock hand, and move the hand to the next
+1:7a816cb:      * holder.
+1:7a816cb:      *
+1:4848ae5:      * @return the holder under the clock hand, or {@code null} if the clock is
+1:4848ae5:      * empty
+1:7a816cb:      */
+1:7a816cb:     private Holder moveHand() {
+1:d8bdc4c:         synchronized (clock) {
+1:4848ae5:             if (clock.isEmpty()) {
+1:4848ae5:                 return null;
+1:4848ae5:             }
+1:7a816cb:             if (hand >= clock.size()) {
+1:7a816cb:                 hand = 0;
+1:d8bdc4c:             }
+1:7a816cb:             return clock.get(hand++);
+1:d8bdc4c:         }
+1:d8bdc4c:     }
+1:d8bdc4c: 
+1:d8bdc4c:     /**
+1:6a317f0:      * Rotate the clock in order to find a free space for a new entry. If
+1:6a317f0:      * <code>allowEvictions</code> is <code>true</code>, an not recently used
+1:6a317f0:      * object might be evicted to make room for the new entry. Otherwise, only
+1:6a317f0:      * unused entries are searched for. When evictions are allowed, entries are
+1:6a317f0:      * marked as not recently used when the clock hand sweeps over them. The
+1:086dee2:      * search stops when a reusable entry is found, or when more than a certain
+1:086dee2:      * percentage of the entries have been visited. If there are
+1:6a317f0:      * free (unused) entries, the search will continue until a reusable entry
+1:6a317f0:      * is found, regardless of how many entries that need to be checked.
+1:d8bdc4c:      *
+1:7a816cb:      * @param entry the entry to insert
+1:6a317f0:      * @param allowEvictions tells whether evictions are allowed (normally
+1:6a317f0:      * <code>true</code> if the cache is full and <code>false</code> otherwise)
+1:7a816cb:      * @return a holder that we can reuse, or <code>null</code> if we didn't
+1:7a816cb:      * find one
+1:d8bdc4c:      */
+1:086dee2:     private Holder rotateClock(CacheEntry entry, boolean allowEvictions)
+1:7a816cb:             throws StandardException {
+1:d8bdc4c: 
+1:0b57378:         // Calculate how many items we need to check before we give up
+1:0b57378:         // finding an evictable one. If we don't allow evictions, none should
+1:0b57378:         // be checked (however, we may search for unused entries in the loop
+1:0b57378:         // below).
+1:0b57378:         int itemsToCheck = 0;
+1:6a317f0:         if (allowEvictions) {
+1:d8bdc4c:             synchronized (clock) {
+1:0b57378:                 itemsToCheck = Math.max(MIN_ITEMS_TO_CHECK,
+1:086dee2:                                         (int) (clock.size() * MAX_ROTATION));
+1:d8bdc4c:             }
+1:d8bdc4c:         }
+1:d8bdc4c: 
+1:6a317f0:         // Check up to itemsToCheck entries before giving up, but don't give up
+1:6a317f0:         // if we know there are unused entries.
+1:6a317f0:         while (itemsToCheck-- > 0 || freeEntries.get() > 0) {
+1:d8bdc4c: 
+1:7a816cb:             final Holder h = moveHand();
+1:4848ae5: 
+1:4848ae5:             if (h == null) {
+1:4848ae5:                 // There are no elements in the clock, hence there is no
+1:4848ae5:                 // reusable entry.
+1:4848ae5:                 return null;
+1:4848ae5:             }
+1:4848ae5: 
+1:7a816cb:             final CacheEntry e = h.getEntry();
+1:d8bdc4c: 
+1:7a816cb:             if (e == null) {
+1:7a816cb:                 if (h.takeIfFree(entry)) {
+4:7a816cb:                     return h;
+1:d8bdc4c:                 }
+1:7a816cb:                 // Someone else grabbed this entry between the calls to
+1:7a816cb:                 // getEntry() and takeIfFree(). Just move on to the next entry.
+1:651fa21:                 continue;
+1:45c4ca4:             }
+1:45c4ca4: 
+1:6a317f0:             if (!allowEvictions) {
+1:6a317f0:                 // Evictions are not allowed, so we can't reuse this entry.
+1:45c4ca4:                 continue;
+1:45c4ca4:             }
+1:45c4ca4: 
+1:651fa21:             // This variable will hold a dirty cacheable that should be cleaned
+1:651fa21:             // after the try/finally block.
+1:651fa21:             final Cacheable dirty;
+1:d8bdc4c: 
+1:7a816cb:             e.lock();
+1:d8bdc4c:             try {
+1:0b57378:                 if (!isEvictable(e, h, true)) {
+1:45c4ca4:                     continue;
+1:d8bdc4c:                 }
+1:d8bdc4c: 
+1:651fa21:                 // The entry is not in use, and has not been used for at least
+1:651fa21:                 // one round on the clock. See if it needs to be cleaned.
+1:7a816cb:                 Cacheable c = e.getCacheable();
+1:651fa21:                 if (!c.isDirty()) {
+1:651fa21:                     // Not in use and not dirty. Take over the holder.
+1:651fa21:                     h.switchEntry(entry);
+1:651fa21:                     cacheManager.evictEntry(c.getIdentity());
+1:651fa21:                     return h;
+1:d8bdc4c:                 }
+1:d8bdc4c: 
+1:651fa21:                 // Ask the background cleaner to clean the entry.
+1:651fa21:                 BackgroundCleaner cleaner = cacheManager.getBackgroundCleaner();
+1:d8bdc4c:                 if (cleaner != null && cleaner.scheduleClean(e)) {
+1:29141b8:                     // Successfully scheduled the clean operation. We can't
+1:29141b8:                     // evict it until the clean operation has finished. Since
+1:29141b8:                     // we'd like to be as responsive as possible, move on to
+1:29141b8:                     // the next entry instead of waiting for the clean
+1:29141b8:                     // operation to finish.
+1:d8bdc4c:                     continue;
+1:d8bdc4c:                 }
+1:d8bdc4c: 
+1:651fa21:                 // There is no background cleaner, or the background cleaner
+1:651fa21:                 // has no free capacity. Let's clean the object ourselves.
+1:651fa21:                 // First, mark the entry as kept to prevent eviction until
+1:651fa21:                 // we have cleaned it, but don't mark it as accessed (recently
+1:651fa21:                 // used).
+1:651fa21:                 e.keep(false);
+1:651fa21:                 dirty = c;
+1:d8bdc4c: 
+1:d8bdc4c:             } finally {
+1:7a816cb:                 e.unlock();
+1:d8bdc4c:             }
+1:d8bdc4c: 
+1:651fa21:             // Clean the entry and unkeep it.
+1:651fa21:             cacheManager.cleanAndUnkeepEntry(e, dirty);
+1:29141b8: 
+1:29141b8:             // If no one has touched the entry while we were cleaning it, we
+1:29141b8:             // could reuse it at this point. The old buffer manager (Clock)
+1:29141b8:             // would however under high load normally move on to the next
+1:29141b8:             // entry in the clock instead of reusing the one it recently
+1:29141b8:             // cleaned. Some of the performance tests performed as part of
+1:29141b8:             // DERBY-2911 indicated that not reusing the entry that was just
+1:29141b8:             // cleaned made the replacement algorithm more efficient. For now
+1:29141b8:             // we try to stay as close to the old buffer manager as possible
+1:29141b8:             // and don't reuse the entry immediately.
+1:d8bdc4c:         }
+1:d8bdc4c: 
+1:7a816cb:         return null;
+1:d8bdc4c:     }
+1:d8bdc4c: 
+1:d8bdc4c:     /**
+1:0b57378:      * Check if an entry can be evicted. Only entries that still are present in
+1:0b57378:      * the cache, are not kept and not recently used, can be evicted. This
+1:0b57378:      * method does not check whether the {@code Cacheable} contained in the
+1:0b57378:      * entry is dirty, so it may be necessary to clean it before an eviction
+1:0b57378:      * can take place even if the method returns {@code true}. The caller must
+1:0b57378:      * hold the lock on the entry before calling this method.
+1:0b57378:      *
+1:0b57378:      * @param e the entry to check
+1:0b57378:      * @param h the holder which holds the entry
+1:0b57378:      * @param clearRecentlyUsedFlag tells whether or not the recently used flag
+1:0b57378:      * should be cleared on the entry ({@code true} only when called as part of
+1:0b57378:      * a normal clock rotation)
+1:0b57378:      * @return whether or not this entry can be evicted (provided that its
+1:0b57378:      * {@code Cacheable} is cleaned first)
+1:0b57378:      */
+1:0b57378:     private boolean isEvictable(CacheEntry e, Holder h,
+1:0b57378:                                 boolean clearRecentlyUsedFlag) {
+1:0b57378: 
+1:0b57378:         if (h.getEntry() != e) {
+1:0b57378:             // Someone else evicted this entry before we obtained the
+1:0b57378:             // lock, so we can't evict it.
+1:0b57378:             return false;
+1:0b57378:         }
+1:0b57378: 
+1:0b57378:         if (e.isKept()) {
+1:0b57378:             // The entry is in use and cannot be evicted.
+1:0b57378:             return false;
+1:0b57378:         }
+1:0b57378: 
+1:0b57378:         if (SanityManager.DEBUG) {
+1:0b57378:             // At this point the entry must be valid. If it's not, it's either
+1:0b57378:             // removed (in which case getEntry() != e and we shouldn't get
+1:0b57378:             // here), or it is setting its identity (in which case it is kept
+1:0b57378:             // and we shouldn't get here).
+1:0b57378:             SanityManager.ASSERT(e.isValid(), "Holder contains invalid entry");
+1:0b57378:             SanityManager.ASSERT(!h.isEvicted(), "Holder is evicted");
+1:0b57378:         }
+1:0b57378: 
+1:0b57378:         if (h.recentlyUsed) {
+1:0b57378:             // The object has been used recently, so it cannot be evicted.
+1:0b57378:             if (clearRecentlyUsedFlag) {
+1:0b57378:                 h.recentlyUsed = false;
+1:0b57378:             }
+1:0b57378:             return false;
+1:0b57378:         }
+1:0b57378: 
+1:0b57378:         return true;
+1:0b57378:     }
+1:0b57378: 
+1:0b57378:     /**
+1:d8bdc4c:      * Remove the holder at the given clock position.
+1:d8bdc4c:      *
+1:d8bdc4c:      * @param pos position of the holder
+1:d8bdc4c:      * @param h the holder to remove
+1:d8bdc4c:      */
+1:d8bdc4c:     private void removeHolder(int pos, Holder h) {
+1:d8bdc4c:         synchronized (clock) {
+1:d8bdc4c:             Holder removed = clock.remove(pos);
+1:d8bdc4c:             if (SanityManager.DEBUG) {
+1:d8bdc4c:                 SanityManager.ASSERT(removed == h, "Wrong Holder removed");
+1:d8bdc4c:             }
+1:d8bdc4c:         }
+1:d8bdc4c:     }
+1:d8bdc4c: 
+1:d8bdc4c:     /**
+1:d8bdc4c:      * Try to shrink the clock if it's larger than its maximum size.
+1:d8bdc4c:      */
+1:d8bdc4c:     public void doShrink() {
+1:d8bdc4c:         // If we're already performing a shrink, ignore this request. We'll get
+1:d8bdc4c:         // a new call later by someone else if the current shrink operation is
+1:2d09c33:         // not enough. If we manage to change isShrinking atomically from false
+1:2d09c33:         // to true, no one else is currently inside shrinkMe(), and others will
+1:2d09c33:         // be blocked from entering it until we reset isShrinking to false.
+2:d8bdc4c:         if (isShrinking.compareAndSet(false, true)) {
+1:d8bdc4c:             try {
+1:2d09c33:                 shrinkMe();
+1:d8bdc4c:             } finally {
+1:2d09c33:                 // allow others to call shrinkMe()
+2:d8bdc4c:                 isShrinking.set(false);
+1:d8bdc4c:             }
+1:d8bdc4c:         }
+1:d8bdc4c:     }
+1:d8bdc4c: 
+1:d8bdc4c:     /**
+1:d8bdc4c:      * Perform the shrinking of the clock. This method should only be called
+1:2d09c33:      * by a single thread at a time.
+1:d8bdc4c:      */
+1:2d09c33:     private void shrinkMe() {
+1:d8bdc4c: 
+1:d8bdc4c:         if (SanityManager.DEBUG) {
+2:d8bdc4c:             SanityManager.ASSERT(isShrinking.get(),
+1:d8bdc4c:                     "Called shrinkMe() without ensuring exclusive access");
+1:d8bdc4c:         }
+1:d8bdc4c: 
+1:086dee2:         // Max number of candidates to look at (always at least 1).
+1:086dee2:         int maxLooks = Math.max(1, (int) (maxSize * PART_OF_CLOCK_FOR_SHRINK));
+1:d8bdc4c: 
+1:d8bdc4c:         // Since we don't scan the entire cache, start at the clock hand so
+1:d8bdc4c:         // that we don't always scan the first 10% of the cache.
+1:d8bdc4c:         int pos;
+1:d8bdc4c:         synchronized (clock) {
+1:d8bdc4c:             pos = hand;
+1:d8bdc4c:         }
+1:d8bdc4c: 
+1:d8bdc4c:         while (maxLooks-- > 0) {
+1:d8bdc4c: 
+2:d8bdc4c:             final Holder h;
+2:d8bdc4c:             final int size;
+1:d8bdc4c: 
+1:ce4ee23:             // Fetch the next holder from the clock.
+1:d8bdc4c:             synchronized (clock) {
+2:d8bdc4c:                 size = clock.size();
+1:d8bdc4c:                 if (pos >= size) {
+1:d8bdc4c:                     pos = 0;
+1:d8bdc4c:                 }
+1:ce4ee23:                 h = clock.get(pos);
+1:d8bdc4c:             }
+1:d8bdc4c: 
+1:ce4ee23:             // The index of the holder we're looking at. Since no one else than
+1:ce4ee23:             // us can remove elements from the clock while we're in this
+1:ce4ee23:             // method, and new elements will be added at the end of the list,
+1:ce4ee23:             // the index for a holder does not change until we remove it.
+1:ce4ee23:             final int index = pos;
+1:ce4ee23: 
+1:ce4ee23:             // Let pos point at the index of the holder we'll look at in the
+1:ce4ee23:             // next iteration.
+1:ce4ee23:             pos++;
+1:ce4ee23: 
+1:d8bdc4c:             // No need to shrink if the size isn't greater than maxSize.
+1:d8bdc4c:             if (size <= maxSize) {
+1:d8bdc4c:                 break;
+1:d8bdc4c:             }
+1:d8bdc4c: 
+1:d8bdc4c:             final CacheEntry e = h.getEntry();
+1:d8bdc4c: 
+1:d8bdc4c:             if (e == null) {
+1:d8bdc4c:                 // The holder does not hold an entry. Try to remove it.
+2:d8bdc4c:                 if (h.evictIfFree()) {
+1:d8bdc4c:                     removeHolder(index, h);
+1:d8bdc4c:                     // move position back because of the removal so that we
+1:d8bdc4c:                     // don't skip one clock element
+1:d8bdc4c:                     pos = index;
+1:d8bdc4c:                 }
+1:d8bdc4c:                 // Either the holder was evicted, or someone else took it
+1:d8bdc4c:                 // before we could evict it. In either case, we should move on
+1:d8bdc4c:                 // to the next holder.
+1:d8bdc4c:                 continue;
+1:d8bdc4c:             }
+1:d8bdc4c: 
+1:d8bdc4c:             e.lock();
+1:d8bdc4c:             try {
+1:0b57378:                 if (!isEvictable(e, h, false)) {
+1:d8bdc4c:                     continue;
+1:d8bdc4c:                 }
+1:d8bdc4c: 
+1:d8bdc4c:                 final Cacheable c = e.getCacheable();
+1:d8bdc4c:                 if (c.isDirty()) {
+1:d8bdc4c:                     // Don't evict dirty entries.
+1:d8bdc4c:                     continue;
+1:d8bdc4c:                 }
+1:d8bdc4c: 
+1:d8bdc4c:                 // mark as evicted to prevent reuse
+1:d8bdc4c:                 h.setEvicted();
+1:d8bdc4c: 
+1:d8bdc4c:                 // remove from cache manager
+1:d8bdc4c:                 cacheManager.evictEntry(c.getIdentity());
+1:d8bdc4c: 
+1:d8bdc4c:                 // remove from clock
+1:d8bdc4c:                 removeHolder(index, h);
+1:d8bdc4c: 
+1:d8bdc4c:                 // move position back because of the removal so that we don't
+1:d8bdc4c:                 // skip one clock element
+1:d8bdc4c:                 pos = index;
+1:d8bdc4c: 
+1:d8bdc4c:             } finally {
+1:d8bdc4c:                 e.unlock();
+1:d8bdc4c:             }
+1:d8bdc4c:         }
+1:d8bdc4c:     }
+1:d8bdc4c: }
+============================================================================
+author:Knut Anders Hatlen
+-------------------------------------------------------------------------------
+commit:6da88fc
+/////////////////////////////////////////////////////////////////////////
+1:     public int size() {
+1:         synchronized (clock) {
+1:             return clock.size();
+1:         }
+commit:86ee0a0
+/////////////////////////////////////////////////////////////////////////
+1:     @Override
+0:     public int freeEntries() {
+0:         return freeEntries.get();
+1:     }
+1: 
+commit:4848ae5
+/////////////////////////////////////////////////////////////////////////
+1:      * @return the holder under the clock hand, or {@code null} if the clock is
+1:      * empty
+1:             if (clock.isEmpty()) {
+1:                 return null;
+1:             }
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:             if (h == null) {
+1:                 // There are no elements in the clock, hence there is no
+1:                 // reusable entry.
+1:                 return null;
+1:             }
+1: 
+commit:2d09c33
+/////////////////////////////////////////////////////////////////////////
+1:      * Tells whether there currently is a thread in the {@code doShrink()}
+1:      * method. If this variable is {@code true} a call to {@code doShrink()}
+1:      * will be a no-op.
+/////////////////////////////////////////////////////////////////////////
+1:         // not enough. If we manage to change isShrinking atomically from false
+1:         // to true, no one else is currently inside shrinkMe(), and others will
+1:         // be blocked from entering it until we reset isShrinking to false.
+1:                 shrinkMe();
+1:                 // allow others to call shrinkMe()
+/////////////////////////////////////////////////////////////////////////
+1:      * by a single thread at a time.
+1:     private void shrinkMe() {
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+commit:ce4ee23
+/////////////////////////////////////////////////////////////////////////
+1:             // Fetch the next holder from the clock.
+1:                 h = clock.get(pos);
+1:             // The index of the holder we're looking at. Since no one else than
+1:             // us can remove elements from the clock while we're in this
+1:             // method, and new elements will be added at the end of the list,
+1:             // the index for a holder does not change until we remove it.
+1:             final int index = pos;
+1: 
+1:             // Let pos point at the index of the holder we'll look at in the
+1:             // next iteration.
+1:             pos++;
+1: 
+commit:086dee2
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * How large part of the clock to look at before giving up in
+1:      * {@code rotateClock()}.
+1:      */
+1:     private static final float MAX_ROTATION = 0.2f;
+1: 
+1:     /**
+1:      * How large part of the clock to look at before giving up finding
+1:      * an evictable entry in {@code shrinkMe()}.
+1:      */
+1:     private static final float PART_OF_CLOCK_FOR_SHRINK = 0.1f;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         Holder h = rotateClock(entry, size >= maxSize);
+/////////////////////////////////////////////////////////////////////////
+1:      * search stops when a reusable entry is found, or when more than a certain
+1:      * percentage of the entries have been visited. If there are
+1:     private Holder rotateClock(CacheEntry entry, boolean allowEvictions)
+/////////////////////////////////////////////////////////////////////////
+1:                                         (int) (clock.size() * MAX_ROTATION));
+/////////////////////////////////////////////////////////////////////////
+1:         // Max number of candidates to look at (always at least 1).
+1:         int maxLooks = Math.max(1, (int) (maxSize * PART_OF_CLOCK_FOR_SHRINK));
+commit:0b57378
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * The minimum number of items to check before we decide to give up
+1:      * looking for evictable entries when rotating the clock.
+1:      */
+1:     private static final int MIN_ITEMS_TO_CHECK = 20;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     public void insertEntry(CacheEntry entry) throws StandardException {
+/////////////////////////////////////////////////////////////////////////
+1:                     clock.add(new Holder(entry));
+1:                     return;
+/////////////////////////////////////////////////////////////////////////
+1:         if (h == null) {
+1:             // didn't find a victim, so we need to grow
+1:             synchronized (clock) {
+1:                 clock.add(new Holder(entry));
+1:             }
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         // Calculate how many items we need to check before we give up
+1:         // finding an evictable one. If we don't allow evictions, none should
+1:         // be checked (however, we may search for unused entries in the loop
+1:         // below).
+1:         int itemsToCheck = 0;
+1:                 itemsToCheck = Math.max(MIN_ITEMS_TO_CHECK,
+0:                                         (int) (clock.size() * partOfClock));
+/////////////////////////////////////////////////////////////////////////
+1:                 if (!isEvictable(e, h, true)) {
+/////////////////////////////////////////////////////////////////////////
+1:      * Check if an entry can be evicted. Only entries that still are present in
+1:      * the cache, are not kept and not recently used, can be evicted. This
+1:      * method does not check whether the {@code Cacheable} contained in the
+1:      * entry is dirty, so it may be necessary to clean it before an eviction
+1:      * can take place even if the method returns {@code true}. The caller must
+1:      * hold the lock on the entry before calling this method.
+1:      *
+1:      * @param e the entry to check
+1:      * @param h the holder which holds the entry
+1:      * @param clearRecentlyUsedFlag tells whether or not the recently used flag
+1:      * should be cleared on the entry ({@code true} only when called as part of
+1:      * a normal clock rotation)
+1:      * @return whether or not this entry can be evicted (provided that its
+1:      * {@code Cacheable} is cleaned first)
+1:      */
+1:     private boolean isEvictable(CacheEntry e, Holder h,
+1:                                 boolean clearRecentlyUsedFlag) {
+1: 
+1:         if (h.getEntry() != e) {
+1:             // Someone else evicted this entry before we obtained the
+1:             // lock, so we can't evict it.
+1:             return false;
+1:         }
+1: 
+1:         if (e.isKept()) {
+1:             // The entry is in use and cannot be evicted.
+1:             return false;
+1:         }
+1: 
+1:         if (SanityManager.DEBUG) {
+1:             // At this point the entry must be valid. If it's not, it's either
+1:             // removed (in which case getEntry() != e and we shouldn't get
+1:             // here), or it is setting its identity (in which case it is kept
+1:             // and we shouldn't get here).
+1:             SanityManager.ASSERT(e.isValid(), "Holder contains invalid entry");
+1:             SanityManager.ASSERT(!h.isEvicted(), "Holder is evicted");
+1:         }
+1: 
+1:         if (h.recentlyUsed) {
+1:             // The object has been used recently, so it cannot be evicted.
+1:             if (clearRecentlyUsedFlag) {
+1:                 h.recentlyUsed = false;
+1:             }
+1:             return false;
+1:         }
+1: 
+1:         return true;
+1:     }
+1: 
+1:     /**
+/////////////////////////////////////////////////////////////////////////
+1:                 if (!isEvictable(e, h, false)) {
+commit:29141b8
+/////////////////////////////////////////////////////////////////////////
+1:                     // Successfully scheduled the clean operation. We can't
+1:                     // evict it until the clean operation has finished. Since
+1:                     // we'd like to be as responsive as possible, move on to
+1:                     // the next entry instead of waiting for the clean
+1:                     // operation to finish.
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:             // If no one has touched the entry while we were cleaning it, we
+1:             // could reuse it at this point. The old buffer manager (Clock)
+1:             // would however under high load normally move on to the next
+1:             // entry in the clock instead of reusing the one it recently
+1:             // cleaned. Some of the performance tests performed as part of
+1:             // DERBY-2911 indicated that not reusing the entry that was just
+1:             // cleaned made the replacement algorithm more efficient. For now
+1:             // we try to stay as close to the old buffer manager as possible
+1:             // and don't reuse the entry immediately.
+commit:4e03030
+/////////////////////////////////////////////////////////////////////////
+0:      * @return {@code true} if the clock shrunk as a result of calling this
+0:      * method
+commit:d7a1ddd
+/////////////////////////////////////////////////////////////////////////
+1:     private final ArrayList<Holder> clock;
+/////////////////////////////////////////////////////////////////////////
+1:      * @param initialSize the initial capacity of the cache
+1:     ClockPolicy(ConcurrentCache cacheManager, int initialSize, int maxSize) {
+1:         clock = new ArrayList<Holder>(initialSize);
+commit:45c4ca4
+/////////////////////////////////////////////////////////////////////////
+0:                 if (e.isKept()) {
+0:                     // The entry is in use. Move on to the next entry.
+1:                     continue;
+1:                 }
+1: 
+0:                     // At this point the entry must be valid. If it's not, it's
+0:                     // either removed (in which case we shouldn't get here), or
+0:                     // it is setting it's identity (in which case it is kept,
+0:                     // and we shouldn't get here).
+/////////////////////////////////////////////////////////////////////////
+0:                 if (e.isKept()) {
+0:                     // Don't evict entries currently in use.
+1:                     continue;
+1:                 }
+1: 
+0:                     // At this point the entry must be valid. If it's not, it's
+0:                     // either removed (in which case we shouldn't get here), or
+0:                     // it is setting it's identity (in which case it is kept,
+0:                     // and we shouldn't get here).
+0:                 if (h.recentlyUsed) {
+0:                     // Don't evict recently used entries.
+commit:d8bdc4c
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.atomic.AtomicBoolean;
+/////////////////////////////////////////////////////////////////////////
+0:      * Tells whether there currently is a thread in the <code>doShrink()</code>
+0:      * or <code>trimToSize()</code> methods. If this variable is
+0:      * <code>true</code> a call to any one of those methods will be a no-op.
+1:      */
+1:     private final AtomicBoolean isShrinking = new AtomicBoolean();
+1: 
+1:     /**
+/////////////////////////////////////////////////////////////////////////
+1:         final int size;
+1:             size = clock.size();
+1:             if (size < maxSize) {
+1:         if (size > maxSize) {
+1:             // Maximum size is exceeded. Shrink the clock in the background
+1:             // cleaner, if we have one; otherwise, shrink it in the current
+1:             // thread.
+1:             BackgroundCleaner cleaner = cacheManager.getBackgroundCleaner();
+1:             if (cleaner != null) {
+1:                 cleaner.scheduleShrink();
+1:             } else {
+1:                 doShrink();
+1:             }
+1:         }
+1: 
+1:         // Rotate the clock hand (look at up to 20% of the cache) and try to
+1:         // find free space for the entry. Only allow evictions if the cache
+1:         // has reached its maximum size. Otherwise, we only look for invalid
+1:         // entries and rather grow the cache than evict valid entries.
+0:         Holder h = rotateClock(entry, (float) 0.2, size >= maxSize);
+/////////////////////////////////////////////////////////////////////////
+1:         /**
+1:          * Flag which tells whether this holder has been evicted from the
+1:          * clock. If it has been evicted, it can't be reused when a new entry
+1:          * is inserted. Only the owner of this holder's monitor is allowed to
+1:          * access this variable.
+1:          */
+1:         private boolean evicted;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:          * specified entry, <code>false</code> if someone else has taken it or
+1:          * the holder has been evicted from the clock
+1:             if (entry == null && !evicted) {
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         /**
+1:          * Evict this holder from the clock if it is not associated with an
+1:          * entry.
+1:          *
+1:          * @return <code>true</code> if the holder was successfully evicted,
+1:          * <code>false</code> otherwise
+1:          */
+1:         synchronized boolean evictIfFree() {
+1:             if (entry == null && !evicted) {
+1:                 int free = freeEntries.decrementAndGet();
+1:                 if (SanityManager.DEBUG) {
+1:                     SanityManager.ASSERT(
+1:                         free >= 0, "freeEntries is negative: " + free);
+1:                 }
+1:                 evicted = true;
+1:                 return true;
+1:             }
+1:             return false;
+1:         }
+1: 
+1:         /**
+1:          * Mark this holder as evicted from the clock, effectively preventing
+1:          * reuse of the holder. Calling thread must have locked the holder's
+1:          * entry.
+1:          */
+1:         synchronized void setEvicted() {
+1:             if (SanityManager.DEBUG) {
+1:                 SanityManager.ASSERT(!evicted, "Already evicted");
+1:             }
+1:             evicted = true;
+1:             entry = null;
+1:         }
+1: 
+1:         /**
+1:          * Check whether this holder has been evicted from the clock.
+1:          *
+1:          * @return <code>true</code> if it has been evicted, <code>false</code>
+1:          * otherwise
+1:          */
+1:         synchronized boolean isEvicted() {
+1:             return evicted;
+1:         }
+/////////////////////////////////////////////////////////////////////////
+0:                     SanityManager.ASSERT(e.isValid(),
+0:                             "Holder contains invalid entry");
+0:                     SanityManager.ASSERT(!h.isEvicted(),
+0:                             "Trying to reuse an evicted holder");
+/////////////////////////////////////////////////////////////////////////
+1:                 if (cleaner != null && cleaner.scheduleClean(e)) {
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     /**
+1:      * Remove the holder at the given clock position.
+1:      *
+1:      * @param pos position of the holder
+1:      * @param h the holder to remove
+1:      */
+1:     private void removeHolder(int pos, Holder h) {
+1:         synchronized (clock) {
+1:             Holder removed = clock.remove(pos);
+1:             if (SanityManager.DEBUG) {
+1:                 SanityManager.ASSERT(removed == h, "Wrong Holder removed");
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Try to shrink the clock if it's larger than its maximum size.
+1:      */
+1:     public void doShrink() {
+1:         // If we're already performing a shrink, ignore this request. We'll get
+1:         // a new call later by someone else if the current shrink operation is
+0:         // not enough.
+1:         if (isShrinking.compareAndSet(false, true)) {
+1:             try {
+0:                 if (shrinkMe()) {
+0:                     // the clock shrunk, try to trim it too
+0:                     trimMe();
+1:                 }
+1:             } finally {
+1:                 isShrinking.set(false);
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+0:      * Try to reduce the size of the clock as much as possible by removing
+0:      * invalid entries. In most cases, this method will do nothing.
+1:      *
+0:      * @see #trimMe()
+1:      */
+0:     public void trimToSize() {
+0:         // ignore this request if we're already performing trim or shrink
+1:         if (isShrinking.compareAndSet(false, true)) {
+1:             try {
+0:                 trimMe();
+1:             } finally {
+1:                 isShrinking.set(false);
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Perform the shrinking of the clock. This method should only be called
+0:      * by a single thread at a time, and should not be called concurrently
+0:      * with <code>trimMe()</code>.
+1:      *
+0:      * @return <code>true</code> if the
+1:      */
+0:     private boolean shrinkMe() {
+1: 
+1:         if (SanityManager.DEBUG) {
+1:             SanityManager.ASSERT(isShrinking.get(),
+1:                     "Called shrinkMe() without ensuring exclusive access");
+1:         }
+1: 
+0:         // Look at 10% of the cache to find candidates for shrinking
+0:         int maxLooks = Math.max(1, maxSize / 10);
+1: 
+1:         // Since we don't scan the entire cache, start at the clock hand so
+1:         // that we don't always scan the first 10% of the cache.
+1:         int pos;
+1:         synchronized (clock) {
+1:             pos = hand;
+1:         }
+1: 
+0:         boolean shrunk = false;
+1: 
+1:         while (maxLooks-- > 0) {
+1: 
+1:             final Holder h;
+1:             final int size;
+1: 
+0:             // The index of the holder we're looking at. Since no one else than
+0:             // us can remove elements from the clock while we're in this
+0:             // method, and new elements will be added at the end of the list,
+0:             // the index for a holder does not change until we remove it.
+0:             final int index;
+1: 
+1:             synchronized (clock) {
+1:                 size = clock.size();
+1:                 if (pos >= size) {
+1:                     pos = 0;
+1:                 }
+0:                 index = pos++;
+0:                 h = clock.get(index);
+1:             }
+1: 
+1:             // No need to shrink if the size isn't greater than maxSize.
+1:             if (size <= maxSize) {
+1:                 break;
+1:             }
+1: 
+1:             final CacheEntry e = h.getEntry();
+1: 
+1:             if (e == null) {
+1:                 // The holder does not hold an entry. Try to remove it.
+1:                 if (h.evictIfFree()) {
+1:                     removeHolder(index, h);
+0:                     shrunk = true;
+1:                     // move position back because of the removal so that we
+1:                     // don't skip one clock element
+1:                     pos = index;
+1:                 }
+1:                 // Either the holder was evicted, or someone else took it
+1:                 // before we could evict it. In either case, we should move on
+1:                 // to the next holder.
+1:                 continue;
+1:             }
+1: 
+1:             e.lock();
+1:             try {
+0:                 if (h.getEntry() != e) {
+0:                     // Entry got evicted before we got the lock. Move on.
+1:                     continue;
+1:                 }
+1: 
+1:                 if (SanityManager.DEBUG) {
+0:                     // At this point the entry must be valid. Otherwise, it
+0:                     // would have been removed from the Holder.
+0:                     SanityManager.ASSERT(e.isValid(),
+0:                             "Holder contains invalid entry");
+0:                     SanityManager.ASSERT(!h.isEvicted(),
+0:                             "Trying to evict already evicted holder");
+1:                 }
+1: 
+0:                 if (e.isKept() || h.recentlyUsed) {
+0:                     // Don't evict entries currently in use or recently used.
+1:                     continue;
+1:                 }
+1: 
+1:                 final Cacheable c = e.getCacheable();
+1:                 if (c.isDirty()) {
+1:                     // Don't evict dirty entries.
+1:                     continue;
+1:                 }
+1: 
+1:                 // mark as evicted to prevent reuse
+1:                 h.setEvicted();
+1: 
+1:                 // remove from cache manager
+1:                 cacheManager.evictEntry(c.getIdentity());
+1: 
+1:                 // remove from clock
+1:                 removeHolder(index, h);
+1: 
+1:                 // move position back because of the removal so that we don't
+1:                 // skip one clock element
+1:                 pos = index;
+1: 
+0:                 shrunk = true;
+1: 
+1:             } finally {
+1:                 e.unlock();
+1:             }
+1:         }
+1: 
+0:         return shrunk;
+1:     }
+1: 
+1:     /**
+0:      * The number of times <code>trimMe()</code> has been called since the last
+0:      * time <code>trimMe()</code> tried to do some real work. This variable is
+0:      * used by <code>trimMe()</code> to decide whether it's about time to
+0:      * actually do something.
+1:      */
+0:     private int trimRequests;
+1: 
+1:     /**
+0:      * Perform the trimming of the clock. This method should only be called by
+0:      * a single thread at a time, and should not be called concurrently with
+0:      * <code>shrinkMe()</code>.
+1:      *
+0:      * This method will not do anything unless it has been called a substantial
+0:      * number of times. Also, it won't do anything if less than 25% of the
+0:      * clock entries are unused.
+1:      */
+0:     private void trimMe() {
+1: 
+1:         if (SanityManager.DEBUG) {
+1:             SanityManager.ASSERT(isShrinking.get(),
+0:                     "Called trimMe() without ensuring exclusive access");
+1:         }
+1: 
+0:         // Only trim the clock occasionally, as it's an expensive operation.
+0:         if (++trimRequests < maxSize / 8) {
+0:             return;
+1:         }
+0:         trimRequests = 0;
+1: 
+0:         // Get the current size of the clock.
+1:         final int size;
+1:         synchronized (clock) {
+1:             size = clock.size();
+1:         }
+1: 
+0:         // no need to trim a small clock
+0:         if (size < 32) {
+0:             return;
+1:         }
+1: 
+0:         final int unused = freeEntries.get();
+1: 
+0:         if (unused < size / 4) {
+0:             // don't trim unless more than 25% of the entries are unused
+0:             return;
+1:         }
+1: 
+0:         // We still want 10% unused entries as a pool for new objects.
+0:         final int minUnused = (size - unused) / 10;
+1: 
+0:         // Search for unused entries from the end since it's cheaper to remove
+0:         // elements near the end of an ArrayList. Since no one else can shrink
+0:         // the cache while we are in this method, we know that the size of the
+0:         // clock still must be the same as or greater than the size variable,
+0:         // so it's OK to search from position (size-1).
+0:         for (int i = size - 1; i >= 0 && freeEntries.get() > minUnused; i--) {
+1:             final Holder h;
+1:             synchronized (clock) {
+0:                 h = clock.get(i);
+1:             }
+0:             // Index will be stable since no one else is allowed to remove
+0:             // elements from the list, and new elements will be appended at the
+0:             // end of the list.
+1:             if (h.evictIfFree()) {
+0:                 removeHolder(i, h);
+1:             }
+1:         }
+1: 
+0:         // Finally, trim the underlying array.
+1:         synchronized (clock) {
+0:             clock.trimToSize();
+1:         }
+1:     }
+commit:651fa21
+/////////////////////////////////////////////////////////////////////////
+1:             // This variable will hold a dirty cacheable that should be cleaned
+1:             // after the try/finally block.
+1:             final Cacheable dirty;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 // The entry is not in use, and has not been used for at least
+1:                 // one round on the clock. See if it needs to be cleaned.
+1:                 if (!c.isDirty()) {
+1:                     // Not in use and not dirty. Take over the holder.
+1:                     h.switchEntry(entry);
+1:                     cacheManager.evictEntry(c.getIdentity());
+1:                     return h;
+1:                 // Ask the background cleaner to clean the entry.
+1:                 BackgroundCleaner cleaner = cacheManager.getBackgroundCleaner();
+0:                 if (cleaner != null && cleaner.scheduleWork(e)) {
+0:                     // Successfully scheduled the clean operation. Move on to
+0:                     // the next entry.
+1:                     continue;
+1:                 }
+1:                 // There is no background cleaner, or the background cleaner
+1:                 // has no free capacity. Let's clean the object ourselves.
+1:                 // First, mark the entry as kept to prevent eviction until
+1:                 // we have cleaned it, but don't mark it as accessed (recently
+1:                 // used).
+1:                 e.keep(false);
+1:                 dirty = c;
+1: 
+1:             // Clean the entry and unkeep it.
+1:             cacheManager.cleanAndUnkeepEntry(e, dirty);
+commit:6a317f0
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.atomic.AtomicInteger;
+/////////////////////////////////////////////////////////////////////////
+1:      * The number of free entries. This is the number of objects that have been
+1:      * removed from the cache and whose entries are free to be reused without
+1:      * eviction.
+1:      */
+1:     private final AtomicInteger freeEntries = new AtomicInteger();
+1: 
+1:     /**
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:         final boolean isFull;
+1:                 if (freeEntries.get() == 0) {
+1:                     // We have not reached the maximum size yet, and there's no
+1:                     // free entry to reuse. Make room by growing.
+0:                     return grow(entry);
+1:                 }
+0:                 // The cache is not full, but there are free entries that can
+0:                 // be reused.
+0:                 isFull = false;
+0:             } else {
+0:                 // The cache is full, so we'll need to rotate the clock hand
+0:                 // and evict an object.
+0:                 isFull = true;
+0:         Holder h = rotateClock(entry, (float) 0.2, isFull);
+/////////////////////////////////////////////////////////////////////////
+1:     private class Holder implements Callback {
+/////////////////////////////////////////////////////////////////////////
+1:             // let others know that a free entry is available
+1:             int free = freeEntries.incrementAndGet();
+0:             if (SanityManager.DEBUG) {
+1:                 SanityManager.ASSERT(
+1:                     free > 0,
+1:                     "freeEntries should be greater than 0, but is " + free);
+1:             }
+/////////////////////////////////////////////////////////////////////////
+1:                 int free = freeEntries.decrementAndGet();
+0:                 if (SanityManager.DEBUG) {
+1:                     SanityManager.ASSERT(
+1:                         free >= 0, "freeEntries is negative: " + free);
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+1:      * Rotate the clock in order to find a free space for a new entry. If
+1:      * <code>allowEvictions</code> is <code>true</code>, an not recently used
+1:      * object might be evicted to make room for the new entry. Otherwise, only
+1:      * unused entries are searched for. When evictions are allowed, entries are
+1:      * marked as not recently used when the clock hand sweeps over them. The
+0:      * search stops when a reusable entry is found, or when as many entries as
+0:      * specified by <code>partOfClock</code> have been checked. If there are
+1:      * free (unused) entries, the search will continue until a reusable entry
+1:      * is found, regardless of how many entries that need to be checked.
+1:      * @param allowEvictions tells whether evictions are allowed (normally
+1:      * <code>true</code> if the cache is full and <code>false</code> otherwise)
+0:     private Holder rotateClock(CacheEntry entry, float partOfClock,
+0:                                boolean allowEvictions)
+1:         if (allowEvictions) {
+0:             final int size;
+0:             synchronized (clock) {
+0:                 size = clock.size();
+1:             }
+0:             if (size < 20) {
+0:                 itemsToCheck = size * 2;
+0:                 itemsToCheck = (int) (size * partOfClock);
+0:         } else {
+0:             // we don't allow evictions, so we shouldn't check any items unless
+0:             // there are unused ones
+0:             itemsToCheck = 0;
+1:         // Check up to itemsToCheck entries before giving up, but don't give up
+1:         // if we know there are unused entries.
+1:         while (itemsToCheck-- > 0 || freeEntries.get() > 0) {
+/////////////////////////////////////////////////////////////////////////
+1:             if (!allowEvictions) {
+1:                 // Evictions are not allowed, so we can't reuse this entry.
+0:                 continue;
+1:             }
+1: 
+commit:7a816cb
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1: 
+1:    Derby - Class org.apache.derby.impl.services.cache.ClockPolicy
+1: 
+1:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:    contributor license agreements.  See the NOTICE file distributed with
+1:    this work for additional information regarding copyright ownership.
+1:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:    (the "License"); you may not use this file except in compliance with
+1:    the License.  You may obtain a copy of the License at
+1: 
+1:       http://www.apache.org/licenses/LICENSE-2.0
+1: 
+1:    Unless required by applicable law or agreed to in writing, software
+1:    distributed under the License is distributed on an "AS IS" BASIS,
+1:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:    See the License for the specific language governing permissions and
+1:    limitations under the License.
+1: 
+1:  */
+1: 
+1: package org.apache.derby.impl.services.cache;
+1: 
+1: import java.util.ArrayList;
+1: import org.apache.derby.iapi.error.StandardException;
+1: import org.apache.derby.iapi.services.cache.Cacheable;
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+1: 
+1: /**
+1:  * Implementation of a replacement policy which uses the clock algorithm. All
+1:  * the cache entries are stored in a circular buffer, called the clock. There
+1:  * is also a clock hand which points to one of the entries in the clock. Each
+1:  * time an entry is accessed, it is marked as recently used. If a new entry is
+1:  * inserted into the cache and the cache is full, the clock hand is moved until
+1:  * it is over a not recently used entry, and that entry is evicted to make
+1:  * space for the new entry. Each time the clock hand sweeps over a recently
+1:  * used entry, it is marked as not recently used, and it will be a candidate
+1:  * for removal the next time the clock hand sweeps over it, unless it has been
+1:  * marked as recently used in the meantime.
+1:  *
+1:  * <p>
+1:  *
+1:  * To allow concurrent access from multiple threads, the methods in this class
+1:  * need to synchronize on a number of different objects:
+1:  *
+1:  * <ul>
+1:  *
+1:  * <li><code>CacheEntry</code> objects must be locked before they can be
+1:  * used</li>
+1:  *
+1:  * <li>accesses to the clock structure (circular buffer + clock hand) should be
+1:  * synchronized on the <code>ArrayList</code> representing the circular
+1:  * buffer</li>
+1:  *
+1:  * <li>accesses to individual <code>Holder</code> objects in the clock
+1:  * structure should be protected by synchronizing on the holder</li>
+1:  *
+1:  * </ul>
+1:  *
+1:  * To avoid deadlocks, we need to ensure that all threads obtain
+1:  * synchronization locks in the same order. <code>CacheEntry</code>'s class
+1:  * javadoc dictates the order when locking <code>CacheEntry</code>
+1:  * objects. Additionally, we require that no thread should obtain any other
+1:  * synchronization locks while it is holding a synchronization lock on the
+1:  * clock structure or on a <code>Holder</code> object. The threads are however
+1:  * allowed to obtain synchronization locks on the clock structure or on a
+1:  * holder while they are locking one or more <code>CacheEntry</code> objects.
+1:  */
+1: final class ClockPolicy implements ReplacementPolicy {
+1: 
+1:     /** The cache manager for which this replacement policy is used. */
+1:     private final ConcurrentCache cacheManager;
+1: 
+1:     /**
+1:      * The maximum size of the cache. When this size is exceeded, entries must
+1:      * be evicted before new ones are inserted.
+1:      */
+1:     private final int maxSize;
+1: 
+1:     /**
+1:      * The circular clock buffer which holds all the entries in the
+1:      * cache. Accesses to <code>clock</code> and <code>hand</code> must be
+1:      * synchronized on <code>clock</code>.
+1:      */
+0:     private final ArrayList<Holder> clock = new ArrayList<Holder>();
+1: 
+1:     /** The current position of the clock hand. */
+1:     private int hand;
+1: 
+1:     /**
+1:      * Create a new <code>ClockPolicy</code> instance.
+1:      *
+1:      * @param cacheManager the cache manager that requests this policy
+1:      * @param maxSize the maximum size of the cache
+1:      */
+0:     ClockPolicy(ConcurrentCache cacheManager, int maxSize) {
+1:         this.cacheManager = cacheManager;
+1:         this.maxSize = maxSize;
+1:     }
+1: 
+1:     /**
+1:      * Insert an entry into the cache. If the maximum size is exceeded, evict a
+1:      * <em>not recently used</em> object from the cache. If there are no
+1:      * entries available for reuse, increase the size of the cache.
+1:      *
+1:      * @param entry the entry to insert (must be locked)
+0:      * @return callback object used by the cache manager
+1:      * @exception StandardException if an error occurs when inserting the entry
+1:      */
+0:     public Callback insertEntry(CacheEntry entry) throws StandardException {
+0:         synchronized (clock) {
+0:             if (clock.size() < maxSize) {
+0:                 // TODO - check whether there are free entries that could be
+0:                 // used instead of growing
+0:                 return grow(entry);
+1:             }
+1:         }
+1: 
+0:         // rotate clock hand (look at up to 20% of the cache)
+0:         Holder h = rotateClock(entry, (float) 0.2);
+0:         if (h != null) {
+1:             return h;
+1:         }
+1: 
+0:         // didn't find a victim, so we need to grow
+0:         synchronized (clock) {
+0:             return grow(entry);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Holder class which represents an entry in the cache. It maintains a
+1:      * <code>recentlyUsed</code> required by the clock algorithm. The class
+1:      * also implements the <code>Callback</code> interface, so that
+1:      * <code>ConcurrentCache</code> can notify the clock policy about events
+1:      * relevant to the clock algorithm.
+1:      */
+0:     private static class Holder implements Callback {
+1:         /**
+1:          * Flag indicating whether or not this entry has been accessed
+1:          * recently. Should only be accessed/modified when the current thread
+1:          * has locked the <code>CacheEntry</code> object stored in the
+1:          * <code>entry</code> field.
+1:          */
+1:         boolean recentlyUsed;
+1: 
+1:         /**
+1:          * Reference to the <code>CacheEntry</code> object held by this
+1:          * object. The reference should only be accessed when the thread owns
+1:          * the monitor on this holder. A thread is only allowed to change the
+1:          * reference if it also has locked the entry that the reference points
+1:          * to (if the reference is non-null). This ensures that no other thread
+1:          * can disassociate a holder from its entry while the entry is locked,
+1:          * even though the monitor on the holder has been released.
+1:          */
+1:         private CacheEntry entry;
+1: 
+1:         /**
+1:          * Cacheable object from a removed object. If this object is non-null,
+1:          * <code>entry</code> must be <code>null</code> (which means that the
+1:          * holder is not associated with any object in the cache).
+1:          */
+1:         private Cacheable freedCacheable;
+1: 
+1:         Holder(CacheEntry e) {
+1:             entry = e;
+1:             e.setCallback(this);
+1:         }
+1: 
+1:         /**
+1:          * Mark this entry as recently used. Caller must have locked
+1:          * <code>entry</code>.
+1:          */
+1:         public void access() {
+1:             recentlyUsed = true;
+1:         }
+1: 
+1:         /**
+1:          * Mark this object as free and reusable. Caller must have locked
+1:          * <code>entry</code>.
+1:          */
+1:         public synchronized void free() {
+1:             freedCacheable = entry.getCacheable();
+1:             entry = null;
+1:             recentlyUsed = false;
+1:         }
+1: 
+1:         /**
+1:          * Associate this holder with the specified entry if the holder is free
+1:          * (that is, not associated with any other entry).
+1:          *
+1:          * @param e the entry to associate the holder with (it must be locked
+1:          * by the current thread)
+1:          * @return <code>true</code> if the holder has been associated with the
+0:          * specified entry, <code>false</code> if someone else has taken it
+1:          */
+1:         synchronized boolean takeIfFree(CacheEntry e) {
+0:             if (entry == null) {
+1:                 // the holder is free - take it!
+1:                 e.setCacheable(freedCacheable);
+1:                 e.setCallback(this);
+1:                 entry = e;
+1:                 freedCacheable = null;
+1:                 return true;
+1:             }
+1:             // someone else has taken it
+1:             return false;
+1:         }
+1: 
+1:         /**
+1:          * Returns the entry that is currently associated with this holder.
+1:          *
+1:          * @return the associated entry
+1:          */
+1:         synchronized CacheEntry getEntry() {
+1:             return entry;
+1:         }
+1: 
+1:         /**
+1:          * Switch which entry the holder is associated with. Will be called
+1:          * when we evict an entry to make room for a new one. When this method
+1:          * is called, the current thread must have locked both the entry that
+1:          * is evicted and the entry that is inserted.
+1:          *
+1:          * @param e the entry to associate this holder with
+1:          */
+1:         synchronized void switchEntry(CacheEntry e) {
+1:             e.setCallback(this);
+1:             e.setCacheable(entry.getCacheable());
+1:             entry = e;
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Get the holder under the clock hand, and move the hand to the next
+1:      * holder.
+1:      *
+0:      * @return the holder under the clock hand
+1:      */
+1:     private Holder moveHand() {
+0:         synchronized (clock) {
+1:             if (hand >= clock.size()) {
+1:                 hand = 0;
+1:             }
+1:             return clock.get(hand++);
+1:         }
+1:     }
+1: 
+1:     /**
+0:      * Increase the size of the clock by one and return a new holder. The
+0:      * caller must be synchronized on <code>clock</code>.
+1:      *
+0:      * @param entry the entry to insert into the clock
+0:      * @return a new holder which wraps the entry
+1:      */
+0:     private Holder grow(CacheEntry entry) {
+0:         Holder h = new Holder(entry);
+0:         clock.add(h);
+1:         return h;
+1:     }
+1: 
+1:     /**
+0:      * Rotate the clock in order to find a free space for a new entry, or a
+0:      * <em>not recently used</em> entry that we can evict to make free
+0:      * space. Entries that we move past are marked as recently used.
+1:      *
+1:      * @param entry the entry to insert
+0:      * @param partOfClock how large part of the clock to look at before we give
+0:      * up
+1:      * @return a holder that we can reuse, or <code>null</code> if we didn't
+1:      * find one
+1:      */
+0:     private Holder rotateClock(CacheEntry entry, float partOfClock)
+1:             throws StandardException {
+1: 
+0:         // calculate how many items to check
+0:         int itemsToCheck;
+0:         synchronized (clock) {
+0:             itemsToCheck = clock.size();
+0:             if (itemsToCheck < 20) {
+0:                 // if we have a very small cache, allow two rounds before
+0:                 // giving up
+0:                 itemsToCheck *= 2;
+0:             } else {
+0:                 // otherwise, just check a fraction of the clock
+0:                 itemsToCheck *= partOfClock;
+1:             }
+1:         }
+1: 
+0:         while (itemsToCheck-- > 0) {
+1: 
+1:             final Holder h = moveHand();
+1:             final CacheEntry e = h.getEntry();
+1: 
+1:             if (e == null) {
+1:                 if (h.takeIfFree(entry)) {
+1:                     return h;
+1:                 }
+1:                 // Someone else grabbed this entry between the calls to
+1:                 // getEntry() and takeIfFree(). Just move on to the next entry.
+0:                 continue;
+1:             }
+1: 
+1:             e.lock();
+0:             try {
+0:                 if (h.getEntry() != e) {
+0:                     // Someone else evicted this entry before we obtained the
+0:                     // lock. Move on to the next entry.
+0:                     continue;
+1:                 }
+1: 
+0:                 if (SanityManager.DEBUG) {
+0:                     // At this point the entry must be valid. Otherwise, it
+0:                     // would have been removed from the Holder.
+0:                     SanityManager.ASSERT(e.isValid());
+1:                 }
+1: 
+0:                 if (e.isKept()) {
+0:                     // The entry is in use. Move on to the next entry.
+0:                     continue;
+1:                 }
+1: 
+0:                 if (h.recentlyUsed) {
+0:                     // The object has been used recently. Clear the
+0:                     // recentlyUsed flag and move on to the next entry.
+0:                     h.recentlyUsed = false;
+0:                     continue;
+1:                 }
+1: 
+0:                 // OK, we can use this Holder
+1:                 Cacheable c = e.getCacheable();
+0:                 if (c.isDirty()) {
+0:                     c.clean(false);
+1:                 }
+1: 
+0:                 h.switchEntry(entry);
+1: 
+0:                 cacheManager.evictEntry(c.getIdentity());
+1: 
+1:                 return h;
+1: 
+0:             } finally {
+1:                 e.unlock();
+1:             }
+1:         }
+1: 
+1:         return null;
+1:     }
+1: }
+author:Bryan Pendleton
+-------------------------------------------------------------------------------
+commit:7e51e9d
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.shared.common.sanity.SanityManager;
+============================================================================

@@ -1,0 +1,586 @@
+1:1cdd095: /*
+1:1cdd095:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:1cdd095:  * contributor license agreements.  See the NOTICE file distributed with
+1:1cdd095:  * this work for additional information regarding copyright ownership.
+1:1cdd095:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:1cdd095:  * (the "License"); you may not use this file except in compliance with
+1:1cdd095:  * the License.  You may obtain a copy of the License at
+1:1cdd095:  *
+1:1cdd095:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:1cdd095:  *
+1:1cdd095:  * Unless required by applicable law or agreed to in writing, software
+1:1cdd095:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:1cdd095:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:1cdd095:  * See the License for the specific language governing permissions and
+1:1cdd095:  * limitations under the License.
+1:1cdd095:  */
+1:1cdd095: 
+1:c898d27: package org.apache.mahout.math.ssvd;
+1:c898d27: 
+1:c898d27: import org.apache.mahout.math.CholeskyDecomposition;
+1:c898d27: import org.apache.mahout.math.DenseMatrix;
+1:c898d27: import org.apache.mahout.math.DenseVector;
+1:c898d27: import org.apache.mahout.math.Matrix;
+1:c898d27: import org.apache.mahout.math.MatrixWritable;
+1:c898d27: import org.apache.mahout.math.RandomTrinaryMatrix;
+1:c898d27: import org.apache.mahout.math.SingularValueDecomposition;
+1:c898d27: import org.apache.mahout.math.Vector;
+1:c898d27: import org.apache.mahout.math.function.Functions;
+1:c898d27: 
+1:c898d27: import java.io.DataInputStream;
+1:c898d27: import java.io.DataOutputStream;
+1:c898d27: import java.io.File;
+1:c898d27: import java.io.FileInputStream;
+1:c898d27: import java.io.FileOutputStream;
+1:c898d27: import java.io.IOException;
+1:c898d27: 
+1:c898d27: /**
+1:c898d27:  * Sequential block-oriented out of core SVD algorithm.
+1:c898d27:  * <p/>
+1:c898d27:  * The basic algorithm (in-core version) is that we do a random projects, get a basis of that and
+1:c898d27:  * then re-project the original matrix using that basis.  This re-projected matrix allows us to get
+1:c898d27:  * an approximate SVD of the original matrix.
+1:c898d27:  * <p/>
+1:c898d27:  * The input to this program is a list of files that contain the sub-matrices A_i.  The result is a
+1:c898d27:  * vector of singular values and optionally files that contain the left and right singular vectors.
+1:c898d27:  * <p/>
+1:c898d27:  * Mathematically, to decompose A, we do this:
+1:c898d27:  * <p/>
+1:c898d27:  * Y = A * \Omega
+1:c898d27:  * <p/>
+1:c898d27:  * Q R = Y
+1:c898d27:  * <p/>
+1:c898d27:  * B = Q" A
+1:c898d27:  * <p/>
+1:c898d27:  * U D V' = B
+1:c898d27:  * <p/>
+1:c898d27:  * (Q U) D V' \approx A
+1:c898d27:  * <p/>
+1:c898d27:  * To do this out of core, we break A into blocks each with the same number of rows.  This gives a
+1:c898d27:  * block-wise version of Y.  As we are computing Y, we can also accumulate Y' Y and when done, we
+1:c898d27:  * can use a Cholesky decomposition to do the QR decomposition of Y in a latent form.  That gives us
+1:c898d27:  * B in block-wise form and we can do the same trick to get an LQ of B.  The L part can be
+1:c898d27:  * decomposed in memory.  Then we can recombine to get the final decomposition.
+1:c898d27:  * <p/>
+1:c898d27:  * The details go like this.  Start with a block form of A.
+1:c898d27:  * <p/>
+1:c898d27:  * Y_i = A_i * \Omega
+1:c898d27:  * <p/>
+1:c898d27:  * Instead of doing a QR decomposition of Y, we do a Cholesky decomposition of Y' Y.  This is a
+1:c898d27:  * small in-memory operation.  Q is large and dense and won't fit in memory.
+1:c898d27:  * <p/>
+1:c898d27:  * R' R = \sum_i Y_i' Y_i
+1:c898d27:  * <p/>
+1:3be3d23:  * For reference, R is all we need to compute explicitly.  Q will be computed on the fly when
+1:3be3d23:  * needed.
+1:c898d27:  * <p/>
+1:c898d27:  * Q = Y R^-1
+1:c898d27:  * <p/>
+1:c898d27:  * B = Q" A = \sum_i (A \Omega R^-1)' A_i
+1:c898d27:  * <p/>
+1:c898d27:  * As B is generated, it needs to be segmented in row-wise blocks since it is wide but not tall.
+1:c898d27:  * This storage requires something like a map-reduce to accumulate the partial sums.  In this code,
+1:c898d27:  * we do this by re-reading previously computed chunks and augmenting them.
+1:c898d27:  * <p/>
+1:c898d27:  * While the pieces of B are being computed, we can accumulate B B' in preparation for a second
+1:c898d27:  * Cholesky decomposition
+1:c898d27:  * <p/>
+1:c898d27:  * L L' = B B' = sum B_j B_j'
+1:c898d27:  * <p/>
+1:c898d27:  * Again, this is an LQ decomposition of BB', but we don't compute the Q part explicitly.  L will be
+1:c898d27:  * small and thus tractable.
+1:c898d27:  * <p/>
+1:c898d27:  * Finally, we do the actual SVD decomposition.
+1:c898d27:  * <p/>
+1:c898d27:  * U_0 D V_0' = L
+1:c898d27:  * <p/>
+1:c898d27:  * D contains the singular values of A.  The left and right singular values can be reconstructed
+1:c898d27:  * using Y and B.  Note that both of these reconstructions can be done with single passes through
+1:c898d27:  * the blocked forms of Y and B.
+1:c898d27:  * <p/>
+1:c898d27:  * U = A \Omega R^{-1} U_0
+1:c898d27:  * <p/>
+1:c898d27:  * V = B' L'^{-1} V_0
+1:c898d27:  */
+1:c898d27: public class SequentialOutOfCoreSvd {
+1:c898d27: 
+1:c898d27:   private final CholeskyDecomposition l2;
+1:c898d27:   private final SingularValueDecomposition svd;
+1:c898d27:   private final CholeskyDecomposition r2;
+1:c898d27:   private final int columnsPerSlice;
+1:c898d27:   private final int seed;
+1:c898d27:   private final int dim;
+1:c898d27: 
+1:229aeff:   public SequentialOutOfCoreSvd(Iterable<File> partsOfA, File tmpDir, int internalDimension, int columnsPerSlice)
+1:229aeff:     throws IOException {
+1:c898d27:     this.columnsPerSlice = columnsPerSlice;
+1:c898d27:     this.dim = internalDimension;
+1:c898d27: 
+1:c898d27:     seed = 1;
+1:c898d27:     Matrix y2 = null;
+1:c898d27: 
+1:c898d27:     // step 1, compute R as in R'R = Y'Y where Y = A \Omega
+2:c898d27:     for (File file : partsOfA) {
+3:c898d27:       MatrixWritable m = new MatrixWritable();
+1:87c15be:       try (DataInputStream in = new DataInputStream(new FileInputStream(file))) {
+1:11763fb:         m.readFields(in);
+1:11763fb:       }
+1:c898d27: 
+2:c898d27:       Matrix aI = m.get();
+1:11763fb:       Matrix omega = new RandomTrinaryMatrix(seed, aI.columnSize(), internalDimension, false);
+1:c898d27:       Matrix y = aI.times(omega);
+1:c898d27: 
+1:c898d27:       if (y2 == null) {
+1:c898d27:         y2 = y.transpose().times(y);
+1:c898d27:       } else {
+1:c898d27:         y2.assign(y.transpose().times(y), Functions.PLUS);
+1:c898d27:       }
+1:c898d27:     }
+1:c898d27:     r2 = new CholeskyDecomposition(y2);
+1:c898d27: 
+1:c898d27:     // step 2, compute B
+1:c898d27:     int ncols = 0;
+1:c898d27:     for (File file : partsOfA) {
+1:c898d27:       MatrixWritable m = new MatrixWritable();
+1:87c15be:       try (DataInputStream in = new DataInputStream(new FileInputStream(file))) {
+1:3be3d23:         m.readFields(in);
+1:3be3d23:       }
+1:c898d27:       Matrix aI = m.get();
+1:11763fb:       ncols = Math.max(ncols, aI.columnSize());
+1:c898d27: 
+1:11763fb:       Matrix omega = new RandomTrinaryMatrix(seed, aI.numCols(), internalDimension, false);
+1:11763fb:       for (int j = 0; j < aI.numCols(); j += columnsPerSlice) {
+1:11763fb:         Matrix yI = aI.times(omega);
+1:11763fb:         Matrix aIJ = aI.viewPart(0, aI.rowSize(), j, Math.min(columnsPerSlice, aI.columnSize() - j));
+1:11763fb:         Matrix bIJ = r2.solveRight(yI).transpose().times(aIJ);
+1:c898d27:         addToSavedCopy(bFile(tmpDir, j), bIJ);
+1:c898d27:       }
+1:c898d27:     }
+1:c898d27: 
+1:c898d27:     // step 3, compute BB', L and SVD(L)
+1:c898d27:     Matrix b2 = new DenseMatrix(internalDimension, internalDimension);
+1:c898d27:     MatrixWritable bTmp = new MatrixWritable();
+2:c898d27:     for (int j = 0; j < ncols; j += columnsPerSlice) {
+2:c898d27:       if (bFile(tmpDir, j).exists()) {
+1:87c15be:         try (DataInputStream in = new DataInputStream(new FileInputStream(bFile(tmpDir, j)))) {
+1:3be3d23:           bTmp.readFields(in);
+1:3be3d23:         }
+1:3be3d23: 
+1:c898d27:         b2.assign(bTmp.get().times(bTmp.get().transpose()), Functions.PLUS);
+1:c898d27:       }
+1:c898d27:     }
+1:c898d27:     l2 = new CholeskyDecomposition(b2);
+1:c898d27:     svd = new SingularValueDecomposition(l2.getL());
+1:c898d27:   }
+1:c898d27: 
+1:3be3d23:   public void computeV(File tmpDir, int ncols) throws IOException {
+1:c898d27:     // step 5, compute pieces of V
+1:3be3d23:     for (int j = 0; j < ncols; j += columnsPerSlice) {
+1:229aeff:       File bPath = bFile(tmpDir, j);
+1:3be3d23:       if (bPath.exists()) {
+1:3be3d23:         MatrixWritable m = new MatrixWritable();
+1:87c15be:         try (DataInputStream in = new DataInputStream(new FileInputStream(bPath))) {
+1:3be3d23:           m.readFields(in);
+1:3be3d23:         }
+1:3be3d23:         m.set(l2.solveRight(m.get().transpose()).times(svd.getV()));
+1:87c15be:         try (DataOutputStream out = new DataOutputStream(new FileOutputStream(
+1:87c15be:             new File(tmpDir, String.format("V-%s", bPath.getName().replaceAll(".*-", "")))))) {
+1:3be3d23:           m.write(out);
+1:c898d27:         }
+1:c898d27:       }
+1:c898d27:     }
+1:c898d27:   }
+1:c898d27: 
+1:3be3d23:   public void computeU(Iterable<File> partsOfA, File tmpDir) throws IOException {
+1:c898d27:     // step 4, compute pieces of U
+1:3be3d23:     for (File file : partsOfA) {
+1:3be3d23:       MatrixWritable m = new MatrixWritable();
+1:3be3d23:       m.readFields(new DataInputStream(new FileInputStream(file)));
+1:3be3d23:       Matrix aI = m.get();
+1:c898d27: 
+1:3be3d23:       Matrix y = aI.times(new RandomTrinaryMatrix(seed, aI.numCols(), dim, false));
+1:3be3d23:       Matrix uI = r2.solveRight(y).times(svd.getU());
+1:3be3d23:       m.set(uI);
+1:87c15be:       try (DataOutputStream out = new DataOutputStream(new FileOutputStream(
+1:87c15be:           new File(tmpDir, String.format("U-%s", file.getName().replaceAll(".*-", "")))))) {
+1:3be3d23:         m.write(out);
+1:c898d27:       }
+1:c898d27:     }
+1:c898d27:   }
+1:c898d27: 
+1:564c3e1:   private static void addToSavedCopy(File file, Matrix matrix) throws IOException {
+1:c898d27:     MatrixWritable mw = new MatrixWritable();
+1:c898d27:     if (file.exists()) {
+1:87c15be:       try (DataInputStream in = new DataInputStream(new FileInputStream(file))) {
+1:c898d27:         mw.readFields(in);
+1:c898d27:       }
+1:c898d27:       mw.get().assign(matrix, Functions.PLUS);
+1:c898d27:     } else {
+1:c898d27:       mw.set(matrix);
+1:c898d27:     }
+1:87c15be:     try (DataOutputStream out = new DataOutputStream(new FileOutputStream(file))) {
+1:c898d27:       mw.write(out);
+1:c898d27:     }
+1:c898d27:   }
+1:c898d27: 
+1:564c3e1:   private static File bFile(File tmpDir, int j) {
+1:c898d27:     return new File(tmpDir, String.format("B-%09d", j));
+1:c898d27:   }
+1:c898d27: 
+1:c898d27:   public Vector getSingularValues() {
+1:c898d27:     return new DenseVector(svd.getSingularValues());
+1:c898d27:   }
+1:c898d27: }
+============================================================================
+author:pferrel
+-------------------------------------------------------------------------------
+commit:b988c49
+author:Suneel Marthi
+-------------------------------------------------------------------------------
+commit:87c15be
+/////////////////////////////////////////////////////////////////////////
+1:       try (DataInputStream in = new DataInputStream(new FileInputStream(file))) {
+/////////////////////////////////////////////////////////////////////////
+1:       try (DataInputStream in = new DataInputStream(new FileInputStream(file))) {
+/////////////////////////////////////////////////////////////////////////
+1:         try (DataInputStream in = new DataInputStream(new FileInputStream(bFile(tmpDir, j)))) {
+/////////////////////////////////////////////////////////////////////////
+1:         try (DataInputStream in = new DataInputStream(new FileInputStream(bPath))) {
+1:         try (DataOutputStream out = new DataOutputStream(new FileOutputStream(
+1:             new File(tmpDir, String.format("V-%s", bPath.getName().replaceAll(".*-", "")))))) {
+/////////////////////////////////////////////////////////////////////////
+1:       try (DataOutputStream out = new DataOutputStream(new FileOutputStream(
+1:           new File(tmpDir, String.format("U-%s", file.getName().replaceAll(".*-", "")))))) {
+/////////////////////////////////////////////////////////////////////////
+1:       try (DataInputStream in = new DataInputStream(new FileInputStream(file))) {
+1:     try (DataOutputStream out = new DataOutputStream(new FileOutputStream(file))) {
+author:frankscholten
+-------------------------------------------------------------------------------
+commit:1a42d85
+author:Sean R. Owen
+-------------------------------------------------------------------------------
+commit:1cdd095
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: 
+commit:229aeff
+/////////////////////////////////////////////////////////////////////////
+1:   public SequentialOutOfCoreSvd(Iterable<File> partsOfA, File tmpDir, int internalDimension, int columnsPerSlice)
+1:     throws IOException {
+/////////////////////////////////////////////////////////////////////////
+0:       DataInputStream in = new DataInputStream(new FileInputStream(file));
+/////////////////////////////////////////////////////////////////////////
+0:         DataInputStream in = new DataInputStream(new FileInputStream(bFile(tmpDir, j)));
+/////////////////////////////////////////////////////////////////////////
+1:       File bPath = bFile(tmpDir, j);
+0:         DataInputStream in = new DataInputStream(new FileInputStream(bPath));
+0:         DataOutputStream out = new DataOutputStream(new FileOutputStream(
+0:             new File(tmpDir, String.format("V-%s", bPath.getName().replaceAll(".*-", "")))));
+/////////////////////////////////////////////////////////////////////////
+0:       DataOutputStream out = new DataOutputStream(new FileOutputStream(
+0:           new File(tmpDir, String.format("U-%s", file.getName().replaceAll(".*-", "")))));
+commit:564c3e1
+/////////////////////////////////////////////////////////////////////////
+1:   private static void addToSavedCopy(File file, Matrix matrix) throws IOException {
+/////////////////////////////////////////////////////////////////////////
+1:   private static File bFile(File tmpDir, int j) {
+author:Ted Dunning
+-------------------------------------------------------------------------------
+commit:3be3d23
+/////////////////////////////////////////////////////////////////////////
+1:  * For reference, R is all we need to compute explicitly.  Q will be computed on the fly when
+1:  * needed.
+/////////////////////////////////////////////////////////////////////////
+0:   public SequentialOutOfCoreSvd(Iterable<File> partsOfA, File tmpDir, int internalDimension, int columnsPerSlice) throws IOException {
+/////////////////////////////////////////////////////////////////////////
+0:       final DataInputStream in = new DataInputStream(new FileInputStream(file));
+0:       try {
+1:         m.readFields(in);
+0:       } finally {
+0:         in.close();
+1:       }
+/////////////////////////////////////////////////////////////////////////
+0:         final DataInputStream in = new DataInputStream(new FileInputStream(bFile(tmpDir, j)));
+0:         try {
+1:           bTmp.readFields(in);
+0:         } finally {
+0:           in.close();
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:   public void computeV(File tmpDir, int ncols) throws IOException {
+1:     for (int j = 0; j < ncols; j += columnsPerSlice) {
+0:       final File bPath = bFile(tmpDir, j);
+1:       if (bPath.exists()) {
+1:         MatrixWritable m = new MatrixWritable();
+0:         final DataInputStream in = new DataInputStream(new FileInputStream(bPath));
+0:         try {
+1:           m.readFields(in);
+0:         } finally {
+0:           in.close();
+1:         }
+1:         m.set(l2.solveRight(m.get().transpose()).times(svd.getV()));
+0:         final DataOutputStream out = new DataOutputStream(new FileOutputStream(new File(tmpDir, String.format("V-%s", bPath.getName().replaceAll(".*-", "")))));
+0:         try {
+1:           m.write(out);
+0:         } finally {
+0:           out.close();
+1:   public void computeU(Iterable<File> partsOfA, File tmpDir) throws IOException {
+1:     for (File file : partsOfA) {
+1:       MatrixWritable m = new MatrixWritable();
+1:       m.readFields(new DataInputStream(new FileInputStream(file)));
+1:       Matrix aI = m.get();
+1:       Matrix y = aI.times(new RandomTrinaryMatrix(seed, aI.numCols(), dim, false));
+1:       Matrix uI = r2.solveRight(y).times(svd.getU());
+1:       m.set(uI);
+0:       final DataOutputStream out = new DataOutputStream(new FileOutputStream(new File(tmpDir, String.format("U-%s", file.getName().replaceAll(".*-", "")))));
+0:       try {
+1:         m.write(out);
+0:       } finally {
+0:         out.close();
+commit:11763fb
+/////////////////////////////////////////////////////////////////////////
+0:       DataInputStream in = new DataInputStream(new FileInputStream(file));
+0:       try {
+1:         m.readFields(in);
+0:       } finally {
+0:         in.close();
+1:       }
+1:       Matrix omega = new RandomTrinaryMatrix(seed, aI.columnSize(), internalDimension, false);
+/////////////////////////////////////////////////////////////////////////
+1:       ncols = Math.max(ncols, aI.columnSize());
+1:       Matrix omega = new RandomTrinaryMatrix(seed, aI.numCols(), internalDimension, false);
+1:       for (int j = 0; j < aI.numCols(); j += columnsPerSlice) {
+1:         Matrix yI = aI.times(omega);
+1:         Matrix aIJ = aI.viewPart(0, aI.rowSize(), j, Math.min(columnsPerSlice, aI.columnSize() - j));
+1:         Matrix bIJ = r2.solveRight(yI).transpose().times(aIJ);
+/////////////////////////////////////////////////////////////////////////
+0:         Matrix y = aI.times(new RandomTrinaryMatrix(seed, aI.numCols(), dim, false));
+0:         Matrix uI = r2.solveRight(y).times(svd.getU());
+0:         m.set(uI);
+0:         i += aI.rowSize();
+commit:c898d27
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.mahout.math.ssvd;
+1: 
+1: import org.apache.mahout.math.CholeskyDecomposition;
+1: import org.apache.mahout.math.DenseMatrix;
+1: import org.apache.mahout.math.DenseVector;
+1: import org.apache.mahout.math.Matrix;
+1: import org.apache.mahout.math.MatrixWritable;
+1: import org.apache.mahout.math.RandomTrinaryMatrix;
+1: import org.apache.mahout.math.SingularValueDecomposition;
+1: import org.apache.mahout.math.Vector;
+1: import org.apache.mahout.math.function.Functions;
+1: 
+1: import java.io.DataInputStream;
+1: import java.io.DataOutputStream;
+1: import java.io.File;
+1: import java.io.FileInputStream;
+1: import java.io.FileOutputStream;
+1: import java.io.IOException;
+1: 
+1: /**
+1:  * Sequential block-oriented out of core SVD algorithm.
+1:  * <p/>
+1:  * The basic algorithm (in-core version) is that we do a random projects, get a basis of that and
+1:  * then re-project the original matrix using that basis.  This re-projected matrix allows us to get
+1:  * an approximate SVD of the original matrix.
+1:  * <p/>
+1:  * The input to this program is a list of files that contain the sub-matrices A_i.  The result is a
+1:  * vector of singular values and optionally files that contain the left and right singular vectors.
+1:  * <p/>
+1:  * Mathematically, to decompose A, we do this:
+1:  * <p/>
+1:  * Y = A * \Omega
+1:  * <p/>
+1:  * Q R = Y
+1:  * <p/>
+1:  * B = Q" A
+1:  * <p/>
+1:  * U D V' = B
+1:  * <p/>
+1:  * (Q U) D V' \approx A
+1:  * <p/>
+1:  * To do this out of core, we break A into blocks each with the same number of rows.  This gives a
+1:  * block-wise version of Y.  As we are computing Y, we can also accumulate Y' Y and when done, we
+1:  * can use a Cholesky decomposition to do the QR decomposition of Y in a latent form.  That gives us
+1:  * B in block-wise form and we can do the same trick to get an LQ of B.  The L part can be
+1:  * decomposed in memory.  Then we can recombine to get the final decomposition.
+1:  * <p/>
+1:  * The details go like this.  Start with a block form of A.
+1:  * <p/>
+1:  * Y_i = A_i * \Omega
+1:  * <p/>
+1:  * Instead of doing a QR decomposition of Y, we do a Cholesky decomposition of Y' Y.  This is a
+1:  * small in-memory operation.  Q is large and dense and won't fit in memory.
+1:  * <p/>
+1:  * R' R = \sum_i Y_i' Y_i
+1:  * <p/>
+0:  * For reference, R is all we need to compute explicitly.  Q will be computed on the fly when needed.
+1:  * <p/>
+1:  * Q = Y R^-1
+1:  * <p/>
+1:  * B = Q" A = \sum_i (A \Omega R^-1)' A_i
+1:  * <p/>
+1:  * As B is generated, it needs to be segmented in row-wise blocks since it is wide but not tall.
+1:  * This storage requires something like a map-reduce to accumulate the partial sums.  In this code,
+1:  * we do this by re-reading previously computed chunks and augmenting them.
+1:  * <p/>
+1:  * While the pieces of B are being computed, we can accumulate B B' in preparation for a second
+1:  * Cholesky decomposition
+1:  * <p/>
+1:  * L L' = B B' = sum B_j B_j'
+1:  * <p/>
+1:  * Again, this is an LQ decomposition of BB', but we don't compute the Q part explicitly.  L will be
+1:  * small and thus tractable.
+1:  * <p/>
+1:  * Finally, we do the actual SVD decomposition.
+1:  * <p/>
+1:  * U_0 D V_0' = L
+1:  * <p/>
+1:  * D contains the singular values of A.  The left and right singular values can be reconstructed
+1:  * using Y and B.  Note that both of these reconstructions can be done with single passes through
+1:  * the blocked forms of Y and B.
+1:  * <p/>
+1:  * U = A \Omega R^{-1} U_0
+1:  * <p/>
+1:  * V = B' L'^{-1} V_0
+1:  */
+1: public class SequentialOutOfCoreSvd {
+1: 
+1:   private final CholeskyDecomposition l2;
+1:   private final SingularValueDecomposition svd;
+1:   private final CholeskyDecomposition r2;
+1:   private final int columnsPerSlice;
+1:   private final int seed;
+1:   private final int dim;
+1: 
+0:   public SequentialOutOfCoreSvd(Iterable<File> partsOfA, String uBase, String vBase, File tmpDir, int internalDimension, int columnsPerSlice) throws IOException {
+1:     this.columnsPerSlice = columnsPerSlice;
+1:     this.dim = internalDimension;
+1: 
+1:     seed = 1;
+1:     Matrix y2 = null;
+1: 
+1:     // step 1, compute R as in R'R = Y'Y where Y = A \Omega
+1:     for (File file : partsOfA) {
+1:       MatrixWritable m = new MatrixWritable();
+0:       m.readFields(new DataInputStream(new FileInputStream(file)));
+1: 
+1:       Matrix aI = m.get();
+0:       Matrix omega = new RandomTrinaryMatrix(seed, aI.numCols(), internalDimension, false);
+1:       Matrix y = aI.times(omega);
+1: 
+1:       if (y2 == null) {
+1:         y2 = y.transpose().times(y);
+1:       } else {
+1:         y2.assign(y.transpose().times(y), Functions.PLUS);
+1:       }
+1:     }
+1:     r2 = new CholeskyDecomposition(y2);
+1: 
+1:     // step 2, compute B
+1:     int ncols = 0;
+1:     for (File file : partsOfA) {
+1:       MatrixWritable m = new MatrixWritable();
+0:       m.readFields(new DataInputStream(new FileInputStream(file)));
+1:       Matrix aI = m.get();
+0:       ncols = Math.max(ncols, aI.numCols());
+1: 
+0:       for (int j = 0; j + columnsPerSlice <= aI.numCols(); j += columnsPerSlice) {
+0:         Matrix omega = new RandomTrinaryMatrix(seed, aI.numCols(), internalDimension, false);
+0:         Matrix bIJ = r2.solveLeft(aI.times(omega).transpose().times(aI.viewPart(0, aI.numRows(), j, columnsPerSlice)));
+1:         addToSavedCopy(bFile(tmpDir, j), bIJ);
+1:       }
+1:     }
+1: 
+1:     // step 3, compute BB', L and SVD(L)
+1:     Matrix b2 = new DenseMatrix(internalDimension, internalDimension);
+1:     MatrixWritable bTmp = new MatrixWritable();
+1:     for (int j = 0; j < ncols; j += columnsPerSlice) {
+1:       if (bFile(tmpDir, j).exists()) {
+0:         bTmp.readFields(new DataInputStream(new FileInputStream(bFile(tmpDir, j))));
+1:         b2.assign(bTmp.get().times(bTmp.get().transpose()), Functions.PLUS);
+1:       }
+1:     }
+1:     l2 = new CholeskyDecomposition(b2);
+1:     svd = new SingularValueDecomposition(l2.getL());
+1:   }
+1: 
+0:   public void computeV(File tmpDir, String vBase, int ncols) throws IOException {
+1:     // step 5, compute pieces of V
+0:     if (vBase != null) {
+1:       for (int j = 0; j < ncols; j += columnsPerSlice) {
+1:         if (bFile(tmpDir, j).exists()) {
+1:           MatrixWritable m = new MatrixWritable();
+0:           m.readFields(new DataInputStream(new FileInputStream(bFile(tmpDir, j))));
+0:           m.set(l2.solveRight(m.get().transpose()).times(svd.getV()));
+0:           m.write(new DataOutputStream(new FileOutputStream(new File(tmpDir, vBase + j / columnsPerSlice))));
+1:         }
+1:       }
+1:     }
+1:   }
+1: 
+0:   public void computeU(Iterable<File> partsOfA, String uBase, File tmpDir) throws IOException {
+1:     // step 4, compute pieces of U
+0:     if (uBase != null) {
+0:       int i = 0;
+1:       for (File file : partsOfA) {
+1:         MatrixWritable m = new MatrixWritable();
+0:         m.readFields(new DataInputStream(new FileInputStream(file)));
+1:         Matrix aI = m.get();
+1: 
+0:         Matrix y = aI.times(new RandomTrinaryMatrix(seed, aI.numCols(), dim, false).viewPart(i * columnsPerSlice, columnsPerSlice, 0, aI.numCols()));
+0:         m.set(r2.solveRight(y).times(svd.getU()));
+0:         m.write(new DataOutputStream(new FileOutputStream(new File(tmpDir, uBase + i))));
+0:         i++;
+1:       }
+1:     }
+1:   }
+1: 
+0:   private void addToSavedCopy(File file, Matrix matrix) throws IOException {
+1:     MatrixWritable mw = new MatrixWritable();
+1:     if (file.exists()) {
+0:       DataInputStream in = new DataInputStream(new FileInputStream(file));
+0:       try {
+1:         mw.readFields(in);
+0:       } finally {
+0:         in.close();
+1:       }
+1:       mw.get().assign(matrix, Functions.PLUS);
+1:     } else {
+1:       mw.set(matrix);
+1:     }
+0:     DataOutputStream out = new DataOutputStream(new FileOutputStream(file));
+0:     try {
+1:       mw.write(out);
+0:     } finally {
+0:       out.close();
+1:     }
+1:   }
+1: 
+0:   private File bFile(File tmpDir, int j) {
+1:     return new File(tmpDir, String.format("B-%09d", j));
+1:   }
+1: 
+1:   public Vector getSingularValues() {
+1:     return new DenseVector(svd.getSingularValues());
+1:   }
+1: }
+============================================================================

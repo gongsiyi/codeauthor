@@ -1,0 +1,1545 @@
+1:0160ad5: /*
+1:0160ad5:  * Licensed to the Apache Software Foundation (ASF) under one
+1:0160ad5:  * or more contributor license agreements.  See the NOTICE file
+1:0160ad5:  * distributed with this work for additional information
+1:0160ad5:  * regarding copyright ownership.  The ASF licenses this file
+1:0160ad5:  * to you under the Apache License, Version 2.0 (the
+1:0160ad5:  * "License"); you may not use this file except in compliance
+1:0160ad5:  * with the License.  You may obtain a copy of the License at
+3:0160ad5:  *
+1:066ef58:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:0160ad5:  *
+1:066ef58:  * Unless required by applicable law or agreed to in writing, software
+1:066ef58:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:066ef58:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:066ef58:  * See the License for the specific language governing permissions and
+1:066ef58:  * limitations under the License.
+1:0160ad5:  */
+1:e8fa865: package org.apache.cassandra.concurrent;
+1:0160ad5: 
+1:e8fa865: import java.util.concurrent.*;
+5:e8fa865: 
+1:0095f0c: import org.slf4j.Logger;
+1:0095f0c: import org.slf4j.LoggerFactory;
+1:5c94432: 
+1:5c94432: import static org.apache.cassandra.tracing.Tracing.isTracing;
+1:5c94432: 
+1:4ef269d: /**
+1:4ef269d:  * This class encorporates some Executor best practices for Cassandra.  Most of the executors in the system
+1:4ef269d:  * should use or extend this.  There are two main improvements over a vanilla TPE:
+1:4ef269d:  *
+1:4ef269d:  * - If a task throws an exception, the default uncaught exception handler will be invoked; if there is
+1:4ef269d:  *   no such handler, the exception will be logged.
+1:4ef269d:  * - MaximumPoolSize is not supported.  Here is what that means (quoting TPE javadoc):
+1:4ef269d:  *
+1:4ef269d:  *     If fewer than corePoolSize threads are running, the Executor always prefers adding a new thread rather than queuing.
+1:4ef269d:  *     If corePoolSize or more threads are running, the Executor always prefers queuing a request rather than adding a new thread.
+1:4ef269d:  *     If a request cannot be queued, a new thread is created unless this would exceed maximumPoolSize, in which case, the task will be rejected.
+1:4ef269d:  *
+1:4ef269d:  *   We don't want this last stage of creating new threads if the queue is full; it makes it needlessly difficult to
+1:4ef269d:  *   reason about the system's behavior.  In other words, if DebuggableTPE has allocated our maximum number of (core)
+1:4ef269d:  *   threads and the queue is full, we want the enqueuer to block.  But to allow the number of threads to drop if a
+1:4ef269d:  *   stage is less busy, core thread timeout is enabled.
+1:4ef269d:  */
+1:dbf6e62: public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements LocalAwareExecutorService
+13:e8fa865: {
+1:5a6e2b0:     protected static final Logger logger = LoggerFactory.getLogger(DebuggableThreadPoolExecutor.class);
+1:26dfdac:     public static final RejectedExecutionHandler blockingExecutionHandler = new RejectedExecutionHandler()
+1:26dfdac:     {
+1:26dfdac:         public void rejectedExecution(Runnable task, ThreadPoolExecutor executor)
+1:26dfdac:         {
+1:26dfdac:             ((DebuggableThreadPoolExecutor) executor).onInitialRejection(task);
+1:26dfdac:             BlockingQueue<Runnable> queue = executor.getQueue();
+1:26dfdac:             while (true)
+1:26dfdac:             {
+1:26dfdac:                 if (executor.isShutdown())
+1:26dfdac:                 {
+1:26dfdac:                     ((DebuggableThreadPoolExecutor) executor).onFinalRejection(task);
+1:26dfdac:                     throw new RejectedExecutionException("ThreadPoolExecutor has shut down");
+1:26dfdac:                 }
+1:26dfdac:                 try
+1:fbe8a6e:                 {
+1:26dfdac:                     if (queue.offer(task, 1000, TimeUnit.MILLISECONDS))
+1:5c94432:                     {
+1:26dfdac:                         ((DebuggableThreadPoolExecutor) executor).onFinalAccept(task);
+1:26dfdac:                         break;
+1:5c94432:                     }
+1:5c94432:                 }
+1:26dfdac:                 catch (InterruptedException e)
+1:5c94432:                 {
+1:26dfdac:                     throw new AssertionError(e);
+1:5c94432:                 }
+1:5c94432:             }
+1:a3545d3:         }
+1:26dfdac:     };
+1:5c94432: 
+1:5ab5e1b:     public DebuggableThreadPoolExecutor(String threadPoolName, int priority)
+1:5c94432:     {
+1:4ef269d:         this(1, Integer.MAX_VALUE, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(), new NamedThreadFactory(threadPoolName, priority));
+1:26dfdac:     }
+1:5c94432: 
+1:9f925e9:     public DebuggableThreadPoolExecutor(int corePoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> queue, ThreadFactory factory)
+1:a3545d3:     {
+1:9f925e9:         this(corePoolSize, corePoolSize, keepAliveTime, unit, queue, factory);
+1:26dfdac:     }
+1:5c94432: 
+1:fe1e7fc:     public DebuggableThreadPoolExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory)
+1:26dfdac:     {
+1:fe1e7fc:         super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory);
+1:4ef269d:         allowCoreThreadTimeOut(true);
+1:5c94432: 
+1:4c8242c:         // block task submissions until queue has room.
+1:4c8242c:         // this is fighting TPE's design a bit because TPE rejects if queue.offer reports a full queue.
+1:4c8242c:         // we'll just override this with a handler that retries until it gets in.  ugly, but effective.
+1:4ef269d:         // (there is an extensive analysis of the options here at
+1:4ef269d:         //  http://today.java.net/pub/a/today/2008/10/23/creating-a-notifying-blocking-thread-pool-executor.html)
+1:26dfdac:         this.setRejectedExecutionHandler(blockingExecutionHandler);
+1:1b0df38:     }
+1:5c94432: 
+1:5c94432:     /**
+1:f5866ca:      * Creates a thread pool that creates new threads as needed, but
+1:f5866ca:      * will reuse previously constructed threads when they are
+1:f5866ca:      * available.
+1:f5866ca:      * @param threadPoolName the name of the threads created by this executor
+1:f5866ca:      * @return The new DebuggableThreadPoolExecutor
+1:f5866ca:      */
+1:f5866ca:     public static DebuggableThreadPoolExecutor createCachedThreadpoolWithMaxSize(String threadPoolName)
+1:f5866ca:     {
+1:f5866ca:         return new DebuggableThreadPoolExecutor(0, Integer.MAX_VALUE,
+1:f5866ca:                                                 60L, TimeUnit.SECONDS,
+1:f5866ca:                                                 new SynchronousQueue<Runnable>(),
+1:f5866ca:                                                 new NamedThreadFactory(threadPoolName));
+1:f5866ca:     }
+1:f5866ca: 
+1:f5866ca:     /**
+1:263f192:      * Returns a ThreadPoolExecutor with a fixed number of threads.
+1:263f192:      * When all threads are actively executing tasks, new tasks are queued.
+1:263f192:      * If (most) threads are expected to be idle most of the time, prefer createWithMaxSize() instead.
+1:263f192:      * @param threadPoolName the name of the threads created by this executor
+1:263f192:      * @param size the fixed number of threads for this executor
+1:263f192:      * @return the new DebuggableThreadPoolExecutor
+1:3e3ebc3:      */
+1:263f192:     public static DebuggableThreadPoolExecutor createWithFixedPoolSize(String threadPoolName, int size)
+1:1b0df38:     {
+1:263f192:         return createWithMaximumPoolSize(threadPoolName, size, Integer.MAX_VALUE, TimeUnit.SECONDS);
+1:26dfdac:     }
+1:1b0df38: 
+1:3e3ebc3:     /**
+1:263f192:      * Returns a ThreadPoolExecutor with a fixed maximum number of threads, but whose
+1:263f192:      * threads are terminated when idle for too long.
+1:263f192:      * When all threads are actively executing tasks, new tasks are queued.
+1:263f192:      * @param threadPoolName the name of the threads created by this executor
+1:263f192:      * @param size the maximum number of threads for this executor
+1:263f192:      * @param keepAliveTime the time an idle thread is kept alive before being terminated
+1:263f192:      * @param unit tht time unit for {@code keepAliveTime}
+1:263f192:      * @return the new DebuggableThreadPoolExecutor
+1:3e3ebc3:      */
+1:263f192:     public static DebuggableThreadPoolExecutor createWithMaximumPoolSize(String threadPoolName, int size, int keepAliveTime, TimeUnit unit)
+1:26dfdac:     {
+1:263f192:         return new DebuggableThreadPoolExecutor(size, Integer.MAX_VALUE, keepAliveTime, unit, new LinkedBlockingQueue<Runnable>(), new NamedThreadFactory(threadPoolName));
+1:26dfdac:     }
+1:e8fa865: 
+1:80bfd0b:     protected void onInitialRejection(Runnable task) {}
+1:80bfd0b:     protected void onFinalAccept(Runnable task) {}
+1:80bfd0b:     protected void onFinalRejection(Runnable task) {}
+1:fbe8a6e: 
+1:dbf6e62:     public void execute(Runnable command, ExecutorLocals locals)
+1:fbe8a6e:     {
+1:dbf6e62:         super.execute(locals == null || command instanceof LocalSessionWrapper
+1:b8b96bd:                       ? command
+1:dbf6e62:                       : new LocalSessionWrapper<Object>(command, locals));
+1:fbe8a6e:     }
+1:e8fa865: 
+1:5420b7a:     public void maybeExecuteImmediately(Runnable command)
+1:26dfdac:     {
+1:5420b7a:         execute(command);
+1:26dfdac:     }
+1:e8fa865: 
+1:5c94432:     // execute does not call newTaskFor
+1:5c94432:     @Override
+1:5c94432:     public void execute(Runnable command)
+1:5c94432:     {
+1:dbf6e62:         super.execute(isTracing() && !(command instanceof LocalSessionWrapper)
+1:dbf6e62:                       ? new LocalSessionWrapper<Object>(Executors.callable(command, null))
+1:5c94432:                       : command);
+1:5c94432:     }
+1:5c94432: 
+1:5c94432:     @Override
+1:5c94432:     protected <T> RunnableFuture<T> newTaskFor(Runnable runnable, T result)
+1:5c94432:     {
+1:dbf6e62:         if (isTracing() && !(runnable instanceof LocalSessionWrapper))
+1:5c94432:         {
+1:dbf6e62:             return new LocalSessionWrapper<T>(Executors.callable(runnable, result));
+1:5c94432:         }
+1:5c94432:         return super.newTaskFor(runnable, result);
+1:5c94432:     }
+1:5c94432: 
+1:5c94432:     @Override
+1:5c94432:     protected <T> RunnableFuture<T> newTaskFor(Callable<T> callable)
+1:5c94432:     {
+1:dbf6e62:         if (isTracing() && !(callable instanceof LocalSessionWrapper))
+1:5c94432:         {
+1:dbf6e62:             return new LocalSessionWrapper<T>(callable);
+1:5c94432:         }
+1:5c94432:         return super.newTaskFor(callable);
+1:5c94432:     }
+1:5c94432: 
+1:5c94432:     @Override
+1:185eca5:     protected void afterExecute(Runnable r, Throwable t)
+1:5c94432:     {
+1:5c94432:         super.afterExecute(r, t);
+1:5c94432: 
+1:6e6a6c3:         maybeResetTraceSessionWrapper(r);
+1:6e6a6c3:         logExceptionsAfterExecute(r, t);
+1:6e6a6c3:     }
+1:6e6a6c3: 
+1:6e6a6c3:     protected static void maybeResetTraceSessionWrapper(Runnable r)
+1:6e6a6c3:     {
+1:dbf6e62:         if (r instanceof LocalSessionWrapper)
+1:5c94432:         {
+1:dbf6e62:             LocalSessionWrapper tsw = (LocalSessionWrapper) r;
+1:5c94432:             // we have to reset trace state as its presence is what denotes the current thread is tracing
+1:5c94432:             // and if left this thread might start tracing unrelated tasks
+1:36b40be:             tsw.reset();
+1:5c94432:         }
+1:5c94432:     }
+1:5c94432: 
+1:5c94432:     @Override
+1:5c94432:     protected void beforeExecute(Thread t, Runnable r)
+1:5c94432:     {
+1:dbf6e62:         if (r instanceof LocalSessionWrapper)
+1:dbf6e62:             ((LocalSessionWrapper) r).setupContext();
+1:5c94432: 
+1:5c94432:         super.beforeExecute(t, r);
+1:5c94432:     }
+1:5c94432: 
+1:eac19fe:     /**
+1:eac19fe:      * Send @param t and any exception wrapped by @param r to the default uncaught exception handler,
+1:eac19fe:      * or log them if none such is set up
+1:eac19fe:      */
+1:7b03e7e:     public static void logExceptionsAfterExecute(Runnable r, Throwable t)
+1:7b03e7e:     {
+1:eac19fe:         Throwable hiddenThrowable = extractThrowable(r);
+1:eac19fe:         if (hiddenThrowable != null)
+1:eac19fe:             handleOrLog(hiddenThrowable);
+1:508503d: 
+1:eac19fe:         // ThreadPoolExecutor will re-throw exceptions thrown by its Task (which will be seen by
+1:eac19fe:         // the default uncaught exception handler) so we only need to do anything if that handler
+1:eac19fe:         // isn't set up yet.
+1:eac19fe:         if (t != null && Thread.getDefaultUncaughtExceptionHandler() == null)
+1:508503d:             handleOrLog(t);
+1:508503d:     }
+1:508503d: 
+1:eac19fe:     /**
+1:eac19fe:      * Send @param t to the default uncaught exception handler, or log it if none such is set up
+1:eac19fe:      */
+1:508503d:     public static void handleOrLog(Throwable t)
+1:508503d:     {
+1:508503d:         if (Thread.getDefaultUncaughtExceptionHandler() == null)
+1:508503d:             logger.error("Error in ThreadPoolExecutor", t);
+1:508503d:         else
+1:508503d:             Thread.getDefaultUncaughtExceptionHandler().uncaughtException(Thread.currentThread(), t);
+1:508503d:     }
+1:508503d: 
+1:eac19fe:     /**
+1:eac19fe:      * @return any exception wrapped by @param runnable, i.e., if it is a FutureTask
+1:eac19fe:      */
+1:eac19fe:     public static Throwable extractThrowable(Runnable runnable)
+1:508503d:     {
+1:4deb779:         // Check for exceptions wrapped by FutureTask.  We do this by calling get(), which will
+1:4deb779:         // cause it to throw any saved exception.
+1:4deb779:         //
+1:4deb779:         // Complicating things, calling get() on a ScheduledFutureTask will block until the task
+1:4deb779:         // is cancelled.  Hence, the extra isDone check beforehand.
+1:eac19fe:         if ((runnable instanceof Future<?>) && ((Future<?>) runnable).isDone())
+1:4ef269d:         {
+1:4ef269d:             try
+1:b2978d2:             {
+1:eac19fe:                 ((Future<?>) runnable).get();
+1:7b03e7e:             }
+1:4ef269d:             catch (InterruptedException e)
+1:e8fa865:             {
+1:4ef269d:                 throw new AssertionError(e);
+1:4ef269d:             }
+1:a3545d3:             catch (CancellationException e)
+1:e8fa865:             {
+1:4a849ef:                 logger.trace("Task cancelled", e);
+1:4ef269d:             }
+1:e8fa865:             catch (ExecutionException e)
+1:e8fa865:             {
+1:508503d:                 return e.getCause();
+1:b2978d2:             }
+13:e8fa865:         }
+1:e8fa865: 
+1:508503d:         return null;
+1:e8fa865:     }
+1:508503d: 
+1:3e3ebc3:     /**
+1:dbf6e62:      * Used to wrap a Runnable or Callable passed to submit or execute so we can clone the ExecutorLocals and move
+1:dbf6e62:      * them into the worker thread.
+1:5c94432:      *
+1:5c94432:      * @param <T>
+1:5c94432:      */
+1:dbf6e62:     private static class LocalSessionWrapper<T> extends FutureTask<T>
+1:5c94432:     {
+1:dbf6e62:         private final ExecutorLocals locals;
+1:5c94432: 
+1:dbf6e62:         public LocalSessionWrapper(Callable<T> callable)
+1:5c94432:         {
+1:5c94432:             super(callable);
+1:dbf6e62:             locals = ExecutorLocals.create();
+1:5c94432:         }
+1:5c94432: 
+1:dbf6e62:         public LocalSessionWrapper(Runnable command, ExecutorLocals locals)
+1:5c94432:         {
+1:fbe8a6e:             super(command, null);
+1:dbf6e62:             this.locals = locals;
+1:fbe8a6e:         }
+1:fbe8a6e: 
+1:5c94432:         private void setupContext()
+1:5c94432:         {
+1:dbf6e62:             ExecutorLocals.set(locals);
+1:5c94432:         }
+1:5c94432: 
+1:5c94432:         private void reset()
+1:5c94432:         {
+1:dbf6e62:             ExecutorLocals.set(null);
+1:5c94432:         }
+1:5c94432:     }
+1:e8fa865: }
+============================================================================
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:087264f
+/////////////////////////////////////////////////////////////////////////
+author:Carl Yeksigian
+-------------------------------------------------------------------------------
+commit:dbf6e62
+/////////////////////////////////////////////////////////////////////////
+1: public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements LocalAwareExecutorService
+/////////////////////////////////////////////////////////////////////////
+1:     public void execute(Runnable command, ExecutorLocals locals)
+1:         super.execute(locals == null || command instanceof LocalSessionWrapper
+1:                       : new LocalSessionWrapper<Object>(command, locals));
+/////////////////////////////////////////////////////////////////////////
+1:         super.execute(isTracing() && !(command instanceof LocalSessionWrapper)
+1:                       ? new LocalSessionWrapper<Object>(Executors.callable(command, null))
+1:         if (isTracing() && !(runnable instanceof LocalSessionWrapper))
+1:             return new LocalSessionWrapper<T>(Executors.callable(runnable, result));
+/////////////////////////////////////////////////////////////////////////
+1:         if (isTracing() && !(callable instanceof LocalSessionWrapper))
+1:             return new LocalSessionWrapper<T>(callable);
+/////////////////////////////////////////////////////////////////////////
+1:         if (r instanceof LocalSessionWrapper)
+1:             LocalSessionWrapper tsw = (LocalSessionWrapper) r;
+/////////////////////////////////////////////////////////////////////////
+1:         if (r instanceof LocalSessionWrapper)
+1:             ((LocalSessionWrapper) r).setupContext();
+/////////////////////////////////////////////////////////////////////////
+1:      * Used to wrap a Runnable or Callable passed to submit or execute so we can clone the ExecutorLocals and move
+1:      * them into the worker thread.
+1:     private static class LocalSessionWrapper<T> extends FutureTask<T>
+1:         private final ExecutorLocals locals;
+1:         public LocalSessionWrapper(Callable<T> callable)
+1:             locals = ExecutorLocals.create();
+1:         public LocalSessionWrapper(Runnable command, ExecutorLocals locals)
+1:             this.locals = locals;
+1:             ExecutorLocals.set(locals);
+1:             ExecutorLocals.set(null);
+author:Paulo Motta
+-------------------------------------------------------------------------------
+commit:4a849ef
+/////////////////////////////////////////////////////////////////////////
+1:                 logger.trace("Task cancelled", e);
+author:Ben Chan
+-------------------------------------------------------------------------------
+commit:f5866ca
+/////////////////////////////////////////////////////////////////////////
+1:      * Creates a thread pool that creates new threads as needed, but
+1:      * will reuse previously constructed threads when they are
+1:      * available.
+1:      * @param threadPoolName the name of the threads created by this executor
+1:      * @return The new DebuggableThreadPoolExecutor
+1:      */
+1:     public static DebuggableThreadPoolExecutor createCachedThreadpoolWithMaxSize(String threadPoolName)
+1:     {
+1:         return new DebuggableThreadPoolExecutor(0, Integer.MAX_VALUE,
+1:                                                 60L, TimeUnit.SECONDS,
+1:                                                 new SynchronousQueue<Runnable>(),
+1:                                                 new NamedThreadFactory(threadPoolName));
+1:     }
+1: 
+1:     /**
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:33de6dc
+commit:6e6a6c3
+/////////////////////////////////////////////////////////////////////////
+1:         maybeResetTraceSessionWrapper(r);
+1:         logExceptionsAfterExecute(r, t);
+1:     }
+1: 
+1:     protected static void maybeResetTraceSessionWrapper(Runnable r)
+1:     {
+/////////////////////////////////////////////////////////////////////////
+commit:15df669
+/////////////////////////////////////////////////////////////////////////
+0:             state = Tracing.instance.get();
+/////////////////////////////////////////////////////////////////////////
+0:             Tracing.instance.set(state);
+0:             Tracing.instance.set(null);
+commit:b8b96bd
+/////////////////////////////////////////////////////////////////////////
+0:         super.execute(state == null || command instanceof TraceSessionWrapper
+1:                       ? command
+0:                       : new TraceSessionWrapper<Object>(command, state));
+/////////////////////////////////////////////////////////////////////////
+0:                       ? new TraceSessionWrapper<Object>(Executors.callable(command, null))
+/////////////////////////////////////////////////////////////////////////
+commit:110d283
+/////////////////////////////////////////////////////////////////////////
+0:         super.execute(state == null || command instanceof TraceSessionWrapper
+0:                       ? command
+0:                       : new TraceSessionWrapper<Object>(command, state));
+/////////////////////////////////////////////////////////////////////////
+0:                       ? new TraceSessionWrapper<Object>(Executors.callable(command, null))
+/////////////////////////////////////////////////////////////////////////
+commit:fbe8a6e
+/////////////////////////////////////////////////////////////////////////
+0: public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements TracingAwareExecutorService
+/////////////////////////////////////////////////////////////////////////
+0:     public void execute(Runnable command, TraceState state)
+1:     {
+0:         super.execute(state == null ? command : new TraceSessionWrapper<Object>(command, state));
+1:     }
+1: 
+0:                       ? new TraceSessionWrapper<Object>(command)
+/////////////////////////////////////////////////////////////////////////
+0:             return new TraceSessionWrapper<T>(Executors.callable(runnable, result));
+/////////////////////////////////////////////////////////////////////////
+0:         public TraceSessionWrapper(Runnable command)
+0:             this(command, null);
+/////////////////////////////////////////////////////////////////////////
+0:         public TraceSessionWrapper(Runnable command, TraceState state)
+1:         {
+1:             super(command, null);
+0:             this.state = state;
+1:         }
+1: 
+commit:36b40be
+/////////////////////////////////////////////////////////////////////////
+0:             TraceSessionWrapper tsw = (TraceSessionWrapper) r;
+1:             tsw.reset();
+/////////////////////////////////////////////////////////////////////////
+0:     private static class TraceSessionWrapper<T> extends FutureTask<T>
+0:             state = Tracing.instance().get();
+0:             state = Tracing.instance().get();
+/////////////////////////////////////////////////////////////////////////
+commit:5c94432
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.tracing.TraceState;
+0: import org.apache.cassandra.tracing.Tracing;
+1: 
+1: import static org.apache.cassandra.tracing.Tracing.isTracing;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     // execute does not call newTaskFor
+1:     @Override
+1:     public void execute(Runnable command)
+1:     {
+0:         super.execute(isTracing() && !(command instanceof TraceSessionWrapper)
+0:                       ? new TraceSessionWrapper<Object>(command, null)
+1:                       : command);
+1:     }
+1: 
+1:     @Override
+1:     protected <T> RunnableFuture<T> newTaskFor(Runnable runnable, T result)
+1:     {
+0:         if (isTracing() && !(runnable instanceof TraceSessionWrapper))
+1:         {
+0:             return new TraceSessionWrapper<T>(runnable, result);
+1:         }
+1:         return super.newTaskFor(runnable, result);
+1:     }
+1: 
+1:     @Override
+1:     protected <T> RunnableFuture<T> newTaskFor(Callable<T> callable)
+1:     {
+0:         if (isTracing() && !(callable instanceof TraceSessionWrapper))
+1:         {
+0:             return new TraceSessionWrapper<T>(callable);
+1:         }
+1:         return super.newTaskFor(callable);
+1:     }
+1: 
+1:         super.afterExecute(r, t);
+1: 
+0:         if (r instanceof TraceSessionWrapper)
+1:         {
+0:             logger.debug("completed executing {}", r);
+1:             // we have to reset trace state as its presence is what denotes the current thread is tracing
+1:             // and if left this thread might start tracing unrelated tasks
+0:             ((TraceSessionWrapper)r).reset();
+1:         }
+1:         
+1:     @Override
+1:     protected void beforeExecute(Thread t, Runnable r)
+1:     {
+0:         if (r instanceof TraceSessionWrapper)
+1:         {
+0:             logger.debug("executing {}", r);
+0:             ((TraceSessionWrapper) r).setupContext();
+1:         }
+1: 
+1:         super.beforeExecute(t, r);
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     /**
+0:      * Used to wrap a Runnable or Callable passed to submit or execute so we can clone the TraceSessionContext and move
+0:      * it into the worker thread.
+1:      *
+1:      * @param <T>
+1:      */
+0:     private static class TraceSessionWrapper<T> extends FutureTask<T> implements Callable<T>
+1:     {
+0:         private final TraceState state;
+0:         private Callable<T> callable;
+1: 
+0:         // Using initializer because the ctor's provided by the FutureTask<> are all we need
+1:         {
+0:             state = Tracing.instance().get();
+1:         }
+1: 
+0:         public TraceSessionWrapper(Runnable runnable, T result)
+1:         {
+0:             super(runnable, result);
+1:         }
+1: 
+0:         public TraceSessionWrapper(Callable<T> callable)
+1:         {
+1:             super(callable);
+0:             this.callable = callable;
+1:         }
+1: 
+1:         private void setupContext()
+1:         {
+0:             Tracing.instance().set(state);
+1:         }
+1: 
+1:         private void reset()
+1:         {
+0:             Tracing.instance().set(null);
+1:         }
+1: 
+0:         public T call() throws Exception
+1:         {
+0:             return callable.call();
+1:         }
+1: 
+1:         @Override
+0:         public String toString()
+1:         {
+0:             return "TraceSessionWrapper{" +
+0:                    "state=" + state +
+0:                    ", callable=" + callable +
+0:                    '}';
+1:         }
+1:     }
+commit:744acdf
+commit:eac19fe
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Send @param t and any exception wrapped by @param r to the default uncaught exception handler,
+1:      * or log them if none such is set up
+1:      */
+1:         Throwable hiddenThrowable = extractThrowable(r);
+1:         if (hiddenThrowable != null)
+1:             handleOrLog(hiddenThrowable);
+1:         // ThreadPoolExecutor will re-throw exceptions thrown by its Task (which will be seen by
+1:         // the default uncaught exception handler) so we only need to do anything if that handler
+1:         // isn't set up yet.
+1:         if (t != null && Thread.getDefaultUncaughtExceptionHandler() == null)
+1:     /**
+1:      * Send @param t to the default uncaught exception handler, or log it if none such is set up
+1:      */
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * @return any exception wrapped by @param runnable, i.e., if it is a FutureTask
+1:      */
+1:     public static Throwable extractThrowable(Runnable runnable)
+1:         if ((runnable instanceof Future<?>) && ((Future<?>) runnable).isDone())
+1:                 ((Future<?>) runnable).get();
+/////////////////////////////////////////////////////////////////////////
+commit:a4fc7e2
+commit:185eca5
+/////////////////////////////////////////////////////////////////////////
+1:     protected void afterExecute(Runnable r, Throwable t)
+commit:508503d
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         if (t == null)
+0:             t = extractThrowable(r);
+1: 
+0:         if (t != null)
+1:             handleOrLog(t);
+1:     }
+1: 
+1:     public static void handleOrLog(Throwable t)
+1:     {
+1:         if (Thread.getDefaultUncaughtExceptionHandler() == null)
+1:             logger.error("Error in ThreadPoolExecutor", t);
+1:         else
+1:             Thread.getDefaultUncaughtExceptionHandler().uncaughtException(Thread.currentThread(), t);
+1:     }
+1: 
+0:     public static Throwable extractThrowable(Runnable r)
+1:     {
+/////////////////////////////////////////////////////////////////////////
+1:                 return e.getCause();
+1:         return null;
+1: 
+commit:050c6b3
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:                 if (Thread.getDefaultUncaughtExceptionHandler() == null)
+0:                     logger.error("Error in ThreadPoolExecutor", e.getCause());
+0:                     Thread.getDefaultUncaughtExceptionHandler().uncaughtException(Thread.currentThread(), e.getCause());
+commit:fe1e7fc
+/////////////////////////////////////////////////////////////////////////
+1:     public DebuggableThreadPoolExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory)
+1:         super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory);
+commit:1b0df38
+/////////////////////////////////////////////////////////////////////////
+0:     public static DebuggableThreadPoolExecutor createWithPoolSize(String threadPoolName, int size)
+1:     {
+0:         return new DebuggableThreadPoolExecutor(size, Integer.MAX_VALUE, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(), new NamedThreadFactory(threadPoolName));
+1:     }
+1: 
+commit:a3545d3
+/////////////////////////////////////////////////////////////////////////
+1:             catch (CancellationException e)
+1:             {
+0:                 logger.debug("Task cancelled", e);
+1:             }
+commit:26dfdac
+/////////////////////////////////////////////////////////////////////////
+1:     public static final RejectedExecutionHandler blockingExecutionHandler = new RejectedExecutionHandler()
+1:     {
+1:         public void rejectedExecution(Runnable task, ThreadPoolExecutor executor)
+1:         {
+1:             ((DebuggableThreadPoolExecutor) executor).onInitialRejection(task);
+1:             BlockingQueue<Runnable> queue = executor.getQueue();
+1:             while (true)
+1:             {
+1:                 if (executor.isShutdown())
+1:                 {
+1:                     ((DebuggableThreadPoolExecutor) executor).onFinalRejection(task);
+1:                     throw new RejectedExecutionException("ThreadPoolExecutor has shut down");
+1:                 }
+1:                 try
+1:                 {
+1:                     if (queue.offer(task, 1000, TimeUnit.MILLISECONDS))
+1:                     {
+1:                         ((DebuggableThreadPoolExecutor) executor).onFinalAccept(task);
+1:                         break;
+1:                     }
+1:                 }
+1:                 catch (InterruptedException e)
+1:                 {
+1:                     throw new AssertionError(e);
+1:                 }
+1:             }
+1:         }
+1:     };
+/////////////////////////////////////////////////////////////////////////
+1:         this.setRejectedExecutionHandler(blockingExecutionHandler);
+commit:6652b5d
+commit:4c8242c
+/////////////////////////////////////////////////////////////////////////
+1:         // block task submissions until queue has room.
+1:         // this is fighting TPE's design a bit because TPE rejects if queue.offer reports a full queue.
+1:         // we'll just override this with a handler that retries until it gets in.  ugly, but effective.
+commit:be44f37
+commit:7b03e7e
+/////////////////////////////////////////////////////////////////////////
+0:     @Override
+0:         logExceptionsAfterExecute(r, t);
+1:     }
+1:     public static void logExceptionsAfterExecute(Runnable r, Throwable t)
+1:     {
+/////////////////////////////////////////////////////////////////////////
+0:                 if (Thread.getDefaultUncaughtExceptionHandler() == null)
+0:                     logger.error("Error in ThreadPoolExecutor", e.getCause());
+0:                 else
+/////////////////////////////////////////////////////////////////////////
+0:             if (Thread.getDefaultUncaughtExceptionHandler() == null)
+0:                 logger.error("Error in ThreadPoolExecutor", t);
+0:             else
+0:                 Thread.getDefaultUncaughtExceptionHandler().uncaughtException(Thread.currentThread(), t);
+commit:4ef269d
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * This class encorporates some Executor best practices for Cassandra.  Most of the executors in the system
+1:  * should use or extend this.  There are two main improvements over a vanilla TPE:
+1:  *
+1:  * - If a task throws an exception, the default uncaught exception handler will be invoked; if there is
+1:  *   no such handler, the exception will be logged.
+1:  * - MaximumPoolSize is not supported.  Here is what that means (quoting TPE javadoc):
+1:  *
+1:  *     If fewer than corePoolSize threads are running, the Executor always prefers adding a new thread rather than queuing.
+1:  *     If corePoolSize or more threads are running, the Executor always prefers queuing a request rather than adding a new thread.
+1:  *     If a request cannot be queued, a new thread is created unless this would exceed maximumPoolSize, in which case, the task will be rejected.
+1:  *
+1:  *   We don't want this last stage of creating new threads if the queue is full; it makes it needlessly difficult to
+1:  *   reason about the system's behavior.  In other words, if DebuggableTPE has allocated our maximum number of (core)
+1:  *   threads and the queue is full, we want the enqueuer to block.  But to allow the number of threads to drop if a
+1:  *   stage is less busy, core thread timeout is enabled.
+1:  */
+1:         this(1, Integer.MAX_VALUE, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(), new NamedThreadFactory(threadPoolName, priority));
+0:     public DebuggableThreadPoolExecutor(int corePoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory)
+0:         super(corePoolSize, corePoolSize, keepAliveTime, unit, workQueue, threadFactory);
+1:         allowCoreThreadTimeOut(true);
+0:         // preserve task serialization.  this is more complicated than it needs to be,
+0:         // since TPE rejects if queue.offer reports a full queue.  we'll just
+0:         // override this with a handler that retries until it gets in.  ugly, but effective.
+1:         // (there is an extensive analysis of the options here at
+1:         //  http://today.java.net/pub/a/today/2008/10/23/creating-a-notifying-blocking-thread-pool-executor.html)
+0:         this.setRejectedExecutionHandler(new RejectedExecutionHandler()
+0:             public void rejectedExecution(Runnable task, ThreadPoolExecutor executor)
+0:                 BlockingQueue<Runnable> queue = executor.getQueue();
+0:                 while (true)
+0:                     if (executor.isShutdown())
+0:                         throw new RejectedExecutionException("ThreadPoolExecutor has shut down");
+1:                     try
+0:                         if (queue.offer(task, 1000, TimeUnit.MILLISECONDS))
+0:                             break;
+1:                     }
+1:                     catch (InterruptedException e)
+1:                     {
+1:                         throw new AssertionError(e);
+1:             }
+0:         });
+commit:6a0df02
+/////////////////////////////////////////////////////////////////////////
+0:         if (r instanceof FutureTask<?>)
+0:                 ((FutureTask<?>) r).get();
+commit:6d3aacd
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:                 if (Thread.getDefaultUncaughtExceptionHandler() != null)
+/////////////////////////////////////////////////////////////////////////
+0:             logger.error("Error in ThreadPoolExecutor", t);
+commit:b2978d2
+/////////////////////////////////////////////////////////////////////////
+0:     @Override
+0:         logTaskException(r, t);
+1:     }
+0:     static void logTaskException(Runnable r, Throwable t)
+1:     {
+/////////////////////////////////////////////////////////////////////////
+0:                 if (Thread.getDefaultUncaughtExceptionHandler() == null)
+0:                     logger.error("Error in executor task", e.getCause());
+0:                 else
+/////////////////////////////////////////////////////////////////////////
+0:             if (Thread.getDefaultUncaughtExceptionHandler() == null)
+0:                 logger.error("Error in executor task", t);
+0:             else
+0:                 Thread.getDefaultUncaughtExceptionHandler().uncaughtException(Thread.currentThread(), t);
+commit:a7ec065
+/////////////////////////////////////////////////////////////////////////
+0:     protected static Logger logger = LoggerFactory.getLogger(DebuggableThreadPoolExecutor.class);
+commit:8520c38
+/////////////////////////////////////////////////////////////////////////
+0:                 if (Thread.getDefaultUncaughtExceptionHandler() != null)
+0:                     Thread.getDefaultUncaughtExceptionHandler().uncaughtException(Thread.currentThread(), e.getCause());
+commit:375a124
+/////////////////////////////////////////////////////////////////////////
+0:                 Thread.getDefaultUncaughtExceptionHandler().uncaughtException(Thread.currentThread(), e.getCause());
+commit:5ab5e1b
+/////////////////////////////////////////////////////////////////////////
+1:     public DebuggableThreadPoolExecutor(String threadPoolName, int priority)
+0:         this(1, 1, Integer.MAX_VALUE, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(), new NamedThreadFactory(threadPoolName, priority));
+commit:0b2ba99
+/////////////////////////////////////////////////////////////////////////
+0:                 Thread.getDefaultUncaughtExceptionHandler().uncaughtException(Thread.currentThread(), e);
+commit:0160ad5
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * 
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  * 
+0:  *   http://www.apache.org/licenses/LICENSE-2.0
+1:  * 
+0:  * Unless required by applicable law or agreed to in writing,
+0:  * software distributed under the License is distributed on an
+0:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+0:  * KIND, either express or implied.  See the License for the
+0:  * specific language governing permissions and limitations
+0:  * under the License.
+1:  * 
+1:  */
+1: 
+commit:e8fa865
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.cassandra.concurrent;
+1: 
+1: import java.util.concurrent.*;
+1: 
+0: import org.apache.log4j.Logger;
+1: 
+0: public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor
+1: {
+0:     protected static Logger logger = Logger.getLogger(JMXEnabledThreadPoolExecutor.class);
+1: 
+0:     public DebuggableThreadPoolExecutor(String threadPoolName)
+1:     {
+0:         this(1, 1, Integer.MAX_VALUE, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(), new NamedThreadFactory(threadPoolName));
+1:     }
+1: 
+0:     public DebuggableThreadPoolExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory)
+1:     {
+0:         super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory);
+1: 
+0:         if (maximumPoolSize > 1)
+1:         {
+0:             // clearly strict serialization is not a requirement.  just make the calling thread execute.
+0:             this.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+1:         }
+0:         else
+1:         {
+0:             // preserve task serialization.  this is more complicated than it needs to be,
+0:             // since TPE rejects if queue.offer reports a full queue.  we'll just
+0:             // override this with a handler that retries until it gets in.  ugly, but effective.
+0:             // (there is an extensive analysis of the options here at
+0:             //  http://today.java.net/pub/a/today/2008/10/23/creating-a-notifying-blocking-thread-pool-executor.html)
+0:             this.setRejectedExecutionHandler(new RejectedExecutionHandler()
+1:             {
+0:                 public void rejectedExecution(Runnable task, ThreadPoolExecutor executor)
+1:                 {
+0:                     BlockingQueue<Runnable> queue = executor.getQueue();
+0:                     while (true)
+1:                     {
+0:                         if (executor.isShutdown())
+0:                             throw new RejectedExecutionException("ThreadPoolExecutor has shut down");
+0:                         try
+1:                         {
+0:                             if (queue.offer(task, 1000, TimeUnit.MILLISECONDS))
+0:                                 break;
+1:                         }
+0:                         catch (InterruptedException e)
+1:                         {
+0:                             throw new AssertionError(e);    
+1:                         }
+1:                     }
+1:                 }
+0:             });
+1:         }
+1:     }
+1: 
+0:     public void afterExecute(Runnable r, Throwable t)
+1:     {
+0:         super.afterExecute(r,t);
+1: 
+0:         // exceptions wrapped by FutureTask
+0:         if (r instanceof FutureTask)
+1:         {
+0:             try
+1:             {
+0:                 ((FutureTask) r).get();
+1:             }
+0:             catch (InterruptedException e)
+1:             {
+0:                 throw new AssertionError(e);
+1:             }
+1:             catch (ExecutionException e)
+1:             {
+0:                 logger.error("Error in executor futuretask", e);
+1:             }
+1:         }
+1: 
+0:         // exceptions for non-FutureTask runnables [i.e., added via execute() instead of submit()]
+0:         if (t != null)
+1:         {
+0:             logger.error("Error in ThreadPoolExecutor", t);
+1:         }
+1:     }
+1: }
+commit:b4c7f55
+/////////////////////////////////////////////////////////////////////////
+0: package org.apache.cassandra.concurrent;
+0: 
+0: import java.util.concurrent.*;
+0: 
+0: import org.apache.log4j.Logger;
+0: 
+0: public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor
+0: {
+0:     protected static Logger logger = Logger.getLogger(JMXEnabledThreadPoolExecutor.class);
+0: 
+0:     public DebuggableThreadPoolExecutor(String threadPoolName)
+0:     {
+0:         this(1, 1, Integer.MAX_VALUE, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(), new NamedThreadFactory(threadPoolName));
+0:     }
+0: 
+0:     public DebuggableThreadPoolExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory)
+0:     {
+0:         super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory);
+0: 
+0:         if (maximumPoolSize > 1)
+0:         {
+0:             this.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+0:         }
+0:         else
+0:         {
+0:             // preserve task serialization.  this is more complicated than it needs to be,
+0:             // since TPE rejects if queue.offer reports a full queue.
+0:             // the easiest option (since most of TPE.execute deals with private members)
+0:             // appears to be to wrap the given queue class with one whose offer
+0:             // simply delegates to put().  this would be ugly, since it violates both
+0:             // the spirit and letter of queue.offer, but effective.
+0:             // so far, though, all our serialized executors use unbounded queues,
+0:             // so actually implementing this has not been necessary.
+0:             this.setRejectedExecutionHandler(new RejectedExecutionHandler()
+0:             {
+0:                 public void rejectedExecution(Runnable r, ThreadPoolExecutor executor)
+0:                 {
+0:                     throw new AssertionError("Blocking serialized executor is not yet implemented");
+0:                 }
+0:             });
+0:         }
+0:     }
+0: 
+0:     public void afterExecute(Runnable r, Throwable t)
+0:     {
+0:         super.afterExecute(r,t);
+0: 
+0:         // exceptions wrapped by FutureTask
+0:         if (r instanceof FutureTask)
+0:         {
+0:             try
+0:             {
+0:                 ((FutureTask) r).get();
+0:             }
+0:             catch (InterruptedException e)
+0:             {
+0:                 throw new AssertionError(e);
+0:             }
+0:             catch (ExecutionException e)
+0:             {
+0:                 logger.error("Error in executor futuretask", e);
+0:             }
+0:         }
+0: 
+0:         // exceptions for non-FutureTask runnables [i.e., added via execute() instead of submit()]
+0:         if (t != null)
+0:         {
+0:             logger.error("Error in ThreadPoolExecutor", t);
+0:         }
+0:     }
+0: }
+commit:360d9b6
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.List;
+/////////////////////////////////////////////////////////////////////////
+0:     private final String mbeanName;
+/////////////////////////////////////////////////////////////////////////
+0:         mbeanName = "org.apache.cassandra.concurrent:type=" + threadFactory.id;
+0:             mbs.registerMBean(this, new ObjectName(mbeanName));
+/////////////////////////////////////////////////////////////////////////
+0:     private void unregisterMBean()
+0:     {
+0:         try
+0:         {
+0:             ManagementFactory.getPlatformMBeanServer().unregisterMBean(new ObjectName(mbeanName));
+0:         }
+0:         catch (Exception ex)
+0:         {
+0:             // don't let it get in the way, but notify.
+0:             logger_.error(ex.getMessage(), ex);
+0:         }
+0:     }
+0: 
+0:     @Override
+0:     public void shutdown()
+0:     {
+0:         unregisterMBean();
+0:         super.shutdown();
+0:     }
+0: 
+0:     @Override
+0:     public List<Runnable> shutdownNow()
+0:     {
+0:         unregisterMBean();
+0:         return super.shutdownNow();
+0:     }
+0: 
+commit:3e3ebc3
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+0:      * Get the number of completed tasks
+1:      */
+0:     public long getCompletedTasks()
+0:     {
+0:         return getCompletedTaskCount();
+0:     }
+0: 
+1:     /**
+0:      * Get the number of tasks waiting to be executed
+1:      */
+commit:4e0c6e6
+/////////////////////////////////////////////////////////////////////////
+0:                                         int maximumPoolSize,
+0:                                         long keepAliveTime,
+0:                                         TimeUnit unit,
+0:                                         BlockingQueue<Runnable> workQueue,
+0:                                         NamedThreadFactory threadFactory)
+/////////////////////////////////////////////////////////////////////////
+0:             mbs.registerMBean(this, new ObjectName("org.apache.cassandra.concurrent:type=" + threadFactory.id));
+0: 
+0:         if (maximumPoolSize > 1)
+0:         {
+0:             this.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+0:         }
+0:         else
+0:         {
+0:             // preserve task serialization.  this is more complicated than it needs to be,
+0:             // since TPE rejects if queue.offer reports a full queue.
+0:             // the easiest option (since most of TPE.execute deals with private members)
+0:             // appears to be to wrap the given queue class with one whose offer
+0:             // simply delegates to put().  this would be ugly, since it violates both
+0:             // the spirit and letter of queue.offer, but effective.
+0:             // so far, though, all our serialized executors use unbounded queues,
+0:             // so actually implementing this has not been necessary.
+0:             this.setRejectedExecutionHandler(new RejectedExecutionHandler()
+0:             {
+0:                 public void rejectedExecution(Runnable r, ThreadPoolExecutor executor)
+0:                 {
+0:                     throw new AssertionError("Blocking serialized executor is not yet implemented");
+0:                 }
+0:             });
+0:         }
+commit:de83183
+/////////////////////////////////////////////////////////////////////////
+0:         // exceptions wrapped by FutureTask
+0:                 ((FutureTask) r).get();
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:         // exceptions for non-FutureTask runnables [i.e., added via execute() instead of submit()]
+0:         if (t != null)
+0:         {
+0:             logger_.error("Error in ThreadPoolExecutor", t);
+0:         }
+0: 
+commit:d7bd37a
+/////////////////////////////////////////////////////////////////////////
+0:         this(1, 1, Integer.MAX_VALUE, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(), new NamedThreadFactory(threadPoolName));
+/////////////////////////////////////////////////////////////////////////
+0:             NamedThreadFactory threadFactory)
+/////////////////////////////////////////////////////////////////////////
+0:             objName = new ObjectName("org.apache.cassandra.concurrent:type=" + threadFactory.id);
+commit:313f053
+/////////////////////////////////////////////////////////////////////////
+0:         logFutureExceptions(r);
+0:         if (t != null)
+0:         {
+0:             logger_.error("Error in ThreadPoolExecutor", t);
+0:         }
+0:     }
+0: 
+0:     public static void logFutureExceptions(Runnable r)
+0:     {
+0:         if (r instanceof FutureTask)
+0:         {
+0:                 throw new AssertionError(e);
+0:                 logger_.error("Error in executor futuretask", e);
+commit:c0df773
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.concurrent.*;
+0: import org.apache.log4j.Logger;
+0: 
+/////////////////////////////////////////////////////////////////////////
+0: 
+/////////////////////////////////////////////////////////////////////////
+commit:066ef58
+/////////////////////////////////////////////////////////////////////////
+0: /**
+0:  * Licensed to the Apache Software Foundation (ASF) under one
+0:  * or more contributor license agreements.  See the NOTICE file
+0:  * distributed with this work for additional information
+0:  * regarding copyright ownership.  The ASF licenses this file
+0:  * to you under the Apache License, Version 2.0 (the
+0:  * "License"); you may not use this file except in compliance
+0:  * with the License.  You may obtain a copy of the License at
+0:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+0:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+0:  */
+0: 
+0: package org.apache.cassandra.concurrent;
+0: 
+0: import java.util.concurrent.*;
+0: import java.lang.management.ManagementFactory;
+0: 
+0: import org.apache.log4j.Logger;
+0: 
+0: import javax.management.MBeanServer;
+0: import javax.management.ObjectName;
+0: 
+0: /**
+0:  * This is a wrapper class for the <i>ScheduledThreadPoolExecutor</i>. It provides an implementation
+0:  * for the <i>afterExecute()</i> found in the <i>ThreadPoolExecutor</i> class to log any unexpected 
+0:  * Runtime Exceptions.
+0:  * 
+0:  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+0:  */
+0: 
+0: public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements DebuggableThreadPoolExecutorMBean
+0: {
+0:     private static Logger logger_ = Logger.getLogger(DebuggableThreadPoolExecutor.class);
+0: 
+0:     private ObjectName objName;
+0:     public DebuggableThreadPoolExecutor(String threadPoolName) 
+0:     {
+0:         this(1, 1, Integer.MAX_VALUE, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(), new ThreadFactoryImpl(threadPoolName));
+0:     }
+0: 
+0:     public DebuggableThreadPoolExecutor(int corePoolSize,
+0:             int maximumPoolSize,
+0:             long keepAliveTime,
+0:             TimeUnit unit,
+0:             BlockingQueue<Runnable> workQueue,
+0:             ThreadFactoryImpl threadFactory)
+0:     {
+0:         super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory);
+0:         super.prestartAllCoreThreads();
+0:         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+0:         try
+0:         {
+0:             objName = new ObjectName("org.apache.cassandra.concurrent:type=" + threadFactory.id_);
+0:             mbs.registerMBean(this, objName);
+0:         }
+0:         catch (Exception e)
+0:         {
+0:             throw new RuntimeException(e);
+0:         }
+0:     }
+0:     
+0:     public void unregisterMBean()
+0:     {
+0:         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+0:         try
+0:         {
+0:             mbs.unregisterMBean(objName);
+0:         }
+0:         catch (Exception e)
+0:         {
+0:             throw new RuntimeException(e);
+0:         }
+0:     }
+0: 
+0:     public long getPendingTasks()
+0:     {
+0:         return getTaskCount() - getCompletedTaskCount();
+0:     }
+0: 
+0:     /*
+0:      * 
+0:      *  (non-Javadoc)
+0:      * @see java.util.concurrent.ThreadPoolExecutor#afterExecute(java.lang.Runnable, java.lang.Throwable)
+0:      * Helps us in figuring out why sometimes the threads are getting 
+0:      * killed and replaced by new ones.
+0:      */
+0:     public void afterExecute(Runnable r, Throwable t)
+0:     {
+0:         super.afterExecute(r,t);
+0: 
+0:         if (r instanceof FutureTask) {
+0:             assert t == null;
+0:             try
+0:             {
+0:                 ((FutureTask)r).get();
+0:             }
+0:             catch (InterruptedException e)
+0:             {
+0:                 throw new RuntimeException(e);
+0:             }
+0:             catch (ExecutionException e)
+0:             {
+0:                 t = e;
+0:             }
+0:         }
+0: 
+0:         if ( t != null )
+0:         {  
+0:             Context ctx = ThreadLocalContext.get();
+0:             if ( ctx != null )
+0:             {
+0:                 Object object = ctx.get(r.getClass().getName());
+0:                 
+0:                 if ( object != null )
+0:                 {
+0:                     logger_.error("In afterExecute() " + t.getClass().getName() + " occured while working with " + object);
+0:                 }
+0:             }
+0:             logger_.error("Error in ThreadPoolExecutor", t);
+0:         }
+0:     }
+0: }
+commit:2fd856d
+/////////////////////////////////////////////////////////////////////////
+0:     private ObjectName objName;
+/////////////////////////////////////////////////////////////////////////
+0:             objName = new ObjectName("org.apache.cassandra.concurrent:type=" + threadFactory.id_);
+0:             mbs.registerMBean(this, objName);
+0:         }
+0:         catch (Exception e)
+0:         {
+0:             throw new RuntimeException(e);
+0:         }
+0:     }
+0:     
+0:     public void unregisterMBean()
+0:     {
+0:         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+0:         try
+0:         {
+0:             mbs.unregisterMBean(objName);
+commit:3ed4e05
+/////////////////////////////////////////////////////////////////////////
+0: import java.lang.management.ManagementFactory;
+0: 
+0: import javax.management.MBeanServer;
+0: import javax.management.ObjectName;
+/////////////////////////////////////////////////////////////////////////
+0: public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements DebuggableThreadPoolExecutorMBean
+/////////////////////////////////////////////////////////////////////////
+0:             ThreadFactoryImpl threadFactory)
+0:         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+0:         try
+0:         {
+0:             mbs.registerMBean(this, new ObjectName("org.apache.cassandra.concurrent:type=" + threadFactory.id_));
+0:         }
+0:         catch (Exception e)
+0:         {
+0:             throw new RuntimeException(e);
+0:         }
+0: 
+0:     public long getPendingTasks()
+0:     {
+0:         return getTaskCount() - getCompletedTaskCount();
+0:     }
+0: 
+commit:3bc3e4c
+/////////////////////////////////////////////////////////////////////////
+0:     private static Logger logger_ = Logger.getLogger(DebuggableThreadPoolExecutor.class);
+0: 
+0:     public DebuggableThreadPoolExecutor(String threadPoolName) 
+0:     {
+0:         this(1, 1, Integer.MAX_VALUE, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(), new ThreadFactoryImpl(threadPoolName));
+0:     }
+0: 
+commit:71739ef
+commit:2b4a0e4
+/////////////////////////////////////////////////////////////////////////
+0: public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor
+commit:d24be7d
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:         if (r instanceof FutureTask) {
+0:             assert t == null;
+0:             try
+0:             {
+0:                 ((FutureTask)r).get();
+0:             }
+0:             catch (InterruptedException e)
+0:             {
+0:                 throw new RuntimeException(e);
+0:             }
+0:             catch (ExecutionException e)
+0:             {
+0:                 t = e;
+0:             }
+0:         }
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:                     logger_.error("In afterExecute() " + t.getClass().getName() + " occured while working with " + object);
+0:             logger_.error("Error in ThreadPoolExecutor", t);
+commit:2249a6a
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:         if (r instanceof FutureTask) {
+0:             assert t == null;
+0:             try
+0:             {
+0:                 ((FutureTask)r).get();
+0:             }
+0:             catch (InterruptedException e)
+0:             {
+0:                 throw new RuntimeException(e);
+0:             }
+0:             catch (ExecutionException e)
+0:             {
+0:                 t = e;
+0:             }
+0:         }
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:                     logger_.error("In afterExecute() " + t.getClass().getName() + " occured while working with " + object);
+0:             logger_.error("Error in ThreadPoolExecutor", t);
+author:belliottsmith
+-------------------------------------------------------------------------------
+commit:5420b7a
+/////////////////////////////////////////////////////////////////////////
+1:     public void maybeExecuteImmediately(Runnable command)
+0:     {
+1:         execute(command);
+0:     }
+0: 
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:d7ff10d
+/////////////////////////////////////////////////////////////////////////
+commit:263f192
+/////////////////////////////////////////////////////////////////////////
+0:     /**
+1:      * Returns a ThreadPoolExecutor with a fixed number of threads.
+1:      * When all threads are actively executing tasks, new tasks are queued.
+1:      * If (most) threads are expected to be idle most of the time, prefer createWithMaxSize() instead.
+1:      * @param threadPoolName the name of the threads created by this executor
+1:      * @param size the fixed number of threads for this executor
+1:      * @return the new DebuggableThreadPoolExecutor
+0:      */
+1:     public static DebuggableThreadPoolExecutor createWithFixedPoolSize(String threadPoolName, int size)
+1:         return createWithMaximumPoolSize(threadPoolName, size, Integer.MAX_VALUE, TimeUnit.SECONDS);
+0:     }
+0: 
+0:     /**
+1:      * Returns a ThreadPoolExecutor with a fixed maximum number of threads, but whose
+1:      * threads are terminated when idle for too long.
+1:      * When all threads are actively executing tasks, new tasks are queued.
+1:      * @param threadPoolName the name of the threads created by this executor
+1:      * @param size the maximum number of threads for this executor
+1:      * @param keepAliveTime the time an idle thread is kept alive before being terminated
+1:      * @param unit tht time unit for {@code keepAliveTime}
+1:      * @return the new DebuggableThreadPoolExecutor
+0:      */
+1:     public static DebuggableThreadPoolExecutor createWithMaximumPoolSize(String threadPoolName, int size, int keepAliveTime, TimeUnit unit)
+0:     {
+1:         return new DebuggableThreadPoolExecutor(size, Integer.MAX_VALUE, keepAliveTime, unit, new LinkedBlockingQueue<Runnable>(), new NamedThreadFactory(threadPoolName));
+commit:07cdfd0
+/////////////////////////////////////////////////////////////////////////
+0:  *
+/////////////////////////////////////////////////////////////////////////
+0:  *
+0:  *
+0:  *
+commit:5a6e2b0
+/////////////////////////////////////////////////////////////////////////
+1:     protected static final Logger logger = LoggerFactory.getLogger(DebuggableThreadPoolExecutor.class);
+commit:07cf56f
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:  *
+0:  *     http://www.apache.org/licenses/LICENSE-2.0
+0:  *
+0:  * Unless required by applicable law or agreed to in writing, software
+0:  * distributed under the License is distributed on an "AS IS" BASIS,
+0:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+0:  * See the License for the specific language governing permissions and
+0:  * limitations under the License.
+0: package org.apache.cassandra.concurrent;
+commit:ba0f2bc
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.compaction.UserInterruptedException;
+/////////////////////////////////////////////////////////////////////////
+0:                 Throwable actualException = e.getCause();
+0:                 if (actualException instanceof UserInterruptedException)
+0:                     logger.info("Task interrupted by user: " + actualException);
+0:                 else if (Thread.getDefaultUncaughtExceptionHandler() == null)
+0:                     logger.error("Error in ThreadPoolExecutor", actualException);
+0:                     Thread.getDefaultUncaughtExceptionHandler().uncaughtException(Thread.currentThread(), actualException);
+commit:5fc19f4
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.compaction.UserInterruptedException;
+/////////////////////////////////////////////////////////////////////////
+0:                 Throwable actualException = e.getCause();
+0:                 if (actualException instanceof UserInterruptedException)
+0:                     logger.info("Task interrupted by user: " + actualException);
+0:                 else if (Thread.getDefaultUncaughtExceptionHandler() == null)
+0:                     logger.error("Error in ThreadPoolExecutor", actualException);
+0:                     Thread.getDefaultUncaughtExceptionHandler().uncaughtException(Thread.currentThread(), actualException);
+commit:9f925e9
+/////////////////////////////////////////////////////////////////////////
+1:     public DebuggableThreadPoolExecutor(int corePoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> queue, ThreadFactory factory)
+1:         this(corePoolSize, corePoolSize, keepAliveTime, unit, queue, factory);
+0:     }
+0: 
+0:     protected DebuggableThreadPoolExecutor(int corePoolSize, int maxPoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory)
+0:     {
+0:         super(corePoolSize, maxPoolSize, keepAliveTime, unit, workQueue, threadFactory);
+commit:80bfd0b
+/////////////////////////////////////////////////////////////////////////
+0:                 ((DebuggableThreadPoolExecutor)executor).onInitialRejection(task);
+0:                     {
+0:                         ((DebuggableThreadPoolExecutor)executor).onFinalRejection(task);
+0:                     }
+0:                         {
+0:                             ((DebuggableThreadPoolExecutor)executor).onFinalAccept(task);
+0:                         }
+/////////////////////////////////////////////////////////////////////////
+1:     protected void onInitialRejection(Runnable task) {}
+1:     protected void onFinalAccept(Runnable task) {}
+1:     protected void onFinalRejection(Runnable task) {}
+0: 
+commit:a6de715
+/////////////////////////////////////////////////////////////////////////
+0:                 ((DebuggableThreadPoolExecutor)executor).onInitialRejection(task);
+0:                     {
+0:                         ((DebuggableThreadPoolExecutor)executor).onFinalRejection(task);
+0:                     }
+0:                         {
+0:                             ((DebuggableThreadPoolExecutor)executor).onFinalAccept(task);
+0:                         }
+/////////////////////////////////////////////////////////////////////////
+0:     protected void onInitialRejection(Runnable task) {}
+0:     protected void onFinalAccept(Runnable task) {}
+0:     protected void onFinalRejection(Runnable task) {}
+0: 
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:4deb779
+/////////////////////////////////////////////////////////////////////////
+1:         // Check for exceptions wrapped by FutureTask.  We do this by calling get(), which will
+1:         // cause it to throw any saved exception.
+1:         //
+1:         // Complicating things, calling get() on a ScheduledFutureTask will block until the task
+1:         // is cancelled.  Hence, the extra isDone check beforehand.
+0:         if ((r instanceof Future<?>) && ((Future<?>) r).isDone())
+0:                 ((Future<?>) r).get();
+author:Gary Dusbabek
+-------------------------------------------------------------------------------
+commit:0095f0c
+/////////////////////////////////////////////////////////////////////////
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+0:     protected static Logger logger = LoggerFactory.getLogger(JMXEnabledThreadPoolExecutor.class);
+author:Avinash Lakshman
+-------------------------------------------------------------------------------
+commit:bd884e4
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:                     logger_.info("**** In afterExecute() " + t.getClass().getName() + " occured while working with " + object + " ****");
+0:                 }
+0:                 else
+0:                 {
+0:                     logger_.info("**** In afterExecute() " + t.getClass().getName() + " occured ****");
+0:             
+0:             Throwable cause = t.getCause();
+0:             if ( cause != null )
+0:             {
+0:                 logger_.info( LogUtil.throwableToString(cause) );
+0:             }
+0:             logger_.info( LogUtil.throwableToString(t) );
+author:Prashant Malik
+-------------------------------------------------------------------------------
+commit:1f91e99
+/////////////////////////////////////////////////////////////////////////
+0: /**
+0:  * Licensed to the Apache Software Foundation (ASF) under one
+0:  * or more contributor license agreements.  See the NOTICE file
+0:  * distributed with this work for additional information
+0:  * regarding copyright ownership.  The ASF licenses this file
+0:  * to you under the Apache License, Version 2.0 (the
+0:  * "License"); you may not use this file except in compliance
+0:  * with the License.  You may obtain a copy of the License at
+0:  *
+0:  *     http://www.apache.org/licenses/LICENSE-2.0
+0:  *
+0:  * Unless required by applicable law or agreed to in writing, software
+0:  * distributed under the License is distributed on an "AS IS" BASIS,
+0:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+0:  * See the License for the specific language governing permissions and
+0:  * limitations under the License.
+0:  */
+0: 
+0: package org.apache.cassandra.concurrent;
+0: 
+0: import java.util.concurrent.*;
+0: 
+0: import org.apache.cassandra.utils.LogUtil;
+0: import org.apache.log4j.Logger;
+0: import org.apache.cassandra.utils.*;
+0: 
+0: /**
+0:  * This is a wrapper class for the <i>ScheduledThreadPoolExecutor</i>. It provides an implementation
+0:  * for the <i>afterExecute()</i> found in the <i>ThreadPoolExecutor</i> class to log any unexpected 
+0:  * Runtime Exceptions.
+0:  * 
+0:  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+0:  */
+0: 
+0: public final class DebuggableThreadPoolExecutor extends ThreadPoolExecutor
+0: {
+0:     private static Logger logger_ = Logger.getLogger(DebuggableThreadPoolExecutor.class);    
+0:     
+0:     public DebuggableThreadPoolExecutor(int corePoolSize,
+0:             int maximumPoolSize,
+0:             long keepAliveTime,
+0:             TimeUnit unit,
+0:             BlockingQueue<Runnable> workQueue,
+0:             ThreadFactory threadFactory)
+0:     {
+0:         super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory);
+0:         super.prestartAllCoreThreads();
+0:     }
+0:     
+0:     /*
+0:      * 
+0:      *  (non-Javadoc)
+0:      * @see java.util.concurrent.ThreadPoolExecutor#afterExecute(java.lang.Runnable, java.lang.Throwable)
+0:      * Helps us in figuring out why sometimes the threads are getting 
+0:      * killed and replaced by new ones.
+0:      */
+0:     public void afterExecute(Runnable r, Throwable t)
+0:     {
+0:         super.afterExecute(r,t);
+0:         if ( t != null )
+0:         {  
+0:             Context ctx = ThreadLocalContext.get();
+0:             if ( ctx != null )
+0:             {
+0:                 Object object = ctx.get(r.getClass().getName());
+0:                 
+0:                 if ( object != null )
+0:                 {
+0:                     logger_.info("**** In afterExecute() " + t.getClass().getName() + " occured while working with " + object + " ****");
+0:                 }
+0:                 else
+0:                 {
+0:                     logger_.info("**** In afterExecute() " + t.getClass().getName() + " occured ****");
+0:                 }
+0:             }
+0:             
+0:             Throwable cause = t.getCause();
+0:             if ( cause != null )
+0:             {
+0:                 logger_.info( LogUtil.throwableToString(cause) );
+0:             }
+0:             logger_.info( LogUtil.throwableToString(t) );
+0:         }
+0:     }
+0: }
+============================================================================

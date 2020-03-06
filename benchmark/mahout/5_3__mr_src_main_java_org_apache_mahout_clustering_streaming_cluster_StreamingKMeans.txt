@@ -1,0 +1,784 @@
+1:fd24254: /*
+1:fd24254:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:fd24254:  * contributor license agreements.  See the NOTICE file distributed with
+1:fd24254:  * this work for additional information regarding copyright ownership.
+1:fd24254:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:fd24254:  * (the "License"); you may not use this file except in compliance with
+1:fd24254:  * the License.  You may obtain a copy of the License at
+1:fd24254:  *
+1:fd24254:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:fd24254:  *
+1:fd24254:  * Unless required by applicable law or agreed to in writing, software
+1:fd24254:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:fd24254:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:fd24254:  * See the License for the specific language governing permissions and
+1:fd24254:  * limitations under the License.
+1:fd24254:  */
+1:fd24254: 
+1:fd24254: package org.apache.mahout.clustering.streaming.cluster;
+1:fd24254: 
+1:85f9ece: import java.util.ArrayList;
+1:fd24254: import java.util.Collections;
+1:fd24254: import java.util.Iterator;
+1:fd24254: import java.util.List;
+1:fd24254: import java.util.Random;
+1:fd24254: 
+1:fd24254: import com.google.common.base.Function;
+1:fd24254: import com.google.common.collect.Iterables;
+1:fd24254: import com.google.common.collect.Iterators;
+1:fd24254: import org.apache.mahout.common.RandomUtils;
+1:6b6b8a0: import org.apache.mahout.common.distance.DistanceMeasure;
+1:fd24254: import org.apache.mahout.math.Centroid;
+1:fd24254: import org.apache.mahout.math.Matrix;
+1:fd24254: import org.apache.mahout.math.MatrixSlice;
+1:fd24254: import org.apache.mahout.math.Vector;
+1:fd24254: import org.apache.mahout.math.jet.math.Constants;
+1:fd24254: import org.apache.mahout.math.neighborhood.UpdatableSearcher;
+1:fd24254: import org.apache.mahout.math.random.WeightedThing;
+1:fd24254: 
+1:fd24254: /**
+1:fd24254:  * Implements a streaming k-means algorithm for weighted vectors.
+1:fd24254:  * The goal clustering points one at a time, especially useful for MapReduce mappers that get inputs one at a time.
+1:fd24254:  *
+1:fd24254:  * A rough description of the algorithm:
+1:fd24254:  * Suppose there are l clusters at one point and a new point p is added.
+1:fd24254:  * The new point can either be added to one of the existing l clusters or become a new cluster. To decide:
+1:fd24254:  * - let c be the closest cluster to point p;
+1:fd24254:  * - let d be the distance between c and p;
+1:fd24254:  * - if d > distanceCutoff, create a new cluster from p (p is too far away from the clusters to be part of them;
+1:fd24254:  * distanceCutoff represents the largest distance from a point its assigned cluster's centroid);
+1:fd24254:  * - else (d <= distanceCutoff), create a new cluster with probability d / distanceCutoff (the probability of creating
+1:fd24254:  * a new cluster increases as d increases).
+1:fd24254:  * There will be either l points or l + 1 points after processing a new point.
+1:fd24254:  *
+1:fd24254:  * As the number of clusters increases, it will go over the numClusters limit (numClusters represents a recommendation
+1:fd24254:  * for the number of clusters that there should be at the end). To decrease the number of clusters the existing clusters
+1:fd24254:  * are treated as data points and are re-clustered (collapsed). This tends to make the number of clusters go down.
+1:fd24254:  * If the number of clusters is still too high, distanceCutoff is increased.
+1:fd24254:  *
+1:fd24254:  * For more details, see:
+1:fd24254:  * - "Streaming  k-means approximation" by N. Ailon, R. Jaiswal, C. Monteleoni
+1:fd24254:  * http://books.nips.cc/papers/files/nips22/NIPS2009_1085.pdf
+1:fd24254:  * - "Fast and Accurate k-means for Large Datasets" by M. Shindler, A. Wong, A. Meyerson,
+1:fd24254:  * http://books.nips.cc/papers/files/nips24/NIPS2011_1271.pdf
+1:fd24254:  */
+1:fd24254: public class StreamingKMeans implements Iterable<Centroid> {
+1:fd24254:   /**
+1:fd24254:    * The searcher containing the centroids that resulted from the clustering of points until now. When adding a new
+1:fd24254:    * point we either assign it to one of the existing clusters in this searcher or create a new centroid for it.
+1:fd24254:    */
+1:fd24254:   private final UpdatableSearcher centroids;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * The estimated number of clusters to cluster the data in. If the actual number of clusters increases beyond this
+1:fd24254:    * limit, the clusters will be "collapsed" (re-clustered, by treating them as data points). This doesn't happen
+1:fd24254:    * recursively and a collapse might not necessarily make the number of actual clusters drop to less than this limit.
+1:fd24254:    *
+1:fd24254:    * If the goal is clustering a large data set into k clusters, numClusters SHOULD NOT BE SET to k. StreamingKMeans is
+1:fd24254:    * useful to reduce the size of the data set by the mappers so that it can fit into memory in one reducer that runs
+1:fd24254:    * BallKMeans.
+1:fd24254:    *
+1:fd24254:    * It is NOT MEANT to cluster the data into k clusters in one pass because it can't guarantee that there will in fact
+1:fd24254:    * be k clusters in total. This is because of the dynamic nature of numClusters over the course of the runtime.
+1:fd24254:    * To get an exact number of clusters, another clustering algorithm needs to be applied to the results.
+1:fd24254:    */
+1:fd24254:   private int numClusters;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * The number of data points seen so far. This is important for re-estimating numClusters when deciding to collapse
+1:fd24254:    * the existing clusters.
+1:fd24254:    */
+1:fd24254:   private int numProcessedDatapoints = 0;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * This is the current value of the distance cutoff.  Points which are much closer than this to a centroid will stick
+1:fd24254:    * to it almost certainly. Points further than this to any centroid will form a new cluster.
+1:fd24254:    *
+1:fd24254:    * This increases (is multiplied by beta) when a cluster collapse did not make the number of clusters drop to below
+1:fd24254:    * numClusters (it effectively increases the tolerance for cluster compactness discouraging the creation of new
+1:fd24254:    * clusters). Since a collapse only happens when centroids.size() > clusterOvershoot * numClusters, the cutoff
+1:fd24254:    * increases when the collapse didn't at least remove the slack in the number of clusters.
+1:fd24254:    */
+1:fd24254:   private double distanceCutoff;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Parameter that controls the growth of the distanceCutoff. After n increases of the
+1:fd24254:    * distanceCutoff starting at d_0, the final value is d_0 * beta^n (distance cutoffs increase following a geometric
+1:fd24254:    * progression with ratio beta).
+1:fd24254:    */
+1:fd24254:   private final double beta;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Multiplying clusterLogFactor with numProcessedDatapoints gets an estimate of the suggested
+1:fd24254:    * number of clusters. This mirrors the recommended number of clusters for n points where there should be k actual
+1:fd24254:    * clusters, k * log n. In the case of our estimate we use clusterLogFactor * log(numProcessedDataPoints).
+1:fd24254:    *
+1:fd24254:    * It is important to note that numClusters is NOT k. It is an estimate of k * log n.
+1:fd24254:    */
+1:fd24254:   private final double clusterLogFactor;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Centroids are collapsed when the number of clusters becomes greater than clusterOvershoot * numClusters. This
+1:fd24254:    * effectively means having a slack in numClusters so that the actual number of centroids, centroids.size() tracks
+1:fd24254:    * numClusters approximately. The idea is that the actual number of clusters should be at least numClusters but not
+1:fd24254:    * much more (so that we don't end up having 1 cluster / point).
+1:fd24254:    */
+1:fd24254:   private final double clusterOvershoot;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Random object to sample values from.
+1:fd24254:    */
+1:335a993:   private final Random random = RandomUtils.getRandom();
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Calls StreamingKMeans(searcher, numClusters, 1.3, 10, 2).
+1:fd24254:    * @see StreamingKMeans#StreamingKMeans(org.apache.mahout.math.neighborhood.UpdatableSearcher, int,
+1:fd24254:    * double, double, double, double)
+1:fd24254:    */
+1:fd24254:   public StreamingKMeans(UpdatableSearcher searcher, int numClusters) {
+1:fd24254:     this(searcher, numClusters, 1.0 / numClusters, 1.3, 20, 2);
+2:fd24254:   }
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Calls StreamingKMeans(searcher, numClusters, distanceCutoff, 1.3, 10, 2).
+1:fd24254:    * @see StreamingKMeans#StreamingKMeans(org.apache.mahout.math.neighborhood.UpdatableSearcher, int,
+1:fd24254:    * double, double, double, double)
+1:fd24254:    */
+1:fd24254:   public StreamingKMeans(UpdatableSearcher searcher, int numClusters, double distanceCutoff) {
+1:fd24254:     this(searcher, numClusters, distanceCutoff, 1.3, 20, 2);
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Creates a new StreamingKMeans class given a searcher and the number of clusters to generate.
+1:fd24254:    *
+1:fd24254:    * @param searcher A Searcher that is used for performing nearest neighbor search. It MUST BE
+1:fd24254:    *                 EMPTY initially because it will be used to keep track of the cluster
+1:fd24254:    *                 centroids.
+1:fd24254:    * @param numClusters An estimated number of clusters to generate for the data points.
+1:fd24254:    *                    This can adjusted, but the actual number will depend on the data. The
+1:fd24254:    * @param distanceCutoff  The initial distance cutoff representing the value of the
+1:fd24254:    *                      distance between a point and its closest centroid after which
+1:fd24254:    *                      the new point will definitely be assigned to a new cluster.
+1:fd24254:    * @param beta Ratio of geometric progression to use when increasing distanceCutoff. After n increases, distanceCutoff
+1:fd24254:    *             becomes distanceCutoff * beta^n. A smaller value increases the distanceCutoff less aggressively.
+1:fd24254:    * @param clusterLogFactor Value multiplied with the number of points counted so far estimating the number of clusters
+1:fd24254:    *                         to aim for. If the final number of clusters is known and this clustering is only for a
+1:fd24254:    *                         sketch of the data, this can be the final number of clusters, k.
+1:fd24254:    * @param clusterOvershoot Multiplicative slack factor for slowing down the collapse of the clusters.
+1:fd24254:    */
+1:fd24254:   public StreamingKMeans(UpdatableSearcher searcher, int numClusters,
+1:fd24254:                          double distanceCutoff, double beta, double clusterLogFactor, double clusterOvershoot) {
+1:fd24254:     this.centroids = searcher;
+1:fd24254:     this.numClusters = numClusters;
+1:fd24254:     this.distanceCutoff = distanceCutoff;
+1:fd24254:     this.beta = beta;
+1:fd24254:     this.clusterLogFactor = clusterLogFactor;
+1:fd24254:     this.clusterOvershoot = clusterOvershoot;
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * @return an Iterator to the Centroids contained in this clusterer.
+1:fd24254:    */
+1:fd24254:   @Override
+1:fd24254:   public Iterator<Centroid> iterator() {
+1:fd24254:     return Iterators.transform(centroids.iterator(), new Function<Vector, Centroid>() {
+1:fd24254:       @Override
+1:fd24254:       public Centroid apply(Vector input) {
+1:fd24254:         return (Centroid)input;
+1:4ca6b86:       }
+1:fd24254:     });
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Cluster the rows of a matrix, treating them as Centroids with weight 1.
+1:fd24254:    * @param data matrix whose rows are to be clustered.
+1:fd24254:    * @return the UpdatableSearcher containing the resulting centroids.
+1:fd24254:    */
+1:fd24254:   public UpdatableSearcher cluster(Matrix data) {
+1:fd24254:     return cluster(Iterables.transform(data, new Function<MatrixSlice, Centroid>() {
+1:fd24254:       @Override
+1:fd24254:       public Centroid apply(MatrixSlice input) {
+1:fd24254:         // The key in a Centroid is actually the MatrixSlice's index.
+1:fd24254:         return Centroid.create(input.index(), input.vector());
+1:fd24254:       }
+1:fd24254:     }));
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Cluster the data points in an Iterable<Centroid>.
+1:fd24254:    * @param datapoints Iterable whose elements are to be clustered.
+1:fd24254:    * @return the UpdatableSearcher containing the resulting centroids.
+1:fd24254:    */
+1:fd24254:   public UpdatableSearcher cluster(Iterable<Centroid> datapoints) {
+1:fd24254:     return clusterInternal(datapoints, false);
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Cluster one data point.
+1:fd24254:    * @param datapoint to be clustered.
+1:fd24254:    * @return the UpdatableSearcher containing the resulting centroids.
+1:fd24254:    */
+1:fd24254:   public UpdatableSearcher cluster(final Centroid datapoint) {
+1:fd24254:     return cluster(new Iterable<Centroid>() {
+1:fd24254:       @Override
+1:fd24254:       public Iterator<Centroid> iterator() {
+1:fd24254:         return new Iterator<Centroid>() {
+1:fd24254:           private boolean accessed = false;
+1:fd24254: 
+1:fd24254:           @Override
+1:fd24254:           public boolean hasNext() {
+1:fd24254:             return !accessed;
+1:fd24254:           }
+1:fd24254: 
+1:fd24254:           @Override
+1:fd24254:           public Centroid next() {
+1:fd24254:             accessed = true;
+1:fd24254:             return datapoint;
+1:fd24254:           }
+1:fd24254: 
+1:fd24254:           @Override
+1:fd24254:           public void remove() {
+1:fd24254:             throw new UnsupportedOperationException();
+1:fd24254:           }
+1:fd24254:         };
+1:fd24254:       }
+1:fd24254:     });
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * @return the number of clusters computed from the points until now.
+1:fd24254:    */
+1:fd24254:   public int getNumClusters() {
+1:fd24254:     return centroids.size();
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Internal clustering method that gets called from the other wrappers.
+1:fd24254:    * @param datapoints Iterable of data points to be clustered.
+1:fd24254:    * @param collapseClusters whether this is an "inner" clustering and the datapoints are the previously computed
+1:fd24254:    *                         centroids. Some logic is different to ensure counters are consistent but it behaves
+1:fd24254:    *                         nearly the same.
+1:fd24254:    * @return the UpdatableSearcher containing the resulting centroids.
+1:fd24254:    */
+1:fd24254:   private UpdatableSearcher clusterInternal(Iterable<Centroid> datapoints, boolean collapseClusters) {
+1:bc5ca94:     Iterator<Centroid> datapointsIterator = datapoints.iterator();
+1:bc5ca94:     if (!datapointsIterator.hasNext()) {
+1:bc5ca94:       return centroids;
+1:bc5ca94:     }
+1:bc5ca94: 
+1:fd24254:     int oldNumProcessedDataPoints = numProcessedDatapoints;
+1:fd24254:     // We clear the centroids we have in case of cluster collapse, the old clusters are the
+1:fd24254:     // datapoints but we need to re-cluster them.
+1:fd24254:     if (collapseClusters) {
+1:fd24254:       centroids.clear();
+1:fd24254:       numProcessedDatapoints = 0;
+1:fd24254:     }
+1:fd24254: 
+1:fd24254:     if (centroids.size() == 0) {
+1:fd24254:       // Assign the first datapoint to the first cluster.
+1:fd24254:       // Adding a vector to a searcher would normally just reference the copy,
+1:fd24254:       // but we could potentially mutate it and so we need to make a clone.
+1:bc5ca94:       centroids.add(datapointsIterator.next().clone());
+1:fd24254:       ++numProcessedDatapoints;
+1:fd24254:     }
+1:fd24254: 
+1:fd24254:     // To cluster, we scan the data and either add each point to the nearest group or create a new group.
+1:fd24254:     // when we get too many groups, we need to increase the threshold and rescan our current groups
+1:bc5ca94:     while (datapointsIterator.hasNext()) {
+1:bc5ca94:       Centroid row = datapointsIterator.next();
+1:fd24254:       // Get the closest vector and its weight as a WeightedThing<Vector>.
+1:fd24254:       // The weight of the WeightedThing is the distance to the query and the value is a
+1:fd24254:       // reference to one of the vectors we added to the searcher previously.
+1:fd24254:       WeightedThing<Vector> closestPair = centroids.searchFirst(row, false);
+1:fd24254: 
+1:fd24254:       // We get a uniformly distributed random number between 0 and 1 and compare it with the
+1:fd24254:       // distance to the closest cluster divided by the distanceCutoff.
+1:fd24254:       // This is so that if the closest cluster is further than distanceCutoff,
+1:fd24254:       // closestPair.getWeight() / distanceCutoff > 1 which will trigger the creation of a new
+1:fd24254:       // cluster anyway.
+1:fd24254:       // However, if the ratio is less than 1, we want to create a new cluster with probability
+1:fd24254:       // proportional to the distance to the closest cluster.
+1:fd24254:       double sample = random.nextDouble();
+1:fd24254:       if (sample < row.getWeight() * closestPair.getWeight() / distanceCutoff) {
+1:fd24254:         // Add new centroid, note that the vector is copied because we may mutate it later.
+1:fd24254:         centroids.add(row.clone());
+1:fd24254:       } else {
+1:fd24254:         // Merge the new point with the existing centroid. This will update the centroid's actual
+1:fd24254:         // position.
+1:fd24254:         // We know that all the points we inserted in the centroids searcher are (or extend)
+1:fd24254:         // WeightedVector, so the cast will always succeed.
+1:fd24254:         Centroid centroid = (Centroid) closestPair.getValue();
+1:fd24254: 
+1:fd24254:         // We will update the centroid by removing it from the searcher and reinserting it to
+1:fd24254:         // ensure consistency.
+1:fd24254:         if (!centroids.remove(centroid, Constants.EPSILON)) {
+1:fd24254:           throw new RuntimeException("Unable to remove centroid");
+1:fd24254:         }
+1:fd24254:         centroid.update(row);
+1:fd24254:         centroids.add(centroid);
+1:fd24254: 
+1:fd24254:       }
+1:fd24254:       ++numProcessedDatapoints;
+1:fd24254: 
+1:fd24254:       if (!collapseClusters && centroids.size() > clusterOvershoot * numClusters) {
+1:fd24254:         numClusters = (int) Math.max(numClusters, clusterLogFactor * Math.log(numProcessedDatapoints));
+1:fd24254: 
+1:85f9ece:         List<Centroid> shuffled = new ArrayList<>();
+1:fd24254:         for (Vector vector : centroids) {
+1:fd24254:           shuffled.add((Centroid) vector);
+1:fd24254:         }
+1:fd24254:         Collections.shuffle(shuffled);
+1:fd24254:         // Re-cluster using the shuffled centroids as data points. The centroids member variable
+1:fd24254:         // is modified directly.
+1:fd24254:         clusterInternal(shuffled, true);
+1:fd24254: 
+1:fd24254:         if (centroids.size() > numClusters) {
+1:fd24254:           distanceCutoff *= beta;
+1:fd24254:         }
+1:fd24254:       }
+1:fd24254:     }
+1:fd24254: 
+1:fd24254:     if (collapseClusters) {
+1:fd24254:       numProcessedDatapoints = oldNumProcessedDataPoints;
+1:fd24254:     }
+1:fd24254:     return centroids;
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   public void reindexCentroids() {
+1:fd24254:     int numCentroids = 0;
+1:fd24254:     for (Centroid centroid : this) {
+1:fd24254:       centroid.setIndex(numCentroids++);
+1:fd24254:     }
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * @return the distanceCutoff (an upper bound for the maximum distance within a cluster).
+1:fd24254:    */
+1:fd24254:   public double getDistanceCutoff() {
+1:fd24254:     return distanceCutoff;
+1:fd24254:   }
+1:6b6b8a0: 
+1:6b6b8a0:   public void setDistanceCutoff(double distanceCutoff) {
+1:6b6b8a0:     this.distanceCutoff = distanceCutoff;
+1:6b6b8a0:   }
+1:6b6b8a0: 
+1:6b6b8a0:   public DistanceMeasure getDistanceMeasure() {
+1:6b6b8a0:     return centroids.getDistanceMeasure();
+1:6b6b8a0:   }
+1:fd24254: }
+============================================================================
+author:Suneel Marthi
+-------------------------------------------------------------------------------
+commit:85f9ece
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.ArrayList;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         List<Centroid> shuffled = new ArrayList<>();
+author:pferrel
+-------------------------------------------------------------------------------
+commit:b988c49
+author:frankscholten
+-------------------------------------------------------------------------------
+commit:1a42d85
+author:Sean R. Owen
+-------------------------------------------------------------------------------
+commit:335a993
+/////////////////////////////////////////////////////////////////////////
+1:   private final Random random = RandomUtils.getRandom();
+commit:4ca6b86
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.NoSuchElementException;
+/////////////////////////////////////////////////////////////////////////
+0:   private final Random random = RandomUtils.getRandom();
+/////////////////////////////////////////////////////////////////////////
+0:             if (!hasNext()) {
+0:               throw new NoSuchElementException();
+1:             }
+author:dfilimon
+-------------------------------------------------------------------------------
+commit:6b6b8a0
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.mahout.common.distance.DistanceMeasure;
+/////////////////////////////////////////////////////////////////////////
+0:   private Random random = RandomUtils.getRandom();
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:   public void setDistanceCutoff(double distanceCutoff) {
+1:     this.distanceCutoff = distanceCutoff;
+1:   }
+1: 
+1:   public DistanceMeasure getDistanceMeasure() {
+1:     return centroids.getDistanceMeasure();
+1:   }
+commit:bc5ca94
+/////////////////////////////////////////////////////////////////////////
+1:     Iterator<Centroid> datapointsIterator = datapoints.iterator();
+1:     if (!datapointsIterator.hasNext()) {
+1:       return centroids;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:       centroids.add(datapointsIterator.next().clone());
+1:     while (datapointsIterator.hasNext()) {
+1:       Centroid row = datapointsIterator.next();
+commit:fd24254
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: 
+1: package org.apache.mahout.clustering.streaming.cluster;
+1: 
+1: import java.util.Collections;
+1: import java.util.Iterator;
+1: import java.util.List;
+1: import java.util.Random;
+1: 
+1: import com.google.common.base.Function;
+1: import com.google.common.collect.Iterables;
+1: import com.google.common.collect.Iterators;
+0: import com.google.common.collect.Lists;
+1: import org.apache.mahout.common.RandomUtils;
+1: import org.apache.mahout.math.Centroid;
+1: import org.apache.mahout.math.Matrix;
+1: import org.apache.mahout.math.MatrixSlice;
+1: import org.apache.mahout.math.Vector;
+1: import org.apache.mahout.math.jet.math.Constants;
+1: import org.apache.mahout.math.neighborhood.UpdatableSearcher;
+1: import org.apache.mahout.math.random.WeightedThing;
+1: 
+1: /**
+1:  * Implements a streaming k-means algorithm for weighted vectors.
+1:  * The goal clustering points one at a time, especially useful for MapReduce mappers that get inputs one at a time.
+1:  *
+1:  * A rough description of the algorithm:
+1:  * Suppose there are l clusters at one point and a new point p is added.
+1:  * The new point can either be added to one of the existing l clusters or become a new cluster. To decide:
+1:  * - let c be the closest cluster to point p;
+1:  * - let d be the distance between c and p;
+1:  * - if d > distanceCutoff, create a new cluster from p (p is too far away from the clusters to be part of them;
+1:  * distanceCutoff represents the largest distance from a point its assigned cluster's centroid);
+1:  * - else (d <= distanceCutoff), create a new cluster with probability d / distanceCutoff (the probability of creating
+1:  * a new cluster increases as d increases).
+1:  * There will be either l points or l + 1 points after processing a new point.
+1:  *
+1:  * As the number of clusters increases, it will go over the numClusters limit (numClusters represents a recommendation
+1:  * for the number of clusters that there should be at the end). To decrease the number of clusters the existing clusters
+1:  * are treated as data points and are re-clustered (collapsed). This tends to make the number of clusters go down.
+1:  * If the number of clusters is still too high, distanceCutoff is increased.
+1:  *
+1:  * For more details, see:
+1:  * - "Streaming  k-means approximation" by N. Ailon, R. Jaiswal, C. Monteleoni
+1:  * http://books.nips.cc/papers/files/nips22/NIPS2009_1085.pdf
+1:  * - "Fast and Accurate k-means for Large Datasets" by M. Shindler, A. Wong, A. Meyerson,
+1:  * http://books.nips.cc/papers/files/nips24/NIPS2011_1271.pdf
+1:  */
+1: public class StreamingKMeans implements Iterable<Centroid> {
+1:   /**
+1:    * The searcher containing the centroids that resulted from the clustering of points until now. When adding a new
+1:    * point we either assign it to one of the existing clusters in this searcher or create a new centroid for it.
+1:    */
+1:   private final UpdatableSearcher centroids;
+1: 
+1:   /**
+1:    * The estimated number of clusters to cluster the data in. If the actual number of clusters increases beyond this
+1:    * limit, the clusters will be "collapsed" (re-clustered, by treating them as data points). This doesn't happen
+1:    * recursively and a collapse might not necessarily make the number of actual clusters drop to less than this limit.
+1:    *
+1:    * If the goal is clustering a large data set into k clusters, numClusters SHOULD NOT BE SET to k. StreamingKMeans is
+1:    * useful to reduce the size of the data set by the mappers so that it can fit into memory in one reducer that runs
+1:    * BallKMeans.
+1:    *
+1:    * It is NOT MEANT to cluster the data into k clusters in one pass because it can't guarantee that there will in fact
+1:    * be k clusters in total. This is because of the dynamic nature of numClusters over the course of the runtime.
+1:    * To get an exact number of clusters, another clustering algorithm needs to be applied to the results.
+1:    */
+1:   private int numClusters;
+1: 
+1:   /**
+1:    * The number of data points seen so far. This is important for re-estimating numClusters when deciding to collapse
+1:    * the existing clusters.
+1:    */
+1:   private int numProcessedDatapoints = 0;
+1: 
+1:   /**
+1:    * This is the current value of the distance cutoff.  Points which are much closer than this to a centroid will stick
+1:    * to it almost certainly. Points further than this to any centroid will form a new cluster.
+1:    *
+1:    * This increases (is multiplied by beta) when a cluster collapse did not make the number of clusters drop to below
+1:    * numClusters (it effectively increases the tolerance for cluster compactness discouraging the creation of new
+1:    * clusters). Since a collapse only happens when centroids.size() > clusterOvershoot * numClusters, the cutoff
+1:    * increases when the collapse didn't at least remove the slack in the number of clusters.
+1:    */
+1:   private double distanceCutoff;
+1: 
+1:   /**
+1:    * Parameter that controls the growth of the distanceCutoff. After n increases of the
+1:    * distanceCutoff starting at d_0, the final value is d_0 * beta^n (distance cutoffs increase following a geometric
+1:    * progression with ratio beta).
+1:    */
+1:   private final double beta;
+1: 
+1:   /**
+1:    * Multiplying clusterLogFactor with numProcessedDatapoints gets an estimate of the suggested
+1:    * number of clusters. This mirrors the recommended number of clusters for n points where there should be k actual
+1:    * clusters, k * log n. In the case of our estimate we use clusterLogFactor * log(numProcessedDataPoints).
+1:    *
+1:    * It is important to note that numClusters is NOT k. It is an estimate of k * log n.
+1:    */
+1:   private final double clusterLogFactor;
+1: 
+1:   /**
+1:    * Centroids are collapsed when the number of clusters becomes greater than clusterOvershoot * numClusters. This
+1:    * effectively means having a slack in numClusters so that the actual number of centroids, centroids.size() tracks
+1:    * numClusters approximately. The idea is that the actual number of clusters should be at least numClusters but not
+1:    * much more (so that we don't end up having 1 cluster / point).
+1:    */
+1:   private final double clusterOvershoot;
+1: 
+1:   /**
+1:    * Random object to sample values from.
+1:    */
+0:   private Random random = RandomUtils.getRandom();
+1: 
+1:   /**
+1:    * Calls StreamingKMeans(searcher, numClusters, 1.3, 10, 2).
+1:    * @see StreamingKMeans#StreamingKMeans(org.apache.mahout.math.neighborhood.UpdatableSearcher, int,
+1:    * double, double, double, double)
+1:    */
+1:   public StreamingKMeans(UpdatableSearcher searcher, int numClusters) {
+1:     this(searcher, numClusters, 1.0 / numClusters, 1.3, 20, 2);
+1:   }
+1: 
+1:   /**
+1:    * Calls StreamingKMeans(searcher, numClusters, distanceCutoff, 1.3, 10, 2).
+1:    * @see StreamingKMeans#StreamingKMeans(org.apache.mahout.math.neighborhood.UpdatableSearcher, int,
+1:    * double, double, double, double)
+1:    */
+1:   public StreamingKMeans(UpdatableSearcher searcher, int numClusters, double distanceCutoff) {
+1:     this(searcher, numClusters, distanceCutoff, 1.3, 20, 2);
+1:   }
+1: 
+1:   /**
+1:    * Creates a new StreamingKMeans class given a searcher and the number of clusters to generate.
+1:    *
+1:    * @param searcher A Searcher that is used for performing nearest neighbor search. It MUST BE
+1:    *                 EMPTY initially because it will be used to keep track of the cluster
+1:    *                 centroids.
+1:    * @param numClusters An estimated number of clusters to generate for the data points.
+1:    *                    This can adjusted, but the actual number will depend on the data. The
+1:    * @param distanceCutoff  The initial distance cutoff representing the value of the
+1:    *                      distance between a point and its closest centroid after which
+1:    *                      the new point will definitely be assigned to a new cluster.
+1:    * @param beta Ratio of geometric progression to use when increasing distanceCutoff. After n increases, distanceCutoff
+1:    *             becomes distanceCutoff * beta^n. A smaller value increases the distanceCutoff less aggressively.
+1:    * @param clusterLogFactor Value multiplied with the number of points counted so far estimating the number of clusters
+1:    *                         to aim for. If the final number of clusters is known and this clustering is only for a
+1:    *                         sketch of the data, this can be the final number of clusters, k.
+1:    * @param clusterOvershoot Multiplicative slack factor for slowing down the collapse of the clusters.
+1:    */
+1:   public StreamingKMeans(UpdatableSearcher searcher, int numClusters,
+1:                          double distanceCutoff, double beta, double clusterLogFactor, double clusterOvershoot) {
+1:     this.centroids = searcher;
+1:     this.numClusters = numClusters;
+1:     this.distanceCutoff = distanceCutoff;
+1:     this.beta = beta;
+1:     this.clusterLogFactor = clusterLogFactor;
+1:     this.clusterOvershoot = clusterOvershoot;
+1:   }
+1: 
+1:   /**
+1:    * @return an Iterator to the Centroids contained in this clusterer.
+1:    */
+1:   @Override
+1:   public Iterator<Centroid> iterator() {
+1:     return Iterators.transform(centroids.iterator(), new Function<Vector, Centroid>() {
+1:       @Override
+1:       public Centroid apply(Vector input) {
+1:         return (Centroid)input;
+1:       }
+1:     });
+1:   }
+1: 
+1:   /**
+1:    * Cluster the rows of a matrix, treating them as Centroids with weight 1.
+1:    * @param data matrix whose rows are to be clustered.
+1:    * @return the UpdatableSearcher containing the resulting centroids.
+1:    */
+1:   public UpdatableSearcher cluster(Matrix data) {
+1:     return cluster(Iterables.transform(data, new Function<MatrixSlice, Centroid>() {
+1:       @Override
+1:       public Centroid apply(MatrixSlice input) {
+1:         // The key in a Centroid is actually the MatrixSlice's index.
+1:         return Centroid.create(input.index(), input.vector());
+1:       }
+1:     }));
+1:   }
+1: 
+1:   /**
+1:    * Cluster the data points in an Iterable<Centroid>.
+1:    * @param datapoints Iterable whose elements are to be clustered.
+1:    * @return the UpdatableSearcher containing the resulting centroids.
+1:    */
+1:   public UpdatableSearcher cluster(Iterable<Centroid> datapoints) {
+1:     return clusterInternal(datapoints, false);
+1:   }
+1: 
+1:   /**
+1:    * Cluster one data point.
+1:    * @param datapoint to be clustered.
+1:    * @return the UpdatableSearcher containing the resulting centroids.
+1:    */
+1:   public UpdatableSearcher cluster(final Centroid datapoint) {
+1:     return cluster(new Iterable<Centroid>() {
+1:       @Override
+1:       public Iterator<Centroid> iterator() {
+1:         return new Iterator<Centroid>() {
+1:           private boolean accessed = false;
+1: 
+1:           @Override
+1:           public boolean hasNext() {
+1:             return !accessed;
+1:           }
+1: 
+1:           @Override
+1:           public Centroid next() {
+1:             accessed = true;
+1:             return datapoint;
+1:           }
+1: 
+1:           @Override
+1:           public void remove() {
+1:             throw new UnsupportedOperationException();
+1:           }
+1:         };
+1:       }
+1:     });
+1:   }
+1: 
+1:   /**
+1:    * @return the number of clusters computed from the points until now.
+1:    */
+1:   public int getNumClusters() {
+1:     return centroids.size();
+1:   }
+1: 
+1:   /**
+1:    * Internal clustering method that gets called from the other wrappers.
+1:    * @param datapoints Iterable of data points to be clustered.
+1:    * @param collapseClusters whether this is an "inner" clustering and the datapoints are the previously computed
+1:    *                         centroids. Some logic is different to ensure counters are consistent but it behaves
+1:    *                         nearly the same.
+1:    * @return the UpdatableSearcher containing the resulting centroids.
+1:    */
+1:   private UpdatableSearcher clusterInternal(Iterable<Centroid> datapoints, boolean collapseClusters) {
+1:     int oldNumProcessedDataPoints = numProcessedDatapoints;
+1:     // We clear the centroids we have in case of cluster collapse, the old clusters are the
+1:     // datapoints but we need to re-cluster them.
+1:     if (collapseClusters) {
+1:       centroids.clear();
+1:       numProcessedDatapoints = 0;
+1:     }
+1: 
+0:     int numCentroidsToSkip = 0;
+1:     if (centroids.size() == 0) {
+1:       // Assign the first datapoint to the first cluster.
+1:       // Adding a vector to a searcher would normally just reference the copy,
+1:       // but we could potentially mutate it and so we need to make a clone.
+0:       centroids.add(Iterables.get(datapoints, 0).clone());
+0:       numCentroidsToSkip = 1;
+1:       ++numProcessedDatapoints;
+1:     }
+1: 
+1:     // To cluster, we scan the data and either add each point to the nearest group or create a new group.
+1:     // when we get too many groups, we need to increase the threshold and rescan our current groups
+0:     for (Centroid row : Iterables.skip(datapoints, numCentroidsToSkip)) {
+1:       // Get the closest vector and its weight as a WeightedThing<Vector>.
+1:       // The weight of the WeightedThing is the distance to the query and the value is a
+1:       // reference to one of the vectors we added to the searcher previously.
+1:       WeightedThing<Vector> closestPair = centroids.searchFirst(row, false);
+1: 
+1:       // We get a uniformly distributed random number between 0 and 1 and compare it with the
+1:       // distance to the closest cluster divided by the distanceCutoff.
+1:       // This is so that if the closest cluster is further than distanceCutoff,
+1:       // closestPair.getWeight() / distanceCutoff > 1 which will trigger the creation of a new
+1:       // cluster anyway.
+1:       // However, if the ratio is less than 1, we want to create a new cluster with probability
+1:       // proportional to the distance to the closest cluster.
+1:       double sample = random.nextDouble();
+1:       if (sample < row.getWeight() * closestPair.getWeight() / distanceCutoff) {
+1:         // Add new centroid, note that the vector is copied because we may mutate it later.
+1:         centroids.add(row.clone());
+1:       } else {
+1:         // Merge the new point with the existing centroid. This will update the centroid's actual
+1:         // position.
+1:         // We know that all the points we inserted in the centroids searcher are (or extend)
+1:         // WeightedVector, so the cast will always succeed.
+1:         Centroid centroid = (Centroid) closestPair.getValue();
+1: 
+1:         // We will update the centroid by removing it from the searcher and reinserting it to
+1:         // ensure consistency.
+1:         if (!centroids.remove(centroid, Constants.EPSILON)) {
+1:           throw new RuntimeException("Unable to remove centroid");
+1:         }
+1:         centroid.update(row);
+1:         centroids.add(centroid);
+1: 
+1:       }
+1:       ++numProcessedDatapoints;
+1: 
+1:       if (!collapseClusters && centroids.size() > clusterOvershoot * numClusters) {
+1:         numClusters = (int) Math.max(numClusters, clusterLogFactor * Math.log(numProcessedDatapoints));
+1: 
+0:         List<Centroid> shuffled = Lists.newArrayList();
+1:         for (Vector vector : centroids) {
+1:           shuffled.add((Centroid) vector);
+1:         }
+1:         Collections.shuffle(shuffled);
+1:         // Re-cluster using the shuffled centroids as data points. The centroids member variable
+1:         // is modified directly.
+1:         clusterInternal(shuffled, true);
+1: 
+1:         if (centroids.size() > numClusters) {
+1:           distanceCutoff *= beta;
+1:         }
+1:       }
+1:     }
+1: 
+1:     if (collapseClusters) {
+1:       numProcessedDatapoints = oldNumProcessedDataPoints;
+1:     }
+1:     return centroids;
+1:   }
+1: 
+1:   public void reindexCentroids() {
+1:     int numCentroids = 0;
+1:     for (Centroid centroid : this) {
+1:       centroid.setIndex(numCentroids++);
+1:     }
+1:   }
+1: 
+1:   /**
+1:    * @return the distanceCutoff (an upper bound for the maximum distance within a cluster).
+1:    */
+1:   public double getDistanceCutoff() {
+1:     return distanceCutoff;
+1:   }
+1: }
+============================================================================

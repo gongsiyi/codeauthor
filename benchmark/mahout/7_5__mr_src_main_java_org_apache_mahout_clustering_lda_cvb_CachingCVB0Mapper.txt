@@ -1,0 +1,339 @@
+1:131eb4a: /**
+1:131eb4a:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:131eb4a:  * contributor license agreements.  See the NOTICE file distributed with
+1:131eb4a:  * this work for additional information regarding copyright ownership.
+1:131eb4a:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:131eb4a:  * (the "License"); you may not use this file except in compliance with
+1:131eb4a:  * the License.  You may obtain a copy of the License at
+4:131eb4a:  *
+1:131eb4a:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:131eb4a:  *
+1:131eb4a:  * Unless required by applicable law or agreed to in writing, software
+1:131eb4a:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:131eb4a:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:131eb4a:  * See the License for the specific language governing permissions and
+1:131eb4a:  * limitations under the License.
+1:131eb4a:  */
+1:131eb4a: package org.apache.mahout.clustering.lda.cvb;
+4:131eb4a: 
+1:131eb4a: import org.apache.hadoop.conf.Configuration;
+1:131eb4a: import org.apache.hadoop.fs.Path;
+1:131eb4a: import org.apache.hadoop.io.IntWritable;
+1:131eb4a: import org.apache.hadoop.mapreduce.Mapper;
+1:4fbfbc6: import org.apache.mahout.common.RandomUtils;
+1:131eb4a: import org.apache.mahout.math.DenseVector;
+1:131eb4a: import org.apache.mahout.math.MatrixSlice;
+1:131eb4a: import org.apache.mahout.math.Vector;
+1:131eb4a: import org.apache.mahout.math.VectorWritable;
+1:131eb4a: import org.slf4j.Logger;
+1:131eb4a: import org.slf4j.LoggerFactory;
+1:131eb4a: 
+1:131eb4a: import java.io.IOException;
+1:131eb4a: 
+1:131eb4a: /**
+1:131eb4a:  * Run ensemble learning via loading the {@link ModelTrainer} with two {@link TopicModel} instances:
+1:131eb4a:  * one from the previous iteration, the other empty.  Inference is done on the first, and the
+1:131eb4a:  * learning updates are stored in the second, and only emitted at cleanup().
+1:c88c240:  * <p/>
+1:131eb4a:  * In terms of obvious performance improvements still available, the memory footprint in this
+1:131eb4a:  * Mapper could be dropped by half if we accumulated model updates onto the model we're using
+1:131eb4a:  * for inference, which might also speed up convergence, as we'd be able to take advantage of
+1:131eb4a:  * learning <em>during</em> iteration, not just after each one is done.  Most likely we don't
+1:131eb4a:  * really need to accumulate double values in the model either, floats would most likely be
+1:131eb4a:  * sufficient.  Between these two, we could squeeze another factor of 4 in memory efficiency.
+1:c88c240:  * <p/>
+1:131eb4a:  * In terms of CPU, we're re-learning the p(topic|doc) distribution on every iteration, starting
+1:131eb4a:  * from scratch.  This is usually only 10 fixed-point iterations per doc, but that's 10x more than
+1:131eb4a:  * only 1.  To avoid having to do this, we would need to do a map-side join of the unchanging
+1:131eb4a:  * corpus with the continually-improving p(topic|doc) matrix, and then emit multiple outputs
+1:131eb4a:  * from the mappers to make sure we can do the reduce model averaging as well.  Tricky, but
+1:131eb4a:  * possibly worth it.
+1:c88c240:  * <p/>
+1:131eb4a:  * {@link ModelTrainer} already takes advantage (in maybe the not-nice way) of multi-core
+1:131eb4a:  * availability by doing multithreaded learning, see that class for details.
+1:131eb4a:  */
+1:131eb4a: public class CachingCVB0Mapper
+1:131eb4a:     extends Mapper<IntWritable, VectorWritable, IntWritable, VectorWritable> {
+1:4fbfbc6: 
+1:4fbfbc6:   private static final Logger log = LoggerFactory.getLogger(CachingCVB0Mapper.class);
+1:4fbfbc6: 
+1:4fbfbc6:   private ModelTrainer modelTrainer;
+1:c88c240:   private TopicModel readModel;
+1:c88c240:   private TopicModel writeModel;
+1:4fbfbc6:   private int maxIters;
+1:4fbfbc6:   private int numTopics;
+1:4aed7cc: 
+1:4fbfbc6:   protected ModelTrainer getModelTrainer() {
+1:4fbfbc6:     return modelTrainer;
+1:4fbfbc6:   }
+1:c88c240: 
+1:4fbfbc6:   protected int getMaxIters() {
+1:4fbfbc6:     return maxIters;
+1:4fbfbc6:   }
+1:c88c240: 
+1:4fbfbc6:   protected int getNumTopics() {
+1:4fbfbc6:     return numTopics;
+1:4fbfbc6:   }
+1:4fbfbc6: 
+1:131eb4a:   @Override
+1:131eb4a:   protected void setup(Context context) throws IOException, InterruptedException {
+1:131eb4a:     log.info("Retrieving configuration");
+1:131eb4a:     Configuration conf = context.getConfiguration();
+1:564c3e1:     float eta = conf.getFloat(CVB0Driver.TERM_TOPIC_SMOOTHING, Float.NaN);
+1:564c3e1:     float alpha = conf.getFloat(CVB0Driver.DOC_TOPIC_SMOOTHING, Float.NaN);
+1:131eb4a:     long seed = conf.getLong(CVB0Driver.RANDOM_SEED, 1234L);
+1:131eb4a:     numTopics = conf.getInt(CVB0Driver.NUM_TOPICS, -1);
+1:131eb4a:     int numTerms = conf.getInt(CVB0Driver.NUM_TERMS, -1);
+1:131eb4a:     int numUpdateThreads = conf.getInt(CVB0Driver.NUM_UPDATE_THREADS, 1);
+1:131eb4a:     int numTrainThreads = conf.getInt(CVB0Driver.NUM_TRAIN_THREADS, 4);
+1:131eb4a:     maxIters = conf.getInt(CVB0Driver.MAX_ITERATIONS_PER_DOC, 10);
+1:564c3e1:     float modelWeight = conf.getFloat(CVB0Driver.MODEL_WEIGHT, 1.0f);
+1:4fbfbc6: 
+1:131eb4a:     log.info("Initializing read model");
+1:131eb4a:     Path[] modelPaths = CVB0Driver.getModelPaths(conf);
+1:e64dd36:     if (modelPaths != null && modelPaths.length > 0) {
+1:131eb4a:       readModel = new TopicModel(conf, eta, alpha, null, numUpdateThreads, modelWeight, modelPaths);
+1:131eb4a:     } else {
+1:131eb4a:       log.info("No model files found");
+1:4fbfbc6:       readModel = new TopicModel(numTopics, numTerms, eta, alpha, RandomUtils.getRandom(seed), null,
+1:131eb4a:           numTrainThreads, modelWeight);
+1:131eb4a:     }
+1:131eb4a: 
+1:131eb4a:     log.info("Initializing write model");
+1:c88c240:     writeModel = modelWeight == 1
+1:131eb4a:         ? new TopicModel(numTopics, numTerms, eta, alpha, null, numUpdateThreads)
+1:131eb4a:         : readModel;
+1:131eb4a: 
+1:131eb4a:     log.info("Initializing model trainer");
+1:131eb4a:     modelTrainer = new ModelTrainer(readModel, writeModel, numTrainThreads, numTopics, numTerms);
+1:131eb4a:     modelTrainer.start();
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   @Override
+1:131eb4a:   public void map(IntWritable docId, VectorWritable document, Context context)
+1:c88c240:       throws IOException, InterruptedException {
+1:131eb4a:     /* where to get docTopics? */
+1:4aed7cc:     Vector topicVector = new DenseVector(numTopics).assign(1.0 / numTopics);
+1:131eb4a:     modelTrainer.train(document.get(), topicVector, true, maxIters);
+1:131eb4a:   }
+1:131eb4a: 
+1:131eb4a:   @Override
+1:131eb4a:   protected void cleanup(Context context) throws IOException, InterruptedException {
+1:131eb4a:     log.info("Stopping model trainer");
+1:131eb4a:     modelTrainer.stop();
+1:131eb4a: 
+1:131eb4a:     log.info("Writing model");
+1:c88c240:     TopicModel readFrom = modelTrainer.getReadModel();
+1:c88c240:     for (MatrixSlice topic : readFrom) {
+1:131eb4a:       context.write(new IntWritable(topic.index()), new VectorWritable(topic.vector()));
+1:131eb4a:     }
+1:c88c240:     readModel.stop();
+1:c88c240:     writeModel.stop();
+1:131eb4a:   }
+1:131eb4a: }
+============================================================================
+author:pferrel
+-------------------------------------------------------------------------------
+commit:b988c49
+author:frankscholten
+-------------------------------------------------------------------------------
+commit:1a42d85
+author:smarthi
+-------------------------------------------------------------------------------
+commit:c88c240
+/////////////////////////////////////////////////////////////////////////
+1:  * <p/>
+1:  * <p/>
+1:  * <p/>
+/////////////////////////////////////////////////////////////////////////
+1:   private TopicModel readModel;
+1:   private TopicModel writeModel;
+1: 
+1: 
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     writeModel = modelWeight == 1
+/////////////////////////////////////////////////////////////////////////
+1:       throws IOException, InterruptedException {
+/////////////////////////////////////////////////////////////////////////
+1:     TopicModel readFrom = modelTrainer.getReadModel();
+1:     for (MatrixSlice topic : readFrom) {
+1:     readModel.stop();
+1:     writeModel.stop();
+author:Sebastian Schelter
+-------------------------------------------------------------------------------
+commit:4aed7cc
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     Vector topicVector = new DenseVector(numTopics).assign(1.0 / numTopics);
+commit:6d16230
+/////////////////////////////////////////////////////////////////////////
+0:     throws IOException, InterruptedException {
+commit:4841efb
+/////////////////////////////////////////////////////////////////////////
+0:       throws IOException, InterruptedException {
+0:     Vector topicVector = new DenseVector(new double[numTopics]).assign(1.0 / numTopics);
+author:tcp
+-------------------------------------------------------------------------------
+commit:e64dd36
+/////////////////////////////////////////////////////////////////////////
+1:     if (modelPaths != null && modelPaths.length > 0) {
+/////////////////////////////////////////////////////////////////////////
+0:     for (MatrixSlice topic : model) {
+author:Sean R. Owen
+-------------------------------------------------------------------------------
+commit:564c3e1
+/////////////////////////////////////////////////////////////////////////
+1:     float eta = conf.getFloat(CVB0Driver.TERM_TOPIC_SMOOTHING, Float.NaN);
+1:     float alpha = conf.getFloat(CVB0Driver.DOC_TOPIC_SMOOTHING, Float.NaN);
+1:     float modelWeight = conf.getFloat(CVB0Driver.MODEL_WEIGHT, 1.0f);
+commit:4fbfbc6
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.mahout.common.RandomUtils;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:   private static final Logger log = LoggerFactory.getLogger(CachingCVB0Mapper.class);
+1: 
+1:   private ModelTrainer modelTrainer;
+1:   private int maxIters;
+1:   private int numTopics;
+1:   
+1:   protected ModelTrainer getModelTrainer() {
+1:     return modelTrainer;
+1:   }
+1:   
+1:   protected int getMaxIters() {
+1:     return maxIters;
+1:   }
+1:   
+1:   protected int getNumTopics() {
+1:     return numTopics;
+1:   }
+/////////////////////////////////////////////////////////////////////////
+1:       readModel = new TopicModel(numTopics, numTerms, eta, alpha, RandomUtils.getRandom(seed), null,
+author:Jacob Alexander Mannix
+-------------------------------------------------------------------------------
+commit:e5ad032
+/////////////////////////////////////////////////////////////////////////
+0:     Vector topicVector = new DenseVector(new double[numTopics]).assign(1.0/numTopics);
+commit:131eb4a
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.mahout.clustering.lda.cvb;
+1: 
+1: import org.apache.hadoop.conf.Configuration;
+1: import org.apache.hadoop.fs.Path;
+1: import org.apache.hadoop.io.IntWritable;
+1: import org.apache.hadoop.mapreduce.Mapper;
+1: import org.apache.mahout.math.DenseVector;
+1: import org.apache.mahout.math.MatrixSlice;
+1: import org.apache.mahout.math.Vector;
+1: import org.apache.mahout.math.VectorWritable;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import java.io.IOException;
+0: import java.util.Random;
+1: 
+1: /**
+1:  * Run ensemble learning via loading the {@link ModelTrainer} with two {@link TopicModel} instances:
+1:  * one from the previous iteration, the other empty.  Inference is done on the first, and the
+1:  * learning updates are stored in the second, and only emitted at cleanup().
+1:  *
+1:  * In terms of obvious performance improvements still available, the memory footprint in this
+1:  * Mapper could be dropped by half if we accumulated model updates onto the model we're using
+1:  * for inference, which might also speed up convergence, as we'd be able to take advantage of
+1:  * learning <em>during</em> iteration, not just after each one is done.  Most likely we don't
+1:  * really need to accumulate double values in the model either, floats would most likely be
+1:  * sufficient.  Between these two, we could squeeze another factor of 4 in memory efficiency.
+1:  *
+1:  * In terms of CPU, we're re-learning the p(topic|doc) distribution on every iteration, starting
+1:  * from scratch.  This is usually only 10 fixed-point iterations per doc, but that's 10x more than
+1:  * only 1.  To avoid having to do this, we would need to do a map-side join of the unchanging
+1:  * corpus with the continually-improving p(topic|doc) matrix, and then emit multiple outputs
+1:  * from the mappers to make sure we can do the reduce model averaging as well.  Tricky, but
+1:  * possibly worth it.
+1:  *
+1:  * {@link ModelTrainer} already takes advantage (in maybe the not-nice way) of multi-core
+1:  * availability by doing multithreaded learning, see that class for details.
+1:  */
+1: public class CachingCVB0Mapper
+1:     extends Mapper<IntWritable, VectorWritable, IntWritable, VectorWritable> {
+0:   private static Logger log = LoggerFactory.getLogger(CachingCVB0Mapper.class);
+1: 
+0:   protected ModelTrainer modelTrainer;
+0:   protected int maxIters;
+0:   protected int numTopics;
+1: 
+1:   @Override
+1:   protected void setup(Context context) throws IOException, InterruptedException {
+1:     log.info("Retrieving configuration");
+1:     Configuration conf = context.getConfiguration();
+0:     double eta = conf.getFloat(CVB0Driver.TERM_TOPIC_SMOOTHING, Float.NaN);
+0:     double alpha = conf.getFloat(CVB0Driver.DOC_TOPIC_SMOOTHING, Float.NaN);
+1:     long seed = conf.getLong(CVB0Driver.RANDOM_SEED, 1234L);
+1:     numTopics = conf.getInt(CVB0Driver.NUM_TOPICS, -1);
+1:     int numTerms = conf.getInt(CVB0Driver.NUM_TERMS, -1);
+1:     int numUpdateThreads = conf.getInt(CVB0Driver.NUM_UPDATE_THREADS, 1);
+1:     int numTrainThreads = conf.getInt(CVB0Driver.NUM_TRAIN_THREADS, 4);
+1:     maxIters = conf.getInt(CVB0Driver.MAX_ITERATIONS_PER_DOC, 10);
+0:     double modelWeight = conf.getFloat(CVB0Driver.MODEL_WEIGHT, 1f);
+1: 
+1:     log.info("Initializing read model");
+0:     TopicModel readModel;
+1:     Path[] modelPaths = CVB0Driver.getModelPaths(conf);
+0:     if(modelPaths != null && modelPaths.length > 0) {
+1:       readModel = new TopicModel(conf, eta, alpha, null, numUpdateThreads, modelWeight, modelPaths);
+1:     } else {
+1:       log.info("No model files found");
+0:       readModel = new TopicModel(numTopics, numTerms, eta, alpha, new Random(seed), null,
+1:           numTrainThreads, modelWeight);
+1:     }
+1: 
+1:     log.info("Initializing write model");
+0:     TopicModel writeModel = modelWeight == 1
+1:         ? new TopicModel(numTopics, numTerms, eta, alpha, null, numUpdateThreads)
+1:         : readModel;
+1: 
+1:     log.info("Initializing model trainer");
+1:     modelTrainer = new ModelTrainer(readModel, writeModel, numTrainThreads, numTopics, numTerms);
+1:     modelTrainer.start();
+1:   }
+1: 
+1:   @Override
+1:   public void map(IntWritable docId, VectorWritable document, Context context)
+0:       throws IOException, InterruptedException{
+1:     /* where to get docTopics? */
+0:     Vector topicVector = new DenseVector(new double[numTopics]).assign(1/numTopics);
+1:     modelTrainer.train(document.get(), topicVector, true, maxIters);
+1:   }
+1: 
+1:   @Override
+1:   protected void cleanup(Context context) throws IOException, InterruptedException {
+1:     log.info("Stopping model trainer");
+1:     modelTrainer.stop();
+1: 
+1:     log.info("Writing model");
+0:     TopicModel model = modelTrainer.getReadModel();
+0:     for(MatrixSlice topic : model) {
+1:       context.write(new IntWritable(topic.index()), new VectorWritable(topic.vector()));
+1:     }
+1:   }
+1: }
+============================================================================

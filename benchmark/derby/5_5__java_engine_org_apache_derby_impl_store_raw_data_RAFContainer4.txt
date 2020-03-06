@@ -1,0 +1,3014 @@
+1:55a6cdc: /*
+33:55a6cdc: 
+1:55a6cdc:    Derby - Class org.apache.derby.impl.store.raw.data.RAFContainer4
+1:bb8f25a: 
+1:55a6cdc:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:55a6cdc:    contributor license agreements.  See the NOTICE file distributed with
+1:55a6cdc:    this work for additional information regarding copyright ownership.
+1:55a6cdc:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:55a6cdc:    (the "License"); you may not use this file except in compliance with
+1:55a6cdc:    the License.  You may obtain a copy of the License at
+1:bb8f25a: 
+1:55a6cdc:       http://www.apache.org/licenses/LICENSE-2.0
+1:bb8f25a: 
+1:55a6cdc:    Unless required by applicable law or agreed to in writing, software
+1:55a6cdc:    distributed under the License is distributed on an "AS IS" BASIS,
+1:55a6cdc:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:55a6cdc:    See the License for the specific language governing permissions and
+1:55a6cdc:    limitations under the License.
+1:bb8f25a: 
+2:55a6cdc:  */
+1:55a6cdc: 
+1:55a6cdc: package org.apache.derby.impl.store.raw.data;
+1:55a6cdc: 
+1:55a6cdc: 
+1:55a6cdc: import org.apache.derby.iapi.error.StandardException;
+1:078bb79: import org.apache.derby.iapi.reference.SQLState;
+1:7e51e9d: import org.apache.derby.shared.common.sanity.SanityManager;
+1:55a6cdc: 
+1:55a6cdc: import org.apache.derby.iapi.store.raw.ContainerKey;
+1:bb8f25a: import org.apache.derby.iapi.util.InterruptStatus;
+1:bb8f25a: import org.apache.derby.iapi.util.InterruptDetectedException;
+1:55a6cdc: 
+1:55a6cdc: import java.io.EOFException;
+1:55a6cdc: import java.io.IOException;
+1:55a6cdc: import java.io.RandomAccessFile;
+1:55a6cdc: import java.nio.ByteBuffer;
+1:55a6cdc: import java.nio.channels.FileChannel;
+1:55a6cdc: import java.nio.channels.ClosedChannelException;
+1:078bb79: import java.nio.channels.ClosedByInterruptException;
+1:bb8f25a: import java.nio.channels.AsynchronousCloseException;
+1:b44572f: import org.apache.derby.io.StorageRandomAccessFile;
+1:55a6cdc: 
+1:b44572f: /**
+1:bb8f25a:  * RAFContainer4 overrides a few methods in FileContainer/RAFContainer in order
+1:bb8f25a:  * to use FileChannel from Java 1.4's New IO framework to issue multiple IO
+1:bb8f25a:  * operations to the same file concurrently instead of strictly serializing IO
+1:bb8f25a:  * operations using a mutex on the container object. Since we compile with Java
+1:bb8f25a:  * 1.4, the override "annotations" are inside the method javadoc headers.
+3:55a6cdc:  * <p>
+1:55a6cdc:  * Note that our requests for multiple concurrent IOs may be serialized further
+1:55a6cdc:  * down in the IO stack - this is entirely up to the JVM and OS. However, at
+1:55a6cdc:  * least in Linux on Sun's 1.4.2_09 JVM we see the desired behavior:
+1:55a6cdc:  * The FileChannel.read/write(ByteBuffer buf, long position) calls map to
+1:55a6cdc:  * pread/pwrite system calls, which enable efficient IO to the same file
+1:55a6cdc:  * descriptor by multiple threads.
+1:55a6cdc:  * <p>
+1:55a6cdc:  * This whole class should be merged back into RAFContainer when Derby
+1:55a6cdc:  * officially stops supporting Java 1.3.
+1:55a6cdc:  * <p>
+1:55a6cdc:  * Significant behavior changes from RAFContainer:
+1:55a6cdc:  * <ol>
+1:55a6cdc:  * <li> Multiple concurrent IOs permitted.
+1:55a6cdc:  * <li> State changes to the container (create, open, close) can now happen while
+1:55a6cdc:  *      IO is in progress due to the lack of locking. Closing a container while
+1:55a6cdc:  *      IO is in progress will cause IOExceptions in the thread calling readPage
+1:55a6cdc:  *      or writePage. If this happens something is probably amiss anyway.
+1:55a6cdc:  *      The iosInProgress variable is used in an attempt to detect this should it
+1:55a6cdc:  *      happen while running a debug build.
+1:55a6cdc:  * </ol>
+1:b231544:  *
+1:55a6cdc:  * @see java.nio.channels.FileChannel
+1:55a6cdc:  */
+1:55a6cdc: class RAFContainer4 extends RAFContainer {
+1:55a6cdc: 
+2:55a6cdc:     /**
+1:55a6cdc:      * This channel will be retrieved from RAFContainer's fileData
+1:55a6cdc:      * member when fileData is set. We wrap a couple of RAFContainer's methods
+1:55a6cdc:      * to accomplish this.
+1:55a6cdc:      */
+1:55a6cdc:     private FileChannel ourChannel = null;
+1:bb8f25a: 
+1:b231544:     private final Object channelCleanupMonitor = new Object();
+1:bb8f25a: 
+1:bb8f25a:     // channelCleanupMonitor protects next three state variables:
+1:bb8f25a: 
+1:bb8f25a:     // volatile on threadsInPageIO, is just to ensure that we get a correct
+1:bb8f25a:     // value for debugging: we can't always use channelCleanupMonitor
+1:1cfe34e:     // then. Otherwise protected by channelCleanupMonitor. Debugging value not
+1:1cfe34e:     // safe on 1.4, but who cares..
+1:bb8f25a:     private volatile int threadsInPageIO = 0;
+1:bb8f25a: 
+1:bb8f25a:     // volatile on restoreChannelInProgress: corner case where we can't use
+1:bb8f25a:     // channelCleanupMonitor: the corner case should not happen if NIO works as
+1:bb8f25a:     // specified: thats is, uniquely only one thread sees
+1:bb8f25a:     // ClosedByInterruptException, always.  Unfortunately, we sometimes get
+1:bb8f25a:     // AsynchronousCloseException, which another thread could theoretically
+1:bb8f25a:     // also see it it were interrupted at the same time inside NIO. In this
+1:bb8f25a:     // case, we could get two threads competing to do recovery. This is
+1:bb8f25a:     // normally OK, unless the thread owns allocCache or "this", in which case
+1:bb8f25a:     // we risk dead-lock if we synchronize on restoreChannelInProgress
+1:bb8f25a:     // (explained below). So, we have to rely on volatile, which isn't safe in
+1:bb8f25a:     // Java 1.4 (old memory model),
+1:bb8f25a:     private volatile boolean restoreChannelInProgress = false;
+1:bb8f25a: 
+1:bb8f25a: 
+1:16a0f6c:     // In case the recovering thread can't successfully recover the container
+1:16a0f6c:     // for some reason, it will throw, so other waiting threads need to give up
+1:16a0f6c:     // as well.
+1:bb8f25a:     private boolean giveUpIO = false;
+1:bb8f25a:     private final Object giveUpIOm = new Object(); // its monitor
+1:bb8f25a: 
+1:bb8f25a: /**
+1:55a6cdc:      * For debugging - will be incremented when an IO is started, decremented
+1:55a6cdc:      * when it is done. Should be == 0 when container state is changed.
+1:55a6cdc:      */
+1:bb8f25a:     private int iosInProgress = 0; // protected by monitor on "this"
+1:55a6cdc: 
+1:55a6cdc:     public RAFContainer4(BaseDataFileFactory factory) {
+1:55a6cdc:         super(factory);
+19:55a6cdc:     }
+1:bb8f25a: 
+1:b231544:     /**
+1:b44572f:      * Return the {@code FileChannel} for the specified
+1:b44572f:      * {@code StorageRandomAccessFile} if it is a {@code RandomAccessFile}.
+1:b44572f:      * Otherwise, return {@code null}.
+1:b44572f:      *
+1:b44572f:      * @param file the file to get the channel for
+1:b44572f:      * @return a {@code FileChannel} if {@code file} is an instance of
+1:b44572f:      * {@code RandomAccessFile}, {@code null} otherwise
+1:b44572f:      */
+1:b44572f:     private FileChannel getChannel(StorageRandomAccessFile file) {
+1:b44572f:         if (file instanceof RandomAccessFile) {
+1:b44572f:             /** XXX - this cast isn't testing friendly.
+1:b44572f:              * A testing class that implements StorageRandomAccessFile but isn't
+1:b44572f:              * a RandomAccessFile will be "worked around" by this class. An
+1:b44572f:              * example of such a class is
+1:b44572f:              * functionTests/util/corruptio/CorruptRandomAccessFile.java.
+1:b44572f:              * An interface rework may be necessary.
+1:b44572f:              */
+1:b44572f:             return ((RandomAccessFile) file).getChannel();
+1:b44572f:         }
+1:b44572f:         return null;
+1:b44572f:     }
+1:bb8f25a: 
+1:b44572f:     /**
+1:dbed020:      * <p>
+1:b44572f:      * Return the file channel for the current value of the {@code fileData}
+1:b44572f:      * field. If {@code fileData} doesn't support file channels, return
+1:b44572f:      * {@code null}.
+1:b44572f:      * </p>
+1:b44572f:      *
+1:b44572f:      * <p>
+1:b44572f:      * Callers of this method must synchronize on the container object since
+1:b44572f:      * two shared fields ({@code fileData} and {@code ourChannel}) are
+1:b44572f:      * accessed.
+1:b44572f:      * </p>
+1:b44572f:      *
+1:b44572f:      * @return a {@code FileChannel} object, if supported, or {@code null}
+1:b44572f:      */
+1:b44572f:     private FileChannel getChannel() {
+1:b44572f:         if (ourChannel == null) {
+1:b44572f:             ourChannel = getChannel(fileData);
+1:b44572f:         }
+1:b44572f:         return ourChannel;
+1:b44572f:     }
+1:bb8f25a: 
+1:08b4ed5:     private ContainerKey currentIdentity;
+1:08b4ed5: 
+1:55a6cdc:     /*
+1:55a6cdc:      * Wrapping methods that retrieve the FileChannel from RAFContainer's
+1:55a6cdc:      * fileData after calling the real methods in RAFContainer.
+1:bb8f25a:      *
+1:bb8f25a:      * override of RAFContainer#openContainer
+1:55a6cdc:      */
+1:55a6cdc:     synchronized boolean openContainer(ContainerKey newIdentity)
+1:55a6cdc:         throws StandardException
+2:55a6cdc:     {
+1:5cc3875:         if (SanityManager.DEBUG) {
+2:55a6cdc:             SanityManager.ASSERT(iosInProgress == 0,
+1:55a6cdc:                     "Container opened while IO operations are in progress. "
+1:55a6cdc:                     + "This should not happen.");
+1:b44572f:             SanityManager.ASSERT(fileData == null, "fileData isn't null");
+1:b44572f:             SanityManager.ASSERT(ourChannel == null, "ourChannel isn't null");
+1:bb8f25a:         }
+1:08b4ed5: 
+1:08b4ed5:         currentIdentity = newIdentity;
+1:b44572f:         return super.openContainer(newIdentity);
+1:5cc3875:     }
+1:bb8f25a: 
+1:bb8f25a:     /**
+1:bb8f25a:      * override of RAFContainer#createContainer
+1:bb8f25a:      */
+1:55a6cdc:     synchronized void createContainer(ContainerKey newIdentity)
+1:55a6cdc:         throws StandardException
+1:55a6cdc:     {
+3:55a6cdc:         if (SanityManager.DEBUG) {
+1:55a6cdc:             SanityManager.ASSERT(iosInProgress == 0,
+1:55a6cdc:                     "Container created while IO operations are in progress. "
+1:55a6cdc:                     + "This should not happen.");
+1:b44572f:             SanityManager.ASSERT(fileData == null, "fileData isn't null");
+1:b44572f:             SanityManager.ASSERT(ourChannel == null, "ourChannel isn't null");
+1:55a6cdc:         }
+1:bb8f25a: 
+1:08b4ed5:         currentIdentity = newIdentity;
+1:55a6cdc:         super.createContainer(newIdentity);
+1:55a6cdc:     }
+1:bb8f25a: 
+1:bb8f25a:     /**
+1:08b4ed5:      * When the existing channel ({@code ourChannel}) has been closed due to
+1:08b4ed5:      * interrupt, we need to reopen the underlying RAF to get a fresh channel
+1:08b4ed5:      * so we can resume IO.
+1:08b4ed5:      */
+1:08b4ed5:     private void reopen() throws StandardException {
+1:08b4ed5:         if (SanityManager.DEBUG) {
+1:08b4ed5:             SanityManager.ASSERT(!ourChannel.isOpen());
+1:08b4ed5:         }
+1:08b4ed5:         ourChannel = null;
+1:08b4ed5:         reopenContainer(currentIdentity);
+1:08b4ed5:     }
+1:08b4ed5: 
+1:08b4ed5:     /**
+1:bb8f25a:      * override of RAFContainer#closeContainer
+1:bb8f25a:      */
+1:55a6cdc:     synchronized void closeContainer() {
+1:55a6cdc:         if (SanityManager.DEBUG) {
+1:af4a9fe:             // Any IOs in progress to a container being dropped will be
+1:af4a9fe:             // ignored, so we should not complain about starting a close
+1:af4a9fe:             // while there are IOs in progress if it is being dropped
+1:af4a9fe:             // anyway.
+1:af4a9fe:             SanityManager.ASSERT( (iosInProgress == 0)
+1:af4a9fe:                     || getCommittedDropState(),
+1:55a6cdc:                     "Container closed while IO operations are in progress. "
+1:55a6cdc:                     + " This should not happen.");
+1:55a6cdc:         }
+1:55a6cdc:         if(ourChannel != null) {
+3:55a6cdc:             try {
+1:55a6cdc:                 ourChannel.close();
+1:55a6cdc:             } catch (IOException e) {
+1:55a6cdc:                 // nevermind.
+1:1cfe34e:             } finally {
+1:55a6cdc:                 ourChannel=null;
+1:55a6cdc:             }
+1:55a6cdc:         }
+1:55a6cdc:         super.closeContainer();
+1:55a6cdc:     }
+1:bb8f25a: 
+1:b44572f:     /**
+1:55a6cdc:      * These are the methods that were rewritten to use FileChannel.
+1:55a6cdc:      **/
+1:bb8f25a: 
+1:55a6cdc:     /**
+1:55a6cdc:      *  Read a page into the supplied array.
+1:bb8f25a:      *  <p/>
+1:bb8f25a:      *  override of RAFContainer#readPage
+1:bb8f25a:      *  <p/>
+1:55a6cdc:      *  <BR> MT - thread safe
+1:55a6cdc:      *  @exception IOException exception reading page
+1:94f158a:      *  @exception StandardException Standard Derby error policy
+1:55a6cdc:      */
+1:55a6cdc:     protected void readPage(long pageNumber, byte[] pageData)
+1:078bb79:          throws IOException, StandardException
+1:55a6cdc:     {
+1:bb8f25a:         readPage(pageNumber, pageData, -1L);
+1:b7f22c3:     }
+1:b7f22c3: 
+1:b7f22c3: 
+1:bb8f25a:     /**
+1:bb8f25a:      *  Read a page into the supplied array.
+1:bb8f25a:      *  <p/>
+1:bb8f25a:      *  override of RAFContainer#readPage
+1:bb8f25a:      *  <p/>
+1:bb8f25a:      *  <BR> MT - thread safe
+1:b7f22c3: 
+1:bb8f25a:      *  @param pageNumber the page number to read data from, or -1 (called from
+1:bb8f25a:      *                    getEmbryonicPage)
+1:bb8f25a:      *  @param pageData  the buffer to read data into
+1:bb8f25a:      *  @param offset -1 normally (not used since offset is computed from
+1:bb8f25a:      *                   pageNumber), but used if pageNumber == -1
+1:bb8f25a:      *                   (getEmbryonicPage)
+1:bb8f25a:      *  @exception IOException exception reading page
+1:bb8f25a:      *  @exception StandardException Standard Derby error policy
+1:bb8f25a:      */
+1:bb8f25a:     private void readPage(long pageNumber, byte[] pageData, long offset)
+1:bb8f25a:          throws IOException, StandardException
+1:bb8f25a:     {
+1:616c0d0:         // Interrupt recovery "stealthMode": If this thread holds a monitor on
+1:616c0d0:         //
+1:616c0d0:         //   a) "this" (when RAFContainer#clean calls getEmbryonicPage via
+1:616c0d0:         //       writeRAFHEader) or
+1:616c0d0:         //   b) "allocCache" (e.g. FileContainer#newPage,
+1:616c0d0:         //       #pageValid)
+1:616c0d0:         //
+1:616c0d0:         // we cannot grab channelCleanupMonitor lest another thread is one
+1:616c0d0:         // doing recovery, since the recovery thread will try to grab both
+1:b0a8928:         // those monitors during container recovery.  So, just forge ahead
+1:616c0d0:         // in stealth mode (i.e. the recovery thread doesn't see us). If we see
+1:bb8f25a:         // ClosedChannelException, throw InterruptDetectedException, so we can
+1:616c0d0:         // retry from RAFContainer releasing "this", or FileContainer
+1:616c0d0:         // (releasing allocCache) as the case may be, so the recovery thread
+1:616c0d0:         // can do its thing.
+1:bb8f25a: 
+1:bb8f25a:         final boolean holdsThis = Thread.holdsLock(this);
+1:bb8f25a:         final boolean holdsAllocCache = Thread.holdsLock(allocCache);
+1:bb8f25a: 
+1:bb8f25a:         final boolean stealthMode = holdsThis || holdsAllocCache;
+1:bb8f25a: 
+1:bb8f25a:         if (SanityManager.DEBUG) {
+1:bb8f25a:             // getEmbryonicPage only
+1:bb8f25a:             if (pageNumber == -1) {
+1:fe96552:                 if (!holdsThis) {
+1:fe96552:                     // Remove when DERBY-6354 is closed:
+1:fe96552:                     new Throwable().printStackTrace(SanityManager.GET_DEBUG_STREAM());
+1:fe96552:                 }
+1:bb8f25a:                 SanityManager.ASSERT(holdsThis);
+1:bb8f25a:             }
+1:bb8f25a:             if (holdsThis) {
+1:bb8f25a:                 SanityManager.ASSERT(pageNumber == -1);
+1:bb8f25a:             }
+1:bb8f25a:         }
+1:bb8f25a: 
+1:bb8f25a: 
+1:bd018fd:         if (stealthMode) {
+1:bb8f25a:             // We go into stealth mode. If we see an
+1:bb8f25a:             // CloseChannelExceptionexception, we will get out of here anyway,
+1:bb8f25a:             // so we don't need to increment threadsInPageIO (nor can we,
+1:bb8f25a:             // without risking dead-lock),
+1:bb8f25a:         } else {
+1:bb8f25a:             synchronized (channelCleanupMonitor) {
+1:bb8f25a: 
+1:bb8f25a:                 // Gain entry
+1:abf8151:                 int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+1:a768c94: 
+1:bb8f25a:                 while (restoreChannelInProgress) {
+1:a768c94:                     if (retries-- == 0) {
+1:a768c94:                         throw StandardException.newException(
+1:a768c94:                             SQLState.FILE_IO_INTERRUPTED);
+1:a768c94:                     }
+1:a768c94: 
+1:bb8f25a:                     try {
+1:abf8151:                         channelCleanupMonitor.wait(
+1:abf8151:                             InterruptStatus.INTERRUPT_RETRY_SLEEP);
+1:bb8f25a:                     } catch (InterruptedException e) {
+1:5d97422:                         InterruptStatus.setInterrupted();
+1:a768c94:                     }
+1:a768c94: 
+1:4afad93:                 }
+1:a768c94: 
+1:bb8f25a:                 threadsInPageIO++;
+1:bb8f25a:             }
+1:bb8f25a:         }
+1:4afad93: 
+1:bb8f25a: 
+1:b7f22c3:         boolean success = false;
+1:abf8151:         int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+1:b7f22c3: 
+1:1cfe34e:       try {
+1:b7f22c3:         while (!success) {
+1:1cfe34e:             try {
+1:bb8f25a:                 if (pageNumber == FIRST_ALLOC_PAGE_NUMBER) {
+1:bb8f25a:                     // If this is the first alloc page, there may be another
+1:bb8f25a:                     // thread accessing the container information in the
+1:bb8f25a:                     // borrowed space on the same page. In that case, we
+1:bb8f25a:                     // synchronize the entire method call, just like
+1:bb8f25a:                     // RAFContainer.readPage() does, in order to avoid
+1:bb8f25a:                     // conflicts. For all other pages it is safe to skip the
+1:bb8f25a:                     // synchronization, since concurrent threads will access
+1:bb8f25a:                     // different pages and therefore don't interfere with each
+1:bb8f25a:                     // other:
+1:b7f22c3:                     synchronized (this) {
+1:bb8f25a:                         readPage0(pageNumber, pageData, offset);
+1:bb8f25a:                     }
+1:bb8f25a:                 } else {
+1:bb8f25a:                     // Normal case.
+1:bb8f25a:                     readPage0(pageNumber, pageData, offset);
+1:bb8f25a:                 }
+1:b7f22c3: 
+1:bb8f25a:                 success = true;
+1:1cfe34e: 
+1:bb8f25a:             } catch (ClosedChannelException e) {
+1:b0a8928:                 handleClosedChannel(e, stealthMode, retries--);
+1:bb8f25a:             }
+1:bb8f25a:         }
+1:1cfe34e:       } finally {
+1:bb8f25a:         if (stealthMode) {
+1:bd018fd:             // don't touch threadsInPageIO
+1:bd018fd:         } else {
+1:bb8f25a:             synchronized (channelCleanupMonitor) {
+1:bb8f25a:                 threadsInPageIO--;
+1:1cfe34e:             }
+1:1cfe34e:         }
+1:bd018fd:       }
+1:a7de081:     }
+1:16a0f6c: 
+1:bb8f25a:     private void readPage0(long pageNumber, byte[] pageData, long offset)
+2:55a6cdc:          throws IOException, StandardException
+1:55a6cdc:     {
+1:55a6cdc:         FileChannel ioChannel;
+1:bb8f25a:         synchronized (this) {
+1:55a6cdc:             if (SanityManager.DEBUG) {
+1:bb8f25a:                 if (pageNumber != -1L) {
+1:bb8f25a:                     SanityManager.ASSERT(!getCommittedDropState());
+1:bb8f25a:                 } // else: can happen from getEmbryonicPage
+1:a7de081:             }
+1:b7f22c3:             ioChannel = getChannel();
+1:b7f22c3:         }
+1:b7f22c3: 
+1:bb8f25a:         if (SanityManager.DEBUG) {
+1:bb8f25a:             if (pageNumber == -1L || pageNumber == FIRST_ALLOC_PAGE_NUMBER) {
+1:bb8f25a:                 // can happen from getEmbryonicPage
+1:bb8f25a:                 SanityManager.ASSERT(Thread.holdsLock(this));
+1:bb8f25a:             } else {
+1:bb8f25a:                 SanityManager.ASSERT(!Thread.holdsLock(this));
+1:bb8f25a:             }
+1:bb8f25a:         }
+1:bd018fd: 
+1:55a6cdc:         if(ioChannel != null) {
+1:bb8f25a: 
+1:55a6cdc:             long pageOffset = pageNumber * pageSize;
+1:bb8f25a: 
+1:55a6cdc:             ByteBuffer pageBuf = ByteBuffer.wrap(pageData);
+1:bb8f25a: 
+1:55a6cdc:             // I hope the try/finally is optimized away by the
+1:55a6cdc:             // compiler/jvm when SanityManager.DEBUG == false?
+1:b7f22c3:             try {
+1:bb8f25a:                 if (SanityManager.DEBUG) {
+2:55a6cdc:                     synchronized(this) {
+1:55a6cdc:                         iosInProgress++;
+1:bb8f25a:                     }
+1:bb8f25a:                 }
+1:bb8f25a: 
+1:bb8f25a:                 if (offset == -1L) {
+1:bb8f25a:                     // Normal page read doesn't specify offset,
+1:bb8f25a:                     // so use one computed from page number.
+1:bb8f25a:                     readFull(pageBuf, ioChannel, pageOffset);
+1:bb8f25a:                 } else {
+1:bb8f25a:                     // getEmbryonicPage specifies it own offset, so use that
+1:bb8f25a:                     if (SanityManager.DEBUG) {
+1:bb8f25a:                         SanityManager.ASSERT(pageNumber == -1L);
+1:bb8f25a:                     }
+1:bb8f25a: 
+1:bb8f25a:                     readFull(pageBuf, ioChannel, offset);
+1:bb8f25a:                 }
+1:bb8f25a:             }
+1:55a6cdc:             finally {
+1:55a6cdc:                 if (SanityManager.DEBUG) {
+1:55a6cdc:                     synchronized(this) {
+1:55a6cdc:                         iosInProgress--;
+1:bb8f25a:                     }
+1:a7de081:                 }
+1:bb8f25a: 
+1:a7de081:             }
+1:bb8f25a: 
+1:55a6cdc:             if (dataFactory.databaseEncrypted() &&
+1:bb8f25a:                 pageNumber != FIRST_ALLOC_PAGE_NUMBER &&
+1:bb8f25a:                 pageNumber != -1L /* getEmbryonicPage */)
+1:55a6cdc:             {
+1:55a6cdc:                 decryptPage(pageData, pageSize);
+1:55a6cdc:             }
+1:55a6cdc:         }
+1:55a6cdc:         else
+1:55a6cdc:         { // iochannel was not initialized, fall back to original method.
+1:55a6cdc:             super.readPage(pageNumber, pageData);
+1:55a6cdc:         }
+1:55a6cdc:     }
+1:bb8f25a: 
+1:bb8f25a: 
+1:55a6cdc:     /**
+1:55a6cdc:      *  Write a page from the supplied array.
+1:bb8f25a:      *  <p/>
+1:bb8f25a:      *  override of RAFContainer#writePage
+1:bb8f25a:      *  <p/>
+1:55a6cdc:      *  <BR> MT - thread safe
+2:b44572f:      *
+1:94f158a:      *  @exception StandardException Standard Derby error policy
+1:55a6cdc:      *  @exception IOException IO error accessing page
+1:55a6cdc:      */
+1:55a6cdc:     protected void writePage(long pageNumber, byte[] pageData, boolean syncPage)
+1:a7de081:          throws IOException, StandardException
+1:55a6cdc:     {
+1:616c0d0:         // Interrupt recovery "stealthMode": If this thread holds a monitor on
+1:616c0d0:         //
+1:616c0d0:         //   a) "allocCache" (e.g. FileContainer#newPage, #pageValid),
+1:616c0d0:         //
+1:616c0d0:         // we cannot grab channelCleanupMonitor lest another thread is one
+1:616c0d0:         // doing recovery, since the recovery thread will try to grab both
+1:b0a8928:         // those monitors during container recovery.  So, just forge ahead
+1:616c0d0:         // in stealth mode (i.e. the recovery thread doesn't see us). If we see
+1:bb8f25a:         // ClosedChannelException, throw InterruptDetectedException, so we can
+1:616c0d0:         // retry from FileContainer releasing allocCache, so the recovery
+1:616c0d0:         // thread can do its thing.
+1:bb8f25a:         boolean stealthMode = Thread.holdsLock(allocCache);
+1:bb8f25a: 
+1:bb8f25a:         if (SanityManager.DEBUG) {
+1:bb8f25a:             SanityManager.ASSERT(!Thread.holdsLock(this));
+1:bb8f25a:         }
+1:bb8f25a: 
+1:bb8f25a:        if (stealthMode) {
+1:bb8f25a:             // We go into stealth mode. If we see an
+1:bb8f25a:             // CloseChannelExceptionexception, we will get out of here anyway,
+1:bb8f25a:             // so we don't need to increment threadsInPageIO (nor can we,
+1:bb8f25a:             // without risking dead-lock),
+1:bb8f25a:         } else {
+1:bb8f25a:             synchronized (channelCleanupMonitor) {
+1:bb8f25a: 
+1:bb8f25a:                 // Gain entry
+1:abf8151:                 int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+1:bb8f25a: 
+1:bb8f25a:                 while (restoreChannelInProgress) {
+1:a768c94:                     if (retries-- == 0) {
+1:a768c94:                         throw StandardException.newException(
+1:a768c94:                             SQLState.FILE_IO_INTERRUPTED);
+1:bb8f25a:                     }
+1:bb8f25a: 
+1:bb8f25a:                     try {
+1:abf8151:                         channelCleanupMonitor.wait(
+1:abf8151:                             InterruptStatus.INTERRUPT_RETRY_SLEEP);
+1:bb8f25a:                     } catch (InterruptedException e) {
+1:5d97422:                         InterruptStatus.setInterrupted();
+1:bb8f25a:                     }
+1:bb8f25a: 
+1:bb8f25a:                 }
+1:bb8f25a: 
+1:bd018fd:                 threadsInPageIO++;
+1:bb8f25a:             }
+1:bb8f25a:         }
+1:bb8f25a: 
+1:bb8f25a:         boolean success = false;
+1:abf8151:         int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+1:bb8f25a: 
+1:bb8f25a:       try {
+1:bb8f25a:         while (!success) {
+1:bb8f25a:             try {
+1:bb8f25a:                 if (pageNumber == FIRST_ALLOC_PAGE_NUMBER) {
+1:bb8f25a:                     // If this is the first alloc page, there may be
+1:bb8f25a:                     // another thread accessing the container information
+1:bb8f25a:                     // in the borrowed space on the same page. In that
+1:bb8f25a:                     // case, we synchronize the entire method call, just
+1:bb8f25a:                     // like RAFContainer.writePage() does, in order to
+1:bb8f25a:                     // avoid conflicts. For all other pages it is safe to
+1:bb8f25a:                     // skip the synchronization, since concurrent threads
+1:bb8f25a:                     // will access different pages and therefore don't
+1:bb8f25a:                     // interfere with each other.
+1:bb8f25a:                     synchronized (this) {
+1:bb8f25a:                         writePage0(pageNumber, pageData, syncPage);
+1:bb8f25a:                     }
+1:bb8f25a:                 } else {
+1:bb8f25a:                     writePage0(pageNumber, pageData, syncPage);
+1:bb8f25a:                 }
+1:bb8f25a: 
+1:b7f22c3:                 success = true;
+1:bb8f25a: 
+1:bb8f25a:             } catch (ClosedChannelException e) {
+1:b0a8928:                 handleClosedChannel(e, stealthMode, retries--);
+1:bb8f25a:             }
+1:bb8f25a:         }
+1:55a6cdc:       } finally {
+1:bb8f25a:         if (stealthMode) {
+1:bb8f25a:             // don't touch threadsInPageIO
+1:bb8f25a:         } else {
+1:bb8f25a:             synchronized (channelCleanupMonitor) {
+1:bb8f25a:                 threadsInPageIO--;
+1:bb8f25a:             }
+1:bb8f25a:         }
+1:bb8f25a:       }
+1:bb8f25a:     }
+1:bb8f25a: 
+1:55a6cdc:     /**
+1:b44572f:      * <p>
+1:b0a8928:      * This method handles what to do when, during a NIO operation we receive a
+1:b0a8928:      * {@code ClosedChannelException}. Note the specialization hierarchy:
+1:dbed020:      * </p>
+1:dbed020:      * <p>
+1:dbed020:      * {@code ClosedChannelException} -&gt; {@code AsynchronousCloseException} -&gt;
+1:b0a8928:      * {@code ClosedByInterruptException}
+1:dbed020:      * </p>
+1:dbed020:      * <p>
+1:b0a8928:      * If {@code e} is a ClosedByInterruptException, we normally start
+1:b0a8928:      * container recovery, i.e. we need to reopen the random access file so we
+1:b0a8928:      * get get a new interruptible channel and continue IO.
+1:dbed020:      * </p>
+1:dbed020:      * <p>
+1:b0a8928:      * If {@code e} is a {@code AsynchronousCloseException} or a plain {@code
+1:b0a8928:      * ClosedChannelException}, the behavior depends of {@code stealthMode}:
+1:dbed020:      * </p>
+1:dbed020:      * <p>
+1:b0a8928:      * If {@code stealthMode == false}, the method will wait for
+1:b0a8928:      * another thread tp finish recovering the IO channel before returning.
+1:dbed020:      * </p>
+1:dbed020:      * <p>
+1:b0a8928:      * If {@code stealthMode == true}, the method throws {@code
+1:b0a8928:      * InterruptDetectedException}, allowing retry at a higher level in the
+1:b0a8928:      * code.  The reason for this is that we sometimes need to release monitors
+1:b0a8928:      * on objects needed by the recovery thread.
+1:dbed020:      * </p>
+1:b0a8928:      *
+1:b0a8928:      * @param e Should be an instance of {@code ClosedChannelException}.
+1:b0a8928:      * @param stealthMode If {@code true}, do retry at a higher level
+1:b0a8928:      * @param retries Give up waiting for another thread to reopen the channel
+1:b0a8928:      *                when {@code retries} reaches 0. Only applicable if {@code
+1:b0a8928:      *                stealthMode == false}.
+1:b0a8928:      * @throws InterruptDetectedException if retry at higher level is required
+1:b0a8928:      *         {@code stealthMode == true}.
+1:b0a8928:      * @throws StandardException standard error policy, incl. when we give up
+1:b0a8928:      *                           waiting for another thread to reopen channel
+1:b0a8928:      */
+1:b0a8928:     private void handleClosedChannel(ClosedChannelException e,
+1:b0a8928:                                      boolean stealthMode,
+1:b0a8928:                                      int retries)
+1:b0a8928:             throws StandardException {
+1:b0a8928: 
+1:b0a8928:         // if (e instanceof ClosedByInterruptException e) {
+1:b0a8928:         // Java NIO Bug 6979009:
+1:b0a8928:         // http://bugs.sun.com/view_bug.do?bug_id=6979009
+1:b0a8928:         // Sometimes NIO throws AsynchronousCloseException instead of
+1:b0a8928:         // ClosedByInterruptException
+1:b0a8928: 
+1:b0a8928:         if (e instanceof AsynchronousCloseException) {
+1:b0a8928:             // Subsumes ClosedByInterruptException
+1:b0a8928: 
+1:b0a8928:             // The interrupted thread may or may not get back here to try
+1:b0a8928:             // recovery before other concurrent IO threads will see (the
+1:b0a8928:             // secondary) ClosedChannelException, but we have logic to handle
+1:b0a8928:             // that, cf threadsInPageIO.
+1:b0a8928: 
+1:b0a8928:             if (Thread.currentThread().isInterrupted()) {
+1:b0a8928:                 if (recoverContainerAfterInterrupt(
+1:b0a8928:                             e.toString(),
+1:b0a8928:                             stealthMode)) {
+1:b0a8928:                     return; // do I/O over again
+1:b0a8928:                 }
+1:b0a8928:             }
+1:b0a8928: 
+1:b0a8928:             // Recovery is in progress, wait for another interrupted thread to
+1:b0a8928:             // clean up.
+1:b0a8928: 
+1:b0a8928:             awaitRestoreChannel(e, stealthMode);
+1:b0a8928:         } else {
+1:b0a8928:             // According to the exception type, We are not the thread that
+1:b0a8928:             // first saw the channel interrupt, so no recovery attempt.
+1:b0a8928:             InterruptStatus.noteAndClearInterrupt(
+1:b0a8928:                 "ClosedChannelException",
+1:b7f22c3:                 threadsInPageIO,
+1:b7f22c3:                 hashCode());
+1:1cfe34e: 
+1:b0a8928:             awaitRestoreChannel(e, stealthMode);
+1:b0a8928:             if (retries == 0) {
+1:1cfe34e:                 throw StandardException.newException(
+1:1cfe34e:                     SQLState.FILE_IO_INTERRUPTED);
+1:1cfe34e:             }
+1:16a0f6c:         }
+1:bb8f25a:     }
+1:bb8f25a: 
+1:bb8f25a:     /**
+1:b231544:      * Use when seeing an exception during IO and when another thread is
+1:b231544:      * presumably doing the recovery.
+1:b0a8928:      * <p/>
+1:b231544:      * If {@code stealthMode == false}, wait for another thread to recover the
+1:b231544:      * container after an interrupt. If {@code stealthMode == true}, throw
+1:b231544:      * internal exception {@code InterruptDetectedException} to do retry from
+1:b231544:      * higher in the stack.
+1:b0a8928:      * <p/>
+1:b231544:      * If {@code stealthMode == false}, maximum wait time for the container to
+1:b231544:      * become available again is determined by the product {@code
+1:abf8151:      * InterruptStatus.MAX_INTERRUPT_RETRIES *
+1:abf8151:      * InterruptStatus.INTERRUPT_RETRY_SLEEP}.
+1:b231544:      * There is a chance this thread will not see any recovery occuring (yet),
+1:b231544:      * in which case it waits for a bit and just returns, so the caller must
+1:b231544:      * retry IO until success.
+1:b0a8928:      * <p/>
+1:b231544:      * If for some reason the recovering thread has given up on resurrecting
+1:b231544:      * the container, cf {@code #giveUpIO}, the method throws {@code
+1:b231544:      * FILE_IO_INTERRUPTED}.
+1:b0a8928:      *
+1:b231544:      * @param e the exception we saw during IO
+1:b231544:      * @param stealthMode true if the thread doing IO in stealth mode
+1:b0a8928:      *
+1:b231544:      * @throws StandardException {@code InterruptDetectedException} and normal
+1:b231544:      *                            error policy
+1:b231544:      */
+1:bb8f25a:     private void awaitRestoreChannel (Exception e,
+1:bb8f25a:                                       boolean stealthMode)
+1:bb8f25a:             throws StandardException {
+1:b0a8928: 
+1:bb8f25a:         if (stealthMode) {
+1:bb8f25a:             // Retry handled at FileContainer or RAFContainer level
+1:bb8f25a:             //
+1:bb8f25a:             // This is necessary since recovery needs the monitor on allocCache
+1:bb8f25a:             // or "this" to clean up, so we need to back out all the way so
+1:bb8f25a:             // this thread can release the monitor to allow recovery to
+1:bb8f25a:             // proceed.
+1:bb8f25a:             if (SanityManager.DEBUG) {
+1:bb8f25a:                     debugTrace(
+1:bb8f25a:                         "thread does stealth mode retry");
+1:b0a8928:             }
+1:b0a8928: 
+1:bb8f25a:             synchronized (giveUpIOm) {
+1:bb8f25a:                 if (giveUpIO) {
+1:b231544: 
+1:bb8f25a:                     if (SanityManager.DEBUG) {
+1:bb8f25a:                         debugTrace(
+1:bb8f25a:                             "giving up retry, another thread gave up " +
+1:bb8f25a:                             "resurrecting container ");
+1:b0a8928:                     }
+1:b0a8928: 
+1:b0a8928:                     throw StandardException.newException(
+1:b0a8928:                         SQLState.FILE_IO_INTERRUPTED);
+1:b0a8928:                 }
+1:bb8f25a:             }
+1:bb8f25a: 
+1:bb8f25a:             throw new InterruptDetectedException();
+1:bb8f25a:         }
+1:bb8f25a: 
+1:bb8f25a:         synchronized (channelCleanupMonitor) {
+1:bd018fd:             // Pave way for the thread that received the interrupt that caused
+1:bd018fd:             // the channel close to clean up, by signaling we are waiting (no
+1:bd018fd:             // longer doing IO):
+1:bd018fd: 
+1:bd018fd:             threadsInPageIO--;
+1:bb8f25a:         }
+1:bb8f25a: 
+1:b0a8928:         // Wait here till the interrupted thread does container recovery.
+1:bb8f25a:         // If we get a channel exception for some other reason, this will never
+1:bb8f25a:         // happen, so throw after waiting long enough (60s).
+1:bb8f25a: 
+1:bb8f25a:         int timesWaited = -1;
+1:bb8f25a: 
+1:bb8f25a:         while (true) {
+1:bb8f25a:             synchronized(channelCleanupMonitor) {
+1:bb8f25a:                 while (restoreChannelInProgress) {
+1:bb8f25a:                     timesWaited++;
+1:bb8f25a: 
+1:bb8f25a:                     if (SanityManager.DEBUG) {
+1:bb8f25a:                         debugTrace(
+1:bb8f25a:                             "thread needs to wait for container recovery: " +
+1:bb8f25a:                             "already waited " + timesWaited + " times");
+1:bb8f25a:                     }
+1:bb8f25a: 
+1:abf8151:                     if (timesWaited > InterruptStatus.MAX_INTERRUPT_RETRIES) {
+1:b231544:                         // Max, give up, probably way too long anyway,
+1:bb8f25a:                         // but doesn't hurt?
+1:4afad93:                         throw StandardException.newException(
+1:bb8f25a:                             SQLState.FILE_IO_INTERRUPTED, e);
+1:bb8f25a:                     }
+1:bb8f25a: 
+1:bb8f25a:                     try {
+1:abf8151:                         channelCleanupMonitor.wait(
+1:abf8151:                             InterruptStatus.INTERRUPT_RETRY_SLEEP);
+1:bb8f25a:                     } catch (InterruptedException we) {
+1:bb8f25a:                         InterruptStatus.setInterrupted();
+1:bb8f25a:                     }
+1:bb8f25a:                 }
+1:bb8f25a: 
+1:bd018fd:                 // Since the channel is presumably ok (lest giveUpIO is set,
+1:16a0f6c:                 // see below), we put ourselves back in the IO set of threads:
+1:bd018fd: 
+2:bb8f25a:                 threadsInPageIO++;
+1:bb8f25a:                 break;
+1:bb8f25a:             }
+1:bb8f25a:         }
+1:bb8f25a: 
+1:bb8f25a:         synchronized (giveUpIOm) {
+1:bb8f25a:             if (giveUpIO) {
+1:bb8f25a: 
+1:bb8f25a:                 if (SanityManager.DEBUG) {
+1:bb8f25a:                     debugTrace(
+1:bb8f25a:                         "giving up retry, another thread gave up " +
+1:bb8f25a:                         "resurrecting container ");
+1:bb8f25a:                 }
+1:bb8f25a: 
+1:bb8f25a:                 threadsInPageIO--;
+1:16a0f6c:                 throw StandardException.newException(
+1:4afad93:                     SQLState.FILE_IO_INTERRUPTED);
+1:bb8f25a:             }
+1:bb8f25a:         }
+1:bb8f25a: 
+1:bb8f25a:         if (timesWaited == -1) {
+1:bb8f25a:             // We have not seen restoreChannelInProgress, so we may
+1:bb8f25a:             // have raced past the interrupted thread, so let's wait a
+1:bb8f25a:             // bit before we attempt a new I/O.
+1:bb8f25a:             try {
+1:abf8151:                 Thread.sleep(InterruptStatus.INTERRUPT_RETRY_SLEEP);
+1:bb8f25a:             } catch (InterruptedException we) {
+1:bb8f25a:                 // This thread is getting hit, too..
+1:bb8f25a:                 InterruptStatus.setInterrupted();
+1:bb8f25a:             }
+1:bb8f25a:         }
+1:bb8f25a:     }
+1:bb8f25a: 
+1:bb8f25a: 
+1:b0a8928:     /**
+1:b0a8928:      * Use this when the thread has received a ClosedByInterruptException (or,
+1:b0a8928:      * prior to JDK 1.7 it may also be AsynchronousCloseException - a bug)
+1:b231544:      * exception during IO and its interruped flag is also set. This makes this
+1:b0a8928:      * thread a likely candicate to do container recovery, unless another
+1:b0a8928:      * thread started it already, cf. return value.
+1:b231544:      *
+1:bb8f25a:      * @param whence caller site (debug info)
+1:bb8f25a:      * @param stealthMode don't update threadsInPageIO if true
+1:b231544:      * @return true if we did recovery, false if we saw someone else do it and
+1:bb8f25a:      * abstained
+1:bb8f25a:      */
+1:bb8f25a:     private boolean recoverContainerAfterInterrupt(
+1:bb8f25a:         String whence,
+1:bb8f25a:         boolean stealthMode) throws StandardException {
+1:bb8f25a: 
+1:bb8f25a:         if (stealthMode && restoreChannelInProgress) {
+1:bd018fd:             // 1) Another interrupted thread got to do the cleanup before us, so
+1:bb8f25a:             // yield.
+1:bb8f25a:             // This should not happen, but since
+1:bb8f25a:             // we had to "fix" NIO, cf. the code marked (**), we could
+1:bb8f25a:             // theoretically see two:
+1:bb8f25a:             //
+1:bb8f25a:             // - the thread that got AsynchronousCloseException, but was the
+1:bb8f25a:             //   one that caused the channel close: it will decide (correctly)
+1:bb8f25a:             //   it is the one to do recovery.
+1:bb8f25a:             //
+1:bb8f25a:             // - another thread that got an interrupt after doing successful IO
+1:bb8f25a:             //   but seeing a closed channel: it will decide (incorrectly) it
+1:bb8f25a:             //   is the one to do recovery. But since we had to fix NIO, this
+1:bb8f25a:             //   case gets conflated with the case that this was *really* the
+1:bb8f25a:             //   thread the caused the channel close.
+1:bb8f25a:             //
+1:bb8f25a:             // Not safe for Java 1.4 (only volatile protection for
+1:bb8f25a:             // restoreChannelInProgress here), compare safe test below (not
+1:bb8f25a:             // stealthMode).
+1:bd018fd:             //
+1:bd018fd:             // 2) The other way to end up here is if we get interrupted during
+1:bd018fd:             // getEmbryonicPage called during container recovery from the same
+1:bd018fd:             // thread (restoreChannelInProgress is set then, and
+1:bd018fd:             // getEmbryonicPage is stealthMode)
+1:bb8f25a: 
+1:b7f22c3:             InterruptStatus.noteAndClearInterrupt(
+1:bb8f25a:                 whence,
+1:b0a8928:                 threadsInPageIO,
+1:b0a8928:                 hashCode());
+1:bb8f25a: 
+1:bb8f25a:             return false;
+1:bb8f25a:         }
+1:bb8f25a: 
+1:bb8f25a:         synchronized (channelCleanupMonitor) {
+1:bb8f25a:             if (restoreChannelInProgress) {
+1:bb8f25a:                 // Another interrupted thread got to do the cleanup before us,
+1:bb8f25a:                 // so yield, see above explanation.
+1:bb8f25a:                 InterruptStatus.noteAndClearInterrupt(
+1:bb8f25a:                     whence,
+2:bb8f25a:                     threadsInPageIO,
+2:bb8f25a:                     hashCode());
+1:bb8f25a: 
+1:bb8f25a:                 return false;
+1:bb8f25a:             }
+1:bb8f25a: 
+1:bb8f25a:             if (stealthMode) {
+1:bb8f25a:                 // don't touch threadsInPageIO
+1:bb8f25a:             } else {
+1:bb8f25a:                 threadsInPageIO--;
+1:bb8f25a:             }
+1:bb8f25a: 
+1:bb8f25a:             // All new writers will now wait till we're done, see "Gain entry"
+1:bb8f25a:             // in writePage above. Any concurrent threads already inside will
+1:bb8f25a:             // also wait till we're done, see below
+1:bb8f25a:             restoreChannelInProgress = true;
+1:bb8f25a:         }
+1:bb8f25a: 
+1:bb8f25a:         // Wait till other concurrent threads hit the wall
+1:4afad93:         // (ClosedChannelException) and are a ready waiting for us to clean up,
+1:4afad93:         // so we can set them loose when we're done.
+1:abf8151:         int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+1:4afad93: 
+1:bb8f25a:         while (true) {
+1:bb8f25a:             synchronized (channelCleanupMonitor) {
+1:bb8f25a:                 if (threadsInPageIO == 0) {
+1:bb8f25a:                     // Either no concurrent threads, or they are now waiting
+1:bb8f25a:                     // for us to clean up (see ClosedChannelException case)
+2:bb8f25a:                     break;
+1:bb8f25a:                 }
+1:bb8f25a: 
+1:1cfe34e:                 if (retries-- == 0) {
+1:1cfe34e:                     // Clean up state and throw
+1:1cfe34e:                     restoreChannelInProgress = false;
+1:1cfe34e:                     channelCleanupMonitor.notifyAll();
+1:1cfe34e: 
+1:1cfe34e:                     throw StandardException.newException(
+1:16a0f6c:                         SQLState.FILE_IO_INTERRUPTED);
+1:1cfe34e:                 }
+1:bb8f25a:             }
+1:bb8f25a: 
+1:bb8f25a:             try {
+1:abf8151:                 Thread.sleep(InterruptStatus.INTERRUPT_RETRY_SLEEP);
+1:bb8f25a:             } catch (InterruptedException te) {
+1:5d97422:                 InterruptStatus.setInterrupted();
+1:bb8f25a:             }
+1:bb8f25a:         }
+1:bb8f25a: 
+1:bb8f25a: 
+1:bb8f25a:         // Initiate recovery
+1:bb8f25a:         synchronized (channelCleanupMonitor) {
+1:bb8f25a:             try {
+1:bb8f25a:                 InterruptStatus.noteAndClearInterrupt(
+1:bb8f25a:                     whence, threadsInPageIO, hashCode());
+1:bb8f25a: 
+1:bb8f25a:                 synchronized(this) {
+1:bb8f25a:                     if (SanityManager.DEBUG) {
+1:bb8f25a:                         SanityManager.ASSERT(ourChannel != null,
+1:bb8f25a:                                              "ourChannel is null");
+1:bb8f25a:                         SanityManager.ASSERT(!ourChannel.isOpen(),
+1:bb8f25a:                                              "ourChannel is open");
+1:bb8f25a:                     }
+1:bb8f25a:                 }
+1:bb8f25a: 
+1:bb8f25a:                 while (true) {
+1:bb8f25a:                     synchronized(this) {
+1:bb8f25a:                         try {
+1:08b4ed5:                             reopen();
+1:bd018fd:                         } catch (Exception newE) {
+1:bd018fd:                             // Something else failed - shutdown happening?
+1:bd018fd:                             synchronized(giveUpIOm) {
+1:bd018fd:                                 // Make sure other threads will give up and
+1:bd018fd:                                 // throw, too.
+1:bd018fd:                                 giveUpIO = true;
+1:bb8f25a: 
+1:bd018fd:                                 if (SanityManager.DEBUG) {
+1:bd018fd:                                     debugTrace(
+1:bd018fd:                                         "can't resurrect container: " +
+1:bd018fd:                                         newE);
+1:bb8f25a:                                 }
+1:bb8f25a: 
+4:bb8f25a:                                 throw StandardException.newException(
+1:bb8f25a:                                     SQLState.FILE_IO_INTERRUPTED, newE);
+1:bb8f25a:                             }
+1:bb8f25a:                         }
+1:bb8f25a:                         break;
+1:bb8f25a:                     }
+1:bb8f25a:                 }
+1:bb8f25a: 
+1:bb8f25a:                 if (stealthMode) {
+1:bb8f25a:                     // don't touch threadsInPageIO
+1:bb8f25a:                 } else {
+1:bb8f25a:                     threadsInPageIO++;
+1:bb8f25a:                 }
+1:bb8f25a: 
+1:bb8f25a:                 // retry IO
+1:bb8f25a:             } finally {
+1:bb8f25a:                 // Recovery work done (or failed), now set other threads free
+1:bb8f25a:                 // to retry or give up as the case may be, cf. giveUpIO.
+1:bb8f25a:                 restoreChannelInProgress = false;
+1:bb8f25a:                 channelCleanupMonitor.notifyAll();
+1:bb8f25a:             }
+1:bb8f25a:         } // end channelCleanupMonitor region
+1:bb8f25a: 
+1:bb8f25a:         return true;
+1:bb8f25a:     }
+1:bb8f25a: 
+1:a7de081:     private void writePage0(long pageNumber, byte[] pageData, boolean syncPage)
+1:a7de081:          throws IOException, StandardException
+1:a7de081:     {
+1:55a6cdc:         FileChannel ioChannel;
+1:b44572f:         synchronized (this) {
+1:55a6cdc:             // committed and dropped, do nothing.
+1:55a6cdc:             // This file container may only be a stub
+1:55a6cdc:             if (getCommittedDropState())
+1:55a6cdc:                 return;
+1:b44572f:             ioChannel = getChannel();
+1:bb8f25a:         }
+1:bb8f25a: 
+1:bb8f25a:         if (SanityManager.DEBUG) {
+1:bb8f25a:             if (pageNumber == FIRST_ALLOC_PAGE_NUMBER) {
+1:bb8f25a:                 // page 0
+1:b231544:                 SanityManager.ASSERT(Thread.holdsLock(this));
+1:bb8f25a:             } else {
+1:b231544:                 SanityManager.ASSERT(!Thread.holdsLock(this));
+1:bb8f25a:             }
+1:bb8f25a:         }
+1:bb8f25a: 
+1:55a6cdc:         if(ioChannel != null) {
+1:55a6cdc:             ///////////////////////////////////////////////////
+1:55a6cdc:             //
+1:55a6cdc:             // RESOLVE: right now, no logical -> physical mapping.
+1:55a6cdc:             // We can calculate the offset.  In the future, we may need to
+1:55a6cdc:             // look at the allocation page or the in memory translation table
+1:55a6cdc:             // to figure out where the page should go
+1:55a6cdc:             //
+1:55a6cdc:             /////////////////////////////////////////////////
+1:bb8f25a: 
+1:55a6cdc:             long pageOffset = pageNumber * pageSize;
+1:bb8f25a: 
+1:55a6cdc:             byte[] encryptionBuf = null;
+1:55a6cdc:             // We only need to allocate the encryptionBuf if updatePageArray is
+1:55a6cdc:             // actually going to use it.
+1:55a6cdc:             if (dataFactory.databaseEncrypted()) {
+1:55a6cdc:                 encryptionBuf = new byte[pageSize];
+1:a7de081:             }
+1:bb8f25a: 
+1:55a6cdc:             byte[] dataToWrite = updatePageArray(pageNumber,
+1:55a6cdc:                                                  pageData,
+1:55a6cdc:                                                  encryptionBuf,
+1:55a6cdc:                                                  false);
+1:bb8f25a: 
+1:55a6cdc:             if (SanityManager.DEBUG) {
+1:55a6cdc:                 SanityManager.ASSERT(dataToWrite != null,
+1:55a6cdc:                         "RAFContainer4: dataToWrite is null after updatePageArray()");
+1:a7de081:             }
+1:bb8f25a: 
+1:55a6cdc:             ByteBuffer writeBuffer = ByteBuffer.wrap(dataToWrite);
+1:bb8f25a: 
+1:55a6cdc:             dataFactory.writeInProgress();
+1:078bb79:             try {
+1:55a6cdc:                 if (SanityManager.DEBUG) {
+1:55a6cdc:                     synchronized(this) {
+1:55a6cdc:                         iosInProgress++;
+1:55a6cdc:                     }
+1:55a6cdc:                 }
+1:b44572f: 
+1:55a6cdc:                 writeFull(writeBuffer, ioChannel, pageOffset);
+1:55a6cdc:             } catch (ClosedChannelException ioe) {
+1:55a6cdc:                 synchronized(this) {
+1:55a6cdc:                     /* If the write failed because the container has been closed
+1:55a6cdc:                      * for deletion between the start of this method and the
+1:55a6cdc:                      * write, we'll just ignore that, as this container is going
+1:55a6cdc:                      * away anyway.
+1:55a6cdc:                      * This could possibly happen if the Cache is cleaning this
+1:55a6cdc:                      * container while it is dropped - BaseDataFileFactory holds
+1:55a6cdc:                      * an exclusive lock on the container while dropping it to
+1:55a6cdc:                      * avoid other interference.
+1:55a6cdc:                      * See the getCommittedDropState() check at the top of this
+1:55a6cdc:                      * method.
+1:55a6cdc:                      */
+1:55a6cdc:                     if (getCommittedDropState()) {
+1:55a6cdc:                         if (SanityManager.DEBUG) {
+1:bb8f25a:                             debugTrace(
+1:bb8f25a:                                 "write to a dropped and " +
+1:bb8f25a:                                 "closed container discarded.");
+1:55a6cdc:                         }
+1:55a6cdc:                         return;
+1:bb8f25a:                     } else {
+1:55a6cdc:                         // This should not happen, better let the exception
+1:55a6cdc:                         // hurt where it's supposed to.
+1:55a6cdc:                         throw ioe;
+1:55a6cdc:                     }
+1:55a6cdc:                 }
+1:55a6cdc:             } finally {
+1:55a6cdc:                 if (SanityManager.DEBUG) {
+1:55a6cdc:                     synchronized(this) {
+1:55a6cdc:                         iosInProgress--;
+1:55a6cdc:                     }
+1:55a6cdc:                 }
+1:b44572f: 
+1:55a6cdc:                 dataFactory.writeFinished();
+1:55a6cdc:             }
+1:b44572f: 
+1:55a6cdc:             /* Note that the original "try {write} catch IOException { pad file,
+1:55a6cdc:              * write again }" in RAFContainer is removed here, because the
+1:55a6cdc:              * FileChannel Javadoc specifies that the file will be grown to
+1:55a6cdc:              * accommodate the new bytes.
+1:55a6cdc:              */
+1:a7de081: 
+1:55a6cdc:             if (syncPage) {
+1:55a6cdc:                 dataFactory.writeInProgress();
+1:55a6cdc:                 try{
+1:55a6cdc:                     if (SanityManager.DEBUG) {
+1:55a6cdc:                         synchronized(this) {
+1:55a6cdc:                             iosInProgress++;
+1:55a6cdc:                         }
+1:55a6cdc:                     }
+1:55a6cdc:                     if (!dataFactory.dataNotSyncedAtAllocation) {
+1:55a6cdc:                         ioChannel.force(false);
+1:55a6cdc:                     }
+1:55a6cdc:                 } finally {
+1:55a6cdc:                     if (SanityManager.DEBUG) {
+1:55a6cdc:                         synchronized(this) {
+1:55a6cdc:                             iosInProgress--;
+1:55a6cdc:                         }
+1:55a6cdc:                     }
+1:55a6cdc:                     dataFactory.writeFinished();
+1:55a6cdc:                 }
+1:b44572f:             } else {
+1:55a6cdc:                 synchronized(this) {
+1:55a6cdc:                     needsSync = true;
+1:55a6cdc:                 }
+1:55a6cdc:             }
+1:a7de081: 
+1:a7de081:         } else {
+1:bb8f25a:             // iochannel was not initialized, fall back to original method.
+1:55a6cdc:             super.writePage(pageNumber, pageData, syncPage);
+1:55a6cdc:         }
+1:55a6cdc:     }
+1:5cc3875: 
+1:55a6cdc:     /**
+1:b0a8928:      * Write a sequence of bytes at the given offset in a file.  This method
+1:b0a8928:      * operates in <em>stealth mode</em>, see doc for {@link
+1:b0a8928:      * #handleClosedChannel handleClosedChannel}.
+1:b0a8928:      * This presumes that IO retry happens at a higher level, i.e. the
+1:b0a8928:      * caller(s) must be prepared to handle {@code InterruptDetectedException}.
+1:b0a8928:      * <p/>
+1:b0a8928:      * This method overrides FileContainer#writeAtOffset.
+1:b0a8928:      * <p/>
+1:b44572f:      * @param file the file to write to
+1:b44572f:      * @param bytes the bytes to write
+1:b44572f:      * @param offset the offset to start writing at
+1:b44572f:      * @throws IOException if an I/O error occurs while writing
+1:b44572f:      */
+1:b44572f:     void writeAtOffset(StorageRandomAccessFile file, byte[] bytes, long offset)
+1:078bb79:             throws IOException, StandardException
+1:b44572f:     {
+1:b44572f:         FileChannel ioChannel = getChannel(file);
+1:55a6cdc: 
+1:b7f22c3:         if (ioChannel == null) {
+1:b44572f:             super.writeAtOffset(file, bytes, offset);
+1:b7f22c3:             return;
+1:b44572f:         }
+1:b44572f: 
+1:b7f22c3:         ourChannel = ioChannel;
+1:55a6cdc: 
+1:bb8f25a:         boolean success = false;
+1:b0a8928:         final boolean stealthMode = true;
+1:55a6cdc: 
+1:bb8f25a:         while (!success) {
+1:55a6cdc: 
+1:a7de081:             synchronized (this) {
+1:b7f22c3:                 // don't use ourChannel directly, could need re-initilization
+1:b7f22c3:                 // after interrupt and container reopening:
+1:b44572f:                 ioChannel = getChannel();
+1:b7f22c3:             }
+1:b7f22c3: 
+1:078bb79:             try {
+1:b7f22c3:                 writeFull(ByteBuffer.wrap(bytes), ioChannel, offset);
+1:bb8f25a:                 success = true;
+1:b7f22c3:             } catch (ClosedChannelException e) {
+1:b0a8928:                 handleClosedChannel(e, stealthMode, -1 /* NA */);
+1:b7f22c3:             }
+1:b7f22c3:         }
+1:b44572f:     }
+1:b7f22c3: 
+1:b44572f:     /**
+1:b44572f:      * Read an embryonic page (that is, a section of the first alloc page that
+1:b44572f:      * is so large that we know all the borrowed space is included in it) from
+1:b44572f:      * the specified offset in a {@code StorageRandomAccessFile}.
+1:b231544:      * <p/>
+1:bb8f25a:      * override of FileContainer#getEmbryonicPage
+1:b231544:      * <p/>
+1:b44572f:      * @param file the file to read from
+1:b44572f:      * @param offset where to start reading (normally
+1:b44572f:      * {@code FileContainer.FIRST_ALLOC_PAGE_OFFSET})
+1:b44572f:      * @return a byte array containing the embryonic page
+1:b44572f:      * @throws IOException if an I/O error occurs while reading
+1:078bb79:      * @throws StandardException if thread is interrupted.
+1:b44572f:      */
+1:b44572f:     byte[] getEmbryonicPage(StorageRandomAccessFile file, long offset)
+1:078bb79:             throws IOException, StandardException
+1:b44572f:     {
+1:b44572f:         FileChannel ioChannel = getChannel(file);
+2:b44572f:         if (ioChannel != null) {
+1:bb8f25a:             byte[] buffer = new byte[AllocPage.MAX_BORROWED_SPACE];
+1:bb8f25a:             readPage(-1L, buffer, offset);
+1:bb8f25a:             return buffer;
+1:b44572f:         } else {
+1:b44572f:             return super.getEmbryonicPage(file, offset);
+1:b44572f:         }
+1:b44572f:     }
+1:b7f22c3: 
+1:55a6cdc:     /**
+1:55a6cdc:      * Attempts to fill buf completely from start until it's full.
+1:b231544:      * <p/>
+1:55a6cdc:      * FileChannel has no readFull() method, so we roll our own.
+1:bb8f25a:      * <p/>
+1:078bb79:      * @param dstBuffer buffer to read into
+1:078bb79:      * @param srcChannel channel to read from
+1:078bb79:      * @param position file position from where to read
+1:078bb79:      *
+1:078bb79:      * @throws IOException if an I/O error occurs while reading
+1:078bb79:      * @throws StandardException If thread is interrupted.
+1:55a6cdc:      */
+1:01a4f9b:     private void readFull(ByteBuffer dstBuffer,
+1:01a4f9b:                           FileChannel srcChannel,
+1:01a4f9b:                           long position)
+1:078bb79:             throws IOException, StandardException
+1:a7de081:     {
+1:55a6cdc:         while(dstBuffer.remaining() > 0) {
+1:bb8f25a:             if (srcChannel.read(dstBuffer,
+1:078bb79:                                     position + dstBuffer.position()) == -1) {
+1:bb8f25a:                 throw new EOFException(
+1:bb8f25a:                     "Reached end of file while attempting to read a "
+1:bb8f25a:                     + "whole page.");
+1:bb8f25a:             }
+1:b7f22c3: 
+1:bb8f25a:             // (**) Sun Java NIO is weird: it can close the channel due to an
+1:bb8f25a:             // interrupt without throwing if bytes got transferred. Compensate,
+1:bb8f25a:             // so we can clean up.  Bug 6979009,
+1:b7f22c3:             // http://bugs.sun.com/view_bug.do?bug_id=6979009
+1:bb8f25a:             if (Thread.currentThread().isInterrupted() &&
+1:bb8f25a:                     !srcChannel.isOpen()) {
+1:bb8f25a:                 throw new ClosedByInterruptException();
+1:078bb79:             }
+1:55a6cdc:         }
+1:55a6cdc:     }
+1:b7f22c3: 
+1:55a6cdc:     /**
+1:55a6cdc:      * Attempts to write buf completely from start until end, at the given
+1:55a6cdc:      * position in the destination fileChannel.
+1:bb8f25a:      * <p/>
+1:55a6cdc:      * FileChannel has no writeFull() method, so we roll our own.
+2:bb8f25a:      * <p/>
+1:078bb79:      * @param srcBuffer buffer to write
+1:078bb79:      * @param dstChannel channel to write to
+1:078bb79:      * @param position file position to start writing at
+1:078bb79:      *
+1:078bb79:      * @throws IOException if an I/O error occurs while writing
+1:078bb79:      * @throws StandardException If thread is interrupted.
+1:55a6cdc:      */
+1:01a4f9b:     private void writeFull(ByteBuffer srcBuffer,
+1:01a4f9b:                            FileChannel dstChannel,
+1:01a4f9b:                            long position)
+1:bb8f25a:             throws IOException
+1:55a6cdc:     {
+1:55a6cdc:         while(srcBuffer.remaining() > 0) {
+1:bb8f25a:             dstChannel.write(srcBuffer, position + srcBuffer.position());
+1:bb8f25a: 
+1:bb8f25a:             // (**) Sun JAVA NIO is weird: it can close the channel due to an
+1:bb8f25a:             // interrupt without throwing if bytes got transferred. Compensate,
+1:bb8f25a:             // so we can clean up. Bug 6979009,
+1:bb8f25a:             // http://bugs.sun.com/view_bug.do?bug_id=6979009
+1:bb8f25a:             if (Thread.currentThread().isInterrupted() &&
+1:bb8f25a:                     !dstChannel.isOpen()) {
+1:bb8f25a:                 throw new ClosedByInterruptException();
+1:bb8f25a:             }
+1:bb8f25a:         }
+1:bb8f25a:     }
+1:bb8f25a: 
+1:bb8f25a:     private static void debugTrace (String msg) {
+1:bb8f25a:         if (SanityManager.DEBUG) { // redundant, just to remove code in insane
+1:bb8f25a:             if (SanityManager.DEBUG_ON("RAF4")) {
+1:bb8f25a:                 SanityManager.DEBUG_PRINT(
+1:bb8f25a:                     "RAF4",
+1:bb8f25a:                     Thread.currentThread().getName() + " " + msg);
+1:078bb79:             }
+1:55a6cdc:         }
+1:55a6cdc:     }
+1:55a6cdc: }
+============================================================================
+author:Richard N. Hillegas
+-------------------------------------------------------------------------------
+commit:dbed020
+/////////////////////////////////////////////////////////////////////////
+1:      * <p>
+1:      * </p>
+1:      * <p>
+1:      * {@code ClosedChannelException} -&gt; {@code AsynchronousCloseException} -&gt;
+1:      * </p>
+1:      * <p>
+1:      * </p>
+1:      * <p>
+1:      * </p>
+1:      * <p>
+1:      * </p>
+1:      * <p>
+1:      * </p>
+author:Dag H. Wanvik
+-------------------------------------------------------------------------------
+commit:fe96552
+/////////////////////////////////////////////////////////////////////////
+1:                 if (!holdsThis) {
+1:                     // Remove when DERBY-6354 is closed:
+1:                     new Throwable().printStackTrace(SanityManager.GET_DEBUG_STREAM());
+1:                 }
+commit:abf8151
+/////////////////////////////////////////////////////////////////////////
+1:                 int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+/////////////////////////////////////////////////////////////////////////
+1:                         channelCleanupMonitor.wait(
+1:                             InterruptStatus.INTERRUPT_RETRY_SLEEP);
+/////////////////////////////////////////////////////////////////////////
+1:         int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+/////////////////////////////////////////////////////////////////////////
+1:                 int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+/////////////////////////////////////////////////////////////////////////
+1:                         channelCleanupMonitor.wait(
+1:                             InterruptStatus.INTERRUPT_RETRY_SLEEP);
+/////////////////////////////////////////////////////////////////////////
+1:         int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+/////////////////////////////////////////////////////////////////////////
+1:      * InterruptStatus.MAX_INTERRUPT_RETRIES *
+1:      * InterruptStatus.INTERRUPT_RETRY_SLEEP}.
+/////////////////////////////////////////////////////////////////////////
+1:                     if (timesWaited > InterruptStatus.MAX_INTERRUPT_RETRIES) {
+/////////////////////////////////////////////////////////////////////////
+1:                         channelCleanupMonitor.wait(
+1:                             InterruptStatus.INTERRUPT_RETRY_SLEEP);
+/////////////////////////////////////////////////////////////////////////
+1:                 Thread.sleep(InterruptStatus.INTERRUPT_RETRY_SLEEP);
+/////////////////////////////////////////////////////////////////////////
+1:         int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+/////////////////////////////////////////////////////////////////////////
+1:                 Thread.sleep(InterruptStatus.INTERRUPT_RETRY_SLEEP);
+commit:b0a8928
+/////////////////////////////////////////////////////////////////////////
+1:         // those monitors during container recovery.  So, just forge ahead
+/////////////////////////////////////////////////////////////////////////
+1:                 handleClosedChannel(e, stealthMode, retries--);
+/////////////////////////////////////////////////////////////////////////
+1:         // those monitors during container recovery.  So, just forge ahead
+/////////////////////////////////////////////////////////////////////////
+1:                 handleClosedChannel(e, stealthMode, retries--);
+/////////////////////////////////////////////////////////////////////////
+1:      * This method handles what to do when, during a NIO operation we receive a
+1:      * {@code ClosedChannelException}. Note the specialization hierarchy:
+1:      * <p/>
+0:      * {@code ClosedChannelException} -> {@code AsynchronousCloseException} ->
+1:      * {@code ClosedByInterruptException}
+1:      * <p/>
+1:      * If {@code e} is a ClosedByInterruptException, we normally start
+1:      * container recovery, i.e. we need to reopen the random access file so we
+1:      * get get a new interruptible channel and continue IO.
+1:      * <p/>
+1:      * If {@code e} is a {@code AsynchronousCloseException} or a plain {@code
+1:      * ClosedChannelException}, the behavior depends of {@code stealthMode}:
+1:      * <p/>
+1:      * If {@code stealthMode == false}, the method will wait for
+1:      * another thread tp finish recovering the IO channel before returning.
+1:      * <p/>
+1:      * If {@code stealthMode == true}, the method throws {@code
+1:      * InterruptDetectedException}, allowing retry at a higher level in the
+1:      * code.  The reason for this is that we sometimes need to release monitors
+1:      * on objects needed by the recovery thread.
+1:      *
+1:      * @param e Should be an instance of {@code ClosedChannelException}.
+1:      * @param stealthMode If {@code true}, do retry at a higher level
+1:      * @param retries Give up waiting for another thread to reopen the channel
+1:      *                when {@code retries} reaches 0. Only applicable if {@code
+1:      *                stealthMode == false}.
+1:      * @throws InterruptDetectedException if retry at higher level is required
+1:      *         {@code stealthMode == true}.
+1:      * @throws StandardException standard error policy, incl. when we give up
+1:      *                           waiting for another thread to reopen channel
+1:      */
+1:     private void handleClosedChannel(ClosedChannelException e,
+1:                                      boolean stealthMode,
+1:                                      int retries)
+1:             throws StandardException {
+1: 
+1:         // if (e instanceof ClosedByInterruptException e) {
+1:         // Java NIO Bug 6979009:
+1:         // http://bugs.sun.com/view_bug.do?bug_id=6979009
+1:         // Sometimes NIO throws AsynchronousCloseException instead of
+1:         // ClosedByInterruptException
+1: 
+1:         if (e instanceof AsynchronousCloseException) {
+1:             // Subsumes ClosedByInterruptException
+1: 
+1:             // The interrupted thread may or may not get back here to try
+1:             // recovery before other concurrent IO threads will see (the
+1:             // secondary) ClosedChannelException, but we have logic to handle
+1:             // that, cf threadsInPageIO.
+1: 
+1:             if (Thread.currentThread().isInterrupted()) {
+1:                 if (recoverContainerAfterInterrupt(
+1:                             e.toString(),
+1:                             stealthMode)) {
+1:                     return; // do I/O over again
+1:                 }
+1:             }
+1: 
+1:             // Recovery is in progress, wait for another interrupted thread to
+1:             // clean up.
+1: 
+1:             awaitRestoreChannel(e, stealthMode);
+1:         } else {
+1:             // According to the exception type, We are not the thread that
+1:             // first saw the channel interrupt, so no recovery attempt.
+1:             InterruptStatus.noteAndClearInterrupt(
+1:                 "ClosedChannelException",
+1:                 threadsInPageIO,
+1:                 hashCode());
+1: 
+1:             awaitRestoreChannel(e, stealthMode);
+1:             if (retries == 0) {
+1:                 throw StandardException.newException(
+1:                     SQLState.FILE_IO_INTERRUPTED);
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+/////////////////////////////////////////////////////////////////////////
+1:      *
+1:      *
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         // Wait here till the interrupted thread does container recovery.
+/////////////////////////////////////////////////////////////////////////
+1:      * Use this when the thread has received a ClosedByInterruptException (or,
+1:      * prior to JDK 1.7 it may also be AsynchronousCloseException - a bug)
+1:      * thread a likely candicate to do container recovery, unless another
+1:      * thread started it already, cf. return value.
+/////////////////////////////////////////////////////////////////////////
+1:      * Write a sequence of bytes at the given offset in a file.  This method
+1:      * operates in <em>stealth mode</em>, see doc for {@link
+1:      * #handleClosedChannel handleClosedChannel}.
+1:      * This presumes that IO retry happens at a higher level, i.e. the
+1:      * caller(s) must be prepared to handle {@code InterruptDetectedException}.
+1:      * This method overrides FileContainer#writeAtOffset.
+/////////////////////////////////////////////////////////////////////////
+1:         final boolean stealthMode = true;
+/////////////////////////////////////////////////////////////////////////
+1:                 handleClosedChannel(e, stealthMode, -1 /* NA */);
+commit:b7f22c3
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         if (ioChannel == null) {
+1:             return;
+1:         }
+1: 
+1:         ourChannel = ioChannel;
+1: 
+1:         boolean success = false;
+0:         boolean stealthMode = true;
+1: 
+1:         while (!success) {
+1: 
+1:             synchronized (this) {
+1:                 // don't use ourChannel directly, could need re-initilization
+1:                 // after interrupt and container reopening:
+1:                 ioChannel = getChannel();
+1:             }
+1: 
+1:             try {
+1:                 writeFull(ByteBuffer.wrap(bytes), ioChannel, offset);
+1:                 success = true;
+0:             //} catch (ClosedByInterruptException e) {
+0:             // Java NIO Bug 6979009:
+1:             // http://bugs.sun.com/view_bug.do?bug_id=6979009
+0:             // Sometimes NIO throws AsynchronousCloseException instead of
+0:             // ClosedByInterruptException
+0:             } catch (AsynchronousCloseException e) {
+0:                 // Subsumes ClosedByInterruptException
+1: 
+0:                 // The interrupted thread may or may not get back here
+0:                 // before other concurrent writers that will see
+0:                 // ClosedChannelException, we have logic to handle that.
+1: 
+0:                 if (Thread.currentThread().isInterrupted()) {
+0:                     // Normal case
+0:                     if (recoverContainerAfterInterrupt(
+0:                                 e.toString(),
+0:                                 stealthMode)) {
+0:                         continue; // do I/O over again
+1:                     }
+1:                 }
+0:                 // Recovery is in progress, wait for another
+0:                 // interrupted thread to clean up, i.e. act as if we
+0:                 // had seen ClosedChannelException.
+1: 
+0:                 // stealthMode == true, so this will throw
+0:                 // InterruptDetectedException
+0:                 awaitRestoreChannel(e, stealthMode);
+1:             } catch (ClosedChannelException e) {
+0:                 // We are not the thread that first saw the channel interrupt,
+0:                 // so no recovery attempt.
+1: 
+1:                 InterruptStatus.noteAndClearInterrupt(
+0:                     "writeAtOffset in ClosedChannelException",
+1:                     threadsInPageIO,
+1:                     hashCode());
+1: 
+0:                 // stealthMode == true, so this will throw
+0:                 // InterruptDetectedException
+0:                 awaitRestoreChannel(e, stealthMode);
+1:             }
+commit:08b4ed5
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private ContainerKey currentIdentity;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         currentIdentity = newIdentity;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         currentIdentity = newIdentity;
+1:      * When the existing channel ({@code ourChannel}) has been closed due to
+1:      * interrupt, we need to reopen the underlying RAF to get a fresh channel
+1:      * so we can resume IO.
+1:      */
+1:     private void reopen() throws StandardException {
+1:         if (SanityManager.DEBUG) {
+1:             SanityManager.ASSERT(!ourChannel.isOpen());
+1:         }
+1:         ourChannel = null;
+1:         reopenContainer(currentIdentity);
+1:     }
+1: 
+1:     /**
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:                             reopen();
+/////////////////////////////////////////////////////////////////////////
+commit:a768c94
+/////////////////////////////////////////////////////////////////////////
+0:                 int retries = MAX_INTERRUPT_RETRIES;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                     if (retries-- == 0) {
+1:                         throw StandardException.newException(
+1:                             SQLState.FILE_IO_INTERRUPTED);
+1:                     }
+1: 
+0:                         channelCleanupMonitor.wait(INTERRUPT_RETRY_SLEEP);
+/////////////////////////////////////////////////////////////////////////
+0:                 int retries = MAX_INTERRUPT_RETRIES;
+1: 
+1:                     if (retries-- == 0) {
+1:                         throw StandardException.newException(
+1:                             SQLState.FILE_IO_INTERRUPTED);
+1:                     }
+1: 
+0:                         channelCleanupMonitor.wait(INTERRUPT_RETRY_SLEEP);
+commit:1cfe34e
+/////////////////////////////////////////////////////////////////////////
+1:     // then. Otherwise protected by channelCleanupMonitor. Debugging value not
+1:     // safe on 1.4, but who cares..
+/////////////////////////////////////////////////////////////////////////
+0:         int retries = MAX_INTERRUPT_RETRIES;
+1: 
+1:       try {
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:                 if (retries-- == 0) {
+1:                     throw StandardException.newException(
+1:                         SQLState.FILE_IO_INTERRUPTED);
+1:                 }
+1:       } finally {
+/////////////////////////////////////////////////////////////////////////
+1:       }
+/////////////////////////////////////////////////////////////////////////
+1:       try {
+/////////////////////////////////////////////////////////////////////////
+1:       } finally {
+/////////////////////////////////////////////////////////////////////////
+1:       }
+/////////////////////////////////////////////////////////////////////////
+0:                 if (retries-- == 0) {
+1:                     // Clean up state and throw
+0:                     threadDoingRestore = null;
+1:                     restoreChannelInProgress = false;
+1:                     channelCleanupMonitor.notifyAll();
+1: 
+1:                     throw StandardException.newException(
+1:                 }
+commit:4afad93
+/////////////////////////////////////////////////////////////////////////
+1:         // (ClosedChannelException) and are a ready waiting for us to clean up,
+1:         // so we can set them loose when we're done.
+0:         int retries = MAX_INTERRUPT_RETRIES;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:             if (retries-- == 0) {
+1:                 throw StandardException.newException(
+1:                         SQLState.FILE_IO_INTERRUPTED);
+1:             }
+1: 
+0:                 Thread.sleep(INTERRUPT_RETRY_SLEEP);
+commit:616c0d0
+/////////////////////////////////////////////////////////////////////////
+1:         // Interrupt recovery "stealthMode": If this thread holds a monitor on
+1:         //
+1:         //   a) "this" (when RAFContainer#clean calls getEmbryonicPage via
+1:         //       writeRAFHEader) or
+1:         //   b) "allocCache" (e.g. FileContainer#newPage,
+1:         //       #pageValid)
+1:         //
+1:         // we cannot grab channelCleanupMonitor lest another thread is one
+1:         // doing recovery, since the recovery thread will try to grab both
+0:         // those monitors during container resurrection.  So, just forge ahead
+1:         // in stealth mode (i.e. the recovery thread doesn't see us). If we see
+1:         // retry from RAFContainer releasing "this", or FileContainer
+1:         // (releasing allocCache) as the case may be, so the recovery thread
+1:         // can do its thing.
+/////////////////////////////////////////////////////////////////////////
+1:         // Interrupt recovery "stealthMode": If this thread holds a monitor on
+1:         //
+1:         //   a) "allocCache" (e.g. FileContainer#newPage, #pageValid),
+1:         //
+1:         // we cannot grab channelCleanupMonitor lest another thread is one
+1:         // doing recovery, since the recovery thread will try to grab both
+0:         // those monitors during container resurrection.  So, just forge ahead
+1:         // in stealth mode (i.e. the recovery thread doesn't see us). If we see
+1:         // retry from FileContainer releasing allocCache, so the recovery
+1:         // thread can do its thing.
+commit:5d97422
+/////////////////////////////////////////////////////////////////////////
+1:                         InterruptStatus.setInterrupted();
+/////////////////////////////////////////////////////////////////////////
+1:                         InterruptStatus.setInterrupted();
+/////////////////////////////////////////////////////////////////////////
+1:                 InterruptStatus.setInterrupted();
+commit:01a4f9b
+/////////////////////////////////////////////////////////////////////////
+0:                             reopenContainer(currentIdentity);
+/////////////////////////////////////////////////////////////////////////
+1:     private void readFull(ByteBuffer dstBuffer,
+1:                           FileChannel srcChannel,
+1:                           long position)
+/////////////////////////////////////////////////////////////////////////
+1:     private void writeFull(ByteBuffer srcBuffer,
+1:                            FileChannel dstChannel,
+1:                            long position)
+commit:16a0f6c
+/////////////////////////////////////////////////////////////////////////
+1:     // In case the recovering thread can't successfully recover the container
+1:     // for some reason, it will throw, so other waiting threads need to give up
+1:     // as well.
+/////////////////////////////////////////////////////////////////////////
+0:         int retries = MAX_INTERRUPT_RETRIES;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:                 if (retries-- == 0) {
+1:                     throw StandardException.newException(
+1:                         SQLState.FILE_IO_INTERRUPTED);
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+1:                 // see below), we put ourselves back in the IO set of threads:
+commit:b231544
+/////////////////////////////////////////////////////////////////////////
+1:     private final Object channelCleanupMonitor = new Object();
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Use when seeing an exception during IO and when another thread is
+1:      * presumably doing the recovery.
+1:      * <p/>
+1:      * If {@code stealthMode == false}, wait for another thread to recover the
+1:      * container after an interrupt. If {@code stealthMode == true}, throw
+1:      * internal exception {@code InterruptDetectedException} to do retry from
+1:      * higher in the stack.
+1:      * <p/>
+1:      * If {@code stealthMode == false}, maximum wait time for the container to
+1:      * become available again is determined by the product {@code
+0:      * FileContainer#MAX_INTERRUPT_RETRIES * FileContainer#INTERRUPT_RETRY_SLEEP}.
+1:      * There is a chance this thread will not see any recovery occuring (yet),
+1:      * in which case it waits for a bit and just returns, so the caller must
+1:      * retry IO until success.
+1:      * <p/>
+1:      * If for some reason the recovering thread has given up on resurrecting
+1:      * the container, cf {@code #giveUpIO}, the method throws {@code
+1:      * FILE_IO_INTERRUPTED}.
+1:      * 
+1:      * @param e the exception we saw during IO
+1:      * @param stealthMode true if the thread doing IO in stealth mode
+1: 
+1:      * @throws StandardException {@code InterruptDetectedException} and normal
+1:      *                            error policy
+1:      */
+/////////////////////////////////////////////////////////////////////////
+1:                         // Max, give up, probably way too long anyway,
+/////////////////////////////////////////////////////////////////////////
+0:      * Use this when the thread has received a AsynchronousCloseException
+1:      * exception during IO and its interruped flag is also set. This makes this
+0:      * thread a likely candicate to do container recovery (aka resurrection),
+0:      * unless another thread started it already, cf. return value.
+1:      *
+1:      * @return true if we did recovery, false if we saw someone else do it and
+/////////////////////////////////////////////////////////////////////////
+1:                 SanityManager.ASSERT(Thread.holdsLock(this));
+1:                 SanityManager.ASSERT(!Thread.holdsLock(this));
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+commit:bd018fd
+/////////////////////////////////////////////////////////////////////////
+1:             // Pave way for the thread that received the interrupt that caused
+1:             // the channel close to clean up, by signaling we are waiting (no
+1:             // longer doing IO):
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 // Since the channel is presumably ok (lest giveUpIO is set,
+0:                 // see below), we put ourselveds back in the IO set of threads:
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 threadsInPageIO--;
+/////////////////////////////////////////////////////////////////////////
+1:             // 1) Another interrupted thread got to do the cleanup before us, so
+/////////////////////////////////////////////////////////////////////////
+1:             //
+1:             // 2) The other way to end up here is if we get interrupted during
+1:             // getEmbryonicPage called during container recovery from the same
+1:             // thread (restoreChannelInProgress is set then, and
+1:             // getEmbryonicPage is stealthMode)
+/////////////////////////////////////////////////////////////////////////
+0:                         } catch (InterruptDetectedException e) {
+0:                             debugTrace("interrupted during recovery's " +
+0:                                        "readEmbryonicPage");
+0:                             continue;
+1:                         } catch (Exception newE) {
+1:                             // Something else failed - shutdown happening?
+1:                             synchronized(giveUpIOm) {
+1:                                 // Make sure other threads will give up and
+1:                                 // throw, too.
+1:                                 giveUpIO = true;
+1:                                 if (SanityManager.DEBUG) {
+1:                                     debugTrace(
+1:                                         "can't resurrect container: " +
+1:                                         newE);
+/////////////////////////////////////////////////////////////////////////
+1:                 if (stealthMode) {
+1:                     // don't touch threadsInPageIO
+1:                 } else {
+1:                     threadsInPageIO++;
+1:                 }
+1: 
+commit:bb8f25a
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.util.InterruptStatus;
+1: import org.apache.derby.iapi.util.InterruptDetectedException;
+/////////////////////////////////////////////////////////////////////////
+1: import java.nio.channels.AsynchronousCloseException;
+1:  * RAFContainer4 overrides a few methods in FileContainer/RAFContainer in order
+1:  * to use FileChannel from Java 1.4's New IO framework to issue multiple IO
+1:  * operations to the same file concurrently instead of strictly serializing IO
+1:  * operations using a mutex on the container object. Since we compile with Java
+1:  * 1.4, the override "annotations" are inside the method javadoc headers.
+/////////////////////////////////////////////////////////////////////////
+0:     private Object channelCleanupMonitor = new Object();
+1: 
+1:     // channelCleanupMonitor protects next three state variables:
+1: 
+0:     private Thread threadDoingRestore = null;
+1: 
+1:     // volatile on threadsInPageIO, is just to ensure that we get a correct
+1:     // value for debugging: we can't always use channelCleanupMonitor
+0:     // then. Not safe on 1.4, but who cares..
+1:     private volatile int threadsInPageIO = 0;
+1: 
+1:     // volatile on restoreChannelInProgress: corner case where we can't use
+1:     // channelCleanupMonitor: the corner case should not happen if NIO works as
+1:     // specified: thats is, uniquely only one thread sees
+1:     // ClosedByInterruptException, always.  Unfortunately, we sometimes get
+1:     // AsynchronousCloseException, which another thread could theoretically
+1:     // also see it it were interrupted at the same time inside NIO. In this
+1:     // case, we could get two threads competing to do recovery. This is
+1:     // normally OK, unless the thread owns allocCache or "this", in which case
+1:     // we risk dead-lock if we synchronize on restoreChannelInProgress
+1:     // (explained below). So, we have to rely on volatile, which isn't safe in
+1:     // Java 1.4 (old memory model),
+1:     private volatile boolean restoreChannelInProgress = false;
+1: 
+1: 
+0:     // In case the recovering thread can't successfully recover the container,
+0:     // it will throw, so other waiting threads need to give up as well.  This
+0:     // can happen at shutdown time when interrupts are used to stop threads.
+1:     private boolean giveUpIO = false;
+1:     private final Object giveUpIOm = new Object(); // its monitor
+1: 
+1: /**
+1:     private int iosInProgress = 0; // protected by monitor on "this"
+/////////////////////////////////////////////////////////////////////////
+1:      *
+1:      * override of RAFContainer#openContainer
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * override of RAFContainer#createContainer
+1:      */
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * override of RAFContainer#closeContainer
+1:      */
+/////////////////////////////////////////////////////////////////////////
+1:      *  <p/>
+1:      *  override of RAFContainer#readPage
+1:      *  <p/>
+/////////////////////////////////////////////////////////////////////////
+1:         readPage(pageNumber, pageData, -1L);
+1:     }
+1: 
+1: 
+1:     /**
+1:      *  Read a page into the supplied array.
+1:      *  <p/>
+1:      *  override of RAFContainer#readPage
+1:      *  <p/>
+1:      *  <BR> MT - thread safe
+1: 
+1:      *  @param pageNumber the page number to read data from, or -1 (called from
+1:      *                    getEmbryonicPage)
+1:      *  @param pageData  the buffer to read data into
+1:      *  @param offset -1 normally (not used since offset is computed from
+1:      *                   pageNumber), but used if pageNumber == -1
+1:      *                   (getEmbryonicPage)
+1:      *  @exception IOException exception reading page
+1:      *  @exception StandardException Standard Derby error policy
+1:      */
+1:     private void readPage(long pageNumber, byte[] pageData, long offset)
+1:          throws IOException, StandardException
+1:     {
+0:         // Interrupt recovery: If this thread holds a monitor on "this" (when
+0:         // RAFContainer#clean calls getEmbryonicPage via writeRAFHEader) or
+0:         // "allocCache" (e.g. FileContainer#newPage, #pageValid) we cannot grab
+0:         // channelCleanupMonitor lest another thread is one doing recovery,
+0:         // since the recovery thread will try to grab both those monitors
+0:         // during container resurrection.  So, just forge ahead in stealth mode
+0:         // (i.e. the recovery thread doesn't see us). If we see
+1:         // ClosedChannelException, throw InterruptDetectedException, so we can
+0:         // retry from RAFContainer ("this") or FileContainer ("allocCache")
+0:         // after having released the relevant monitor.
+1: 
+1:         final boolean holdsThis = Thread.holdsLock(this);
+1:         final boolean holdsAllocCache = Thread.holdsLock(allocCache);
+1: 
+1:         final boolean stealthMode = holdsThis || holdsAllocCache;
+1: 
+1:         if (SanityManager.DEBUG) {
+1:             // getEmbryonicPage only
+1:             if (pageNumber == -1) {
+1:                 SanityManager.ASSERT(holdsThis);
+1:             if (holdsThis) {
+1:                 SanityManager.ASSERT(pageNumber == -1);
+1:             }
+1:         }
+1: 
+1: 
+1:         if (stealthMode) {
+1:             // We go into stealth mode. If we see an
+1:             // CloseChannelExceptionexception, we will get out of here anyway,
+1:             // so we don't need to increment threadsInPageIO (nor can we,
+1:             // without risking dead-lock),
+1:             synchronized (channelCleanupMonitor) {
+1: 
+1:                 // Gain entry
+1:                 while (restoreChannelInProgress) {
+0:                     if (Thread.currentThread() == threadDoingRestore) {
+0:                         // Reopening the container will do readEmbryonicPage
+0:                         // (i.e. ReadPage is called recursively from
+0:                         // recoverContainerAfterInterrupt), so now let's make
+0:                         // sure we don't get stuck waiting for ourselves ;-)
+1:                         break;
+1:                     }
+1: 
+1:                     try {
+0:                         channelCleanupMonitor.wait();
+1:                     } catch (InterruptedException e) {
+1:                         InterruptStatus.noteAndClearInterrupt(
+0:                             "interrupt while waiting to gain entry",
+1:                             threadsInPageIO,
+1:                             hashCode());
+1:                     }
+1: 
+1:                 }
+1: 
+1:                 threadsInPageIO++;
+1:             }
+1:         }
+1: 
+1: 
+1:         boolean success = false;
+1:         while (!success) {
+1:             try {
+1:                 if (pageNumber == FIRST_ALLOC_PAGE_NUMBER) {
+1:                     // If this is the first alloc page, there may be another
+1:                     // thread accessing the container information in the
+1:                     // borrowed space on the same page. In that case, we
+1:                     // synchronize the entire method call, just like
+1:                     // RAFContainer.readPage() does, in order to avoid
+1:                     // conflicts. For all other pages it is safe to skip the
+1:                     // synchronization, since concurrent threads will access
+1:                     // different pages and therefore don't interfere with each
+1:                     // other:
+1:                     synchronized (this) {
+1:                         readPage0(pageNumber, pageData, offset);
+1:                     }
+1:                 } else {
+1:                     // Normal case.
+1:                     readPage0(pageNumber, pageData, offset);
+1:                 }
+1: 
+1:                 success = true;
+1: 
+0:           //} catch (ClosedByInterruptException e) {
+0:           // Java NIO Bug 6979009:
+1:           // http://bugs.sun.com/view_bug.do?bug_id=6979009
+0:           // Sometimes NIO throws AsynchronousCloseException instead of
+0:           // ClosedByInterruptException
+0:             } catch (AsynchronousCloseException e) {
+0:                 // Subsumes ClosedByInterruptException
+1: 
+0:                 // The interrupted thread may or may not get back here
+0:                 // before other concurrent writers that will see
+0:                 // ClosedChannelException, we have logic to handle that.
+0:                 if (Thread.currentThread().isInterrupted()) {
+0:                     // Normal case
+0:                     if (recoverContainerAfterInterrupt(
+0:                                 e.toString(),
+0:                                 stealthMode)) {
+0:                         continue; // do I/O over again
+1:                     }
+1:                 }
+1: 
+1: 
+0:                 // Recovery is in progress, wait for another
+0:                 // interrupted thread to clean up, i.e. act as if we
+0:                 // had seen ClosedChannelException.
+1: 
+0:                 awaitRestoreChannel(e, stealthMode);
+1: 
+1:             } catch (ClosedChannelException e) {
+0:                 // We are not the thread that first saw the channel interrupt,
+0:                 // so no recovery attempt.
+1: 
+0:                 // if we also have seen an interrupt, we might as well take
+0:                 // notice now.
+1:                 InterruptStatus.noteAndClearInterrupt(
+0:                     "readPage in ClosedChannelException",
+1:                     threadsInPageIO,
+1:                     hashCode());
+1: 
+0:                 // Recovery is in progress, wait for another interrupted thread
+0:                 // to clean up.
+0:                 awaitRestoreChannel(e, stealthMode);
+1:             }
+1:         }
+1: 
+1:         if (stealthMode) {
+1:             // don't touch threadsInPageIO
+1:         } else {
+1:             synchronized (channelCleanupMonitor) {
+1:                 threadsInPageIO--;
+1:             }
+1:     private void readPage0(long pageNumber, byte[] pageData, long offset)
+1:                 if (pageNumber != -1L) {
+1:                     SanityManager.ASSERT(!getCommittedDropState());
+1:                 } // else: can happen from getEmbryonicPage
+1:         if (SanityManager.DEBUG) {
+1:             if (pageNumber == -1L || pageNumber == FIRST_ALLOC_PAGE_NUMBER) {
+1:                 // can happen from getEmbryonicPage
+1:                 SanityManager.ASSERT(Thread.holdsLock(this));
+1:             } else {
+1:                 SanityManager.ASSERT(!Thread.holdsLock(this));
+1:             }
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 if (offset == -1L) {
+1:                     // Normal page read doesn't specify offset,
+1:                     // so use one computed from page number.
+1:                     readFull(pageBuf, ioChannel, pageOffset);
+1:                 } else {
+1:                     // getEmbryonicPage specifies it own offset, so use that
+1:                     if (SanityManager.DEBUG) {
+1:                         SanityManager.ASSERT(pageNumber == -1L);
+1:                     }
+1: 
+1:                     readFull(pageBuf, ioChannel, offset);
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+1:                 pageNumber != FIRST_ALLOC_PAGE_NUMBER &&
+1:                 pageNumber != -1L /* getEmbryonicPage */)
+/////////////////////////////////////////////////////////////////////////
+1:      *  <p/>
+1:      *  override of RAFContainer#writePage
+1:      *  <p/>
+/////////////////////////////////////////////////////////////////////////
+0:         // Interrupt recovery: If this thread holds a monitor "allocCache"
+0:         // (e.g. FileContainer#newPage, #pageValid) we cannot grab
+0:         // channelCleanupMonitor lest another thread is one doing recovery,
+0:         // since the recovery thread will try to grab both those monitors
+0:         // during container resurrection.  So, just forge ahead in stealth mode
+0:         // (i.e. the recovery thread doesn't see us). If we see
+1:         // ClosedChannelException, throw InterruptDetectedException, so we can
+0:         // retry from FileContainer ("allocCache") after having released the
+0:         // relevant monitor.
+1:         boolean stealthMode = Thread.holdsLock(allocCache);
+1: 
+1:         if (SanityManager.DEBUG) {
+1:             SanityManager.ASSERT(!Thread.holdsLock(this));
+1: 
+1:        if (stealthMode) {
+1:             // We go into stealth mode. If we see an
+1:             // CloseChannelExceptionexception, we will get out of here anyway,
+1:             // so we don't need to increment threadsInPageIO (nor can we,
+1:             // without risking dead-lock),
+1:         } else {
+1:             synchronized (channelCleanupMonitor) {
+1: 
+1:                 // Gain entry
+1:                 while (restoreChannelInProgress) {
+1:                     try {
+0:                         channelCleanupMonitor.wait();
+1:                     } catch (InterruptedException e) {
+0:                         InterruptStatus.noteAndClearInterrupt(
+0:                             "interrupt while waiting to gain entry",
+0:                             threadsInPageIO,
+0:                             hashCode());
+1:                     }
+1: 
+1:                 }
+1: 
+1:                 threadsInPageIO++;
+1:             }
+1:         }
+1: 
+1:         boolean success = false;
+1:         while (!success) {
+1:             try {
+1:                 if (pageNumber == FIRST_ALLOC_PAGE_NUMBER) {
+1:                     // If this is the first alloc page, there may be
+1:                     // another thread accessing the container information
+1:                     // in the borrowed space on the same page. In that
+1:                     // case, we synchronize the entire method call, just
+1:                     // like RAFContainer.writePage() does, in order to
+1:                     // avoid conflicts. For all other pages it is safe to
+1:                     // skip the synchronization, since concurrent threads
+1:                     // will access different pages and therefore don't
+1:                     // interfere with each other.
+1:                     synchronized (this) {
+1:                         writePage0(pageNumber, pageData, syncPage);
+1:                     }
+1:                 } else {
+1:                     writePage0(pageNumber, pageData, syncPage);
+1:                 }
+1: 
+1:                 success = true;
+1: 
+0:           //} catch (ClosedByInterruptException e) {
+0:           // Java NIO Bug 6979009:
+0:           // http://bugs.sun.com/view_bug.do?bug_id=6979009
+0:           // Sometimes NIO throws AsynchronousCloseException instead of
+0:           // ClosedByInterruptException
+0:             } catch (AsynchronousCloseException e) {
+0:                 // Subsumes ClosedByInterruptException
+1: 
+0:                 // The interrupted thread may or may not get back here
+0:                 // before other concurrent writers that will see
+0:                 // ClosedChannelException, we have logic to handle that.
+1: 
+0:                 if (Thread.currentThread().isInterrupted()) {
+0:                     // Normal case
+0:                     if (recoverContainerAfterInterrupt(
+0:                                 e.toString(),
+0:                                 stealthMode)) {
+0:                         continue; // do I/O over again
+1:                     }
+1:                 }
+0:                 // Recovery is in progress, wait for another
+0:                 // interrupted thread to clean up, i.e. act as if we
+0:                 // had seen ClosedChannelException.
+1: 
+0:                 awaitRestoreChannel(e, stealthMode);
+1: 
+1:             } catch (ClosedChannelException e) {
+0:                 // We are not the thread that first saw the channel interrupt,
+0:                 // so no recovery attempt.
+1: 
+0:                 InterruptStatus.noteAndClearInterrupt(
+0:                     "writePage in ClosedChannelException",
+0:                     threadsInPageIO,
+0:                     hashCode());
+1: 
+0:                 // Recovery is in progress, wait for another
+0:                 // interrupted thread to clean up, i.e. act as if we
+0:                 // had seen ClosedChannelException.
+1: 
+0:                 awaitRestoreChannel(e, stealthMode);
+1:             }
+1:         }
+1: 
+1:         if (stealthMode) {
+1:             // don't touch threadsInPageIO
+1:         } else {
+1:             synchronized (channelCleanupMonitor) {
+1:                 threadsInPageIO--;
+1:             }
+1:         }
+1:     }
+1: 
+1:     private void awaitRestoreChannel (Exception e,
+1:                                       boolean stealthMode)
+1:             throws StandardException {
+1: 
+1:         if (stealthMode) {
+1:             // Retry handled at FileContainer or RAFContainer level
+1:             //
+1:             // This is necessary since recovery needs the monitor on allocCache
+1:             // or "this" to clean up, so we need to back out all the way so
+1:             // this thread can release the monitor to allow recovery to
+1:             // proceed.
+1:             if (SanityManager.DEBUG) {
+1:                     debugTrace(
+1:                         "thread does stealth mode retry");
+1:             }
+1: 
+1:             synchronized (giveUpIOm) {
+1:                 if (giveUpIO) {
+1: 
+1:                     if (SanityManager.DEBUG) {
+1:                         debugTrace(
+1:                             "giving up retry, another thread gave up " +
+1:                             "resurrecting container ");
+1:                     }
+1:                 
+1:                     throw StandardException.newException(
+0:                         SQLState.FILE_IO_INTERRUPTED);
+1:                 }
+1:             }
+1: 
+1:             throw new InterruptDetectedException();
+1:         }
+1: 
+1:         synchronized (channelCleanupMonitor) {
+1:             threadsInPageIO--;
+1:         }
+1: 
+0:         // Wait here till the interrupted thread does container resurrection.
+1:         // If we get a channel exception for some other reason, this will never
+1:         // happen, so throw after waiting long enough (60s).
+1: 
+1:         int timesWaited = -1;
+1: 
+1:         while (true) {
+1:             synchronized(channelCleanupMonitor) {
+1:                 while (restoreChannelInProgress) {
+1:                     timesWaited++;
+1: 
+1:                     if (SanityManager.DEBUG) {
+1:                         debugTrace(
+1:                             "thread needs to wait for container recovery: " +
+1:                             "already waited " + timesWaited + " times");
+1:                     }
+1: 
+0:                     if (timesWaited > MAX_INTERRUPT_RETRIES) {
+0:                         // Max 60s, then give up, probably way too long anyway,
+1:                         // but doesn't hurt?
+1:                         throw StandardException.newException(
+1:                             SQLState.FILE_IO_INTERRUPTED, e);
+1:                     }
+1: 
+1:                     try {
+0:                         channelCleanupMonitor.wait(INTERRUPT_RETRY_SLEEP);
+1:                     } catch (InterruptedException we) {
+1:                         InterruptStatus.setInterrupted();
+1:                     }
+1:                 }
+1: 
+1:                 threadsInPageIO++;
+1:                 break;
+1:             }
+1:         }
+1: 
+1:         synchronized (giveUpIOm) {
+1:             if (giveUpIO) {
+1: 
+1:                 if (SanityManager.DEBUG) {
+1:                     debugTrace(
+1:                         "giving up retry, another thread gave up " +
+1:                         "resurrecting container ");
+1:                 }
+1: 
+1:                 throw StandardException.newException(
+0:                     SQLState.FILE_IO_INTERRUPTED);
+1:             }
+1:         }
+1: 
+1:         if (timesWaited == -1) {
+1:             // We have not seen restoreChannelInProgress, so we may
+1:             // have raced past the interrupted thread, so let's wait a
+1:             // bit before we attempt a new I/O.
+1:             try {
+0:                 Thread.sleep(INTERRUPT_RETRY_SLEEP);
+1:             } catch (InterruptedException we) {
+1:                 // This thread is getting hit, too..
+1:                 InterruptStatus.setInterrupted();
+1:             }
+1:         }
+1:     }
+1: 
+1: 
+1:     /**
+1:      * @param whence caller site (debug info)
+1:      * @param stealthMode don't update threadsInPageIO if true
+0:      * @return true if we did it, false if we saw someone else do it and
+1:      * abstained
+1:      */
+1:     private boolean recoverContainerAfterInterrupt(
+1:         String whence,
+1:         boolean stealthMode) throws StandardException {
+1: 
+1:         if (stealthMode && restoreChannelInProgress) {
+0:             // Another interrupted thread got to do the cleanup before us, so
+1:             // yield.
+1:             // This should not happen, but since
+1:             // we had to "fix" NIO, cf. the code marked (**), we could
+1:             // theoretically see two:
+1:             //
+1:             // - the thread that got AsynchronousCloseException, but was the
+1:             //   one that caused the channel close: it will decide (correctly)
+1:             //   it is the one to do recovery.
+1:             //
+1:             // - another thread that got an interrupt after doing successful IO
+1:             //   but seeing a closed channel: it will decide (incorrectly) it
+1:             //   is the one to do recovery. But since we had to fix NIO, this
+1:             //   case gets conflated with the case that this was *really* the
+1:             //   thread the caused the channel close.
+1:             //
+1:             // Not safe for Java 1.4 (only volatile protection for
+1:             // restoreChannelInProgress here), compare safe test below (not
+1:             // stealthMode).
+1: 
+0:             InterruptStatus.noteAndClearInterrupt(
+1:                 whence,
+0:                 threadsInPageIO,
+0:                 hashCode());
+1: 
+1:             return false;
+1:         }
+1: 
+1:         synchronized (channelCleanupMonitor) {
+1:             if (restoreChannelInProgress) {
+1:                 // Another interrupted thread got to do the cleanup before us,
+1:                 // so yield, see above explanation.
+0:                 InterruptStatus.noteAndClearInterrupt(
+1:                     whence,
+0:                     threadsInPageIO,
+0:                     hashCode());
+1: 
+1:                 return false;
+1:             }
+1: 
+1:             if (stealthMode) {
+1:                 // don't touch threadsInPageIO
+1:             } else {
+1:                 threadsInPageIO--;
+1:             }
+1: 
+1:             // All new writers will now wait till we're done, see "Gain entry"
+1:             // in writePage above. Any concurrent threads already inside will
+1:             // also wait till we're done, see below
+1:             restoreChannelInProgress = true;
+0:             threadDoingRestore = Thread.currentThread();
+1:         }
+1: 
+1:         // Wait till other concurrent threads hit the wall
+0:         // (ClosedChannelException) and are a ready wait for us to clean up, so
+0:         // we can set them loose when we're done.
+1:         while (true) {
+1:             synchronized (channelCleanupMonitor) {
+1:                 if (threadsInPageIO == 0) {
+1:                     // Either no concurrent threads, or they are now waiting
+1:                     // for us to clean up (see ClosedChannelException case)
+1:                     break;
+1:                 }
+1:             }
+1: 
+1:             try {
+0:                 Thread.sleep(10);
+1:             } catch (InterruptedException te) {
+0:                 // again! No need, we have already taken note, pal!
+1:             }
+1:         }
+1: 
+1: 
+1:         // Initiate recovery
+1:         synchronized (channelCleanupMonitor) {
+1:             try {
+0:                 InterruptStatus.noteAndClearInterrupt(
+1:                     whence, threadsInPageIO, hashCode());
+1: 
+1:                 synchronized(this) {
+1:                     if (SanityManager.DEBUG) {
+1:                         SanityManager.ASSERT(ourChannel != null,
+1:                                              "ourChannel is null");
+1:                         SanityManager.ASSERT(!ourChannel.isOpen(),
+1:                                              "ourChannel is open");
+1:                     }
+1:                 }
+1: 
+1:                 while (true) {
+1:                     synchronized(this) {
+1:                         try {
+0:                             closeContainer();
+0:                             openContainer(currentIdentity);
+0:                         } catch (Exception newE) {
+0:                             // Interrupted again?
+1: 
+0:                             if (InterruptStatus.noteAndClearInterrupt(
+0:                                         "RAF: isInterrupted during recovery",
+0:                                         threadsInPageIO,
+0:                                         hashCode())) {
+0:                                 continue;
+1:                             } else {
+0:                                 // Something else failed - shutdown happening?
+0:                                 synchronized(giveUpIOm) {
+0:                                     // Make sure other threads will give up and
+0:                                     // throw, too.
+0:                                     giveUpIO = true;
+1: 
+1:                                     if (SanityManager.DEBUG) {
+1:                                         debugTrace(
+0:                                             "can't resurrect container: " +
+0:                                             newE);
+1:                                     }
+1:                                 }
+1: 
+1:                                 throw StandardException.newException(
+1:                                     SQLState.FILE_IO_INTERRUPTED, newE);
+1:                             }
+1:                         }
+1:                         break;
+1:                     }
+1:                 }
+1: 
+1:                 threadsInPageIO++;
+1:                 // retry IO
+1:             } finally {
+1:                 // Recovery work done (or failed), now set other threads free
+1:                 // to retry or give up as the case may be, cf. giveUpIO.
+1:                 restoreChannelInProgress = false;
+0:                 threadDoingRestore = null;
+1:                 channelCleanupMonitor.notifyAll();
+1:             }
+1:         } // end channelCleanupMonitor region
+1: 
+1:         return true;
+/////////////////////////////////////////////////////////////////////////
+1:         if (SanityManager.DEBUG) {
+1:             if (pageNumber == FIRST_ALLOC_PAGE_NUMBER) {
+1:                 // page 0
+0:                 SanityManager.ASSERT(Thread.currentThread().holdsLock(this));
+1:             } else {
+0:                 SanityManager.ASSERT(!Thread.currentThread().holdsLock(this));
+1:             }
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:                             debugTrace(
+1:                                 "write to a dropped and " +
+1:                                 "closed container discarded.");
+/////////////////////////////////////////////////////////////////////////
+1:         } else {
+1:             // iochannel was not initialized, fall back to original method.
+1:      * <p/>
+0:      * override of FileContainer#writeAtOffset
+1:      * <p/>
+/////////////////////////////////////////////////////////////////////////
+1:      * <p/>
+1:      * override of FileContainer#getEmbryonicPage
+1:      * <p/>
+/////////////////////////////////////////////////////////////////////////
+1:             byte[] buffer = new byte[AllocPage.MAX_BORROWED_SPACE];
+1:             readPage(-1L, buffer, offset);
+1:             return buffer;
+/////////////////////////////////////////////////////////////////////////
+0:         boolean beforeOpen = srcChannel.isOpen();
+0:         boolean beforeInterrupted = Thread.currentThread().isInterrupted();
+1: 
+1:             if (srcChannel.read(dstBuffer,
+1:                 throw new EOFException(
+1:                     "Reached end of file while attempting to read a "
+1:                     + "whole page.");
+1:             }
+1: 
+1:             // (**) Sun Java NIO is weird: it can close the channel due to an
+1:             // interrupt without throwing if bytes got transferred. Compensate,
+1:             // so we can clean up.  Bug 6979009,
+0:             // http://bugs.sun.com/view_bug.do?bug_id=6979009
+1:             if (Thread.currentThread().isInterrupted() &&
+1:                     !srcChannel.isOpen()) {
+1:                 throw new ClosedByInterruptException();
+/////////////////////////////////////////////////////////////////////////
+1:             throws IOException
+0:         boolean beforeOpen = dstChannel.isOpen();
+0:         boolean beforeInterrupted = Thread.currentThread().isInterrupted();
+1: 
+1:             dstChannel.write(srcBuffer, position + srcBuffer.position());
+1: 
+1:             // (**) Sun JAVA NIO is weird: it can close the channel due to an
+1:             // interrupt without throwing if bytes got transferred. Compensate,
+1:             // so we can clean up. Bug 6979009,
+0:             // http://bugs.sun.com/view_bug.do?bug_id=6979009
+1:             if (Thread.currentThread().isInterrupted() &&
+1:                     !dstChannel.isOpen()) {
+1:                 throw new ClosedByInterruptException();
+1:             }
+1:         }
+1:     }
+1: 
+1:     private static void debugTrace (String msg) {
+1:         if (SanityManager.DEBUG) { // redundant, just to remove code in insane
+1:             if (SanityManager.DEBUG_ON("RAF4")) {
+1:                 SanityManager.DEBUG_PRINT(
+1:                     "RAF4",
+1:                     Thread.currentThread().getName() + " " + msg);
+commit:078bb79
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.reference.SQLState;
+/////////////////////////////////////////////////////////////////////////
+1: import java.nio.channels.ClosedByInterruptException;
+/////////////////////////////////////////////////////////////////////////
+1:             throws IOException, StandardException
+/////////////////////////////////////////////////////////////////////////
+1:      * @throws StandardException if thread is interrupted.
+1:             throws IOException, StandardException
+/////////////////////////////////////////////////////////////////////////
+0:      * <p/>
+0:      * <p/>
+1:      * @param dstBuffer buffer to read into
+1:      * @param srcChannel channel to read from
+1:      * @param position file position from where to read
+1:      *
+1:      * @throws IOException if an I/O error occurs while reading
+1:      * @throws StandardException If thread is interrupted.
+1:             throws IOException, StandardException
+1:             try {
+0:                 if (srcChannel.read(dstBuffer,
+1:                                     position + dstBuffer.position()) == -1) {
+0:                         throw new EOFException(
+0:                             "Reached end of file while attempting to read a "
+0:                             + "whole page.");
+1:                 }
+0:             } catch (ClosedByInterruptException e) {
+0:                 throw StandardException.newException(
+0:                     SQLState.FILE_IO_INTERRUPTED, e);
+/////////////////////////////////////////////////////////////////////////
+0:      * <p/>
+0:      * <p/>
+1:      * @param srcBuffer buffer to write
+1:      * @param dstChannel channel to write to
+1:      * @param position file position to start writing at
+1:      *
+1:      * @throws IOException if an I/O error occurs while writing
+1:      * @throws StandardException If thread is interrupted.
+1:             throws IOException, StandardException
+1:             try {
+0:                 dstChannel.write(srcBuffer, position + srcBuffer.position());
+0:             } catch (ClosedByInterruptException e) {
+0:                 throw StandardException.newException(
+0:                     SQLState.FILE_IO_INTERRUPTED, e);
+1:             }
+author:Bryan Pendleton
+-------------------------------------------------------------------------------
+commit:7e51e9d
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.shared.common.sanity.SanityManager;
+author:Knut Anders Hatlen
+-------------------------------------------------------------------------------
+commit:b44572f
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.io.StorageRandomAccessFile;
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Return the {@code FileChannel} for the specified
+1:      * {@code StorageRandomAccessFile} if it is a {@code RandomAccessFile}.
+1:      * Otherwise, return {@code null}.
+1:      *
+1:      * @param file the file to get the channel for
+1:      * @return a {@code FileChannel} if {@code file} is an instance of
+1:      * {@code RandomAccessFile}, {@code null} otherwise
+1:      */
+1:     private FileChannel getChannel(StorageRandomAccessFile file) {
+1:         if (file instanceof RandomAccessFile) {
+1:             /** XXX - this cast isn't testing friendly.
+1:              * A testing class that implements StorageRandomAccessFile but isn't
+1:              * a RandomAccessFile will be "worked around" by this class. An
+1:              * example of such a class is
+1:              * functionTests/util/corruptio/CorruptRandomAccessFile.java.
+1:              * An interface rework may be necessary.
+1:              */
+1:             return ((RandomAccessFile) file).getChannel();
+1:         }
+1:         return null;
+1:     }
+1: 
+1:     /**
+1:      * <p>
+1:      * Return the file channel for the current value of the {@code fileData}
+1:      * field. If {@code fileData} doesn't support file channels, return
+1:      * {@code null}.
+1:      * </p>
+1:      *
+1:      * <p>
+1:      * Callers of this method must synchronize on the container object since
+1:      * two shared fields ({@code fileData} and {@code ourChannel}) are
+1:      * accessed.
+1:      * </p>
+1:      *
+1:      * @return a {@code FileChannel} object, if supported, or {@code null}
+1:      */
+1:     private FileChannel getChannel() {
+1:         if (ourChannel == null) {
+1:             ourChannel = getChannel(fileData);
+1:         }
+1:         return ourChannel;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             SanityManager.ASSERT(fileData == null, "fileData isn't null");
+1:             SanityManager.ASSERT(ourChannel == null, "ourChannel isn't null");
+1:         return super.openContainer(newIdentity);
+/////////////////////////////////////////////////////////////////////////
+1:             SanityManager.ASSERT(fileData == null, "fileData isn't null");
+1:             SanityManager.ASSERT(ourChannel == null, "ourChannel isn't null");
+/////////////////////////////////////////////////////////////////////////
+1:             ioChannel = getChannel();
+/////////////////////////////////////////////////////////////////////////
+1:         synchronized (this) {
+1:             ioChannel = getChannel();
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+0:      * Write a sequence of bytes at the given offset in a file.
+1:      *
+1:      * @param file the file to write to
+1:      * @param bytes the bytes to write
+1:      * @param offset the offset to start writing at
+1:      * @throws IOException if an I/O error occurs while writing
+1:      */
+1:     void writeAtOffset(StorageRandomAccessFile file, byte[] bytes, long offset)
+0:             throws IOException
+1:     {
+1:         FileChannel ioChannel = getChannel(file);
+1:         if (ioChannel != null) {
+0:             writeFull(ByteBuffer.wrap(bytes), ioChannel, offset);
+1:         } else {
+1:             super.writeAtOffset(file, bytes, offset);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Read an embryonic page (that is, a section of the first alloc page that
+1:      * is so large that we know all the borrowed space is included in it) from
+1:      * the specified offset in a {@code StorageRandomAccessFile}.
+1:      *
+1:      * @param file the file to read from
+1:      * @param offset where to start reading (normally
+1:      * {@code FileContainer.FIRST_ALLOC_PAGE_OFFSET})
+1:      * @return a byte array containing the embryonic page
+1:      * @throws IOException if an I/O error occurs while reading
+1:      */
+1:     byte[] getEmbryonicPage(StorageRandomAccessFile file, long offset)
+0:             throws IOException
+1:     {
+1:         FileChannel ioChannel = getChannel(file);
+1:         if (ioChannel != null) {
+0:             ByteBuffer buffer =
+0:                     ByteBuffer.allocate(AllocPage.MAX_BORROWED_SPACE);
+0:             readFull(buffer, ioChannel, offset);
+0:             return buffer.array();
+1:         } else {
+1:             return super.getEmbryonicPage(file, offset);
+1:         }
+1:     }
+commit:a7de081
+/////////////////////////////////////////////////////////////////////////
+0:         // If this is the first alloc page, there may be another thread
+0:         // accessing the container information in the borrowed space on the
+0:         // same page. In that case, we synchronize the entire method call, just
+0:         // like RAFContainer.readPage() does, in order to avoid conflicts. For
+0:         // all other pages it is safe to skip the synchronization, since
+0:         // concurrent threads will access different pages and therefore don't
+0:         // interfere with each other.
+0:         if (pageNumber == FIRST_ALLOC_PAGE_NUMBER) {
+1:             synchronized (this) {
+0:                 readPage0(pageNumber, pageData);
+1:             }
+1:         } else {
+0:             readPage0(pageNumber, pageData);
+1:         }
+1:     }
+1: 
+0:     private void readPage0(long pageNumber, byte[] pageData)
+1:          throws IOException, StandardException
+1:     {
+/////////////////////////////////////////////////////////////////////////
+0:         // If this is the first alloc page, there may be another thread
+0:         // accessing the container information in the borrowed space on the
+0:         // same page. In that case, we synchronize the entire method call, just
+0:         // like RAFContainer.writePage() does, in order to avoid conflicts. For
+0:         // all other pages it is safe to skip the synchronization, since
+0:         // concurrent threads will access different pages and therefore don't
+0:         // interfere with each other.
+0:         if (pageNumber == FIRST_ALLOC_PAGE_NUMBER) {
+0:             synchronized (this) {
+0:                 writePage0(pageNumber, pageData, syncPage);
+1:             }
+0:         } else {
+0:             writePage0(pageNumber, pageData, syncPage);
+1:         }
+1:     }
+1: 
+1:     private void writePage0(long pageNumber, byte[] pageData, boolean syncPage)
+1:          throws IOException, StandardException
+1:     {
+commit:5cc3875
+/////////////////////////////////////////////////////////////////////////
+0:                 // If ioChannel == null and fileData supports getChannel()
+0:                 // we have a problem. See this.openContainer(ContainerKey 
+0:                 // newIdentity).
+0:                 SanityManager.ASSERT(! ((ioChannel == null) &&
+0:                         super.fileData instanceof java.io.RandomAccessFile),
+0:                         "RAFContainer4: New style readPage attempted" +
+0:                         " with uninitialized ioChannel");
+1: 
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:             if (SanityManager.DEBUG) {
+0:                 // If ioChannel == null and fileData supports getChannel()
+0:                 // we have a problem
+0:                 SanityManager.ASSERT(! ((ioChannel == null) &&
+0:                         super.fileData instanceof java.io.RandomAccessFile),
+0:                         "RAFContainer4: New style writePage attempted " +
+0:                         "with uninitialized ioChannel");
+1:             }
+/////////////////////////////////////////////////////////////////////////
+commit:af4a9fe
+/////////////////////////////////////////////////////////////////////////
+1:             // Any IOs in progress to a container being dropped will be
+1:             // ignored, so we should not complain about starting a close
+1:             // while there are IOs in progress if it is being dropped
+1:             // anyway.
+1:             SanityManager.ASSERT( (iosInProgress == 0)
+1:                     || getCommittedDropState(),
+commit:55a6cdc
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1: 
+1:    Derby - Class org.apache.derby.impl.store.raw.data.RAFContainer4
+1: 
+1:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:    contributor license agreements.  See the NOTICE file distributed with
+1:    this work for additional information regarding copyright ownership.
+1:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:    (the "License"); you may not use this file except in compliance with
+1:    the License.  You may obtain a copy of the License at
+1: 
+1:       http://www.apache.org/licenses/LICENSE-2.0
+1: 
+1:    Unless required by applicable law or agreed to in writing, software
+1:    distributed under the License is distributed on an "AS IS" BASIS,
+1:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:    See the License for the specific language governing permissions and
+1:    limitations under the License.
+1: 
+1:  */
+1: 
+1: package org.apache.derby.impl.store.raw.data;
+1: 
+1: 
+1: import org.apache.derby.iapi.error.StandardException;
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+0: import org.apache.derby.iapi.services.io.FormatIdUtil;
+1: 
+0: import org.apache.derby.impl.store.raw.data.BaseDataFileFactory;
+1: import org.apache.derby.iapi.store.raw.ContainerKey;
+1: 
+1: import java.io.EOFException;
+1: import java.io.IOException;
+1: import java.io.RandomAccessFile;
+1: import java.nio.ByteBuffer;
+1: import java.nio.channels.FileChannel;
+1: import java.nio.channels.ClosedChannelException;
+1: 
+1: /**
+0:  * RAFContainer4 overrides a few methods in RAFContainer in an attempt to use
+0:  * FileChannel from Java 1.4's New IO framework to issue multiple IO operations
+0:  * to the same file concurrently instead of strictly serializing IO operations
+0:  * using a mutex on the container object.
+1:  * <p>
+1:  * Note that our requests for multiple concurrent IOs may be serialized further
+1:  * down in the IO stack - this is entirely up to the JVM and OS. However, at
+1:  * least in Linux on Sun's 1.4.2_09 JVM we see the desired behavior:
+1:  * The FileChannel.read/write(ByteBuffer buf, long position) calls map to
+1:  * pread/pwrite system calls, which enable efficient IO to the same file
+1:  * descriptor by multiple threads.
+1:  * <p>
+1:  * This whole class should be merged back into RAFContainer when Derby
+1:  * officially stops supporting Java 1.3.
+1:  * <p>
+1:  * Significant behavior changes from RAFContainer:
+1:  * <ol>
+1:  * <li> Multiple concurrent IOs permitted.
+1:  * <li> State changes to the container (create, open, close) can now happen while
+1:  *      IO is in progress due to the lack of locking. Closing a container while
+1:  *      IO is in progress will cause IOExceptions in the thread calling readPage
+1:  *      or writePage. If this happens something is probably amiss anyway.
+1:  *      The iosInProgress variable is used in an attempt to detect this should it
+1:  *      happen while running a debug build.
+1:  * </ol>
+0:  *
+1:  * @see java.nio.channels.FileChannel
+1:  */
+1: class RAFContainer4 extends RAFContainer {
+1: 
+1:     /**
+1:      * This channel will be retrieved from RAFContainer's fileData
+1:      * member when fileData is set. We wrap a couple of RAFContainer's methods
+1:      * to accomplish this.
+1:      */
+1:     private FileChannel ourChannel = null;
+1: 
+1:     /**
+1:      * For debugging - will be incremented when an IO is started, decremented
+1:      * when it is done. Should be == 0 when container state is changed.
+1:      */
+0:     private int iosInProgress = 0;
+1: 
+1:     public RAFContainer4(BaseDataFileFactory factory) {
+1:         super(factory);
+1:     }
+1: 
+1:     /*
+1:      * Wrapping methods that retrieve the FileChannel from RAFContainer's
+1:      * fileData after calling the real methods in RAFContainer.
+1:      */
+1:     synchronized boolean openContainer(ContainerKey newIdentity)
+1:         throws StandardException
+1:     {
+1:         if (SanityManager.DEBUG) {
+1:             SanityManager.ASSERT(iosInProgress == 0,
+1:                     "Container opened while IO operations are in progress. "
+1:                     + "This should not happen.");
+1:         }
+1: 
+0:         boolean result = super.openContainer(newIdentity);
+0:         if (result == true && super.fileData != null &&
+0:                 super.fileData instanceof java.io.RandomAccessFile) {
+0:             /** XXX - this cast isn't testing friendly.
+0:              * A testing class that implements StorageRandomAccessFile but isn't
+0:              * a RandomAccessFile will be "worked around" by this class. An
+0:              * example of such a class is
+0:              * functionTests/util/corruptio/CorruptRandomAccessFile.java.
+0:              * An interface rework may be necessary.
+1:              */
+0:             ourChannel = ((RandomAccessFile)super.fileData).getChannel();
+1:         }
+0:         return result;
+1:     }
+1: 
+1:     synchronized void createContainer(ContainerKey newIdentity)
+1:         throws StandardException
+1:     {
+1:         if (SanityManager.DEBUG) {
+1:             SanityManager.ASSERT(iosInProgress == 0,
+1:                     "Container created while IO operations are in progress. "
+1:                     + "This should not happen.");
+1:         }
+1:         super.createContainer(newIdentity);
+1: 
+0:         if (super.fileData != null &&
+0:                 super.fileData instanceof java.io.RandomAccessFile) {
+0:             // XXX - see "XXX" comment above.
+0:             ourChannel = ((RandomAccessFile) super.fileData).getChannel();
+1:         }
+1:     }
+1: 
+1: 
+1:     synchronized void closeContainer() {
+1:         if (SanityManager.DEBUG) {
+1:             SanityManager.ASSERT(iosInProgress == 0,
+1:                     "Container closed while IO operations are in progress. "
+1:                     + " This should not happen.");
+1:         }
+1:         if(ourChannel != null) {
+1:             try {
+1:                 ourChannel.close();
+1:             } catch (IOException e) {
+1:                 // nevermind.
+1:             } finally {
+1:                 ourChannel=null;
+1:             }
+1:         }
+1:         super.closeContainer();
+1:     }
+1: 
+1:     /**
+1:      * These are the methods that were rewritten to use FileChannel.
+1:      **/
+1: 
+1:     /**
+1:      *  Read a page into the supplied array.
+0:      *
+1:      *  <BR> MT - thread safe
+1:      *  @exception IOException exception reading page
+0:      *  @exception StandardException Standard Cloudscape error policy
+1:      */
+1:     protected void readPage(long pageNumber, byte[] pageData)
+1:          throws IOException, StandardException
+1:     {
+1:         FileChannel ioChannel;
+0:         synchronized (this) {
+0:             ioChannel = ourChannel;
+1:             if (SanityManager.DEBUG) {
+0:                 SanityManager.ASSERT(!getCommittedDropState());
+1:             }
+1:         }
+1: 
+1:         if(ioChannel != null) {
+1: 
+1:             long pageOffset = pageNumber * pageSize;
+1: 
+1:             ByteBuffer pageBuf = ByteBuffer.wrap(pageData);
+1: 
+1:             // I hope the try/finally is optimized away by the
+1:             // compiler/jvm when SanityManager.DEBUG == false?
+1:             try {
+1:                 if (SanityManager.DEBUG) {
+1:                     synchronized(this) {
+1:                         iosInProgress++;
+1:                     }
+1:                 }
+1: 
+0:                 readFull(pageBuf, ioChannel, pageOffset);
+1:             }
+1:             finally {
+1:                 if (SanityManager.DEBUG) {
+1:                     synchronized(this) {
+1:                         iosInProgress--;
+1:                     }
+1:                 }
+1: 
+1:             }
+1: 
+1:             if (dataFactory.databaseEncrypted() &&
+0:                 pageNumber != FIRST_ALLOC_PAGE_NUMBER)
+1:             {
+1:                 decryptPage(pageData, pageSize);
+1:             }
+1:         }
+1:         else
+1:         { // iochannel was not initialized, fall back to original method.
+0:             if(SanityManager.DEBUG) {
+0:                 SanityManager.DEBUG_PRINT("RAFContainer4",
+0:                         "New style readPage attempted with uninitialized ioChannel");
+1:             }
+1:             super.readPage(pageNumber, pageData);
+1:         }
+1:     }
+1: 
+1: 
+1:     /**
+1:      *  Write a page from the supplied array.
+0:      *
+1:      *  <BR> MT - thread safe
+0:      *
+0:      *  @exception StandardException Standard Cloudscape error policy
+1:      *  @exception IOException IO error accessing page
+1:      */
+1:     protected void writePage(long pageNumber, byte[] pageData, boolean syncPage)
+1:          throws IOException, StandardException
+1:     {
+1:         FileChannel ioChannel;
+1:         synchronized(this) {
+1:             // committed and dropped, do nothing.
+1:             // This file container may only be a stub
+1:             if (getCommittedDropState())
+1:                 return;
+0:             ioChannel = ourChannel;
+1:         }
+1:         if(ioChannel != null) {
+1:             ///////////////////////////////////////////////////
+1:             //
+1:             // RESOLVE: right now, no logical -> physical mapping.
+1:             // We can calculate the offset.  In the future, we may need to
+1:             // look at the allocation page or the in memory translation table
+1:             // to figure out where the page should go
+1:             //
+1:             /////////////////////////////////////////////////
+1: 
+1:             long pageOffset = pageNumber * pageSize;
+1: 
+1:             byte[] encryptionBuf = null;
+1:             // We only need to allocate the encryptionBuf if updatePageArray is
+1:             // actually going to use it.
+1:             if (dataFactory.databaseEncrypted()) {
+1:                 encryptionBuf = new byte[pageSize];
+1:             }
+1: 
+1:             byte[] dataToWrite = updatePageArray(pageNumber,
+1:                                                  pageData,
+1:                                                  encryptionBuf,
+1:                                                  false);
+1: 
+1:             if (SanityManager.DEBUG) {
+1:                 SanityManager.ASSERT(dataToWrite != null,
+1:                         "RAFContainer4: dataToWrite is null after updatePageArray()");
+1:             }
+1: 
+1:             ByteBuffer writeBuffer = ByteBuffer.wrap(dataToWrite);
+1: 
+1:             dataFactory.writeInProgress();
+1:             try {
+1:                 if (SanityManager.DEBUG) {
+1:                     synchronized(this) {
+1:                         iosInProgress++;
+1:                     }
+1:                 }
+1: 
+1:                 writeFull(writeBuffer, ioChannel, pageOffset);
+1:             } catch (ClosedChannelException ioe) {
+1:                 synchronized(this) {
+1:                     /* If the write failed because the container has been closed
+1:                      * for deletion between the start of this method and the
+1:                      * write, we'll just ignore that, as this container is going
+1:                      * away anyway.
+1:                      * This could possibly happen if the Cache is cleaning this
+1:                      * container while it is dropped - BaseDataFileFactory holds
+1:                      * an exclusive lock on the container while dropping it to
+1:                      * avoid other interference.
+1:                      * See the getCommittedDropState() check at the top of this
+1:                      * method.
+1:                      */
+1:                     if (getCommittedDropState()) {
+1:                         if (SanityManager.DEBUG) {
+0:                             SanityManager.DEBUG_PRINT("RAFContainer4",
+0:                                 "Write to a dropped and closed container discarded.");
+1:                         }
+1:                         return;
+0:                     } else {
+1:                         // This should not happen, better let the exception
+1:                         // hurt where it's supposed to.
+1:                         throw ioe;
+1:                     }
+1:                 }
+1:             } finally {
+1:                 if (SanityManager.DEBUG) {
+1:                     synchronized(this) {
+1:                         iosInProgress--;
+1:                     }
+1:                 }
+1: 
+1:                 dataFactory.writeFinished();
+1:             }
+1: 
+1:             /* Note that the original "try {write} catch IOException { pad file,
+1:              * write again }" in RAFContainer is removed here, because the
+1:              * FileChannel Javadoc specifies that the file will be grown to
+1:              * accommodate the new bytes.
+1:              */
+1: 
+1:             if (syncPage) {
+1:                 dataFactory.writeInProgress();
+1:                 try{
+1:                     if (SanityManager.DEBUG) {
+1:                         synchronized(this) {
+1:                             iosInProgress++;
+1:                         }
+1:                     }
+1:                     if (!dataFactory.dataNotSyncedAtAllocation) {
+1:                         ioChannel.force(false);
+1:                     }
+1:                 } finally {
+1:                     if (SanityManager.DEBUG) {
+1:                         synchronized(this) {
+1:                             iosInProgress--;
+1:                         }
+1:                     }
+1:                     dataFactory.writeFinished();
+1:                 }
+0:             } else {
+1:                 synchronized(this) {
+1:                     needsSync = true;
+1:                 }
+1:             }
+1: 
+0:         } else { // iochannel was not initialized, fall back to original method.
+0:             if(SanityManager.DEBUG) {
+0:                 SanityManager.DEBUG_PRINT("RAFContainer4",
+0:                         "New style writePage attempted with uninitialized ioChannel");
+1:             }
+1:             super.writePage(pageNumber, pageData, syncPage);
+1:         }
+1:     }
+1: 
+1: 
+1:     /**
+1:      * Attempts to fill buf completely from start until it's full.
+1:      * <p>
+1:      * FileChannel has no readFull() method, so we roll our own.
+1:      */
+0:     private final void readFull(ByteBuffer dstBuffer,
+0:                                 FileChannel srcChannel,
+0:                                 long position)
+0:         throws IOException
+1:     {
+1:         while(dstBuffer.remaining() > 0) {
+0:             if( srcChannel.read(dstBuffer, position + dstBuffer.position())
+0:                     == -1)
+1:             {
+0:                 throw new EOFException(
+0:                         "Reached end of file while attempting to read a "
+0:                         + "whole page.");
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Attempts to write buf completely from start until end, at the given
+1:      * position in the destination fileChannel.
+1:      * <p>
+1:      * FileChannel has no writeFull() method, so we roll our own.
+1:      */
+0:     private final void writeFull(ByteBuffer srcBuffer,
+0:                                  FileChannel dstChannel,
+0:                                  long position)
+0:         throws IOException
+1:     {
+1:         while(srcBuffer.remaining() > 0) {
+0:             dstChannel.write(srcBuffer, position + srcBuffer.position());
+1:         }
+1:     }
+1: }
+author:Samuel Andrew McIntyre
+-------------------------------------------------------------------------------
+commit:94f158a
+/////////////////////////////////////////////////////////////////////////
+1:      *  @exception StandardException Standard Derby error policy
+/////////////////////////////////////////////////////////////////////////
+1:      *  @exception StandardException Standard Derby error policy
+============================================================================

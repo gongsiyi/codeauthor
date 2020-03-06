@@ -1,0 +1,1339 @@
+1:6528fbf: /*
+1:6528fbf:  * Licensed to the Apache Softw≤are Foundation (ASF) under one
+1:6528fbf:  * or more contributor license agreements.  See the NOTICE file
+1:6528fbf:  * distributed with this work for additional information
+1:6528fbf:  * regarding copyright ownership.  The ASF licenses this file
+1:6528fbf:  * to you under the Apache License, Version 2.0 (the
+1:6528fbf:  * "License"); you may not use this file except in compliance
+1:6528fbf:  * with the License.  You may obtain a copy of the License at
+1:6528fbf:  *
+1:6528fbf:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:6528fbf:  *
+1:6528fbf:  * Unless required by applicable law or agreed to in writing, software
+1:6528fbf:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:6528fbf:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:6528fbf:  * See the License for the specific language governing permissions and
+1:6528fbf:  * limitations under the License.
+1:6528fbf:  */
+1:6528fbf: 
+1:6528fbf: package org.apache.cassandra.db;
+1:6528fbf: 
+1:6528fbf: import java.nio.ByteBuffer;
+1:6528fbf: import java.util.*;
+1:6528fbf: import java.util.concurrent.atomic.*;
+1:6528fbf: import java.util.function.*;
+1:6528fbf: 
+1:6528fbf: import com.google.common.annotations.VisibleForTesting;
+1:6528fbf: import com.google.common.collect.Iterables;
+1:6528fbf: 
+1:6528fbf: import org.apache.cassandra.config.*;
+1:6528fbf: import org.apache.cassandra.cql3.*;
+1:6528fbf: import org.apache.cassandra.cql3.statements.*;
+1:6528fbf: import org.apache.cassandra.db.marshal.*;
+1:6528fbf: import org.apache.cassandra.schema.*;
+1:6528fbf: import org.apache.cassandra.utils.*;
+1:6528fbf: 
+1:6528fbf: /**
+1:6528fbf:  * Helper methods to represent CFMetadata and related objects in CQL format
+1:6528fbf:  */
+1:6528fbf: public class ColumnFamilyStoreCQLHelper
+1:6528fbf: {
+1:6528fbf:     public static List<String> dumpReCreateStatements(CFMetaData metadata)
+1:6528fbf:     {
+1:6528fbf:         List<String> l = new ArrayList<>();
+1:6528fbf:         // Types come first, as table can't be created without them
+1:6528fbf:         l.addAll(ColumnFamilyStoreCQLHelper.getUserTypesAsCQL(metadata));
+1:6528fbf:         // Record re-create schema statements
+1:6528fbf:         l.add(ColumnFamilyStoreCQLHelper.getCFMetadataAsCQL(metadata, true));
+1:6528fbf:         // Dropped columns (and re-additions)
+1:6528fbf:         l.addAll(ColumnFamilyStoreCQLHelper.getDroppedColumnsAsCQL(metadata));
+1:6528fbf:         // Indexes applied as last, since otherwise they may interfere with column drops / re-additions
+1:6528fbf:         l.addAll(ColumnFamilyStoreCQLHelper.getIndexesAsCQL(metadata));
+1:6528fbf:         return l;
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     private static List<ColumnDefinition> getClusteringColumns(CFMetaData metadata)
+1:6528fbf:     {
+1:6528fbf:         List<ColumnDefinition> cds = new ArrayList<>(metadata.clusteringColumns().size());
+1:6528fbf: 
+1:6528fbf:         if (!metadata.isStaticCompactTable())
+1:6528fbf:             for (ColumnDefinition cd : metadata.clusteringColumns())
+1:6528fbf:                 cds.add(cd);
+1:6528fbf: 
+1:6528fbf:         return cds;
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     private static List<ColumnDefinition> getPartitionColumns(CFMetaData metadata)
+1:6528fbf:     {
+1:6528fbf:         List<ColumnDefinition> cds = new ArrayList<>(metadata.partitionColumns().size());
+1:6528fbf: 
+1:6528fbf:         for (ColumnDefinition cd : metadata.partitionColumns().statics)
+1:6528fbf:             cds.add(cd);
+1:6528fbf: 
+1:6528fbf:         if (metadata.isDense())
+1:6528fbf:         {
+1:6528fbf:             // remove an empty type
+1:6528fbf:             for (ColumnDefinition cd : metadata.partitionColumns().withoutStatics())
+1:6528fbf:                 if (!cd.type.equals(EmptyType.instance))
+1:6528fbf:                     cds.add(cd);
+1:6528fbf:         }
+1:6528fbf:         // "regular" columns are not exposed for static compact tables
+1:6528fbf:         else if (!metadata.isStaticCompactTable())
+1:6528fbf:         {
+1:6528fbf:             for (ColumnDefinition cd : metadata.partitionColumns().withoutStatics())
+1:6528fbf:                 cds.add(cd);
+1:6528fbf:         }
+1:6528fbf: 
+1:6528fbf:         return cds;
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     /**
+1:6528fbf:      * Build a CQL String representation of Column Family Metadata
+1:6528fbf:      */
+1:6528fbf:     @VisibleForTesting
+1:6528fbf:     public static String getCFMetadataAsCQL(CFMetaData metadata, boolean includeDroppedColumns)
+1:6528fbf:     {
+1:6528fbf:         StringBuilder sb = new StringBuilder();
+1:6528fbf:         if (!isCqlCompatible(metadata))
+1:6528fbf:         {
+1:6528fbf:             sb.append(String.format("/*\nWarning: Table %s.%s omitted because it has constructs not compatible with CQL (was created via legacy API).\n",
+1:6528fbf:                                     metadata.ksName,
+1:6528fbf:                                     metadata.cfName));
+1:6528fbf:             sb.append("\nApproximate structure, for reference:");
+1:6528fbf:             sb.append("\n(this should not be used to reproduce this schema)\n\n");
+1:6528fbf:         }
+1:6528fbf: 
+1:6528fbf:         sb.append("CREATE TABLE IF NOT EXISTS ");
+1:6528fbf:         sb.append(quoteIdentifier(metadata.ksName)).append('.').append(quoteIdentifier(metadata.cfName)).append(" (");
+1:6528fbf: 
+1:6528fbf:         List<ColumnDefinition> partitionKeyColumns = metadata.partitionKeyColumns();
+1:6528fbf:         List<ColumnDefinition> clusteringColumns = getClusteringColumns(metadata);
+1:6528fbf:         List<ColumnDefinition> partitionColumns = getPartitionColumns(metadata);
+1:6528fbf: 
+1:6528fbf:         Consumer<StringBuilder> cdCommaAppender = commaAppender("\n\t");
+1:6528fbf:         sb.append("\n\t");
+1:6528fbf:         for (ColumnDefinition cfd: partitionKeyColumns)
+1:6528fbf:         {
+1:6528fbf:             cdCommaAppender.accept(sb);
+1:6528fbf:             sb.append(toCQL(cfd));
+1:6528fbf:             if (partitionKeyColumns.size() == 1 && clusteringColumns.size() == 0)
+1:6528fbf:                 sb.append(" PRIMARY KEY");
+1:6528fbf:         }
+1:6528fbf: 
+1:6528fbf:         for (ColumnDefinition cfd: clusteringColumns)
+1:6528fbf:         {
+1:6528fbf:             cdCommaAppender.accept(sb);
+1:6528fbf:             sb.append(toCQL(cfd));
+1:6528fbf:         }
+1:6528fbf: 
+1:6528fbf:         for (ColumnDefinition cfd: partitionColumns)
+1:6528fbf:         {
+1:6528fbf:             cdCommaAppender.accept(sb);
+1:6528fbf:             sb.append(toCQL(cfd, metadata.isStaticCompactTable()));
+1:6528fbf:         }
+1:6528fbf: 
+1:6528fbf:         if (includeDroppedColumns)
+1:6528fbf:         {
+1:6528fbf:             for (Map.Entry<ByteBuffer, CFMetaData.DroppedColumn> entry: metadata.getDroppedColumns().entrySet())
+1:6528fbf:             {
+1:6528fbf:                 if (metadata.getColumnDefinition(entry.getKey()) != null)
+1:6528fbf:                     continue;
+1:6528fbf: 
+1:6528fbf:                 CFMetaData.DroppedColumn droppedColumn = entry.getValue();
+1:6528fbf:                 cdCommaAppender.accept(sb);
+1:6528fbf:                 sb.append(quoteIdentifier(droppedColumn.name));
+1:6528fbf:                 sb.append(' ');
+1:6528fbf:                 sb.append(droppedColumn.type.asCQL3Type().toString());
+1:6528fbf:             }
+1:6528fbf:         }
+1:6528fbf: 
+1:6528fbf:         if (clusteringColumns.size() > 0 || partitionKeyColumns.size() > 1)
+1:6528fbf:         {
+1:6528fbf:             sb.append(",\n\tPRIMARY KEY (");
+1:6528fbf:             if (partitionKeyColumns.size() > 1)
+1:6528fbf:             {
+1:6528fbf:                 sb.append("(");
+1:6528fbf:                 Consumer<StringBuilder> pkCommaAppender = commaAppender(" ");
+1:6528fbf:                 for (ColumnDefinition cfd : partitionKeyColumns)
+1:6528fbf:                 {
+1:6528fbf:                     pkCommaAppender.accept(sb);
+1:6528fbf:                     sb.append(quoteIdentifier(cfd.name.toString()));
+1:6528fbf:                 }
+1:6528fbf:                 sb.append(")");
+1:6528fbf:             }
+1:6528fbf:             else
+1:6528fbf:             {
+1:6528fbf:                 sb.append(quoteIdentifier(partitionKeyColumns.get(0).name.toString()));
+1:6528fbf:             }
+1:6528fbf: 
+1:6528fbf:             for (ColumnDefinition cfd : metadata.clusteringColumns())
+1:6528fbf:                 sb.append(", ").append(quoteIdentifier(cfd.name.toString()));
+1:6528fbf: 
+1:6528fbf:             sb.append(')');
+1:6528fbf:         }
+1:6528fbf:         sb.append(")\n\t");
+1:6528fbf:         sb.append("WITH ");
+1:6528fbf: 
+1:6528fbf:         sb.append("ID = ").append(metadata.cfId).append("\n\tAND ");
+1:6528fbf: 
+1:6528fbf:         if (metadata.isCompactTable())
+1:6528fbf:             sb.append("COMPACT STORAGE\n\tAND ");
+1:6528fbf: 
+1:6528fbf:         if (clusteringColumns.size() > 0)
+1:6528fbf:         {
+1:6528fbf:             sb.append("CLUSTERING ORDER BY (");
+1:6528fbf: 
+1:6528fbf:             Consumer<StringBuilder> cOrderCommaAppender = commaAppender(" ");
+1:6528fbf:             for (ColumnDefinition cd : clusteringColumns)
+1:6528fbf:             {
+1:6528fbf:                 cOrderCommaAppender.accept(sb);
+1:6528fbf:                 sb.append(quoteIdentifier(cd.name.toString())).append(' ').append(cd.clusteringOrder().toString());
+1:6528fbf:             }
+1:6528fbf:             sb.append(")\n\tAND ");
+1:6528fbf:         }
+1:6528fbf: 
+1:6528fbf:         sb.append(toCQL(metadata.params));
+1:6528fbf:         sb.append(";");
+1:6528fbf: 
+1:6528fbf:         if (!isCqlCompatible(metadata))
+1:6528fbf:         {
+1:6528fbf:             sb.append("\n*/");
+1:6528fbf:         }
+1:6528fbf:         return sb.toString();
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     /**
+1:6528fbf:      * Build a CQL String representation of User Types used in the given Column Family.
+1:6528fbf:      *
+1:6528fbf:      * Type order is ensured as types are built incrementally: from the innermost (most nested)
+1:6528fbf:      * to the outermost.
+1:6528fbf:      */
+1:6528fbf:     @VisibleForTesting
+1:6528fbf:     public static List<String> getUserTypesAsCQL(CFMetaData metadata)
+1:6528fbf:     {
+1:a123e98:         List<AbstractType> types = new ArrayList<>();
+1:a123e98:         Set<AbstractType> typeSet = new HashSet<>();
+1:6528fbf:         for (ColumnDefinition cd: Iterables.concat(metadata.partitionKeyColumns(), metadata.clusteringColumns(), metadata.partitionColumns()))
+1:6528fbf:         {
+1:6528fbf:             AbstractType type = cd.type;
+1:a123e98:             if (type.isUDT())
+1:6528fbf:                 resolveUserType((UserType) type, typeSet, types);
+1:6528fbf:         }
+1:6528fbf: 
+1:6528fbf:         List<String> typeStrings = new ArrayList<>();
+1:a123e98:         for (AbstractType type: types)
+1:a123e98:             typeStrings.add(toCQL((UserType) type));
+1:6528fbf:         return typeStrings;
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     /**
+1:6528fbf:      * Build a CQL String representation of Dropped Columns in the given Column Family.
+1:6528fbf:      *
+1:6528fbf:      * If the column was dropped once, but is now re-created `ADD` will be appended accordingly.
+1:6528fbf:      */
+1:6528fbf:     @VisibleForTesting
+1:6528fbf:     public static List<String> getDroppedColumnsAsCQL(CFMetaData metadata)
+1:6528fbf:     {
+1:6528fbf:         List<String> droppedColumns = new ArrayList<>();
+1:6528fbf: 
+1:6528fbf:         for (Map.Entry<ByteBuffer, CFMetaData.DroppedColumn> entry: metadata.getDroppedColumns().entrySet())
+1:6528fbf:         {
+1:6528fbf:             CFMetaData.DroppedColumn column = entry.getValue();
+1:6528fbf:             droppedColumns.add(toCQLDrop(metadata.ksName, metadata.cfName, column));
+1:6528fbf:             if (metadata.getColumnDefinition(entry.getKey()) != null)
+1:6528fbf:                 droppedColumns.add(toCQLAdd(metadata.ksName, metadata.cfName, metadata.getColumnDefinition(entry.getKey())));
+1:6528fbf:         }
+1:6528fbf: 
+1:6528fbf:         return droppedColumns;
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     /**
+1:6528fbf:      * Build a CQL String representation of Indexes on columns in the given Column Family
+1:6528fbf:      */
+1:6528fbf:     @VisibleForTesting
+1:6528fbf:     public static List<String> getIndexesAsCQL(CFMetaData metadata)
+1:6528fbf:     {
+1:6528fbf:         List<String> indexes = new ArrayList<>();
+1:6528fbf:         for (IndexMetadata indexMetadata: metadata.getIndexes())
+1:6528fbf:             indexes.add(toCQL(metadata.ksName, metadata.cfName, indexMetadata));
+1:6528fbf:         return indexes;
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     private static String toCQL(String keyspace, String cf, IndexMetadata indexMetadata)
+1:6528fbf:     {
+1:6528fbf:         if (indexMetadata.isCustom())
+1:6528fbf:         {
+1:6528fbf:             Map<String, String> options = new HashMap<>();
+1:6528fbf:             indexMetadata.options.forEach((k, v) -> {
+1:6528fbf:                 if (!k.equals(IndexTarget.TARGET_OPTION_NAME) && !k.equals(IndexTarget.CUSTOM_INDEX_OPTION_NAME))
+1:6528fbf:                     options.put(k, v);
+1:6528fbf:             });
+1:6528fbf: 
+1:6528fbf:             return String.format("CREATE CUSTOM INDEX %s ON %s.%s (%s) USING '%s'%s;",
+1:6528fbf:                                  quoteIdentifier(indexMetadata.name),
+1:6528fbf:                                  quoteIdentifier(keyspace),
+1:6528fbf:                                  quoteIdentifier(cf),
+1:6528fbf:                                  indexMetadata.options.get(IndexTarget.TARGET_OPTION_NAME),
+1:6528fbf:                                  indexMetadata.options.get(IndexTarget.CUSTOM_INDEX_OPTION_NAME),
+1:6528fbf:                                  options.isEmpty() ? "" : " WITH OPTIONS " + toCQL(options));
+1:6528fbf:         }
+1:6528fbf:         else
+1:6528fbf:         {
+1:6528fbf:             return String.format("CREATE INDEX %s ON %s.%s (%s);",
+1:6528fbf:                                  quoteIdentifier(indexMetadata.name),
+1:6528fbf:                                  quoteIdentifier(keyspace),
+1:6528fbf:                                  quoteIdentifier(cf),
+1:6528fbf:                                  indexMetadata.options.get(IndexTarget.TARGET_OPTION_NAME));
+1:6528fbf:         }
+1:6528fbf:     }
+1:6528fbf:     private static String toCQL(UserType userType)
+1:6528fbf:     {
+1:6528fbf:         StringBuilder sb = new StringBuilder();
+1:6528fbf:         sb.append(String.format("CREATE TYPE %s.%s(",
+1:6528fbf:                                 quoteIdentifier(userType.keyspace),
+1:6528fbf:                                 quoteIdentifier(userType.getNameAsString())));
+1:6528fbf: 
+1:6528fbf:         Consumer<StringBuilder> commaAppender = commaAppender(" ");
+1:6528fbf:         for (int i = 0; i < userType.size(); i++)
+1:6528fbf:         {
+1:6528fbf:             commaAppender.accept(sb);
+1:6528fbf:             sb.append(String.format("%s %s",
+1:6528fbf:                                     userType.fieldNameAsString(i),
+1:6528fbf:                                     userType.fieldType(i).asCQL3Type()));
+1:6528fbf:         }
+1:6528fbf:         sb.append(");");
+1:6528fbf:         return sb.toString();
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     private static String toCQL(TableParams tableParams)
+1:6528fbf:     {
+1:6528fbf:         StringBuilder builder = new StringBuilder();
+1:6528fbf: 
+1:6528fbf:         builder.append("bloom_filter_fp_chance = ").append(tableParams.bloomFilterFpChance);
+1:6528fbf:         builder.append("\n\tAND dclocal_read_repair_chance = ").append(tableParams.dcLocalReadRepairChance);
+1:6528fbf:         builder.append("\n\tAND crc_check_chance = ").append(tableParams.crcCheckChance);
+1:6528fbf:         builder.append("\n\tAND default_time_to_live = ").append(tableParams.defaultTimeToLive);
+1:6528fbf:         builder.append("\n\tAND gc_grace_seconds = ").append(tableParams.gcGraceSeconds);
+1:6528fbf:         builder.append("\n\tAND min_index_interval = ").append(tableParams.minIndexInterval);
+1:6528fbf:         builder.append("\n\tAND max_index_interval = ").append(tableParams.maxIndexInterval);
+1:6528fbf:         builder.append("\n\tAND memtable_flush_period_in_ms = ").append(tableParams.memtableFlushPeriodInMs);
+1:6528fbf:         builder.append("\n\tAND read_repair_chance = ").append(tableParams.readRepairChance);
+1:6528fbf:         builder.append("\n\tAND speculative_retry = '").append(tableParams.speculativeRetry).append("'");
+1:6528fbf:         builder.append("\n\tAND comment = ").append(singleQuote(tableParams.comment));
+1:6528fbf:         builder.append("\n\tAND caching = ").append(toCQL(tableParams.caching.asMap()));
+1:6528fbf:         builder.append("\n\tAND compaction = ").append(toCQL(tableParams.compaction.asMap()));
+1:6528fbf:         builder.append("\n\tAND compression = ").append(toCQL(tableParams.compression.asMap()));
+1:a123e98:         builder.append("\n\tAND cdc = ").append(tableParams.cdc);
+1:6528fbf: 
+1:6528fbf:         builder.append("\n\tAND extensions = { ");
+1:6528fbf:         for (Map.Entry<String, ByteBuffer> entry : tableParams.extensions.entrySet())
+1:6528fbf:         {
+1:6528fbf:             builder.append(singleQuote(entry.getKey()));
+1:6528fbf:             builder.append(": ");
+1:f59a78b:             builder.append("0x").append(ByteBufferUtil.bytesToHex(entry.getValue()));
+1:6528fbf:         }
+1:6528fbf:         builder.append(" }");
+1:6528fbf:         return builder.toString();
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     private static String toCQL(Map<?, ?> map)
+1:6528fbf:     {
+1:6528fbf:         StringBuilder builder = new StringBuilder("{ ");
+1:6528fbf: 
+1:6528fbf:         boolean isFirst = true;
+1:6528fbf:         for (Map.Entry entry: map.entrySet())
+1:6528fbf:         {
+1:6528fbf:             if (isFirst)
+1:6528fbf:                 isFirst = false;
+1:6528fbf:             else
+1:6528fbf:                 builder.append(", ");
+1:6528fbf:             builder.append(singleQuote(entry.getKey().toString()));
+1:6528fbf:             builder.append(": ");
+1:6528fbf:             builder.append(singleQuote(entry.getValue().toString()));
+1:6528fbf:         }
+1:6528fbf: 
+1:6528fbf:         builder.append(" }");
+1:6528fbf:         return builder.toString();
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     private static String toCQL(ColumnDefinition cd)
+1:6528fbf:     {
+1:6528fbf:         return toCQL(cd, false);
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     private static String toCQL(ColumnDefinition cd, boolean isStaticCompactTable)
+1:6528fbf:     {
+1:6528fbf:         return String.format("%s %s%s",
+1:6528fbf:                              quoteIdentifier(cd.name.toString()),
+1:6528fbf:                              cd.type.asCQL3Type().toString(),
+1:6528fbf:                              cd.isStatic() && !isStaticCompactTable ? " static" : "");
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     private static String toCQLAdd(String keyspace, String cf, ColumnDefinition cd)
+1:6528fbf:     {
+1:6528fbf:         return String.format("ALTER TABLE %s.%s ADD %s %s%s;",
+1:6528fbf:                              quoteIdentifier(keyspace),
+1:6528fbf:                              quoteIdentifier(cf),
+1:6528fbf:                              quoteIdentifier(cd.name.toString()),
+1:6528fbf:                              cd.type.asCQL3Type().toString(),
+1:6528fbf:                              cd.isStatic() ? " static" : "");
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     private static String toCQLDrop(String keyspace, String cf, CFMetaData.DroppedColumn droppedColumn)
+1:6528fbf:     {
+1:6528fbf:         return String.format("ALTER TABLE %s.%s DROP %s USING TIMESTAMP %s;",
+1:6528fbf:                              quoteIdentifier(keyspace),
+1:6528fbf:                              quoteIdentifier(cf),
+1:6528fbf:                              quoteIdentifier(droppedColumn.name),
+1:6528fbf:                              droppedColumn.droppedTime);
+1:6528fbf:     }
+1:6528fbf: 
+1:a123e98:     private static void resolveUserType(UserType type, Set<AbstractType> typeSet, List<AbstractType> types)
+1:6528fbf:     {
+1:6528fbf:         for (AbstractType subType: type.fieldTypes())
+1:a123e98:             if (!typeSet.contains(subType) && subType.isUDT())
+1:6528fbf:                 resolveUserType((UserType) subType, typeSet, types);
+1:6528fbf: 
+1:6528fbf:         if (!typeSet.contains(type))
+1:6528fbf:         {
+1:a123e98:             typeSet.add(type);
+1:a123e98:             types.add(type);
+1:6528fbf:         }
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     private static String singleQuote(String s)
+1:6528fbf:     {
+1:6528fbf:         return String.format("'%s'", s.replaceAll("'", "''"));
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     private static Consumer<StringBuilder> commaAppender(String afterComma)
+1:6528fbf:     {
+1:6528fbf:         AtomicBoolean isFirst = new AtomicBoolean(true);
+1:6528fbf:         return new Consumer<StringBuilder>()
+1:6528fbf:         {
+1:6528fbf:             public void accept(StringBuilder stringBuilder)
+1:6528fbf:             {
+1:6528fbf:                 if (!isFirst.getAndSet(false))
+1:6528fbf:                     stringBuilder.append(',').append(afterComma);
+1:6528fbf:             }
+1:6528fbf:         };
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     private static String quoteIdentifier(String id)
+1:6528fbf:     {
+1:6528fbf:         return ColumnIdentifier.maybeQuote(id);
+1:6528fbf:     }
+1:6528fbf: 
+1:6528fbf:     /**
+1:6528fbf:      * Whether or not the given metadata is compatible / representable with CQL Language
+1:6528fbf:      */
+1:6528fbf:     public static boolean isCqlCompatible(CFMetaData metaData)
+1:6528fbf:     {
+1:6528fbf:         if (metaData.isSuper())
+1:6528fbf:             return false;
+1:6528fbf: 
+1:6528fbf:         if (metaData.isCompactTable()
+1:6528fbf:             && metaData.partitionColumns().withoutStatics().size() > 1
+1:6528fbf:             && metaData.clusteringColumns().size() >= 1)
+1:6528fbf:             return false;
+1:6528fbf: 
+1:6528fbf:         return true;
+1:6528fbf:     }
+1:6528fbf: }
+============================================================================
+author:Alex Petrov
+-------------------------------------------------------------------------------
+commit:6528fbf
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Softw≤are Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: 
+1: package org.apache.cassandra.db;
+1: 
+1: import java.nio.ByteBuffer;
+1: import java.util.*;
+1: import java.util.concurrent.atomic.*;
+1: import java.util.function.*;
+1: 
+1: import com.google.common.annotations.VisibleForTesting;
+1: import com.google.common.collect.Iterables;
+1: 
+1: import org.apache.cassandra.config.*;
+1: import org.apache.cassandra.cql3.*;
+1: import org.apache.cassandra.cql3.statements.*;
+1: import org.apache.cassandra.db.marshal.*;
+1: import org.apache.cassandra.schema.*;
+1: import org.apache.cassandra.utils.*;
+1: 
+1: /**
+1:  * Helper methods to represent CFMetadata and related objects in CQL format
+1:  */
+1: public class ColumnFamilyStoreCQLHelper
+1: {
+1:     public static List<String> dumpReCreateStatements(CFMetaData metadata)
+1:     {
+1:         List<String> l = new ArrayList<>();
+1:         // Types come first, as table can't be created without them
+1:         l.addAll(ColumnFamilyStoreCQLHelper.getUserTypesAsCQL(metadata));
+1:         // Record re-create schema statements
+1:         l.add(ColumnFamilyStoreCQLHelper.getCFMetadataAsCQL(metadata, true));
+1:         // Dropped columns (and re-additions)
+1:         l.addAll(ColumnFamilyStoreCQLHelper.getDroppedColumnsAsCQL(metadata));
+1:         // Indexes applied as last, since otherwise they may interfere with column drops / re-additions
+1:         l.addAll(ColumnFamilyStoreCQLHelper.getIndexesAsCQL(metadata));
+1:         return l;
+1:     }
+1: 
+1:     private static List<ColumnDefinition> getClusteringColumns(CFMetaData metadata)
+1:     {
+1:         List<ColumnDefinition> cds = new ArrayList<>(metadata.clusteringColumns().size());
+1: 
+1:         if (!metadata.isStaticCompactTable())
+1:             for (ColumnDefinition cd : metadata.clusteringColumns())
+1:                 cds.add(cd);
+1: 
+1:         return cds;
+1:     }
+1: 
+1:     private static List<ColumnDefinition> getPartitionColumns(CFMetaData metadata)
+1:     {
+1:         List<ColumnDefinition> cds = new ArrayList<>(metadata.partitionColumns().size());
+1: 
+1:         for (ColumnDefinition cd : metadata.partitionColumns().statics)
+1:             cds.add(cd);
+1: 
+1:         if (metadata.isDense())
+1:         {
+1:             // remove an empty type
+1:             for (ColumnDefinition cd : metadata.partitionColumns().withoutStatics())
+1:                 if (!cd.type.equals(EmptyType.instance))
+1:                     cds.add(cd);
+1:         }
+1:         // "regular" columns are not exposed for static compact tables
+1:         else if (!metadata.isStaticCompactTable())
+1:         {
+1:             for (ColumnDefinition cd : metadata.partitionColumns().withoutStatics())
+1:                 cds.add(cd);
+1:         }
+1: 
+1:         return cds;
+1:     }
+1: 
+1:     /**
+1:      * Build a CQL String representation of Column Family Metadata
+1:      */
+1:     @VisibleForTesting
+1:     public static String getCFMetadataAsCQL(CFMetaData metadata, boolean includeDroppedColumns)
+1:     {
+1:         StringBuilder sb = new StringBuilder();
+1:         if (!isCqlCompatible(metadata))
+1:         {
+1:             sb.append(String.format("/*\nWarning: Table %s.%s omitted because it has constructs not compatible with CQL (was created via legacy API).\n",
+1:                                     metadata.ksName,
+1:                                     metadata.cfName));
+1:             sb.append("\nApproximate structure, for reference:");
+1:             sb.append("\n(this should not be used to reproduce this schema)\n\n");
+1:         }
+1: 
+1:         sb.append("CREATE TABLE IF NOT EXISTS ");
+1:         sb.append(quoteIdentifier(metadata.ksName)).append('.').append(quoteIdentifier(metadata.cfName)).append(" (");
+1: 
+1:         List<ColumnDefinition> partitionKeyColumns = metadata.partitionKeyColumns();
+1:         List<ColumnDefinition> clusteringColumns = getClusteringColumns(metadata);
+1:         List<ColumnDefinition> partitionColumns = getPartitionColumns(metadata);
+1: 
+1:         Consumer<StringBuilder> cdCommaAppender = commaAppender("\n\t");
+1:         sb.append("\n\t");
+1:         for (ColumnDefinition cfd: partitionKeyColumns)
+1:         {
+1:             cdCommaAppender.accept(sb);
+1:             sb.append(toCQL(cfd));
+1:             if (partitionKeyColumns.size() == 1 && clusteringColumns.size() == 0)
+1:                 sb.append(" PRIMARY KEY");
+1:         }
+1: 
+1:         for (ColumnDefinition cfd: clusteringColumns)
+1:         {
+1:             cdCommaAppender.accept(sb);
+1:             sb.append(toCQL(cfd));
+1:         }
+1: 
+1:         for (ColumnDefinition cfd: partitionColumns)
+1:         {
+1:             cdCommaAppender.accept(sb);
+1:             sb.append(toCQL(cfd, metadata.isStaticCompactTable()));
+1:         }
+1: 
+1:         if (includeDroppedColumns)
+1:         {
+1:             for (Map.Entry<ByteBuffer, CFMetaData.DroppedColumn> entry: metadata.getDroppedColumns().entrySet())
+1:             {
+1:                 if (metadata.getColumnDefinition(entry.getKey()) != null)
+1:                     continue;
+1: 
+1:                 CFMetaData.DroppedColumn droppedColumn = entry.getValue();
+1:                 cdCommaAppender.accept(sb);
+1:                 sb.append(quoteIdentifier(droppedColumn.name));
+1:                 sb.append(' ');
+1:                 sb.append(droppedColumn.type.asCQL3Type().toString());
+1:             }
+1:         }
+1: 
+1:         if (clusteringColumns.size() > 0 || partitionKeyColumns.size() > 1)
+1:         {
+1:             sb.append(",\n\tPRIMARY KEY (");
+1:             if (partitionKeyColumns.size() > 1)
+1:             {
+1:                 sb.append("(");
+1:                 Consumer<StringBuilder> pkCommaAppender = commaAppender(" ");
+1:                 for (ColumnDefinition cfd : partitionKeyColumns)
+1:                 {
+1:                     pkCommaAppender.accept(sb);
+1:                     sb.append(quoteIdentifier(cfd.name.toString()));
+1:                 }
+1:                 sb.append(")");
+1:             }
+1:             else
+1:             {
+1:                 sb.append(quoteIdentifier(partitionKeyColumns.get(0).name.toString()));
+1:             }
+1: 
+1:             for (ColumnDefinition cfd : metadata.clusteringColumns())
+1:                 sb.append(", ").append(quoteIdentifier(cfd.name.toString()));
+1: 
+1:             sb.append(')');
+1:         }
+1:         sb.append(")\n\t");
+1:         sb.append("WITH ");
+1: 
+1:         sb.append("ID = ").append(metadata.cfId).append("\n\tAND ");
+1: 
+1:         if (metadata.isCompactTable())
+1:             sb.append("COMPACT STORAGE\n\tAND ");
+1: 
+1:         if (clusteringColumns.size() > 0)
+1:         {
+1:             sb.append("CLUSTERING ORDER BY (");
+1: 
+1:             Consumer<StringBuilder> cOrderCommaAppender = commaAppender(" ");
+1:             for (ColumnDefinition cd : clusteringColumns)
+1:             {
+1:                 cOrderCommaAppender.accept(sb);
+1:                 sb.append(quoteIdentifier(cd.name.toString())).append(' ').append(cd.clusteringOrder().toString());
+1:             }
+1:             sb.append(")\n\tAND ");
+1:         }
+1: 
+1:         sb.append(toCQL(metadata.params));
+1:         sb.append(";");
+1: 
+1:         if (!isCqlCompatible(metadata))
+1:         {
+1:             sb.append("\n*/");
+1:         }
+1:         return sb.toString();
+1:     }
+1: 
+1:     /**
+1:      * Build a CQL String representation of User Types used in the given Column Family.
+1:      *
+1:      * Type order is ensured as types are built incrementally: from the innermost (most nested)
+1:      * to the outermost.
+1:      */
+1:     @VisibleForTesting
+1:     public static List<String> getUserTypesAsCQL(CFMetaData metadata)
+1:     {
+0:         List<UserType> types = new ArrayList<>();
+0:         Set<UserType> typeSet = new HashSet<>();
+1:         for (ColumnDefinition cd: Iterables.concat(metadata.partitionKeyColumns(), metadata.clusteringColumns(), metadata.partitionColumns()))
+1:         {
+1:             AbstractType type = cd.type;
+0:             if (type instanceof UserType)
+1:                 resolveUserType((UserType) type, typeSet, types);
+1:         }
+1: 
+1:         List<String> typeStrings = new ArrayList<>();
+0:         for (UserType type: types)
+0:             typeStrings.add(toCQL(type));
+1:         return typeStrings;
+1:     }
+1: 
+1:     /**
+1:      * Build a CQL String representation of Dropped Columns in the given Column Family.
+1:      *
+1:      * If the column was dropped once, but is now re-created `ADD` will be appended accordingly.
+1:      */
+1:     @VisibleForTesting
+1:     public static List<String> getDroppedColumnsAsCQL(CFMetaData metadata)
+1:     {
+1:         List<String> droppedColumns = new ArrayList<>();
+1: 
+1:         for (Map.Entry<ByteBuffer, CFMetaData.DroppedColumn> entry: metadata.getDroppedColumns().entrySet())
+1:         {
+1:             CFMetaData.DroppedColumn column = entry.getValue();
+1:             droppedColumns.add(toCQLDrop(metadata.ksName, metadata.cfName, column));
+1:             if (metadata.getColumnDefinition(entry.getKey()) != null)
+1:                 droppedColumns.add(toCQLAdd(metadata.ksName, metadata.cfName, metadata.getColumnDefinition(entry.getKey())));
+1:         }
+1: 
+1:         return droppedColumns;
+1:     }
+1: 
+1:     /**
+1:      * Build a CQL String representation of Indexes on columns in the given Column Family
+1:      */
+1:     @VisibleForTesting
+1:     public static List<String> getIndexesAsCQL(CFMetaData metadata)
+1:     {
+1:         List<String> indexes = new ArrayList<>();
+1:         for (IndexMetadata indexMetadata: metadata.getIndexes())
+1:             indexes.add(toCQL(metadata.ksName, metadata.cfName, indexMetadata));
+1:         return indexes;
+1:     }
+1: 
+1:     private static String toCQL(String keyspace, String cf, IndexMetadata indexMetadata)
+1:     {
+1:         if (indexMetadata.isCustom())
+1:         {
+1:             Map<String, String> options = new HashMap<>();
+1:             indexMetadata.options.forEach((k, v) -> {
+1:                 if (!k.equals(IndexTarget.TARGET_OPTION_NAME) && !k.equals(IndexTarget.CUSTOM_INDEX_OPTION_NAME))
+1:                     options.put(k, v);
+1:             });
+1: 
+1:             return String.format("CREATE CUSTOM INDEX %s ON %s.%s (%s) USING '%s'%s;",
+1:                                  quoteIdentifier(indexMetadata.name),
+1:                                  quoteIdentifier(keyspace),
+1:                                  quoteIdentifier(cf),
+1:                                  indexMetadata.options.get(IndexTarget.TARGET_OPTION_NAME),
+1:                                  indexMetadata.options.get(IndexTarget.CUSTOM_INDEX_OPTION_NAME),
+1:                                  options.isEmpty() ? "" : " WITH OPTIONS " + toCQL(options));
+1:         }
+1:         else
+1:         {
+1:             return String.format("CREATE INDEX %s ON %s.%s (%s);",
+1:                                  quoteIdentifier(indexMetadata.name),
+1:                                  quoteIdentifier(keyspace),
+1:                                  quoteIdentifier(cf),
+1:                                  indexMetadata.options.get(IndexTarget.TARGET_OPTION_NAME));
+1:         }
+1:     }
+1:     private static String toCQL(UserType userType)
+1:     {
+1:         StringBuilder sb = new StringBuilder();
+1:         sb.append(String.format("CREATE TYPE %s.%s(",
+1:                                 quoteIdentifier(userType.keyspace),
+1:                                 quoteIdentifier(userType.getNameAsString())));
+1: 
+1:         Consumer<StringBuilder> commaAppender = commaAppender(" ");
+1:         for (int i = 0; i < userType.size(); i++)
+1:         {
+1:             commaAppender.accept(sb);
+1:             sb.append(String.format("%s %s",
+1:                                     userType.fieldNameAsString(i),
+1:                                     userType.fieldType(i).asCQL3Type()));
+1:         }
+1:         sb.append(");");
+1:         return sb.toString();
+1:     }
+1: 
+1:     private static String toCQL(TableParams tableParams)
+1:     {
+1:         StringBuilder builder = new StringBuilder();
+1: 
+1:         builder.append("bloom_filter_fp_chance = ").append(tableParams.bloomFilterFpChance);
+1:         builder.append("\n\tAND dclocal_read_repair_chance = ").append(tableParams.dcLocalReadRepairChance);
+1:         builder.append("\n\tAND crc_check_chance = ").append(tableParams.crcCheckChance);
+1:         builder.append("\n\tAND default_time_to_live = ").append(tableParams.defaultTimeToLive);
+1:         builder.append("\n\tAND gc_grace_seconds = ").append(tableParams.gcGraceSeconds);
+1:         builder.append("\n\tAND min_index_interval = ").append(tableParams.minIndexInterval);
+1:         builder.append("\n\tAND max_index_interval = ").append(tableParams.maxIndexInterval);
+1:         builder.append("\n\tAND memtable_flush_period_in_ms = ").append(tableParams.memtableFlushPeriodInMs);
+1:         builder.append("\n\tAND read_repair_chance = ").append(tableParams.readRepairChance);
+1:         builder.append("\n\tAND speculative_retry = '").append(tableParams.speculativeRetry).append("'");
+1:         builder.append("\n\tAND comment = ").append(singleQuote(tableParams.comment));
+1:         builder.append("\n\tAND caching = ").append(toCQL(tableParams.caching.asMap()));
+1:         builder.append("\n\tAND compaction = ").append(toCQL(tableParams.compaction.asMap()));
+1:         builder.append("\n\tAND compression = ").append(toCQL(tableParams.compression.asMap()));
+1: 
+1:         builder.append("\n\tAND extensions = { ");
+1:         for (Map.Entry<String, ByteBuffer> entry : tableParams.extensions.entrySet())
+1:         {
+1:             builder.append(singleQuote(entry.getKey()));
+1:             builder.append(": ");
+0:             builder.append("0x" + ByteBufferUtil.bytesToHex(entry.getValue()));
+1:         }
+1:         builder.append(" }");
+1:         return builder.toString();
+1:     }
+1: 
+1:     private static String toCQL(Map<?, ?> map)
+1:     {
+1:         StringBuilder builder = new StringBuilder("{ ");
+1: 
+1:         boolean isFirst = true;
+1:         for (Map.Entry entry: map.entrySet())
+1:         {
+1:             if (isFirst)
+1:                 isFirst = false;
+1:             else
+1:                 builder.append(", ");
+1:             builder.append(singleQuote(entry.getKey().toString()));
+1:             builder.append(": ");
+1:             builder.append(singleQuote(entry.getValue().toString()));
+1:         }
+1: 
+1:         builder.append(" }");
+1:         return builder.toString();
+1:     }
+1: 
+1:     private static String toCQL(ColumnDefinition cd)
+1:     {
+1:         return toCQL(cd, false);
+1:     }
+1: 
+1:     private static String toCQL(ColumnDefinition cd, boolean isStaticCompactTable)
+1:     {
+1:         return String.format("%s %s%s",
+1:                              quoteIdentifier(cd.name.toString()),
+1:                              cd.type.asCQL3Type().toString(),
+1:                              cd.isStatic() && !isStaticCompactTable ? " static" : "");
+1:     }
+1: 
+1:     private static String toCQLAdd(String keyspace, String cf, ColumnDefinition cd)
+1:     {
+1:         return String.format("ALTER TABLE %s.%s ADD %s %s%s;",
+1:                              quoteIdentifier(keyspace),
+1:                              quoteIdentifier(cf),
+1:                              quoteIdentifier(cd.name.toString()),
+1:                              cd.type.asCQL3Type().toString(),
+1:                              cd.isStatic() ? " static" : "");
+1:     }
+1: 
+1:     private static String toCQLDrop(String keyspace, String cf, CFMetaData.DroppedColumn droppedColumn)
+1:     {
+1:         return String.format("ALTER TABLE %s.%s DROP %s USING TIMESTAMP %s;",
+1:                              quoteIdentifier(keyspace),
+1:                              quoteIdentifier(cf),
+1:                              quoteIdentifier(droppedColumn.name),
+1:                              droppedColumn.droppedTime);
+1:     }
+1: 
+0:     private static void resolveUserType(UserType type, Set<UserType> typeSet, List<UserType> types)
+1:     {
+1:         for (AbstractType subType: type.fieldTypes())
+0:             if (!typeSet.contains(subType) && subType instanceof UserType)
+1:                 resolveUserType((UserType) subType, typeSet, types);
+1: 
+1:         if (!typeSet.contains(type))
+1:         {
+0:             UserType t = type;
+0:             typeSet.add(t);
+0:             types.add(t);
+1:         }
+1:     }
+1: 
+1:     private static String singleQuote(String s)
+1:     {
+1:         return String.format("'%s'", s.replaceAll("'", "''"));
+1:     }
+1: 
+1:     private static Consumer<StringBuilder> commaAppender(String afterComma)
+1:     {
+1:         AtomicBoolean isFirst = new AtomicBoolean(true);
+1:         return new Consumer<StringBuilder>()
+1:         {
+1:             public void accept(StringBuilder stringBuilder)
+1:             {
+1:                 if (!isFirst.getAndSet(false))
+1:                     stringBuilder.append(',').append(afterComma);
+1:             }
+1:         };
+1:     }
+1: 
+1:     private static String quoteIdentifier(String id)
+1:     {
+1:         return ColumnIdentifier.maybeQuote(id);
+1:     }
+1: 
+1:     /**
+1:      * Whether or not the given metadata is compatible / representable with CQL Language
+1:      */
+1:     public static boolean isCqlCompatible(CFMetaData metaData)
+1:     {
+1:         if (metaData.isSuper())
+1:             return false;
+1: 
+1:         if (metaData.isCompactTable()
+1:             && metaData.partitionColumns().withoutStatics().size() > 1
+1:             && metaData.clusteringColumns().size() >= 1)
+1:             return false;
+1: 
+1:         return true;
+1:     }
+1: }
+commit:a123e98
+/////////////////////////////////////////////////////////////////////////
+0: /*
+0:  * Licensed to the Apache Softw≤are Foundation (ASF) under one
+0:  * or more contributor license agreements.  See the NOTICE file
+0:  * distributed with this work for additional information
+0:  * regarding copyright ownership.  The ASF licenses this file
+0:  * to you under the Apache License, Version 2.0 (the
+0:  * "License"); you may not use this file except in compliance
+0:  * with the License.  You may obtain a copy of the License at
+0:  *
+0:  *     http://www.apache.org/licenses/LICENSE-2.0
+0:  *
+0:  * Unless required by applicable law or agreed to in writing, software
+0:  * distributed under the License is distributed on an "AS IS" BASIS,
+0:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+0:  * See the License for the specific language governing permissions and
+0:  * limitations under the License.
+0:  */
+0: 
+0: package org.apache.cassandra.db;
+0: 
+0: import java.nio.ByteBuffer;
+0: import java.util.*;
+0: import java.util.concurrent.atomic.*;
+0: import java.util.function.*;
+0: 
+0: import com.google.common.annotations.VisibleForTesting;
+0: import com.google.common.collect.Iterables;
+0: 
+0: import org.apache.cassandra.config.*;
+0: import org.apache.cassandra.cql3.*;
+0: import org.apache.cassandra.cql3.statements.*;
+0: import org.apache.cassandra.db.marshal.*;
+0: import org.apache.cassandra.schema.*;
+0: import org.apache.cassandra.utils.*;
+0: 
+0: /**
+0:  * Helper methods to represent CFMetadata and related objects in CQL format
+0:  */
+0: public class ColumnFamilyStoreCQLHelper
+0: {
+0:     public static List<String> dumpReCreateStatements(CFMetaData metadata)
+0:     {
+0:         List<String> l = new ArrayList<>();
+0:         // Types come first, as table can't be created without them
+0:         l.addAll(ColumnFamilyStoreCQLHelper.getUserTypesAsCQL(metadata));
+0:         // Record re-create schema statements
+0:         l.add(ColumnFamilyStoreCQLHelper.getCFMetadataAsCQL(metadata, true));
+0:         // Dropped columns (and re-additions)
+0:         l.addAll(ColumnFamilyStoreCQLHelper.getDroppedColumnsAsCQL(metadata));
+0:         // Indexes applied as last, since otherwise they may interfere with column drops / re-additions
+0:         l.addAll(ColumnFamilyStoreCQLHelper.getIndexesAsCQL(metadata));
+0:         return l;
+0:     }
+0: 
+0:     private static List<ColumnDefinition> getClusteringColumns(CFMetaData metadata)
+0:     {
+0:         List<ColumnDefinition> cds = new ArrayList<>(metadata.clusteringColumns().size());
+0: 
+0:         if (!metadata.isStaticCompactTable())
+0:             for (ColumnDefinition cd : metadata.clusteringColumns())
+0:                 cds.add(cd);
+0: 
+0:         return cds;
+0:     }
+0: 
+0:     private static List<ColumnDefinition> getPartitionColumns(CFMetaData metadata)
+0:     {
+0:         List<ColumnDefinition> cds = new ArrayList<>(metadata.partitionColumns().size());
+0: 
+0:         for (ColumnDefinition cd : metadata.partitionColumns().statics)
+0:             cds.add(cd);
+0: 
+0:         if (metadata.isDense())
+0:         {
+0:             // remove an empty type
+0:             for (ColumnDefinition cd : metadata.partitionColumns().withoutStatics())
+0:                 if (!cd.type.equals(EmptyType.instance))
+0:                     cds.add(cd);
+0:         }
+0:         // "regular" columns are not exposed for static compact tables
+0:         else if (!metadata.isStaticCompactTable())
+0:         {
+0:             for (ColumnDefinition cd : metadata.partitionColumns().withoutStatics())
+0:                 cds.add(cd);
+0:         }
+0: 
+0:         return cds;
+0:     }
+0: 
+0:     /**
+0:      * Build a CQL String representation of Column Family Metadata
+0:      */
+0:     @VisibleForTesting
+0:     public static String getCFMetadataAsCQL(CFMetaData metadata, boolean includeDroppedColumns)
+0:     {
+0:         StringBuilder sb = new StringBuilder();
+0:         if (!isCqlCompatible(metadata))
+0:         {
+0:             sb.append(String.format("/*\nWarning: Table %s.%s omitted because it has constructs not compatible with CQL (was created via legacy API).\n",
+0:                                     metadata.ksName,
+0:                                     metadata.cfName));
+0:             sb.append("\nApproximate structure, for reference:");
+0:             sb.append("\n(this should not be used to reproduce this schema)\n\n");
+0:         }
+0: 
+0:         sb.append("CREATE TABLE IF NOT EXISTS ");
+0:         sb.append(quoteIdentifier(metadata.ksName)).append('.').append(quoteIdentifier(metadata.cfName)).append(" (");
+0: 
+0:         List<ColumnDefinition> partitionKeyColumns = metadata.partitionKeyColumns();
+0:         List<ColumnDefinition> clusteringColumns = getClusteringColumns(metadata);
+0:         List<ColumnDefinition> partitionColumns = getPartitionColumns(metadata);
+0: 
+0:         Consumer<StringBuilder> cdCommaAppender = commaAppender("\n\t");
+0:         sb.append("\n\t");
+0:         for (ColumnDefinition cfd: partitionKeyColumns)
+0:         {
+0:             cdCommaAppender.accept(sb);
+0:             sb.append(toCQL(cfd));
+0:             if (partitionKeyColumns.size() == 1 && clusteringColumns.size() == 0)
+0:                 sb.append(" PRIMARY KEY");
+0:         }
+0: 
+0:         for (ColumnDefinition cfd: clusteringColumns)
+0:         {
+0:             cdCommaAppender.accept(sb);
+0:             sb.append(toCQL(cfd));
+0:         }
+0: 
+0:         for (ColumnDefinition cfd: partitionColumns)
+0:         {
+0:             cdCommaAppender.accept(sb);
+0:             sb.append(toCQL(cfd, metadata.isStaticCompactTable()));
+0:         }
+0: 
+0:         if (includeDroppedColumns)
+0:         {
+0:             for (Map.Entry<ByteBuffer, CFMetaData.DroppedColumn> entry: metadata.getDroppedColumns().entrySet())
+0:             {
+0:                 if (metadata.getColumnDefinition(entry.getKey()) != null)
+0:                     continue;
+0: 
+0:                 CFMetaData.DroppedColumn droppedColumn = entry.getValue();
+0:                 cdCommaAppender.accept(sb);
+0:                 sb.append(quoteIdentifier(droppedColumn.name));
+0:                 sb.append(' ');
+0:                 sb.append(droppedColumn.type.asCQL3Type().toString());
+0:             }
+0:         }
+0: 
+0:         if (clusteringColumns.size() > 0 || partitionKeyColumns.size() > 1)
+0:         {
+0:             sb.append(",\n\tPRIMARY KEY (");
+0:             if (partitionKeyColumns.size() > 1)
+0:             {
+0:                 sb.append("(");
+0:                 Consumer<StringBuilder> pkCommaAppender = commaAppender(" ");
+0:                 for (ColumnDefinition cfd : partitionKeyColumns)
+0:                 {
+0:                     pkCommaAppender.accept(sb);
+0:                     sb.append(quoteIdentifier(cfd.name.toString()));
+0:                 }
+0:                 sb.append(")");
+0:             }
+0:             else
+0:             {
+0:                 sb.append(quoteIdentifier(partitionKeyColumns.get(0).name.toString()));
+0:             }
+0: 
+0:             for (ColumnDefinition cfd : metadata.clusteringColumns())
+0:                 sb.append(", ").append(quoteIdentifier(cfd.name.toString()));
+0: 
+0:             sb.append(')');
+0:         }
+0:         sb.append(")\n\t");
+0:         sb.append("WITH ");
+0: 
+0:         sb.append("ID = ").append(metadata.cfId).append("\n\tAND ");
+0: 
+0:         if (metadata.isCompactTable())
+0:             sb.append("COMPACT STORAGE\n\tAND ");
+0: 
+0:         if (clusteringColumns.size() > 0)
+0:         {
+0:             sb.append("CLUSTERING ORDER BY (");
+0: 
+0:             Consumer<StringBuilder> cOrderCommaAppender = commaAppender(" ");
+0:             for (ColumnDefinition cd : clusteringColumns)
+0:             {
+0:                 cOrderCommaAppender.accept(sb);
+0:                 sb.append(quoteIdentifier(cd.name.toString())).append(' ').append(cd.clusteringOrder().toString());
+0:             }
+0:             sb.append(")\n\tAND ");
+0:         }
+0: 
+0:         sb.append(toCQL(metadata.params));
+0:         sb.append(";");
+0: 
+0:         if (!isCqlCompatible(metadata))
+0:         {
+0:             sb.append("\n*/");
+0:         }
+0:         return sb.toString();
+0:     }
+0: 
+0:     /**
+0:      * Build a CQL String representation of User Types used in the given Column Family.
+0:      *
+0:      * Type order is ensured as types are built incrementally: from the innermost (most nested)
+0:      * to the outermost.
+0:      */
+0:     @VisibleForTesting
+0:     public static List<String> getUserTypesAsCQL(CFMetaData metadata)
+0:     {
+1:         List<AbstractType> types = new ArrayList<>();
+1:         Set<AbstractType> typeSet = new HashSet<>();
+0:         for (ColumnDefinition cd: Iterables.concat(metadata.partitionKeyColumns(), metadata.clusteringColumns(), metadata.partitionColumns()))
+0:         {
+0:             AbstractType type = cd.type;
+1:             if (type.isUDT())
+0:                 resolveUserType((UserType) type, typeSet, types);
+0:         }
+0: 
+0:         List<String> typeStrings = new ArrayList<>();
+1:         for (AbstractType type: types)
+1:             typeStrings.add(toCQL((UserType) type));
+0:         return typeStrings;
+0:     }
+0: 
+0:     /**
+0:      * Build a CQL String representation of Dropped Columns in the given Column Family.
+0:      *
+0:      * If the column was dropped once, but is now re-created `ADD` will be appended accordingly.
+0:      */
+0:     @VisibleForTesting
+0:     public static List<String> getDroppedColumnsAsCQL(CFMetaData metadata)
+0:     {
+0:         List<String> droppedColumns = new ArrayList<>();
+0: 
+0:         for (Map.Entry<ByteBuffer, CFMetaData.DroppedColumn> entry: metadata.getDroppedColumns().entrySet())
+0:         {
+0:             CFMetaData.DroppedColumn column = entry.getValue();
+0:             droppedColumns.add(toCQLDrop(metadata.ksName, metadata.cfName, column));
+0:             if (metadata.getColumnDefinition(entry.getKey()) != null)
+0:                 droppedColumns.add(toCQLAdd(metadata.ksName, metadata.cfName, metadata.getColumnDefinition(entry.getKey())));
+0:         }
+0: 
+0:         return droppedColumns;
+0:     }
+0: 
+0:     /**
+0:      * Build a CQL String representation of Indexes on columns in the given Column Family
+0:      */
+0:     @VisibleForTesting
+0:     public static List<String> getIndexesAsCQL(CFMetaData metadata)
+0:     {
+0:         List<String> indexes = new ArrayList<>();
+0:         for (IndexMetadata indexMetadata: metadata.getIndexes())
+0:             indexes.add(toCQL(metadata.ksName, metadata.cfName, indexMetadata));
+0:         return indexes;
+0:     }
+0: 
+0:     private static String toCQL(String keyspace, String cf, IndexMetadata indexMetadata)
+0:     {
+0:         if (indexMetadata.isCustom())
+0:         {
+0:             Map<String, String> options = new HashMap<>();
+0:             indexMetadata.options.forEach((k, v) -> {
+0:                 if (!k.equals(IndexTarget.TARGET_OPTION_NAME) && !k.equals(IndexTarget.CUSTOM_INDEX_OPTION_NAME))
+0:                     options.put(k, v);
+0:             });
+0: 
+0:             return String.format("CREATE CUSTOM INDEX %s ON %s.%s (%s) USING '%s'%s;",
+0:                                  quoteIdentifier(indexMetadata.name),
+0:                                  quoteIdentifier(keyspace),
+0:                                  quoteIdentifier(cf),
+0:                                  indexMetadata.options.get(IndexTarget.TARGET_OPTION_NAME),
+0:                                  indexMetadata.options.get(IndexTarget.CUSTOM_INDEX_OPTION_NAME),
+0:                                  options.isEmpty() ? "" : " WITH OPTIONS " + toCQL(options));
+0:         }
+0:         else
+0:         {
+0:             return String.format("CREATE INDEX %s ON %s.%s (%s);",
+0:                                  quoteIdentifier(indexMetadata.name),
+0:                                  quoteIdentifier(keyspace),
+0:                                  quoteIdentifier(cf),
+0:                                  indexMetadata.options.get(IndexTarget.TARGET_OPTION_NAME));
+0:         }
+0:     }
+0:     private static String toCQL(UserType userType)
+0:     {
+0:         StringBuilder sb = new StringBuilder();
+0:         sb.append(String.format("CREATE TYPE %s.%s(",
+0:                                 quoteIdentifier(userType.keyspace),
+0:                                 quoteIdentifier(userType.getNameAsString())));
+0: 
+0:         Consumer<StringBuilder> commaAppender = commaAppender(" ");
+0:         for (int i = 0; i < userType.size(); i++)
+0:         {
+0:             commaAppender.accept(sb);
+0:             sb.append(String.format("%s %s",
+0:                                     userType.fieldNameAsString(i),
+0:                                     userType.fieldType(i).asCQL3Type()));
+0:         }
+0:         sb.append(");");
+0:         return sb.toString();
+0:     }
+0: 
+0:     private static String toCQL(TableParams tableParams)
+0:     {
+0:         StringBuilder builder = new StringBuilder();
+0: 
+0:         builder.append("bloom_filter_fp_chance = ").append(tableParams.bloomFilterFpChance);
+0:         builder.append("\n\tAND dclocal_read_repair_chance = ").append(tableParams.dcLocalReadRepairChance);
+0:         builder.append("\n\tAND crc_check_chance = ").append(tableParams.crcCheckChance);
+0:         builder.append("\n\tAND default_time_to_live = ").append(tableParams.defaultTimeToLive);
+0:         builder.append("\n\tAND gc_grace_seconds = ").append(tableParams.gcGraceSeconds);
+0:         builder.append("\n\tAND min_index_interval = ").append(tableParams.minIndexInterval);
+0:         builder.append("\n\tAND max_index_interval = ").append(tableParams.maxIndexInterval);
+0:         builder.append("\n\tAND memtable_flush_period_in_ms = ").append(tableParams.memtableFlushPeriodInMs);
+0:         builder.append("\n\tAND read_repair_chance = ").append(tableParams.readRepairChance);
+0:         builder.append("\n\tAND speculative_retry = '").append(tableParams.speculativeRetry).append("'");
+0:         builder.append("\n\tAND comment = ").append(singleQuote(tableParams.comment));
+0:         builder.append("\n\tAND caching = ").append(toCQL(tableParams.caching.asMap()));
+0:         builder.append("\n\tAND compaction = ").append(toCQL(tableParams.compaction.asMap()));
+0:         builder.append("\n\tAND compression = ").append(toCQL(tableParams.compression.asMap()));
+1:         builder.append("\n\tAND cdc = ").append(tableParams.cdc);
+0: 
+0:         builder.append("\n\tAND extensions = { ");
+0:         for (Map.Entry<String, ByteBuffer> entry : tableParams.extensions.entrySet())
+0:         {
+0:             builder.append(singleQuote(entry.getKey()));
+0:             builder.append(": ");
+0:             builder.append("0x" + ByteBufferUtil.bytesToHex(entry.getValue()));
+0:         }
+0:         builder.append(" }");
+0:         return builder.toString();
+0:     }
+0: 
+0:     private static String toCQL(Map<?, ?> map)
+0:     {
+0:         StringBuilder builder = new StringBuilder("{ ");
+0: 
+0:         boolean isFirst = true;
+0:         for (Map.Entry entry: map.entrySet())
+0:         {
+0:             if (isFirst)
+0:                 isFirst = false;
+0:             else
+0:                 builder.append(", ");
+0:             builder.append(singleQuote(entry.getKey().toString()));
+0:             builder.append(": ");
+0:             builder.append(singleQuote(entry.getValue().toString()));
+0:         }
+0: 
+0:         builder.append(" }");
+0:         return builder.toString();
+0:     }
+0: 
+0:     private static String toCQL(ColumnDefinition cd)
+0:     {
+0:         return toCQL(cd, false);
+0:     }
+0: 
+0:     private static String toCQL(ColumnDefinition cd, boolean isStaticCompactTable)
+0:     {
+0:         return String.format("%s %s%s",
+0:                              quoteIdentifier(cd.name.toString()),
+0:                              cd.type.asCQL3Type().toString(),
+0:                              cd.isStatic() && !isStaticCompactTable ? " static" : "");
+0:     }
+0: 
+0:     private static String toCQLAdd(String keyspace, String cf, ColumnDefinition cd)
+0:     {
+0:         return String.format("ALTER TABLE %s.%s ADD %s %s%s;",
+0:                              quoteIdentifier(keyspace),
+0:                              quoteIdentifier(cf),
+0:                              quoteIdentifier(cd.name.toString()),
+0:                              cd.type.asCQL3Type().toString(),
+0:                              cd.isStatic() ? " static" : "");
+0:     }
+0: 
+0:     private static String toCQLDrop(String keyspace, String cf, CFMetaData.DroppedColumn droppedColumn)
+0:     {
+0:         return String.format("ALTER TABLE %s.%s DROP %s USING TIMESTAMP %s;",
+0:                              quoteIdentifier(keyspace),
+0:                              quoteIdentifier(cf),
+0:                              quoteIdentifier(droppedColumn.name),
+0:                              droppedColumn.droppedTime);
+0:     }
+0: 
+1:     private static void resolveUserType(UserType type, Set<AbstractType> typeSet, List<AbstractType> types)
+0:     {
+0:         for (AbstractType subType: type.fieldTypes())
+1:             if (!typeSet.contains(subType) && subType.isUDT())
+0:                 resolveUserType((UserType) subType, typeSet, types);
+0: 
+0:         if (!typeSet.contains(type))
+0:         {
+1:             typeSet.add(type);
+1:             types.add(type);
+0:         }
+0:     }
+0: 
+0:     private static String singleQuote(String s)
+0:     {
+0:         return String.format("'%s'", s.replaceAll("'", "''"));
+0:     }
+0: 
+0:     private static Consumer<StringBuilder> commaAppender(String afterComma)
+0:     {
+0:         AtomicBoolean isFirst = new AtomicBoolean(true);
+0:         return new Consumer<StringBuilder>()
+0:         {
+0:             public void accept(StringBuilder stringBuilder)
+0:             {
+0:                 if (!isFirst.getAndSet(false))
+0:                     stringBuilder.append(',').append(afterComma);
+0:             }
+0:         };
+0:     }
+0: 
+0:     private static String quoteIdentifier(String id)
+0:     {
+0:         return ColumnIdentifier.maybeQuote(id);
+0:     }
+0: 
+0:     /**
+0:      * Whether or not the given metadata is compatible / representable with CQL Language
+0:      */
+0:     public static boolean isCqlCompatible(CFMetaData metaData)
+0:     {
+0:         if (metaData.isSuper())
+0:             return false;
+0: 
+0:         if (metaData.isCompactTable()
+0:             && metaData.partitionColumns().withoutStatics().size() > 1
+0:             && metaData.clusteringColumns().size() >= 1)
+0:             return false;
+0: 
+0:         return true;
+0:     }
+0: }
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:f59a78b
+/////////////////////////////////////////////////////////////////////////
+1:             builder.append("0x").append(ByteBufferUtil.bytesToHex(entry.getValue()));
+============================================================================

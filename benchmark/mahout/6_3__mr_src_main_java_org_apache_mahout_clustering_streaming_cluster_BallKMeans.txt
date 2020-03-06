@@ -1,0 +1,971 @@
+1:fd24254: /*
+1:fd24254:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:fd24254:  * contributor license agreements.  See the NOTICE file distributed with
+1:fd24254:  * this work for additional information regarding copyright ownership.
+1:fd24254:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:fd24254:  * (the "License"); you may not use this file except in compliance with
+1:fd24254:  * the License.  You may obtain a copy of the License at
+1:fd24254:  *
+1:fd24254:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:fd24254:  *
+1:fd24254:  * Unless required by applicable law or agreed to in writing, software
+1:fd24254:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:fd24254:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:fd24254:  * See the License for the specific language governing permissions and
+1:fd24254:  * limitations under the License.
+1:fd24254:  */
+1:fd24254: 
+1:fd24254: package org.apache.mahout.clustering.streaming.cluster;
+1:fd24254: 
+1:85f9ece: import java.util.ArrayList;
+1:fd24254: import java.util.Collections;
+1:fd24254: import java.util.Iterator;
+1:fd24254: import java.util.List;
+1:fd24254: import java.util.Random;
+1:fd24254: 
+1:fd24254: import com.google.common.base.Function;
+1:fd24254: import com.google.common.base.Preconditions;
+1:fd24254: import com.google.common.collect.Iterables;
+1:fd24254: import com.google.common.collect.Iterators;
+1:fd24254: import org.apache.mahout.clustering.ClusteringUtils;
+1:fd24254: import org.apache.mahout.common.Pair;
+1:fd24254: import org.apache.mahout.common.RandomUtils;
+1:fd24254: import org.apache.mahout.common.distance.DistanceMeasure;
+1:fd24254: import org.apache.mahout.math.Centroid;
+1:fd24254: import org.apache.mahout.math.Vector;
+1:fd24254: import org.apache.mahout.math.WeightedVector;
+1:fd24254: import org.apache.mahout.math.neighborhood.UpdatableSearcher;
+1:fd24254: import org.apache.mahout.math.random.Multinomial;
+1:fd24254: import org.apache.mahout.math.random.WeightedThing;
+1:fd24254: 
+1:fd24254: /**
+1:fd24254:  * Implements a ball k-means algorithm for weighted vectors with probabilistic seeding similar to k-means++.
+1:fd24254:  * The idea is that k-means++ gives good starting clusters and ball k-means can tune up the final result very nicely
+1:fd24254:  * in only a few passes (or even in a single iteration for well-clusterable data).
+1:fd24254:  *
+1:fd24254:  * A good reference for this class of algorithms is "The Effectiveness of Lloyd-Type Methods for the k-Means Problem"
+1:fd24254:  * by Rafail Ostrovsky, Yuval Rabani, Leonard J. Schulman and Chaitanya Swamy.  The code here uses the seeding strategy
+1:fd24254:  * as described in section 4.1.1 of that paper and the ball k-means step as described in section 4.2.  We support
+1:fd24254:  * multiple iterations in contrast to the algorithm described in the paper.
+1:fd24254:  */
+1:fd24254: public class BallKMeans implements Iterable<Centroid> {
+1:fd24254:   /**
+1:fd24254:    * The searcher containing the centroids.
+1:fd24254:    */
+1:fd24254:   private final UpdatableSearcher centroids;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * The number of clusters to cluster the data into.
+1:fd24254:    */
+1:fd24254:   private final int numClusters;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * The maximum number of iterations of the algorithm to run waiting for the cluster assignments
+1:fd24254:    * to stabilize. If there are no changes in cluster assignment earlier, we can finish early.
+1:fd24254:    */
+1:fd24254:   private final int maxNumIterations;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * When deciding which points to include in the new centroid calculation,
+1:fd24254:    * it's preferable to exclude outliers since it increases the rate of convergence.
+1:fd24254:    * So, we calculate the distance from each cluster to its closest neighboring cluster. When
+1:fd24254:    * evaluating the points assigned to a cluster, we compare the distance between the centroid to
+1:fd24254:    * the point with the distance between the centroid and its closest centroid neighbor
+1:fd24254:    * multiplied by this trimFraction. If the distance between the centroid and the point is
+1:fd24254:    * greater, we consider it an outlier and we don't use it.
+1:fd24254:    */
+1:fd24254:   private final double trimFraction;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Selecting the initial centroids is the most important part of the ball k-means clustering. Poor choices, like two
+1:fd24254:    * centroids in the same actual cluster result in a low-quality final result.
+1:fd24254:    * k-means++ initialization yields good quality clusters, especially when using BallKMeans after StreamingKMeans as
+1:fd24254:    * the points have weights.
+1:fd24254:    * Simple, random selection of the points based on their weights is faster but sometimes fails to produce the
+1:fd24254:    * desired number of clusters.
+1:fd24254:    * This field is true if the initialization should be done with k-means++.
+1:fd24254:    */
+1:fd24254:   private final boolean kMeansPlusPlusInit;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * When using trimFraction, the weight of each centroid will not be the sum of the weights of
+1:fd24254:    * the vectors assigned to that cluster because outliers are not used to compute the updated
+1:fd24254:    * centroid.
+1:fd24254:    * So, the total weight is probably wrong. This can be fixed by doing another pass over the
+1:fd24254:    * data points and adjusting the weights of each centroid. This doesn't update the coordinates
+1:fd24254:    * of the centroids, but is useful if the weights matter.
+1:fd24254:    */
+1:fd24254:   private final boolean correctWeights;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * When running multiple ball k-means passes to get the one with the smallest total cost, can compute the
+1:fd24254:    * overall cost, using all the points for clustering, or reserve a fraction of them, testProbability in a test set.
+1:fd24254:    * The cost is the sum of the distances between each point and its corresponding centroid.
+1:fd24254:    * We then use this set of points to compute the total cost on. We're therefore trying to select the clustering
+1:fd24254:    * that best describes the underlying distribution of the clusters.
+1:fd24254:    * This field is the probability of assigning a given point to the test set. If this is 0, the cost will be computed
+1:fd24254:    * on the entire set of points.
+1:fd24254:    */
+1:fd24254:   private final double testProbability;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Whether or not testProbability > 0, i.e., there exists a non-empty 'test' set.
+1:fd24254:    */
+1:fd24254:   private final boolean splitTrainTest;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * How many k-means runs to have. If there's more than one run, we compute the cost of each clustering as described
+1:fd24254:    * above and select the clustering that minimizes the cost.
+1:fd24254:    * Multiple runs are a lot more useful when using the random initialization. With kmeans++, 1-2 runs are enough and
+1:fd24254:    * more runs are not likely to help quality much.
+1:fd24254:    */
+1:fd24254:   private final int numRuns;
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Random object to sample values from.
+1:fd24254:    */
+1:fd24254:   private final Random random;
+1:fd24254: 
+1:fd24254:   public BallKMeans(UpdatableSearcher searcher, int numClusters, int maxNumIterations) {
+1:fd24254:     // By default, the trimFraction is 0.9, k-means++ is used, the weights will be corrected at the end,
+1:fd24254:     // there will be 0 points in the test set and 1 run.
+1:fd24254:     this(searcher, numClusters, maxNumIterations, 0.9, true, true, 0.0, 1);
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   public BallKMeans(UpdatableSearcher searcher, int numClusters, int maxNumIterations,
+1:fd24254:                     boolean kMeansPlusPlusInit, int numRuns) {
+1:fd24254:     // By default, the trimFraction is 0.9, k-means++ is used, the weights will be corrected at the end,
+1:fd24254:     // there will be 10% points of in the test set.
+1:fd24254:     this(searcher, numClusters, maxNumIterations, 0.9, kMeansPlusPlusInit, true, 0.1, numRuns);
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   public BallKMeans(UpdatableSearcher searcher, int numClusters, int maxNumIterations,
+1:fd24254:                     double trimFraction, boolean kMeansPlusPlusInit, boolean correctWeights,
+1:fd24254:                     double testProbability, int numRuns) {
+1:fd24254:     Preconditions.checkArgument(searcher.size() == 0, "Searcher must be empty initially to populate with centroids");
+1:fd24254:     Preconditions.checkArgument(numClusters > 0, "The requested number of clusters must be positive");
+1:fd24254:     Preconditions.checkArgument(maxNumIterations > 0, "The maximum number of iterations must be positive");
+1:fd24254:     Preconditions.checkArgument(trimFraction > 0, "The trim fraction must be positive");
+1:fd24254:     Preconditions.checkArgument(testProbability >= 0 && testProbability < 1, "The testProbability must be in [0, 1)");
+1:fd24254:     Preconditions.checkArgument(numRuns > 0, "There has to be at least one run");
+1:fd24254: 
+1:fd24254:     this.centroids = searcher;
+1:fd24254:     this.numClusters = numClusters;
+1:fd24254:     this.maxNumIterations = maxNumIterations;
+1:fd24254: 
+1:fd24254:     this.trimFraction = trimFraction;
+1:fd24254:     this.kMeansPlusPlusInit = kMeansPlusPlusInit;
+1:fd24254:     this.correctWeights = correctWeights;
+1:fd24254: 
+1:fd24254:     this.testProbability = testProbability;
+1:fd24254:     this.splitTrainTest = testProbability > 0;
+1:fd24254:     this.numRuns = numRuns;
+1:fd24254: 
+1:fd24254:     this.random = RandomUtils.getRandom();
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   public Pair<List<? extends WeightedVector>, List<? extends WeightedVector>> splitTrainTest(
+1:fd24254:       List<? extends WeightedVector> datapoints) {
+1:fd24254:     // If there will be no points assigned to the test set, return now.
+1:fd24254:     if (testProbability == 0) {
+1:fd24254:       return new Pair<List<? extends WeightedVector>, List<? extends WeightedVector>>(datapoints,
+1:85f9ece:           new ArrayList<WeightedVector>());
+1:fd24254:     }
+1:fd24254: 
+1:fd24254:     int numTest = (int) (testProbability * datapoints.size());
+1:fd24254:     Preconditions.checkArgument(numTest > 0 && numTest < datapoints.size(),
+1:fd24254:         "Must have nonzero number of training and test vectors. Asked for %.1f %% of %d vectors for test",
+1:fd24254:         testProbability * 100, datapoints.size());
+1:fd24254: 
+1:fd24254:     Collections.shuffle(datapoints);
+1:fd24254:     return new Pair<List<? extends WeightedVector>, List<? extends WeightedVector>>(
+1:fd24254:         datapoints.subList(numTest, datapoints.size()), datapoints.subList(0, numTest));
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Clusters the datapoints in the list doing either random seeding of the centroids or k-means++.
+1:fd24254:    *
+1:fd24254:    * @param datapoints the points to be clustered.
+1:fd24254:    * @return an UpdatableSearcher with the resulting clusters.
+1:fd24254:    */
+1:fd24254:   public UpdatableSearcher cluster(List<? extends WeightedVector> datapoints) {
+1:fd24254:     Pair<List<? extends WeightedVector>, List<? extends WeightedVector>> trainTestSplit = splitTrainTest(datapoints);
+1:85f9ece:     List<Vector> bestCentroids = new ArrayList<>();
+1:fd24254:     double cost = Double.POSITIVE_INFINITY;
+1:fd24254:     double bestCost = Double.POSITIVE_INFINITY;
+1:fd24254:     for (int i = 0; i < numRuns; ++i) {
+1:fd24254:       centroids.clear();
+1:fd24254:       if (kMeansPlusPlusInit) {
+1:fd24254:         // Use k-means++ to set initial centroids.
+1:fd24254:         initializeSeedsKMeansPlusPlus(trainTestSplit.getFirst());
+1:fd24254:       } else {
+1:fd24254:         // Randomly select the initial centroids.
+1:fd24254:         initializeSeedsRandomly(trainTestSplit.getFirst());
+1:fd24254:       }
+1:fd24254:       // Do k-means iterations with trimmed mean computation (aka ball k-means).
+1:fd24254:       if (numRuns > 1) {
+1:fd24254:         // If the clustering is successful (there are no zero-weight centroids).
+1:fd24254:         iterativeAssignment(trainTestSplit.getFirst());
+1:fd24254:         // Compute the cost of the clustering and possibly save the centroids.
+1:fd24254:         cost = ClusteringUtils.totalClusterCost(
+1:fd24254:             splitTrainTest ? datapoints : trainTestSplit.getSecond(), centroids);
+1:fd24254:         if (cost < bestCost) {
+1:fd24254:           bestCost = cost;
+1:fd24254:           bestCentroids.clear();
+1:fd24254:           Iterables.addAll(bestCentroids, centroids);
+1:fd24254:         }
+1:fd24254:       } else {
+1:fd24254:         // If there is only going to be one run, the cost doesn't need to be computed, so we just return the clustering.
+1:fd24254:         iterativeAssignment(datapoints);
+1:fd24254:         return centroids;
+1:fd24254:       }
+1:fd24254:     }
+1:fd24254:     if (bestCost == Double.POSITIVE_INFINITY) {
+1:fd24254:       throw new RuntimeException("No valid clustering was found");
+1:fd24254:     }
+1:fd24254:     if (cost != bestCost) {
+1:fd24254:       centroids.clear();
+1:fd24254:       centroids.addAll(bestCentroids);
+1:fd24254:     }
+1:fd24254:     if (correctWeights) {
+1:fd24254:       for (WeightedVector testDatapoint : trainTestSplit.getSecond()) {
+1:fd24254:         WeightedVector closest = (WeightedVector) centroids.searchFirst(testDatapoint, false).getValue();
+1:fd24254:         closest.setWeight(closest.getWeight() + testDatapoint.getWeight());
+1:fd24254:       }
+1:fd24254:     }
+1:fd24254:     return centroids;
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Selects some of the original points randomly with probability proportional to their weights. This is much
+1:fd24254:    * less sophisticated than the kmeans++ approach, however it is faster and coupled with
+1:fd24254:    *
+1:fd24254:    * The side effect of this method is to fill the centroids structure itself.
+1:fd24254:    *
+1:fd24254:    * @param datapoints The datapoints to select from.  These datapoints should be WeightedVectors of some kind.
+1:fd24254:    */
+1:fd24254:   private void initializeSeedsRandomly(List<? extends WeightedVector> datapoints) {
+1:fd24254:     int numDatapoints = datapoints.size();
+1:fd24254:     double totalWeight = 0;
+1:fd24254:     for (WeightedVector datapoint : datapoints) {
+1:fd24254:       totalWeight += datapoint.getWeight();
+1:fd24254:     }
+1:87c15be:     Multinomial<Integer> seedSelector = new Multinomial<>();
+1:fd24254:     for (int i = 0; i < numDatapoints; ++i) {
+1:fd24254:       seedSelector.add(i, datapoints.get(i).getWeight() / totalWeight);
+1:fd24254:     }
+1:fd24254:     for (int i = 0; i < numClusters; ++i) {
+1:fd24254:       int sample = seedSelector.sample();
+1:fd24254:       seedSelector.delete(sample);
+1:fd24254:       Centroid centroid = new Centroid(datapoints.get(sample));
+1:fd24254:       centroid.setIndex(i);
+1:fd24254:       centroids.add(centroid);
+1:fd24254:     }
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Selects some of the original points according to the k-means++ algorithm.  The basic idea is that
+1:fd24254:    * points are selected with probability proportional to their distance from any selected point.  In
+1:fd24254:    * this version, points have weights which multiply their likelihood of being selected.  This is the
+1:fd24254:    * same as if there were as many copies of the same point as indicated by the weight.
+1:fd24254:    *
+1:fd24254:    * This is pretty expensive, but it vastly improves the quality and convergences of the k-means algorithm.
+1:fd24254:    * The basic idea can be made much faster by only processing a random subset of the original points.
+1:fd24254:    * In the context of streaming k-means, the total number of possible seeds will be about k log n so this
+1:fd24254:    * selection will cost O(k^2 (log n)^2) which isn't much worse than the random sampling idea.  At
+1:fd24254:    * n = 10^9, the cost of this initialization will be about 10x worse than a reasonable random sampling
+1:fd24254:    * implementation.
+1:fd24254:    *
+1:fd24254:    * The side effect of this method is to fill the centroids structure itself.
+1:fd24254:    *
+1:fd24254:    * @param datapoints The datapoints to select from.  These datapoints should be WeightedVectors of some kind.
+1:fd24254:    */
+1:fd24254:   private void initializeSeedsKMeansPlusPlus(List<? extends WeightedVector> datapoints) {
+1:eb78d61:     Preconditions.checkArgument(datapoints.size() > 1, "Must have at least two datapoints points to cluster " +
+1:eb78d61:         "sensibly");
+1:fd24254:     Preconditions.checkArgument(datapoints.size() >= numClusters,
+1:fd24254:         String.format("Must have more datapoints [%d] than clusters [%d]", datapoints.size(), numClusters));
+1:eb78d61:     // Compute the centroid of all of the datapoints.  This is then used to compute the squared radius of the datapoints.
+1:fd24254:     Centroid center = new Centroid(datapoints.iterator().next());
+1:fd24254:     for (WeightedVector row : Iterables.skip(datapoints, 1)) {
+1:fd24254:       center.update(row);
+1:fd24254:     }
+1:fd24254: 
+1:fd24254:     // Given the centroid, we can compute \Delta_1^2(X), the total squared distance for the datapoints
+1:fd24254:     // this accelerates seed selection.
+1:fd24254:     double deltaX = 0;
+1:fd24254:     DistanceMeasure distanceMeasure = centroids.getDistanceMeasure();
+1:fd24254:     for (WeightedVector row : datapoints) {
+1:fd24254:       deltaX += distanceMeasure.distance(row, center);
+1:fd24254:     }
+1:fd24254: 
+1:fd24254:     // Find the first seed c_1 (and conceptually the second, c_2) as might be done in the 2-means clustering so that
+1:fd24254:     // the probability of selecting c_1 and c_2 is proportional to || c_1 - c_2 ||^2.  This is done
+1:fd24254:     // by first selecting c_1 with probability:
+1:fd24254:     //
+1:fd24254:     // p(c_1) = sum_{c_1} || c_1 - c_2 ||^2 \over sum_{c_1, c_2} || c_1 - c_2 ||^2
+1:fd24254:     //
+1:fd24254:     // This can be simplified to:
+1:fd24254:     //
+1:fd24254:     // p(c_1) = \Delta_1^2(X) + n || c_1 - c ||^2 / (2 n \Delta_1^2(X))
+1:fd24254:     //
+1:fd24254:     // where c = \sum x / n and \Delta_1^2(X) = sum || x - c ||^2
+1:fd24254:     //
+1:fd24254:     // All subsequent seeds c_i (including c_2) can then be selected from the remaining points with probability
+1:fd24254:     // proportional to Pr(c_i == x_j) = min_{m < i} || c_m - x_j ||^2.
+1:fd24254: 
+1:fd24254:     // Multinomial distribution of vector indices for the selection seeds. These correspond to
+1:fd24254:     // the indices of the vectors in the original datapoints list.
+1:87c15be:     Multinomial<Integer> seedSelector = new Multinomial<>();
+1:fd24254:     for (int i = 0; i < datapoints.size(); ++i) {
+1:fd24254:       double selectionProbability =
+1:fd24254:           deltaX + datapoints.size() * distanceMeasure.distance(datapoints.get(i), center);
+1:fd24254:       seedSelector.add(i, selectionProbability);
+1:fd24254:     }
+1:fd24254: 
+1:fd24254:     int selected = random.nextInt(datapoints.size());
+1:fd24254:     Centroid c_1 = new Centroid(datapoints.get(selected).clone());
+1:fd24254:     c_1.setIndex(0);
+1:fd24254:     // Construct a set of weighted things which can be used for random selection.  Initial weights are
+1:fd24254:     // set to the squared distance from c_1
+1:fd24254:     for (int i = 0; i < datapoints.size(); ++i) {
+1:fd24254:       WeightedVector row = datapoints.get(i);
+1:335a993:       double w = distanceMeasure.distance(c_1, row) * 2 * Math.log(1 + row.getWeight());
+1:fd24254:       seedSelector.set(i, w);
+1:fd24254:     }
+1:fd24254: 
+1:fd24254:     // From here, seeds are selected with probability proportional to:
+1:fd24254:     //
+1:fd24254:     // r_i = min_{c_j} || x_i - c_j ||^2
+1:fd24254:     //
+1:fd24254:     // when we only have c_1, we have already set these distances and as we select each new
+1:fd24254:     // seed, we update the minimum distances.
+1:fd24254:     centroids.add(c_1);
+1:fd24254:     int clusterIndex = 1;
+1:fd24254:     while (centroids.size() < numClusters) {
+1:fd24254:       // Select according to weights.
+1:fd24254:       int seedIndex = seedSelector.sample();
+1:fd24254:       Centroid nextSeed = new Centroid(datapoints.get(seedIndex));
+1:fd24254:       nextSeed.setIndex(clusterIndex++);
+1:fd24254:       centroids.add(nextSeed);
+1:fd24254:       // Don't select this one again.
+1:fd24254:       seedSelector.delete(seedIndex);
+1:fd24254:       // Re-weight everything according to the minimum distance to a seed.
+1:fd24254:       for (int currSeedIndex : seedSelector) {
+1:fd24254:         WeightedVector curr = datapoints.get(currSeedIndex);
+1:fd24254:         double newWeight = nextSeed.getWeight() * distanceMeasure.distance(nextSeed, curr);
+1:fd24254:         if (newWeight < seedSelector.getWeight(currSeedIndex)) {
+1:fd24254:           seedSelector.set(currSeedIndex, newWeight);
+1:fd24254:         }
+1:fd24254:       }
+1:fd24254:     }
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   /**
+1:fd24254:    * Examines the datapoints and updates cluster centers to be the centroid of the nearest datapoints points.  To
+1:fd24254:    * compute a new center for cluster c_i, we average all points that are closer than d_i * trimFraction
+1:fd24254:    * where d_i is
+1:fd24254:    *
+1:fd24254:    * d_i = min_j \sqrt ||c_j - c_i||^2
+1:fd24254:    *
+1:fd24254:    * By ignoring distant points, the centroids converge more quickly to a good approximation of the
+1:fd24254:    * optimal k-means solution (given good starting points).
+1:fd24254:    *
+1:fd24254:    * @param datapoints the points to cluster.
+1:fd24254:    */
+1:fd24254:   private void iterativeAssignment(List<? extends WeightedVector> datapoints) {
+1:fd24254:     DistanceMeasure distanceMeasure = centroids.getDistanceMeasure();
+1:fd24254:     // closestClusterDistances.get(i) is the distance from the i'th cluster to its closest
+1:fd24254:     // neighboring cluster.
+1:85f9ece:     List<Double> closestClusterDistances = new ArrayList<>(numClusters);
+1:fd24254:     // clusterAssignments[i] == j means that the i'th point is assigned to the j'th cluster. When
+1:fd24254:     // these don't change, we are done.
+1:fd24254:     // Each point is assigned to the invalid "-1" cluster initially.
+1:85f9ece:     List<Integer> clusterAssignments = new ArrayList<>(Collections.nCopies(datapoints.size(), -1));
+1:fd24254: 
+1:fd24254:     boolean changed = true;
+1:fd24254:     for (int i = 0; changed && i < maxNumIterations; i++) {
+1:fd24254:       changed = false;
+1:fd24254:       // We compute what the distance between each cluster and its closest neighbor is to set a
+1:fd24254:       // proportional distance threshold for points that should be involved in calculating the
+1:fd24254:       // centroid.
+1:fd24254:       closestClusterDistances.clear();
+1:fd24254:       for (Vector center : centroids) {
+1:fd24254:         // If a centroid has no points assigned to it, the clustering failed.
+1:fd24254:         Vector closestOtherCluster = centroids.searchFirst(center, true).getValue();
+1:fd24254:         closestClusterDistances.add(distanceMeasure.distance(center, closestOtherCluster));
+1:fd24254:       }
+1:fd24254: 
+1:fd24254:       // Copies the current cluster centroids to newClusters and sets their weights to 0. This is
+1:fd24254:       // so we calculate the new centroids as we go through the datapoints.
+1:85f9ece:       List<Centroid> newCentroids = new ArrayList<>();
+1:fd24254:       for (Vector centroid : centroids) {
+1:fd24254:         // need a deep copy because we will mutate these values
+1:fd24254:         Centroid newCentroid = (Centroid)centroid.clone();
+1:fd24254:         newCentroid.setWeight(0);
+1:fd24254:         newCentroids.add(newCentroid);
+1:fd24254:       }
+1:fd24254: 
+1:fd24254:       // Pass over the datapoints computing new centroids.
+1:fd24254:       for (int j = 0; j < datapoints.size(); ++j) {
+1:fd24254:         WeightedVector datapoint = datapoints.get(j);
+1:fd24254:         // Get the closest cluster this point belongs to.
+1:fd24254:         WeightedThing<Vector> closestPair = centroids.searchFirst(datapoint, false);
+1:fd24254:         int closestIndex = ((WeightedVector) closestPair.getValue()).getIndex();
+1:fd24254:         double closestDistance = closestPair.getWeight();
+1:fd24254:         // Update its cluster assignment if necessary.
+1:fd24254:         if (closestIndex != clusterAssignments.get(j)) {
+1:fd24254:           changed = true;
+1:fd24254:           clusterAssignments.set(j, closestIndex);
+1:fd24254:         }
+1:fd24254:         // Only update if the datapoints point is near enough. What this means is that the weight
+1:fd24254:         // of outliers is NOT taken into account and the final weights of the centroids will
+1:fd24254:         // reflect this (it will be less or equal to the initial sum of the weights).
+1:fd24254:         if (closestDistance < trimFraction * closestClusterDistances.get(closestIndex)) {
+1:fd24254:           newCentroids.get(closestIndex).update(datapoint);
+1:fd24254:         }
+1:fd24254:       }
+1:fd24254:       // Add the new centers back into searcher.
+1:fd24254:       centroids.clear();
+1:fd24254:       centroids.addAll(newCentroids);
+1:fd24254:     }
+1:fd24254: 
+1:fd24254:     if (correctWeights) {
+1:fd24254:       for (Vector v : centroids) {
+1:fd24254:         ((Centroid)v).setWeight(0);
+1:fd24254:       }
+1:fd24254:       for (WeightedVector datapoint : datapoints) {
+1:fd24254:         Centroid closestCentroid = (Centroid) centroids.searchFirst(datapoint, false).getValue();
+1:fd24254:         closestCentroid.setWeight(closestCentroid.getWeight() + datapoint.getWeight());
+1:fd24254:       }
+1:fd24254:     }
+1:fd24254:   }
+1:fd24254: 
+1:fd24254:   @Override
+1:fd24254:   public Iterator<Centroid> iterator() {
+1:fd24254:     return Iterators.transform(centroids.iterator(), new Function<Vector, Centroid>() {
+1:fd24254:       @Override
+1:fd24254:       public Centroid apply(Vector input) {
+1:eb78d61:         Preconditions.checkArgument(input instanceof Centroid, "Non-centroid in centroids " +
+1:eb78d61:             "searcher");
+1:fd24254:         //noinspection ConstantConditions
+1:fd24254:         return (Centroid)input;
+1:fd24254:       }
+1:fd24254:     });
+1:fd24254:   }
+1:fd24254: }
+============================================================================
+author:Suneel Marthi
+-------------------------------------------------------------------------------
+commit:85f9ece
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.ArrayList;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:           new ArrayList<WeightedVector>());
+/////////////////////////////////////////////////////////////////////////
+1:     List<Vector> bestCentroids = new ArrayList<>();
+/////////////////////////////////////////////////////////////////////////
+1:     List<Double> closestClusterDistances = new ArrayList<>(numClusters);
+1:     List<Integer> clusterAssignments = new ArrayList<>(Collections.nCopies(datapoints.size(), -1));
+/////////////////////////////////////////////////////////////////////////
+1:       List<Centroid> newCentroids = new ArrayList<>();
+commit:87c15be
+/////////////////////////////////////////////////////////////////////////
+1:     Multinomial<Integer> seedSelector = new Multinomial<>();
+/////////////////////////////////////////////////////////////////////////
+1:     Multinomial<Integer> seedSelector = new Multinomial<>();
+author:pferrel
+-------------------------------------------------------------------------------
+commit:b988c49
+author:frankscholten
+-------------------------------------------------------------------------------
+commit:1a42d85
+author:Sean R. Owen
+-------------------------------------------------------------------------------
+commit:335a993
+/////////////////////////////////////////////////////////////////////////
+0:     Multinomial<Integer> seedSelector = new Multinomial<Integer>();
+/////////////////////////////////////////////////////////////////////////
+1:       double w = distanceMeasure.distance(c_1, row) * 2 * Math.log(1 + row.getWeight());
+author:dfilimon
+-------------------------------------------------------------------------------
+commit:eb78d61
+/////////////////////////////////////////////////////////////////////////
+1:     Preconditions.checkArgument(datapoints.size() > 1, "Must have at least two datapoints points to cluster " +
+1:         "sensibly");
+1:     // Compute the centroid of all of the datapoints.  This is then used to compute the squared radius of the datapoints.
+/////////////////////////////////////////////////////////////////////////
+0:       final double w = distanceMeasure.distance(c_1, row) * 2 * Math.log(1 + row.getWeight());
+/////////////////////////////////////////////////////////////////////////
+1:         Preconditions.checkArgument(input instanceof Centroid, "Non-centroid in centroids " +
+1:             "searcher");
+commit:fd24254
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: 
+1: package org.apache.mahout.clustering.streaming.cluster;
+1: 
+1: import java.util.Collections;
+1: import java.util.Iterator;
+1: import java.util.List;
+1: import java.util.Random;
+1: 
+1: import com.google.common.base.Function;
+1: import com.google.common.base.Preconditions;
+1: import com.google.common.collect.Iterables;
+1: import com.google.common.collect.Iterators;
+0: import com.google.common.collect.Lists;
+1: import org.apache.mahout.clustering.ClusteringUtils;
+1: import org.apache.mahout.common.Pair;
+1: import org.apache.mahout.common.RandomUtils;
+1: import org.apache.mahout.common.distance.DistanceMeasure;
+1: import org.apache.mahout.math.Centroid;
+1: import org.apache.mahout.math.Vector;
+1: import org.apache.mahout.math.WeightedVector;
+1: import org.apache.mahout.math.neighborhood.UpdatableSearcher;
+1: import org.apache.mahout.math.random.Multinomial;
+1: import org.apache.mahout.math.random.WeightedThing;
+1: 
+1: /**
+1:  * Implements a ball k-means algorithm for weighted vectors with probabilistic seeding similar to k-means++.
+1:  * The idea is that k-means++ gives good starting clusters and ball k-means can tune up the final result very nicely
+1:  * in only a few passes (or even in a single iteration for well-clusterable data).
+1:  *
+1:  * A good reference for this class of algorithms is "The Effectiveness of Lloyd-Type Methods for the k-Means Problem"
+1:  * by Rafail Ostrovsky, Yuval Rabani, Leonard J. Schulman and Chaitanya Swamy.  The code here uses the seeding strategy
+1:  * as described in section 4.1.1 of that paper and the ball k-means step as described in section 4.2.  We support
+1:  * multiple iterations in contrast to the algorithm described in the paper.
+1:  */
+1: public class BallKMeans implements Iterable<Centroid> {
+1:   /**
+1:    * The searcher containing the centroids.
+1:    */
+1:   private final UpdatableSearcher centroids;
+1: 
+1:   /**
+1:    * The number of clusters to cluster the data into.
+1:    */
+1:   private final int numClusters;
+1: 
+1:   /**
+1:    * The maximum number of iterations of the algorithm to run waiting for the cluster assignments
+1:    * to stabilize. If there are no changes in cluster assignment earlier, we can finish early.
+1:    */
+1:   private final int maxNumIterations;
+1: 
+1:   /**
+1:    * When deciding which points to include in the new centroid calculation,
+1:    * it's preferable to exclude outliers since it increases the rate of convergence.
+1:    * So, we calculate the distance from each cluster to its closest neighboring cluster. When
+1:    * evaluating the points assigned to a cluster, we compare the distance between the centroid to
+1:    * the point with the distance between the centroid and its closest centroid neighbor
+1:    * multiplied by this trimFraction. If the distance between the centroid and the point is
+1:    * greater, we consider it an outlier and we don't use it.
+1:    */
+1:   private final double trimFraction;
+1: 
+1:   /**
+1:    * Selecting the initial centroids is the most important part of the ball k-means clustering. Poor choices, like two
+1:    * centroids in the same actual cluster result in a low-quality final result.
+1:    * k-means++ initialization yields good quality clusters, especially when using BallKMeans after StreamingKMeans as
+1:    * the points have weights.
+1:    * Simple, random selection of the points based on their weights is faster but sometimes fails to produce the
+1:    * desired number of clusters.
+1:    * This field is true if the initialization should be done with k-means++.
+1:    */
+1:   private final boolean kMeansPlusPlusInit;
+1: 
+1:   /**
+1:    * When using trimFraction, the weight of each centroid will not be the sum of the weights of
+1:    * the vectors assigned to that cluster because outliers are not used to compute the updated
+1:    * centroid.
+1:    * So, the total weight is probably wrong. This can be fixed by doing another pass over the
+1:    * data points and adjusting the weights of each centroid. This doesn't update the coordinates
+1:    * of the centroids, but is useful if the weights matter.
+1:    */
+1:   private final boolean correctWeights;
+1: 
+1:   /**
+1:    * When running multiple ball k-means passes to get the one with the smallest total cost, can compute the
+1:    * overall cost, using all the points for clustering, or reserve a fraction of them, testProbability in a test set.
+1:    * The cost is the sum of the distances between each point and its corresponding centroid.
+1:    * We then use this set of points to compute the total cost on. We're therefore trying to select the clustering
+1:    * that best describes the underlying distribution of the clusters.
+1:    * This field is the probability of assigning a given point to the test set. If this is 0, the cost will be computed
+1:    * on the entire set of points.
+1:    */
+1:   private final double testProbability;
+1: 
+1:   /**
+1:    * Whether or not testProbability > 0, i.e., there exists a non-empty 'test' set.
+1:    */
+1:   private final boolean splitTrainTest;
+1: 
+1:   /**
+1:    * How many k-means runs to have. If there's more than one run, we compute the cost of each clustering as described
+1:    * above and select the clustering that minimizes the cost.
+1:    * Multiple runs are a lot more useful when using the random initialization. With kmeans++, 1-2 runs are enough and
+1:    * more runs are not likely to help quality much.
+1:    */
+1:   private final int numRuns;
+1: 
+1:   /**
+1:    * Random object to sample values from.
+1:    */
+1:   private final Random random;
+1: 
+1:   public BallKMeans(UpdatableSearcher searcher, int numClusters, int maxNumIterations) {
+1:     // By default, the trimFraction is 0.9, k-means++ is used, the weights will be corrected at the end,
+1:     // there will be 0 points in the test set and 1 run.
+1:     this(searcher, numClusters, maxNumIterations, 0.9, true, true, 0.0, 1);
+1:   }
+1: 
+1:   public BallKMeans(UpdatableSearcher searcher, int numClusters, int maxNumIterations,
+1:                     boolean kMeansPlusPlusInit, int numRuns) {
+1:     // By default, the trimFraction is 0.9, k-means++ is used, the weights will be corrected at the end,
+1:     // there will be 10% points of in the test set.
+1:     this(searcher, numClusters, maxNumIterations, 0.9, kMeansPlusPlusInit, true, 0.1, numRuns);
+1:   }
+1: 
+1:   public BallKMeans(UpdatableSearcher searcher, int numClusters, int maxNumIterations,
+1:                     double trimFraction, boolean kMeansPlusPlusInit, boolean correctWeights,
+1:                     double testProbability, int numRuns) {
+1:     Preconditions.checkArgument(searcher.size() == 0, "Searcher must be empty initially to populate with centroids");
+1:     Preconditions.checkArgument(numClusters > 0, "The requested number of clusters must be positive");
+1:     Preconditions.checkArgument(maxNumIterations > 0, "The maximum number of iterations must be positive");
+1:     Preconditions.checkArgument(trimFraction > 0, "The trim fraction must be positive");
+1:     Preconditions.checkArgument(testProbability >= 0 && testProbability < 1, "The testProbability must be in [0, 1)");
+1:     Preconditions.checkArgument(numRuns > 0, "There has to be at least one run");
+1: 
+1:     this.centroids = searcher;
+1:     this.numClusters = numClusters;
+1:     this.maxNumIterations = maxNumIterations;
+1: 
+1:     this.trimFraction = trimFraction;
+1:     this.kMeansPlusPlusInit = kMeansPlusPlusInit;
+1:     this.correctWeights = correctWeights;
+1: 
+1:     this.testProbability = testProbability;
+1:     this.splitTrainTest = testProbability > 0;
+1:     this.numRuns = numRuns;
+1: 
+1:     this.random = RandomUtils.getRandom();
+1:   }
+1: 
+1:   public Pair<List<? extends WeightedVector>, List<? extends WeightedVector>> splitTrainTest(
+1:       List<? extends WeightedVector> datapoints) {
+1:     // If there will be no points assigned to the test set, return now.
+1:     if (testProbability == 0) {
+1:       return new Pair<List<? extends WeightedVector>, List<? extends WeightedVector>>(datapoints,
+0:           Lists.<WeightedVector>newArrayList());
+1:     }
+1: 
+1:     int numTest = (int) (testProbability * datapoints.size());
+1:     Preconditions.checkArgument(numTest > 0 && numTest < datapoints.size(),
+1:         "Must have nonzero number of training and test vectors. Asked for %.1f %% of %d vectors for test",
+1:         testProbability * 100, datapoints.size());
+1: 
+1:     Collections.shuffle(datapoints);
+1:     return new Pair<List<? extends WeightedVector>, List<? extends WeightedVector>>(
+1:         datapoints.subList(numTest, datapoints.size()), datapoints.subList(0, numTest));
+1:   }
+1: 
+1:   /**
+1:    * Clusters the datapoints in the list doing either random seeding of the centroids or k-means++.
+1:    *
+1:    * @param datapoints the points to be clustered.
+1:    * @return an UpdatableSearcher with the resulting clusters.
+1:    */
+1:   public UpdatableSearcher cluster(List<? extends WeightedVector> datapoints) {
+1:     Pair<List<? extends WeightedVector>, List<? extends WeightedVector>> trainTestSplit = splitTrainTest(datapoints);
+0:     List<Vector> bestCentroids = Lists.newArrayList();
+1:     double cost = Double.POSITIVE_INFINITY;
+1:     double bestCost = Double.POSITIVE_INFINITY;
+1:     for (int i = 0; i < numRuns; ++i) {
+1:       centroids.clear();
+1:       if (kMeansPlusPlusInit) {
+1:         // Use k-means++ to set initial centroids.
+1:         initializeSeedsKMeansPlusPlus(trainTestSplit.getFirst());
+1:       } else {
+1:         // Randomly select the initial centroids.
+1:         initializeSeedsRandomly(trainTestSplit.getFirst());
+1:       }
+1:       // Do k-means iterations with trimmed mean computation (aka ball k-means).
+1:       if (numRuns > 1) {
+1:         // If the clustering is successful (there are no zero-weight centroids).
+1:         iterativeAssignment(trainTestSplit.getFirst());
+1:         // Compute the cost of the clustering and possibly save the centroids.
+1:         cost = ClusteringUtils.totalClusterCost(
+1:             splitTrainTest ? datapoints : trainTestSplit.getSecond(), centroids);
+1:         if (cost < bestCost) {
+1:           bestCost = cost;
+1:           bestCentroids.clear();
+1:           Iterables.addAll(bestCentroids, centroids);
+1:         }
+1:       } else {
+1:         // If there is only going to be one run, the cost doesn't need to be computed, so we just return the clustering.
+1:         iterativeAssignment(datapoints);
+1:         return centroids;
+1:       }
+1:     }
+1:     if (bestCost == Double.POSITIVE_INFINITY) {
+1:       throw new RuntimeException("No valid clustering was found");
+1:     }
+1:     if (cost != bestCost) {
+1:       centroids.clear();
+1:       centroids.addAll(bestCentroids);
+1:     }
+1:     if (correctWeights) {
+1:       for (WeightedVector testDatapoint : trainTestSplit.getSecond()) {
+1:         WeightedVector closest = (WeightedVector) centroids.searchFirst(testDatapoint, false).getValue();
+1:         closest.setWeight(closest.getWeight() + testDatapoint.getWeight());
+1:       }
+1:     }
+1:     return centroids;
+1:   }
+1: 
+1:   /**
+1:    * Selects some of the original points randomly with probability proportional to their weights. This is much
+1:    * less sophisticated than the kmeans++ approach, however it is faster and coupled with
+1:    *
+1:    * The side effect of this method is to fill the centroids structure itself.
+1:    *
+1:    * @param datapoints The datapoints to select from.  These datapoints should be WeightedVectors of some kind.
+1:    */
+1:   private void initializeSeedsRandomly(List<? extends WeightedVector> datapoints) {
+0:     Multinomial<Integer> seedSelector = new Multinomial<Integer>();
+1:     int numDatapoints = datapoints.size();
+1:     double totalWeight = 0;
+1:     for (WeightedVector datapoint : datapoints) {
+1:       totalWeight += datapoint.getWeight();
+1:     }
+1:     for (int i = 0; i < numDatapoints; ++i) {
+1:       seedSelector.add(i, datapoints.get(i).getWeight() / totalWeight);
+1:     }
+1:     for (int i = 0; i < numClusters; ++i) {
+1:       int sample = seedSelector.sample();
+1:       seedSelector.delete(sample);
+1:       Centroid centroid = new Centroid(datapoints.get(sample));
+1:       centroid.setIndex(i);
+1:       centroids.add(centroid);
+1:     }
+1:   }
+1: 
+1:   /**
+1:    * Selects some of the original points according to the k-means++ algorithm.  The basic idea is that
+1:    * points are selected with probability proportional to their distance from any selected point.  In
+1:    * this version, points have weights which multiply their likelihood of being selected.  This is the
+1:    * same as if there were as many copies of the same point as indicated by the weight.
+1:    *
+1:    * This is pretty expensive, but it vastly improves the quality and convergences of the k-means algorithm.
+1:    * The basic idea can be made much faster by only processing a random subset of the original points.
+1:    * In the context of streaming k-means, the total number of possible seeds will be about k log n so this
+1:    * selection will cost O(k^2 (log n)^2) which isn't much worse than the random sampling idea.  At
+1:    * n = 10^9, the cost of this initialization will be about 10x worse than a reasonable random sampling
+1:    * implementation.
+1:    *
+1:    * The side effect of this method is to fill the centroids structure itself.
+1:    *
+1:    * @param datapoints The datapoints to select from.  These datapoints should be WeightedVectors of some kind.
+1:    */
+1:   private void initializeSeedsKMeansPlusPlus(List<? extends WeightedVector> datapoints) {
+0:     Preconditions.checkArgument(datapoints.size() > 1, "Must have at least two datapoints points to cluster " +
+0:         "sensibly");
+1:     Preconditions.checkArgument(datapoints.size() >= numClusters,
+1:         String.format("Must have more datapoints [%d] than clusters [%d]", datapoints.size(), numClusters));
+0:     // Compute the centroid of all of the datapoints.  This is then used to compute the squared radius of the datapoints.
+1:     Centroid center = new Centroid(datapoints.iterator().next());
+1:     for (WeightedVector row : Iterables.skip(datapoints, 1)) {
+1:       center.update(row);
+1:     }
+1: 
+1:     // Given the centroid, we can compute \Delta_1^2(X), the total squared distance for the datapoints
+1:     // this accelerates seed selection.
+1:     double deltaX = 0;
+1:     DistanceMeasure distanceMeasure = centroids.getDistanceMeasure();
+1:     for (WeightedVector row : datapoints) {
+1:       deltaX += distanceMeasure.distance(row, center);
+1:     }
+1: 
+1:     // Find the first seed c_1 (and conceptually the second, c_2) as might be done in the 2-means clustering so that
+1:     // the probability of selecting c_1 and c_2 is proportional to || c_1 - c_2 ||^2.  This is done
+1:     // by first selecting c_1 with probability:
+1:     //
+1:     // p(c_1) = sum_{c_1} || c_1 - c_2 ||^2 \over sum_{c_1, c_2} || c_1 - c_2 ||^2
+1:     //
+1:     // This can be simplified to:
+1:     //
+1:     // p(c_1) = \Delta_1^2(X) + n || c_1 - c ||^2 / (2 n \Delta_1^2(X))
+1:     //
+1:     // where c = \sum x / n and \Delta_1^2(X) = sum || x - c ||^2
+1:     //
+1:     // All subsequent seeds c_i (including c_2) can then be selected from the remaining points with probability
+1:     // proportional to Pr(c_i == x_j) = min_{m < i} || c_m - x_j ||^2.
+1: 
+1:     // Multinomial distribution of vector indices for the selection seeds. These correspond to
+1:     // the indices of the vectors in the original datapoints list.
+0:     Multinomial<Integer> seedSelector = new Multinomial<Integer>();
+1:     for (int i = 0; i < datapoints.size(); ++i) {
+1:       double selectionProbability =
+1:           deltaX + datapoints.size() * distanceMeasure.distance(datapoints.get(i), center);
+1:       seedSelector.add(i, selectionProbability);
+1:     }
+1: 
+1:     int selected = random.nextInt(datapoints.size());
+1:     Centroid c_1 = new Centroid(datapoints.get(selected).clone());
+1:     c_1.setIndex(0);
+1:     // Construct a set of weighted things which can be used for random selection.  Initial weights are
+1:     // set to the squared distance from c_1
+1:     for (int i = 0; i < datapoints.size(); ++i) {
+1:       WeightedVector row = datapoints.get(i);
+0:       final double w = distanceMeasure.distance(c_1, row) * row.getWeight();
+1:       seedSelector.set(i, w);
+1:     }
+1: 
+1:     // From here, seeds are selected with probability proportional to:
+1:     //
+1:     // r_i = min_{c_j} || x_i - c_j ||^2
+1:     //
+1:     // when we only have c_1, we have already set these distances and as we select each new
+1:     // seed, we update the minimum distances.
+1:     centroids.add(c_1);
+1:     int clusterIndex = 1;
+1:     while (centroids.size() < numClusters) {
+1:       // Select according to weights.
+1:       int seedIndex = seedSelector.sample();
+1:       Centroid nextSeed = new Centroid(datapoints.get(seedIndex));
+1:       nextSeed.setIndex(clusterIndex++);
+1:       centroids.add(nextSeed);
+1:       // Don't select this one again.
+1:       seedSelector.delete(seedIndex);
+1:       // Re-weight everything according to the minimum distance to a seed.
+1:       for (int currSeedIndex : seedSelector) {
+1:         WeightedVector curr = datapoints.get(currSeedIndex);
+1:         double newWeight = nextSeed.getWeight() * distanceMeasure.distance(nextSeed, curr);
+1:         if (newWeight < seedSelector.getWeight(currSeedIndex)) {
+1:           seedSelector.set(currSeedIndex, newWeight);
+1:         }
+1:       }
+1:     }
+1:   }
+1: 
+1:   /**
+1:    * Examines the datapoints and updates cluster centers to be the centroid of the nearest datapoints points.  To
+1:    * compute a new center for cluster c_i, we average all points that are closer than d_i * trimFraction
+1:    * where d_i is
+1:    *
+1:    * d_i = min_j \sqrt ||c_j - c_i||^2
+1:    *
+1:    * By ignoring distant points, the centroids converge more quickly to a good approximation of the
+1:    * optimal k-means solution (given good starting points).
+1:    *
+1:    * @param datapoints the points to cluster.
+1:    */
+1:   private void iterativeAssignment(List<? extends WeightedVector> datapoints) {
+1:     DistanceMeasure distanceMeasure = centroids.getDistanceMeasure();
+1:     // closestClusterDistances.get(i) is the distance from the i'th cluster to its closest
+1:     // neighboring cluster.
+0:     List<Double> closestClusterDistances = Lists.newArrayListWithExpectedSize(numClusters);
+1:     // clusterAssignments[i] == j means that the i'th point is assigned to the j'th cluster. When
+1:     // these don't change, we are done.
+1:     // Each point is assigned to the invalid "-1" cluster initially.
+0:     List<Integer> clusterAssignments = Lists.newArrayList(Collections.nCopies(datapoints.size(), -1));
+1: 
+1:     boolean changed = true;
+1:     for (int i = 0; changed && i < maxNumIterations; i++) {
+1:       changed = false;
+1:       // We compute what the distance between each cluster and its closest neighbor is to set a
+1:       // proportional distance threshold for points that should be involved in calculating the
+1:       // centroid.
+1:       closestClusterDistances.clear();
+1:       for (Vector center : centroids) {
+1:         // If a centroid has no points assigned to it, the clustering failed.
+1:         Vector closestOtherCluster = centroids.searchFirst(center, true).getValue();
+1:         closestClusterDistances.add(distanceMeasure.distance(center, closestOtherCluster));
+1:       }
+1: 
+1:       // Copies the current cluster centroids to newClusters and sets their weights to 0. This is
+1:       // so we calculate the new centroids as we go through the datapoints.
+0:       List<Centroid> newCentroids = Lists.newArrayList();
+1:       for (Vector centroid : centroids) {
+1:         // need a deep copy because we will mutate these values
+1:         Centroid newCentroid = (Centroid)centroid.clone();
+1:         newCentroid.setWeight(0);
+1:         newCentroids.add(newCentroid);
+1:       }
+1: 
+1:       // Pass over the datapoints computing new centroids.
+1:       for (int j = 0; j < datapoints.size(); ++j) {
+1:         WeightedVector datapoint = datapoints.get(j);
+1:         // Get the closest cluster this point belongs to.
+1:         WeightedThing<Vector> closestPair = centroids.searchFirst(datapoint, false);
+1:         int closestIndex = ((WeightedVector) closestPair.getValue()).getIndex();
+1:         double closestDistance = closestPair.getWeight();
+1:         // Update its cluster assignment if necessary.
+1:         if (closestIndex != clusterAssignments.get(j)) {
+1:           changed = true;
+1:           clusterAssignments.set(j, closestIndex);
+1:         }
+1:         // Only update if the datapoints point is near enough. What this means is that the weight
+1:         // of outliers is NOT taken into account and the final weights of the centroids will
+1:         // reflect this (it will be less or equal to the initial sum of the weights).
+1:         if (closestDistance < trimFraction * closestClusterDistances.get(closestIndex)) {
+1:           newCentroids.get(closestIndex).update(datapoint);
+1:         }
+1:       }
+1:       // Add the new centers back into searcher.
+1:       centroids.clear();
+1:       centroids.addAll(newCentroids);
+1:     }
+1: 
+1:     if (correctWeights) {
+1:       for (Vector v : centroids) {
+1:         ((Centroid)v).setWeight(0);
+1:       }
+1:       for (WeightedVector datapoint : datapoints) {
+1:         Centroid closestCentroid = (Centroid) centroids.searchFirst(datapoint, false).getValue();
+1:         closestCentroid.setWeight(closestCentroid.getWeight() + datapoint.getWeight());
+1:       }
+1:     }
+1:   }
+1: 
+1:   @Override
+1:   public Iterator<Centroid> iterator() {
+1:     return Iterators.transform(centroids.iterator(), new Function<Vector, Centroid>() {
+1:       @Override
+1:       public Centroid apply(Vector input) {
+0:         Preconditions.checkArgument(input instanceof Centroid, "Non-centroid in centroids " +
+0:             "searcher");
+1:         //noinspection ConstantConditions
+1:         return (Centroid)input;
+1:       }
+1:     });
+1:   }
+1: }
+author:Sebastian Schelter
+-------------------------------------------------------------------------------
+commit:58cc1ae
+/////////////////////////////////////////////////////////////////////////
+0:     Preconditions.checkArgument(datapoints.size() > 1, "Must have at least two datapoints points to cluster "
+0:         + "sensibly");
+0:     // Compute the centroid of all of the datapoints. This is then used to compute the squared radius of the datapoints.
+/////////////////////////////////////////////////////////////////////////
+0:         Preconditions.checkArgument(input instanceof Centroid, "Non-centroid in centroids "
+0:             + "searcher");
+============================================================================

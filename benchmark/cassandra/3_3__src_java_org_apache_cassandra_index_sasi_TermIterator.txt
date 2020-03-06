@@ -1,0 +1,451 @@
+1:72790dc: /*
+1:72790dc:  * Licensed to the Apache Software Foundation (ASF) under one
+1:72790dc:  * or more contributor license agreements.  See the NOTICE file
+1:72790dc:  * distributed with this work for additional information
+1:72790dc:  * regarding copyright ownership.  The ASF licenses this file
+1:72790dc:  * to you under the Apache License, Version 2.0 (the
+1:72790dc:  * "License"); you may not use this file except in compliance
+1:72790dc:  * with the License.  You may obtain a copy of the License at
+1:72790dc:  *
+1:72790dc:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:72790dc:  *
+1:72790dc:  * Unless required by applicable law or agreed to in writing, software
+1:72790dc:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:72790dc:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:72790dc:  * See the License for the specific language governing permissions and
+1:72790dc:  * limitations under the License.
+1:72790dc:  */
+1:72790dc: package org.apache.cassandra.index.sasi;
+1:72790dc: 
+1:72790dc: import java.util.List;
+1:72790dc: import java.util.Set;
+1:72790dc: import java.util.concurrent.*;
+1:72790dc: import java.util.concurrent.atomic.AtomicInteger;
+1:72790dc: import java.util.concurrent.atomic.AtomicLong;
+1:72790dc: 
+1:72790dc: import org.apache.cassandra.config.DatabaseDescriptor;
+1:2ca2fff: import org.apache.cassandra.index.sasi.disk.OnDiskIndexBuilder;
+1:72790dc: import org.apache.cassandra.index.sasi.disk.Token;
+1:72790dc: import org.apache.cassandra.index.sasi.plan.Expression;
+1:72790dc: import org.apache.cassandra.index.sasi.utils.RangeUnionIterator;
+1:72790dc: import org.apache.cassandra.index.sasi.utils.RangeIterator;
+1:72790dc: import org.apache.cassandra.io.util.FileUtils;
+1:72790dc: 
+1:72790dc: import com.google.common.util.concurrent.MoreExecutors;
+1:72790dc: import com.google.common.util.concurrent.Uninterruptibles;
+1:72790dc: 
+1:72790dc: import org.slf4j.Logger;
+1:72790dc: import org.slf4j.LoggerFactory;
+1:72790dc: 
+1:72790dc: public class TermIterator extends RangeIterator<Long, Token>
+1:72790dc: {
+1:72790dc:     private static final Logger logger = LoggerFactory.getLogger(TermIterator.class);
+1:72790dc: 
+1:72790dc:     private static final ThreadLocal<ExecutorService> SEARCH_EXECUTOR = new ThreadLocal<ExecutorService>()
+1:72790dc:     {
+1:72790dc:         public ExecutorService initialValue()
+1:72790dc:         {
+1:72790dc:             final String currentThread = Thread.currentThread().getName();
+1:72790dc:             final int concurrencyFactor = DatabaseDescriptor.searchConcurrencyFactor();
+1:72790dc: 
+1:72790dc:             logger.info("Search Concurrency Factor is set to {} for {}", concurrencyFactor, currentThread);
+1:72790dc: 
+1:72790dc:             return (concurrencyFactor <= 1)
+1:72790dc:                     ? MoreExecutors.newDirectExecutorService()
+1:72790dc:                     : Executors.newFixedThreadPool(concurrencyFactor, new ThreadFactory()
+1:72790dc:             {
+1:72790dc:                 public final AtomicInteger count = new AtomicInteger();
+1:72790dc: 
+1:72790dc:                 public Thread newThread(Runnable task)
+1:72790dc:                 {
+1:72790dc:                     return new Thread(task, currentThread + "-SEARCH-" + count.incrementAndGet()) {{ setDaemon(true); }};
+1:72790dc:                 }
+1:72790dc:             });
+1:72790dc:         }
+1:72790dc:     };
+1:72790dc: 
+1:72790dc:     private final Expression expression;
+1:72790dc: 
+1:72790dc:     private final RangeIterator<Long, Token> union;
+1:72790dc:     private final Set<SSTableIndex> referencedIndexes;
+1:72790dc: 
+1:72790dc:     private TermIterator(Expression e,
+1:72790dc:                          RangeIterator<Long, Token> union,
+1:72790dc:                          Set<SSTableIndex> referencedIndexes)
+1:72790dc:     {
+1:72790dc:         super(union.getMinimum(), union.getMaximum(), union.getCount());
+1:72790dc: 
+1:72790dc:         this.expression = e;
+1:72790dc:         this.union = union;
+1:72790dc:         this.referencedIndexes = referencedIndexes;
+1:72790dc:     }
+1:72790dc: 
+1:733d1ee:     @SuppressWarnings("resource")
+1:72790dc:     public static TermIterator build(final Expression e, Set<SSTableIndex> perSSTableIndexes)
+1:72790dc:     {
+1:72790dc:         final List<RangeIterator<Long, Token>> tokens = new CopyOnWriteArrayList<>();
+1:72790dc:         final AtomicLong tokenCount = new AtomicLong(0);
+1:72790dc: 
+1:72790dc:         RangeIterator<Long, Token> memtableIterator = e.index.searchMemtable(e);
+1:72790dc:         if (memtableIterator != null)
+1:72790dc:         {
+1:72790dc:             tokens.add(memtableIterator);
+1:72790dc:             tokenCount.addAndGet(memtableIterator.getCount());
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         final Set<SSTableIndex> referencedIndexes = new CopyOnWriteArraySet<>();
+1:72790dc: 
+1:72790dc:         try
+1:72790dc:         {
+1:72790dc:             final CountDownLatch latch = new CountDownLatch(perSSTableIndexes.size());
+1:72790dc:             final ExecutorService searchExecutor = SEARCH_EXECUTOR.get();
+1:72790dc: 
+1:72790dc:             for (final SSTableIndex index : perSSTableIndexes)
+1:72790dc:             {
+1:2ca2fff:                 if (e.getOp() == Expression.Op.PREFIX &&
+1:2ca2fff:                     index.mode() == OnDiskIndexBuilder.Mode.CONTAINS && !index.hasMarkedPartials())
+1:2ca2fff:                     throw new UnsupportedOperationException(String.format("The index %s has not yet been upgraded " +
+1:2ca2fff:                                                                           "to support prefix queries in CONTAINS mode. " +
+1:2ca2fff:                                                                           "Wait for compaction or rebuild the index.",
+1:2ca2fff:                                                                           index.getPath()));
+1:2ca2fff: 
+1:2ca2fff: 
+1:72790dc:                 if (!index.reference())
+1:72790dc:                 {
+1:72790dc:                     latch.countDown();
+1:72790dc:                     continue;
+1:72790dc:                 }
+1:72790dc: 
+1:72790dc:                 // add to referenced right after the reference was acquired,
+1:72790dc:                 // that helps to release index if something goes bad inside of the search
+1:72790dc:                 referencedIndexes.add(index);
+1:72790dc: 
+1:72790dc:                 searchExecutor.submit((Runnable) () -> {
+1:72790dc:                     try
+1:72790dc:                     {
+1:72790dc:                         e.checkpoint();
+1:72790dc: 
+1:72790dc:                         RangeIterator<Long, Token> keyIterator = index.search(e);
+1:72790dc:                         if (keyIterator == null)
+1:72790dc:                         {
+1:72790dc:                             releaseIndex(referencedIndexes, index);
+1:72790dc:                             return;
+1:72790dc:                         }
+1:72790dc: 
+1:72790dc:                         tokens.add(keyIterator);
+1:72790dc:                         tokenCount.getAndAdd(keyIterator.getCount());
+1:72790dc:                     }
+1:72790dc:                     catch (Throwable e1)
+1:72790dc:                     {
+1:72790dc:                         releaseIndex(referencedIndexes, index);
+1:72790dc: 
+1:72790dc:                         if (logger.isDebugEnabled())
+1:72790dc:                             logger.debug(String.format("Failed search an index %s, skipping.", index.getPath()), e1);
+1:72790dc:                     }
+1:72790dc:                     finally
+1:72790dc:                     {
+1:72790dc:                         latch.countDown();
+1:72790dc:                     }
+1:72790dc:                 });
+1:72790dc:             }
+1:72790dc: 
+1:72790dc:             Uninterruptibles.awaitUninterruptibly(latch);
+1:72790dc: 
+1:72790dc:             // checkpoint right away after all indexes complete search because we might have crossed the quota
+1:72790dc:             e.checkpoint();
+1:72790dc: 
+1:72790dc:             RangeIterator<Long, Token> ranges = RangeUnionIterator.build(tokens);
+1:72790dc:             return ranges == null ? null : new TermIterator(e, ranges, referencedIndexes);
+1:72790dc:         }
+1:72790dc:         catch (Throwable ex)
+1:72790dc:         {
+1:72790dc:             // if execution quota was exceeded while opening indexes or something else happened
+1:72790dc:             // local (yet to be tracked) indexes should be released first before re-throwing exception
+1:72790dc:             referencedIndexes.forEach(TermIterator::releaseQuietly);
+1:72790dc: 
+1:72790dc:             throw ex;
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     protected Token computeNext()
+1:72790dc:     {
+1:72790dc:         try
+1:72790dc:         {
+1:72790dc:             return union.hasNext() ? union.next() : endOfData();
+1:72790dc:         }
+1:72790dc:         finally
+1:72790dc:         {
+1:72790dc:             expression.checkpoint();
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     protected void performSkipTo(Long nextToken)
+1:72790dc:     {
+1:72790dc:         try
+1:72790dc:         {
+1:72790dc:             union.skipTo(nextToken);
+1:72790dc:         }
+1:72790dc:         finally
+1:72790dc:         {
+1:72790dc:             expression.checkpoint();
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     public void close()
+1:72790dc:     {
+1:72790dc:         FileUtils.closeQuietly(union);
+1:72790dc:         referencedIndexes.forEach(TermIterator::releaseQuietly);
+1:72790dc:         referencedIndexes.clear();
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private static void releaseIndex(Set<SSTableIndex> indexes, SSTableIndex index)
+1:72790dc:     {
+1:72790dc:         indexes.remove(index);
+1:72790dc:         releaseQuietly(index);
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private static void releaseQuietly(SSTableIndex index)
+1:72790dc:     {
+1:72790dc:         try
+1:72790dc:         {
+1:72790dc:             index.release();
+1:72790dc:         }
+1:72790dc:         catch (Throwable e)
+1:72790dc:         {
+1:72790dc:             logger.error(String.format("Failed to release index %s", index.getPath()), e);
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: }
+============================================================================
+author:Jordan West
+-------------------------------------------------------------------------------
+commit:2ca2fff
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.index.sasi.disk.OnDiskIndexBuilder;
+/////////////////////////////////////////////////////////////////////////
+1:                 if (e.getOp() == Expression.Op.PREFIX &&
+1:                     index.mode() == OnDiskIndexBuilder.Mode.CONTAINS && !index.hasMarkedPartials())
+1:                     throw new UnsupportedOperationException(String.format("The index %s has not yet been upgraded " +
+1:                                                                           "to support prefix queries in CONTAINS mode. " +
+1:                                                                           "Wait for compaction or rebuild the index.",
+1:                                                                           index.getPath()));
+1: 
+1: 
+author:Jason Brown
+-------------------------------------------------------------------------------
+commit:733d1ee
+/////////////////////////////////////////////////////////////////////////
+1:     @SuppressWarnings("resource")
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:72790dc
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.index.sasi;
+1: 
+1: import java.util.List;
+1: import java.util.Set;
+1: import java.util.concurrent.*;
+1: import java.util.concurrent.atomic.AtomicInteger;
+1: import java.util.concurrent.atomic.AtomicLong;
+1: 
+1: import org.apache.cassandra.config.DatabaseDescriptor;
+1: import org.apache.cassandra.index.sasi.disk.Token;
+1: import org.apache.cassandra.index.sasi.plan.Expression;
+1: import org.apache.cassandra.index.sasi.utils.RangeUnionIterator;
+1: import org.apache.cassandra.index.sasi.utils.RangeIterator;
+1: import org.apache.cassandra.io.util.FileUtils;
+1: 
+1: import com.google.common.util.concurrent.MoreExecutors;
+1: import com.google.common.util.concurrent.Uninterruptibles;
+1: 
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: public class TermIterator extends RangeIterator<Long, Token>
+1: {
+1:     private static final Logger logger = LoggerFactory.getLogger(TermIterator.class);
+1: 
+1:     private static final ThreadLocal<ExecutorService> SEARCH_EXECUTOR = new ThreadLocal<ExecutorService>()
+1:     {
+1:         public ExecutorService initialValue()
+1:         {
+1:             final String currentThread = Thread.currentThread().getName();
+1:             final int concurrencyFactor = DatabaseDescriptor.searchConcurrencyFactor();
+1: 
+1:             logger.info("Search Concurrency Factor is set to {} for {}", concurrencyFactor, currentThread);
+1: 
+1:             return (concurrencyFactor <= 1)
+1:                     ? MoreExecutors.newDirectExecutorService()
+1:                     : Executors.newFixedThreadPool(concurrencyFactor, new ThreadFactory()
+1:             {
+1:                 public final AtomicInteger count = new AtomicInteger();
+1: 
+1:                 public Thread newThread(Runnable task)
+1:                 {
+1:                     return new Thread(task, currentThread + "-SEARCH-" + count.incrementAndGet()) {{ setDaemon(true); }};
+1:                 }
+1:             });
+1:         }
+1:     };
+1: 
+1:     private final Expression expression;
+1: 
+1:     private final RangeIterator<Long, Token> union;
+1:     private final Set<SSTableIndex> referencedIndexes;
+1: 
+1:     private TermIterator(Expression e,
+1:                          RangeIterator<Long, Token> union,
+1:                          Set<SSTableIndex> referencedIndexes)
+1:     {
+1:         super(union.getMinimum(), union.getMaximum(), union.getCount());
+1: 
+1:         this.expression = e;
+1:         this.union = union;
+1:         this.referencedIndexes = referencedIndexes;
+1:     }
+1: 
+1:     public static TermIterator build(final Expression e, Set<SSTableIndex> perSSTableIndexes)
+1:     {
+1:         final List<RangeIterator<Long, Token>> tokens = new CopyOnWriteArrayList<>();
+1:         final AtomicLong tokenCount = new AtomicLong(0);
+1: 
+1:         RangeIterator<Long, Token> memtableIterator = e.index.searchMemtable(e);
+1:         if (memtableIterator != null)
+1:         {
+1:             tokens.add(memtableIterator);
+1:             tokenCount.addAndGet(memtableIterator.getCount());
+1:         }
+1: 
+1:         final Set<SSTableIndex> referencedIndexes = new CopyOnWriteArraySet<>();
+1: 
+1:         try
+1:         {
+1:             final CountDownLatch latch = new CountDownLatch(perSSTableIndexes.size());
+1:             final ExecutorService searchExecutor = SEARCH_EXECUTOR.get();
+1: 
+1:             for (final SSTableIndex index : perSSTableIndexes)
+1:             {
+1:                 if (!index.reference())
+1:                 {
+1:                     latch.countDown();
+1:                     continue;
+1:                 }
+1: 
+1:                 // add to referenced right after the reference was acquired,
+1:                 // that helps to release index if something goes bad inside of the search
+1:                 referencedIndexes.add(index);
+1: 
+1:                 searchExecutor.submit((Runnable) () -> {
+1:                     try
+1:                     {
+1:                         e.checkpoint();
+1: 
+1:                         RangeIterator<Long, Token> keyIterator = index.search(e);
+1:                         if (keyIterator == null)
+1:                         {
+1:                             releaseIndex(referencedIndexes, index);
+1:                             return;
+1:                         }
+1: 
+1:                         tokens.add(keyIterator);
+1:                         tokenCount.getAndAdd(keyIterator.getCount());
+1:                     }
+1:                     catch (Throwable e1)
+1:                     {
+1:                         releaseIndex(referencedIndexes, index);
+1: 
+1:                         if (logger.isDebugEnabled())
+1:                             logger.debug(String.format("Failed search an index %s, skipping.", index.getPath()), e1);
+1:                     }
+1:                     finally
+1:                     {
+1:                         latch.countDown();
+1:                     }
+1:                 });
+1:             }
+1: 
+1:             Uninterruptibles.awaitUninterruptibly(latch);
+1: 
+1:             // checkpoint right away after all indexes complete search because we might have crossed the quota
+1:             e.checkpoint();
+1: 
+1:             RangeIterator<Long, Token> ranges = RangeUnionIterator.build(tokens);
+1:             return ranges == null ? null : new TermIterator(e, ranges, referencedIndexes);
+1:         }
+1:         catch (Throwable ex)
+1:         {
+1:             // if execution quota was exceeded while opening indexes or something else happened
+1:             // local (yet to be tracked) indexes should be released first before re-throwing exception
+1:             referencedIndexes.forEach(TermIterator::releaseQuietly);
+1: 
+1:             throw ex;
+1:         }
+1:     }
+1: 
+1:     protected Token computeNext()
+1:     {
+1:         try
+1:         {
+1:             return union.hasNext() ? union.next() : endOfData();
+1:         }
+1:         finally
+1:         {
+1:             expression.checkpoint();
+1:         }
+1:     }
+1: 
+1:     protected void performSkipTo(Long nextToken)
+1:     {
+1:         try
+1:         {
+1:             union.skipTo(nextToken);
+1:         }
+1:         finally
+1:         {
+1:             expression.checkpoint();
+1:         }
+1:     }
+1: 
+1:     public void close()
+1:     {
+1:         FileUtils.closeQuietly(union);
+1:         referencedIndexes.forEach(TermIterator::releaseQuietly);
+1:         referencedIndexes.clear();
+1:     }
+1: 
+1:     private static void releaseIndex(Set<SSTableIndex> indexes, SSTableIndex index)
+1:     {
+1:         indexes.remove(index);
+1:         releaseQuietly(index);
+1:     }
+1: 
+1:     private static void releaseQuietly(SSTableIndex index)
+1:     {
+1:         try
+1:         {
+1:             index.release();
+1:         }
+1:         catch (Throwable e)
+1:         {
+1:             logger.error(String.format("Failed to release index %s", index.getPath()), e);
+1:         }
+1:     }
+1: }
+============================================================================

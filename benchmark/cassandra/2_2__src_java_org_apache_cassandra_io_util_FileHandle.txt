@@ -1,0 +1,893 @@
+1:b4133f3: /*
+1:b4133f3:  * Licensed to the Apache Software Foundation (ASF) under one
+1:b4133f3:  * or more contributor license agreements.  See the NOTICE file
+1:b4133f3:  * distributed with this work for additional information
+1:b4133f3:  * regarding copyright ownership.  The ASF licenses this file
+1:b4133f3:  * to you under the Apache License, Version 2.0 (the
+1:b4133f3:  * "License"); you may not use this file except in compliance
+1:b4133f3:  * with the License.  You may obtain a copy of the License at
+1:b4133f3:  *
+1:b4133f3:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:b4133f3:  *
+1:b4133f3:  * Unless required by applicable law or agreed to in writing, software
+1:b4133f3:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:b4133f3:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:b4133f3:  * See the License for the specific language governing permissions and
+1:b4133f3:  * limitations under the License.
+1:b4133f3:  */
+1:b4133f3: package org.apache.cassandra.io.util;
+1:b4133f3: 
+1:b4133f3: import java.util.Objects;
+1:b4133f3: import java.util.Optional;
+1:b4133f3: 
+1:b4133f3: import com.google.common.util.concurrent.RateLimiter;
+1:b4133f3: import org.slf4j.Logger;
+1:b4133f3: import org.slf4j.LoggerFactory;
+1:b4133f3: 
+1:b4133f3: import org.apache.cassandra.cache.ChunkCache;
+1:b4133f3: import org.apache.cassandra.io.compress.BufferType;
+1:b4133f3: import org.apache.cassandra.io.compress.CompressionMetadata;
+1:b4133f3: import org.apache.cassandra.utils.CLibrary;
+1:b4133f3: import org.apache.cassandra.utils.concurrent.Ref;
+1:b4133f3: import org.apache.cassandra.utils.concurrent.RefCounted;
+1:b4133f3: import org.apache.cassandra.utils.concurrent.SharedCloseableImpl;
+1:b4133f3: 
+1:b4133f3: import static org.apache.cassandra.utils.Throwables.maybeFail;
+1:b4133f3: 
+1:b4133f3: /**
+1:b4133f3:  * {@link FileHandle} provides access to a file for reading, including the ones written by various {@link SequentialWriter}
+1:b4133f3:  * instances, and it is typically used by {@link org.apache.cassandra.io.sstable.format.SSTableReader}.
+1:b4133f3:  *
+1:b4133f3:  * Use {@link FileHandle.Builder} to create an instance, and call {@link #createReader()} (and its variants) to
+1:b4133f3:  * access the readers for the underlying file.
+1:b4133f3:  *
+1:b4133f3:  * You can use {@link Builder#complete()} several times during its lifecycle with different {@code overrideLength}(i.e. early opening file).
+1:b4133f3:  * For that reason, the builder keeps a reference to the file channel and makes a copy for each {@link Builder#complete()} call.
+1:b4133f3:  * Therefore, it is important to close the {@link Builder} when it is no longer needed, as well as any {@link FileHandle}
+1:b4133f3:  * instances.
+1:b4133f3:  */
+1:b4133f3: public class FileHandle extends SharedCloseableImpl
+1:b4133f3: {
+1:b4133f3:     private static final Logger logger = LoggerFactory.getLogger(FileHandle.class);
+1:b4133f3: 
+1:b4133f3:     public final ChannelProxy channel;
+1:b4133f3: 
+1:b4133f3:     public final long onDiskLength;
+1:b4133f3: 
+1:b4133f3:     /*
+1:b4133f3:      * Rebufferer factory to use when constructing RandomAccessReaders
+1:b4133f3:      */
+1:b4133f3:     private final RebuffererFactory rebuffererFactory;
+1:b4133f3: 
+1:b4133f3:     /*
+1:b4133f3:      * Optional CompressionMetadata when dealing with compressed file
+1:b4133f3:      */
+1:b4133f3:     private final Optional<CompressionMetadata> compressionMetadata;
+1:b4133f3: 
+1:b4133f3:     private FileHandle(Cleanup cleanup,
+1:b4133f3:                        ChannelProxy channel,
+1:b4133f3:                        RebuffererFactory rebuffererFactory,
+1:b4133f3:                        CompressionMetadata compressionMetadata,
+1:b4133f3:                        long onDiskLength)
+1:b4133f3:     {
+1:b4133f3:         super(cleanup);
+1:b4133f3:         this.rebuffererFactory = rebuffererFactory;
+1:b4133f3:         this.channel = channel;
+1:b4133f3:         this.compressionMetadata = Optional.ofNullable(compressionMetadata);
+1:b4133f3:         this.onDiskLength = onDiskLength;
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     private FileHandle(FileHandle copy)
+1:b4133f3:     {
+1:b4133f3:         super(copy);
+1:b4133f3:         channel = copy.channel;
+1:b4133f3:         rebuffererFactory = copy.rebuffererFactory;
+1:b4133f3:         compressionMetadata = copy.compressionMetadata;
+1:b4133f3:         onDiskLength = copy.onDiskLength;
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     /**
+1:b4133f3:      * @return Path to the file this factory is referencing
+1:b4133f3:      */
+1:b4133f3:     public String path()
+1:b4133f3:     {
+1:b4133f3:         return channel.filePath();
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     public long dataLength()
+1:b4133f3:     {
+1:b4133f3:         return compressionMetadata.map(c -> c.dataLength).orElseGet(rebuffererFactory::fileLength);
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     public RebuffererFactory rebuffererFactory()
+1:b4133f3:     {
+1:b4133f3:         return rebuffererFactory;
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     public Optional<CompressionMetadata> compressionMetadata()
+1:b4133f3:     {
+1:b4133f3:         return compressionMetadata;
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     @Override
+1:b4133f3:     public void addTo(Ref.IdentityCollection identities)
+1:b4133f3:     {
+1:b4133f3:         super.addTo(identities);
+1:b4133f3:         compressionMetadata.ifPresent(metadata -> metadata.addTo(identities));
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     @Override
+1:b4133f3:     public FileHandle sharedCopy()
+1:b4133f3:     {
+1:b4133f3:         return new FileHandle(this);
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     /**
+1:b4133f3:      * Create {@link RandomAccessReader} with configured method of reading content of the file.
+1:b4133f3:      *
+1:b4133f3:      * @return RandomAccessReader for the file
+1:b4133f3:      */
+1:b4133f3:     public RandomAccessReader createReader()
+1:b4133f3:     {
+1:b4133f3:         return createReader(null);
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     /**
+1:b4133f3:      * Create {@link RandomAccessReader} with configured method of reading content of the file.
+1:b4133f3:      * Reading from file will be rate limited by given {@link RateLimiter}.
+1:b4133f3:      *
+1:b4133f3:      * @param limiter RateLimiter to use for rate limiting read
+1:b4133f3:      * @return RandomAccessReader for the file
+1:b4133f3:      */
+1:b4133f3:     public RandomAccessReader createReader(RateLimiter limiter)
+1:b4133f3:     {
+1:b4133f3:         return new RandomAccessReader(instantiateRebufferer(limiter));
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     public FileDataInput createReader(long position)
+1:b4133f3:     {
+1:b4133f3:         RandomAccessReader reader = createReader();
+1:b4133f3:         reader.seek(position);
+1:b4133f3:         return reader;
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     /**
+1:b4133f3:      * Drop page cache from start to given {@code before}.
+1:b4133f3:      *
+1:b4133f3:      * @param before uncompressed position from start of the file to be dropped from cache. if 0, to end of file.
+1:b4133f3:      */
+1:b4133f3:     public void dropPageCache(long before)
+1:b4133f3:     {
+1:b4133f3:         long position = compressionMetadata.map(metadata -> {
+1:b4133f3:             if (before >= metadata.dataLength)
+1:b4133f3:                 return 0L;
+1:b4133f3:             else
+1:b4133f3:                 return metadata.chunkFor(before).offset;
+1:b4133f3:         }).orElse(before);
+1:b4133f3:         CLibrary.trySkipCache(channel.getFileDescriptor(), 0, position, path());
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     private Rebufferer instantiateRebufferer(RateLimiter limiter)
+1:b4133f3:     {
+1:b4133f3:         Rebufferer rebufferer = rebuffererFactory.instantiateRebufferer();
+1:b4133f3: 
+1:b4133f3:         if (limiter != null)
+1:b4133f3:             rebufferer = new LimitingRebufferer(rebufferer, limiter, DiskOptimizationStrategy.MAX_BUFFER_SIZE);
+1:b4133f3:         return rebufferer;
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     /**
+1:b4133f3:      * Perform clean up of all resources held by {@link FileHandle}.
+1:b4133f3:      */
+1:b4133f3:     private static class Cleanup implements RefCounted.Tidy
+1:b4133f3:     {
+1:b4133f3:         final ChannelProxy channel;
+1:b4133f3:         final RebuffererFactory rebufferer;
+1:b4133f3:         final CompressionMetadata compressionMetadata;
+1:b4133f3:         final Optional<ChunkCache> chunkCache;
+1:b4133f3: 
+1:b4133f3:         private Cleanup(ChannelProxy channel,
+1:b4133f3:                         RebuffererFactory rebufferer,
+1:b4133f3:                         CompressionMetadata compressionMetadata,
+1:b4133f3:                         ChunkCache chunkCache)
+1:b4133f3:         {
+1:b4133f3:             this.channel = channel;
+1:b4133f3:             this.rebufferer = rebufferer;
+1:b4133f3:             this.compressionMetadata = compressionMetadata;
+1:b4133f3:             this.chunkCache = Optional.ofNullable(chunkCache);
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         public String name()
+1:b4133f3:         {
+1:b4133f3:             return channel.filePath();
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         public void tidy()
+1:b4133f3:         {
+1:b4133f3:             chunkCache.ifPresent(cache -> cache.invalidateFile(name()));
+1:b4133f3:             try
+1:b4133f3:             {
+1:b4133f3:                 if (compressionMetadata != null)
+1:b4133f3:                 {
+1:b4133f3:                     compressionMetadata.close();
+1:b4133f3:                 }
+1:b4133f3:             }
+1:b4133f3:             finally
+1:b4133f3:             {
+1:b4133f3:                 try
+1:b4133f3:                 {
+1:b4133f3:                     channel.close();
+1:b4133f3:                 }
+1:b4133f3:                 finally
+1:b4133f3:                 {
+1:b4133f3:                     rebufferer.close();
+1:b4133f3:                 }
+1:b4133f3:             }
+1:b4133f3:         }
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     /**
+1:b4133f3:      * Configures how the file will be read (compressed, mmapped, use cache etc.)
+1:b4133f3:      */
+1:b4133f3:     public static class Builder implements AutoCloseable
+1:b4133f3:     {
+1:b4133f3:         private final String path;
+1:b4133f3: 
+1:b4133f3:         private ChannelProxy channel;
+1:b4133f3:         private CompressionMetadata compressionMetadata;
+1:b4133f3:         private MmappedRegions regions;
+1:b4133f3:         private ChunkCache chunkCache;
+1:b4133f3:         private int bufferSize = RandomAccessReader.DEFAULT_BUFFER_SIZE;
+1:b4133f3:         private BufferType bufferType = BufferType.OFF_HEAP;
+1:b4133f3: 
+1:b4133f3:         private boolean mmapped = false;
+1:b4133f3:         private boolean compressed = false;
+1:b4133f3: 
+1:b4133f3:         public Builder(String path)
+1:b4133f3:         {
+1:b4133f3:             this.path = path;
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         public Builder(ChannelProxy channel)
+1:b4133f3:         {
+1:b4133f3:             this.channel = channel;
+1:b4133f3:             this.path = channel.filePath();
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         public Builder compressed(boolean compressed)
+1:b4133f3:         {
+1:b4133f3:             this.compressed = compressed;
+1:b4133f3:             return this;
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         /**
+1:b4133f3:          * Set {@link ChunkCache} to use.
+1:b4133f3:          *
+1:b4133f3:          * @param chunkCache ChunkCache object to use for caching
+1:b4133f3:          * @return this object
+1:b4133f3:          */
+1:b4133f3:         public Builder withChunkCache(ChunkCache chunkCache)
+1:b4133f3:         {
+1:b4133f3:             this.chunkCache = chunkCache;
+1:b4133f3:             return this;
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         /**
+1:b4133f3:          * Provide {@link CompressionMetadata} to use when reading compressed file.
+1:b4133f3:          *
+1:b4133f3:          * @param metadata CompressionMetadata to use
+1:b4133f3:          * @return this object
+1:b4133f3:          */
+1:b4133f3:         public Builder withCompressionMetadata(CompressionMetadata metadata)
+1:b4133f3:         {
+1:b4133f3:             this.compressed = Objects.nonNull(metadata);
+1:b4133f3:             this.compressionMetadata = metadata;
+1:b4133f3:             return this;
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         /**
+1:b4133f3:          * Set whether to use mmap for reading
+1:b4133f3:          *
+1:b4133f3:          * @param mmapped true if using mmap
+1:b4133f3:          * @return this instance
+1:b4133f3:          */
+1:b4133f3:         public Builder mmapped(boolean mmapped)
+1:b4133f3:         {
+1:b4133f3:             this.mmapped = mmapped;
+1:b4133f3:             return this;
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         /**
+1:b4133f3:          * Set the buffer size to use (if appropriate).
+1:b4133f3:          *
+1:b4133f3:          * @param bufferSize Buffer size in bytes
+1:b4133f3:          * @return this instance
+1:b4133f3:          */
+1:b4133f3:         public Builder bufferSize(int bufferSize)
+1:b4133f3:         {
+1:b4133f3:             this.bufferSize = bufferSize;
+1:b4133f3:             return this;
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         /**
+1:b4133f3:          * Set the buffer type (on heap or off heap) to use (if appropriate).
+1:b4133f3:          *
+1:b4133f3:          * @param bufferType Buffer type to use
+1:b4133f3:          * @return this instance
+1:b4133f3:          */
+1:b4133f3:         public Builder bufferType(BufferType bufferType)
+1:b4133f3:         {
+1:b4133f3:             this.bufferType = bufferType;
+1:b4133f3:             return this;
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         /**
+1:b4133f3:          * Complete building {@link FileHandle} without overriding file length.
+1:b4133f3:          *
+1:b4133f3:          * @see #complete(long)
+1:b4133f3:          */
+1:b4133f3:         public FileHandle complete()
+1:b4133f3:         {
+1:b4133f3:             return complete(-1L);
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         /**
+1:b4133f3:          * Complete building {@link FileHandle} with the given length, which overrides the file length.
+1:b4133f3:          *
+1:b4133f3:          * @param overrideLength Override file length (in bytes) so that read cannot go further than this value.
+1:b4133f3:          *                       If the value is less than or equal to 0, then the value is ignored.
+1:b4133f3:          * @return Built file
+1:b4133f3:          */
+1:b4133f3:         @SuppressWarnings("resource")
+1:b4133f3:         public FileHandle complete(long overrideLength)
+1:b4133f3:         {
+1:b4133f3:             if (channel == null)
+1:b4133f3:             {
+1:b4133f3:                 channel = new ChannelProxy(path);
+1:b4133f3:             }
+1:b4133f3: 
+1:b4133f3:             ChannelProxy channelCopy = channel.sharedCopy();
+1:b4133f3:             try
+1:b4133f3:             {
+1:b4133f3:                 if (compressed && compressionMetadata == null)
+1:b4133f3:                     compressionMetadata = CompressionMetadata.create(channelCopy.filePath());
+1:b4133f3: 
+1:b4133f3:                 long length = overrideLength > 0 ? overrideLength : compressed ? compressionMetadata.compressedFileLength : channelCopy.size();
+1:b4133f3: 
+1:b4133f3:                 RebuffererFactory rebuffererFactory;
+1:b4133f3:                 if (mmapped)
+1:b4133f3:                 {
+1:b4133f3:                     if (compressed)
+1:b4133f3:                     {
+1:b4133f3:                         regions = MmappedRegions.map(channelCopy, compressionMetadata);
+1:b4133f3:                         rebuffererFactory = maybeCached(new CompressedChunkReader.Mmap(channelCopy, compressionMetadata,
+1:b4133f3:                                                                                        regions));
+1:b4133f3:                     }
+1:b4133f3:                     else
+1:b4133f3:                     {
+1:b4133f3:                         updateRegions(channelCopy, length);
+1:b4133f3:                         rebuffererFactory = new MmapRebufferer(channelCopy, length, regions.sharedCopy());
+1:b4133f3:                     }
+1:b4133f3:                 }
+1:b4133f3:                 else
+1:b4133f3:                 {
+1:b4133f3:                     regions = null;
+1:b4133f3:                     if (compressed)
+1:b4133f3:                     {
+1:b4133f3:                         rebuffererFactory = maybeCached(new CompressedChunkReader.Standard(channelCopy, compressionMetadata));
+1:b4133f3:                     }
+1:b4133f3:                     else
+1:b4133f3:                     {
+1:b4133f3:                         rebuffererFactory = maybeCached(new SimpleChunkReader(channelCopy, length, bufferType, bufferSize));
+1:b4133f3:                     }
+1:b4133f3:                 }
+1:b4133f3:                 Cleanup cleanup = new Cleanup(channelCopy, rebuffererFactory, compressionMetadata, chunkCache);
+1:b4133f3:                 return new FileHandle(cleanup, channelCopy, rebuffererFactory, compressionMetadata, length);
+1:b4133f3:             }
+1:b4133f3:             catch (Throwable t)
+1:b4133f3:             {
+1:b4133f3:                 channelCopy.close();
+1:b4133f3:                 throw t;
+1:b4133f3:             }
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         public Throwable close(Throwable accumulate)
+1:b4133f3:         {
+1:b4133f3:             if (!compressed && regions != null)
+1:b4133f3:                 accumulate = regions.close(accumulate);
+1:b4133f3:             if (channel != null)
+1:b4133f3:                 return channel.close(accumulate);
+1:b4133f3: 
+1:b4133f3:             return accumulate;
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         public void close()
+1:b4133f3:         {
+1:b4133f3:             maybeFail(close(null));
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         private RebuffererFactory maybeCached(ChunkReader reader)
+1:b4133f3:         {
+1:b4133f3:             if (chunkCache != null && chunkCache.capacity() > 0)
+1:b4133f3:                 return chunkCache.wrap(reader);
+1:b4133f3:             return reader;
+1:b4133f3:         }
+1:b4133f3: 
+1:b4133f3:         private void updateRegions(ChannelProxy channel, long length)
+1:b4133f3:         {
+1:b4133f3:             if (regions != null && !regions.isValid(channel))
+1:b4133f3:             {
+1:b4133f3:                 Throwable err = regions.close(null);
+1:b4133f3:                 if (err != null)
+1:b4133f3:                     logger.error("Failed to close mapped regions", err);
+1:b4133f3: 
+1:b4133f3:                 regions = null;
+1:b4133f3:             }
+1:b4133f3: 
+1:b4133f3:             if (regions == null)
+1:b4133f3:                 regions = MmappedRegions.map(channel, length);
+1:b4133f3:             else
+1:b4133f3:                 regions.extend(length);
+1:b4133f3:         }
+1:b4133f3:     }
+1:b4133f3: 
+1:b4133f3:     @Override
+1:68d2526:     public String toString()
+1:68d2526:     {
+1:b4133f3:         return getClass().getSimpleName() + "(path='" + path() + '\'' +
+1:b4133f3:                ", length=" + rebuffererFactory.fileLength() +
+1:b4133f3:                ')';
+1:b4133f3:     }
+1:b4133f3: }
+============================================================================
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:68d2526
+/////////////////////////////////////////////////////////////////////////
+1:     public String toString()
+1:     {
+author:Yuki Morishita
+-------------------------------------------------------------------------------
+commit:b4133f3
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.io.util;
+1: 
+1: import java.util.Objects;
+1: import java.util.Optional;
+1: 
+1: import com.google.common.util.concurrent.RateLimiter;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import org.apache.cassandra.cache.ChunkCache;
+1: import org.apache.cassandra.io.compress.BufferType;
+1: import org.apache.cassandra.io.compress.CompressionMetadata;
+1: import org.apache.cassandra.utils.CLibrary;
+1: import org.apache.cassandra.utils.concurrent.Ref;
+1: import org.apache.cassandra.utils.concurrent.RefCounted;
+1: import org.apache.cassandra.utils.concurrent.SharedCloseableImpl;
+1: 
+1: import static org.apache.cassandra.utils.Throwables.maybeFail;
+1: 
+1: /**
+1:  * {@link FileHandle} provides access to a file for reading, including the ones written by various {@link SequentialWriter}
+1:  * instances, and it is typically used by {@link org.apache.cassandra.io.sstable.format.SSTableReader}.
+1:  *
+1:  * Use {@link FileHandle.Builder} to create an instance, and call {@link #createReader()} (and its variants) to
+1:  * access the readers for the underlying file.
+1:  *
+1:  * You can use {@link Builder#complete()} several times during its lifecycle with different {@code overrideLength}(i.e. early opening file).
+1:  * For that reason, the builder keeps a reference to the file channel and makes a copy for each {@link Builder#complete()} call.
+1:  * Therefore, it is important to close the {@link Builder} when it is no longer needed, as well as any {@link FileHandle}
+1:  * instances.
+1:  */
+1: public class FileHandle extends SharedCloseableImpl
+1: {
+1:     private static final Logger logger = LoggerFactory.getLogger(FileHandle.class);
+1: 
+1:     public final ChannelProxy channel;
+1: 
+1:     public final long onDiskLength;
+1: 
+1:     /*
+1:      * Rebufferer factory to use when constructing RandomAccessReaders
+1:      */
+1:     private final RebuffererFactory rebuffererFactory;
+1: 
+1:     /*
+1:      * Optional CompressionMetadata when dealing with compressed file
+1:      */
+1:     private final Optional<CompressionMetadata> compressionMetadata;
+1: 
+1:     private FileHandle(Cleanup cleanup,
+1:                        ChannelProxy channel,
+1:                        RebuffererFactory rebuffererFactory,
+1:                        CompressionMetadata compressionMetadata,
+1:                        long onDiskLength)
+1:     {
+1:         super(cleanup);
+1:         this.rebuffererFactory = rebuffererFactory;
+1:         this.channel = channel;
+1:         this.compressionMetadata = Optional.ofNullable(compressionMetadata);
+1:         this.onDiskLength = onDiskLength;
+1:     }
+1: 
+1:     private FileHandle(FileHandle copy)
+1:     {
+1:         super(copy);
+1:         channel = copy.channel;
+1:         rebuffererFactory = copy.rebuffererFactory;
+1:         compressionMetadata = copy.compressionMetadata;
+1:         onDiskLength = copy.onDiskLength;
+1:     }
+1: 
+1:     /**
+1:      * @return Path to the file this factory is referencing
+1:      */
+1:     public String path()
+1:     {
+1:         return channel.filePath();
+1:     }
+1: 
+1:     public long dataLength()
+1:     {
+1:         return compressionMetadata.map(c -> c.dataLength).orElseGet(rebuffererFactory::fileLength);
+1:     }
+1: 
+1:     public RebuffererFactory rebuffererFactory()
+1:     {
+1:         return rebuffererFactory;
+1:     }
+1: 
+1:     public Optional<CompressionMetadata> compressionMetadata()
+1:     {
+1:         return compressionMetadata;
+1:     }
+1: 
+1:     @Override
+1:     public void addTo(Ref.IdentityCollection identities)
+1:     {
+1:         super.addTo(identities);
+1:         compressionMetadata.ifPresent(metadata -> metadata.addTo(identities));
+1:     }
+1: 
+1:     @Override
+1:     public FileHandle sharedCopy()
+1:     {
+1:         return new FileHandle(this);
+1:     }
+1: 
+1:     /**
+1:      * Create {@link RandomAccessReader} with configured method of reading content of the file.
+1:      *
+1:      * @return RandomAccessReader for the file
+1:      */
+1:     public RandomAccessReader createReader()
+1:     {
+1:         return createReader(null);
+1:     }
+1: 
+1:     /**
+1:      * Create {@link RandomAccessReader} with configured method of reading content of the file.
+1:      * Reading from file will be rate limited by given {@link RateLimiter}.
+1:      *
+1:      * @param limiter RateLimiter to use for rate limiting read
+1:      * @return RandomAccessReader for the file
+1:      */
+1:     public RandomAccessReader createReader(RateLimiter limiter)
+1:     {
+1:         return new RandomAccessReader(instantiateRebufferer(limiter));
+1:     }
+1: 
+1:     public FileDataInput createReader(long position)
+1:     {
+1:         RandomAccessReader reader = createReader();
+1:         reader.seek(position);
+1:         return reader;
+1:     }
+1: 
+1:     /**
+1:      * Drop page cache from start to given {@code before}.
+1:      *
+1:      * @param before uncompressed position from start of the file to be dropped from cache. if 0, to end of file.
+1:      */
+1:     public void dropPageCache(long before)
+1:     {
+1:         long position = compressionMetadata.map(metadata -> {
+1:             if (before >= metadata.dataLength)
+1:                 return 0L;
+1:             else
+1:                 return metadata.chunkFor(before).offset;
+1:         }).orElse(before);
+1:         CLibrary.trySkipCache(channel.getFileDescriptor(), 0, position, path());
+1:     }
+1: 
+1:     private Rebufferer instantiateRebufferer(RateLimiter limiter)
+1:     {
+1:         Rebufferer rebufferer = rebuffererFactory.instantiateRebufferer();
+1: 
+1:         if (limiter != null)
+1:             rebufferer = new LimitingRebufferer(rebufferer, limiter, DiskOptimizationStrategy.MAX_BUFFER_SIZE);
+1:         return rebufferer;
+1:     }
+1: 
+1:     /**
+1:      * Perform clean up of all resources held by {@link FileHandle}.
+1:      */
+1:     private static class Cleanup implements RefCounted.Tidy
+1:     {
+1:         final ChannelProxy channel;
+1:         final RebuffererFactory rebufferer;
+1:         final CompressionMetadata compressionMetadata;
+1:         final Optional<ChunkCache> chunkCache;
+1: 
+1:         private Cleanup(ChannelProxy channel,
+1:                         RebuffererFactory rebufferer,
+1:                         CompressionMetadata compressionMetadata,
+1:                         ChunkCache chunkCache)
+1:         {
+1:             this.channel = channel;
+1:             this.rebufferer = rebufferer;
+1:             this.compressionMetadata = compressionMetadata;
+1:             this.chunkCache = Optional.ofNullable(chunkCache);
+1:         }
+1: 
+1:         public String name()
+1:         {
+1:             return channel.filePath();
+1:         }
+1: 
+1:         public void tidy()
+1:         {
+1:             chunkCache.ifPresent(cache -> cache.invalidateFile(name()));
+1:             try
+1:             {
+1:                 if (compressionMetadata != null)
+1:                 {
+1:                     compressionMetadata.close();
+1:                 }
+1:             }
+1:             finally
+1:             {
+1:                 try
+1:                 {
+1:                     channel.close();
+1:                 }
+1:                 finally
+1:                 {
+1:                     rebufferer.close();
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Configures how the file will be read (compressed, mmapped, use cache etc.)
+1:      */
+1:     public static class Builder implements AutoCloseable
+1:     {
+1:         private final String path;
+1: 
+1:         private ChannelProxy channel;
+1:         private CompressionMetadata compressionMetadata;
+1:         private MmappedRegions regions;
+1:         private ChunkCache chunkCache;
+1:         private int bufferSize = RandomAccessReader.DEFAULT_BUFFER_SIZE;
+1:         private BufferType bufferType = BufferType.OFF_HEAP;
+1: 
+1:         private boolean mmapped = false;
+1:         private boolean compressed = false;
+1: 
+1:         public Builder(String path)
+1:         {
+1:             this.path = path;
+1:         }
+1: 
+1:         public Builder(ChannelProxy channel)
+1:         {
+1:             this.channel = channel;
+1:             this.path = channel.filePath();
+1:         }
+1: 
+1:         public Builder compressed(boolean compressed)
+1:         {
+1:             this.compressed = compressed;
+1:             return this;
+1:         }
+1: 
+1:         /**
+1:          * Set {@link ChunkCache} to use.
+1:          *
+1:          * @param chunkCache ChunkCache object to use for caching
+1:          * @return this object
+1:          */
+1:         public Builder withChunkCache(ChunkCache chunkCache)
+1:         {
+1:             this.chunkCache = chunkCache;
+1:             return this;
+1:         }
+1: 
+1:         /**
+1:          * Provide {@link CompressionMetadata} to use when reading compressed file.
+1:          *
+1:          * @param metadata CompressionMetadata to use
+1:          * @return this object
+1:          */
+1:         public Builder withCompressionMetadata(CompressionMetadata metadata)
+1:         {
+1:             this.compressed = Objects.nonNull(metadata);
+1:             this.compressionMetadata = metadata;
+1:             return this;
+1:         }
+1: 
+1:         /**
+1:          * Set whether to use mmap for reading
+1:          *
+1:          * @param mmapped true if using mmap
+1:          * @return this instance
+1:          */
+1:         public Builder mmapped(boolean mmapped)
+1:         {
+1:             this.mmapped = mmapped;
+1:             return this;
+1:         }
+1: 
+1:         /**
+1:          * Set the buffer size to use (if appropriate).
+1:          *
+1:          * @param bufferSize Buffer size in bytes
+1:          * @return this instance
+1:          */
+1:         public Builder bufferSize(int bufferSize)
+1:         {
+1:             this.bufferSize = bufferSize;
+1:             return this;
+1:         }
+1: 
+1:         /**
+1:          * Set the buffer type (on heap or off heap) to use (if appropriate).
+1:          *
+1:          * @param bufferType Buffer type to use
+1:          * @return this instance
+1:          */
+1:         public Builder bufferType(BufferType bufferType)
+1:         {
+1:             this.bufferType = bufferType;
+1:             return this;
+1:         }
+1: 
+1:         /**
+1:          * Complete building {@link FileHandle} without overriding file length.
+1:          *
+1:          * @see #complete(long)
+1:          */
+1:         public FileHandle complete()
+1:         {
+1:             return complete(-1L);
+1:         }
+1: 
+1:         /**
+1:          * Complete building {@link FileHandle} with the given length, which overrides the file length.
+1:          *
+1:          * @param overrideLength Override file length (in bytes) so that read cannot go further than this value.
+1:          *                       If the value is less than or equal to 0, then the value is ignored.
+1:          * @return Built file
+1:          */
+1:         @SuppressWarnings("resource")
+1:         public FileHandle complete(long overrideLength)
+1:         {
+1:             if (channel == null)
+1:             {
+1:                 channel = new ChannelProxy(path);
+1:             }
+1: 
+1:             ChannelProxy channelCopy = channel.sharedCopy();
+1:             try
+1:             {
+1:                 if (compressed && compressionMetadata == null)
+1:                     compressionMetadata = CompressionMetadata.create(channelCopy.filePath());
+1: 
+1:                 long length = overrideLength > 0 ? overrideLength : compressed ? compressionMetadata.compressedFileLength : channelCopy.size();
+1: 
+1:                 RebuffererFactory rebuffererFactory;
+1:                 if (mmapped)
+1:                 {
+1:                     if (compressed)
+1:                     {
+1:                         regions = MmappedRegions.map(channelCopy, compressionMetadata);
+1:                         rebuffererFactory = maybeCached(new CompressedChunkReader.Mmap(channelCopy, compressionMetadata,
+1:                                                                                        regions));
+1:                     }
+1:                     else
+1:                     {
+1:                         updateRegions(channelCopy, length);
+1:                         rebuffererFactory = new MmapRebufferer(channelCopy, length, regions.sharedCopy());
+1:                     }
+1:                 }
+1:                 else
+1:                 {
+1:                     regions = null;
+1:                     if (compressed)
+1:                     {
+1:                         rebuffererFactory = maybeCached(new CompressedChunkReader.Standard(channelCopy, compressionMetadata));
+1:                     }
+1:                     else
+1:                     {
+1:                         rebuffererFactory = maybeCached(new SimpleChunkReader(channelCopy, length, bufferType, bufferSize));
+1:                     }
+1:                 }
+1:                 Cleanup cleanup = new Cleanup(channelCopy, rebuffererFactory, compressionMetadata, chunkCache);
+1:                 return new FileHandle(cleanup, channelCopy, rebuffererFactory, compressionMetadata, length);
+1:             }
+1:             catch (Throwable t)
+1:             {
+1:                 channelCopy.close();
+1:                 throw t;
+1:             }
+1:         }
+1: 
+1:         public Throwable close(Throwable accumulate)
+1:         {
+1:             if (!compressed && regions != null)
+1:                 accumulate = regions.close(accumulate);
+1:             if (channel != null)
+1:                 return channel.close(accumulate);
+1: 
+1:             return accumulate;
+1:         }
+1: 
+1:         public void close()
+1:         {
+1:             maybeFail(close(null));
+1:         }
+1: 
+1:         private RebuffererFactory maybeCached(ChunkReader reader)
+1:         {
+1:             if (chunkCache != null && chunkCache.capacity() > 0)
+1:                 return chunkCache.wrap(reader);
+1:             return reader;
+1:         }
+1: 
+1:         private void updateRegions(ChannelProxy channel, long length)
+1:         {
+1:             if (regions != null && !regions.isValid(channel))
+1:             {
+1:                 Throwable err = regions.close(null);
+1:                 if (err != null)
+1:                     logger.error("Failed to close mapped regions", err);
+1: 
+1:                 regions = null;
+1:             }
+1: 
+1:             if (regions == null)
+1:                 regions = MmappedRegions.map(channel, length);
+1:             else
+1:                 regions.extend(length);
+1:         }
+1:     }
+1: 
+1:     @Override
+0:     public String toString() {
+1:         return getClass().getSimpleName() + "(path='" + path() + '\'' +
+1:                ", length=" + rebuffererFactory.fileLength() +
+1:                ')';
+1:     }
+1: }
+============================================================================

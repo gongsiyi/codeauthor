@@ -1,0 +1,931 @@
+1:557bbbc: /*
+1:557bbbc:  * Licensed to the Apache Software Foundation (ASF) under one
+1:557bbbc:  * or more contributor license agreements.  See the NOTICE file
+1:557bbbc:  * distributed with this work for additional information
+1:557bbbc:  * regarding copyright ownership.  The ASF licenses this file
+1:557bbbc:  * to you under the Apache License, Version 2.0 (the
+1:557bbbc:  * "License"); you may not use this file except in compliance
+1:557bbbc:  * with the License.  You may obtain a copy of the License at
+1:557bbbc:  *
+1:557bbbc:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:557bbbc:  *
+1:557bbbc:  * Unless required by applicable law or agreed to in writing, software
+1:557bbbc:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:557bbbc:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:557bbbc:  * See the License for the specific language governing permissions and
+1:557bbbc:  * limitations under the License.
+1:557bbbc:  */
+5:557bbbc: 
+1:557bbbc: package org.apache.cassandra.db.monitoring;
+1:557bbbc: 
+1:557bbbc: import java.util.Arrays;
+1:557bbbc: import java.util.Collections;
+1:557bbbc: import java.util.HashMap;
+1:557bbbc: import java.util.List;
+1:557bbbc: import java.util.Map;
+1:557bbbc: import java.util.concurrent.ArrayBlockingQueue;
+1:557bbbc: import java.util.concurrent.BlockingQueue;
+1:557bbbc: import java.util.concurrent.LinkedBlockingQueue;
+1:557bbbc: import java.util.concurrent.ScheduledFuture;
+1:557bbbc: import java.util.concurrent.TimeUnit;
+1:557bbbc: import java.util.concurrent.atomic.AtomicLong;
+1:557bbbc: 
+1:557bbbc: import com.google.common.annotations.VisibleForTesting;
+1:557bbbc: import org.slf4j.Logger;
+1:557bbbc: import org.slf4j.LoggerFactory;
+1:557bbbc: 
+1:557bbbc: import org.apache.cassandra.concurrent.ScheduledExecutors;
+1:557bbbc: import org.apache.cassandra.config.Config;
+1:6966fcd: import org.apache.cassandra.utils.NoSpamLogger;
+1:557bbbc: 
+1:557bbbc: import static java.lang.System.getProperty;
+1:557bbbc: 
+1:557bbbc: /**
+1:557bbbc:  * A task for monitoring in progress operations, currently only read queries, and aborting them if they time out.
+1:557bbbc:  * We also log timed out operations, see CASSANDRA-7392.
+1:6966fcd:  * Since CASSANDRA-12403 we also log queries that were slow.
+1:557bbbc:  */
+1:6966fcd: class MonitoringTask
+3:557bbbc: {
+1:557bbbc:     private static final String LINE_SEPARATOR = getProperty("line.separator");
+1:557bbbc:     private static final Logger logger = LoggerFactory.getLogger(MonitoringTask.class);
+1:6966fcd:     private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 5L, TimeUnit.MINUTES);
+1:557bbbc: 
+1:557bbbc:     /**
+1:557bbbc:      * Defines the interval for reporting any operations that have timed out.
+1:557bbbc:      */
+1:f6ca482:     private static final int REPORT_INTERVAL_MS = Math.max(0, Integer.parseInt(System.getProperty(Config.PROPERTY_PREFIX + "monitoring_report_interval_ms", "5000")));
+1:557bbbc: 
+1:557bbbc:     /**
+1:557bbbc:      * Defines the maximum number of unique timed out queries that will be reported in the logs.
+1:557bbbc:      * Use a negative number to remove any limit.
+1:557bbbc:      */
+1:f6ca482:     private static final int MAX_OPERATIONS = Integer.parseInt(System.getProperty(Config.PROPERTY_PREFIX + "monitoring_max_operations", "50"));
+1:557bbbc: 
+2:557bbbc:     @VisibleForTesting
+1:557bbbc:     static MonitoringTask instance = make(REPORT_INTERVAL_MS, MAX_OPERATIONS);
+1:557bbbc: 
+1:557bbbc:     private final ScheduledFuture<?> reportingTask;
+1:6966fcd:     private final OperationsQueue failedOperationsQueue;
+1:6966fcd:     private final OperationsQueue slowOperationsQueue;
+1:557bbbc:     private long lastLogTime;
+1:6966fcd: 
+1:557bbbc: 
+1:557bbbc:     @VisibleForTesting
+1:557bbbc:     static MonitoringTask make(int reportIntervalMillis, int maxTimedoutOperations)
+1:557bbbc:     {
+1:557bbbc:         if (instance != null)
+1:557bbbc:         {
+1:557bbbc:             instance.cancel();
+1:557bbbc:             instance = null;
+3:557bbbc:         }
+1:557bbbc: 
+1:557bbbc:         return new MonitoringTask(reportIntervalMillis, maxTimedoutOperations);
+1:557bbbc:     }
+1:557bbbc: 
+1:557bbbc:     private MonitoringTask(int reportIntervalMillis, int maxOperations)
+1:557bbbc:     {
+1:6966fcd:         this.failedOperationsQueue = new OperationsQueue(maxOperations);
+1:6966fcd:         this.slowOperationsQueue = new OperationsQueue(maxOperations);
+1:6966fcd: 
+1:557bbbc:         this.lastLogTime = ApproximateTime.currentTimeMillis();
+1:557bbbc: 
+1:557bbbc:         logger.info("Scheduling monitoring task with report interval of {} ms, max operations {}", reportIntervalMillis, maxOperations);
+1:6966fcd:         this.reportingTask = ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(() -> logOperations(ApproximateTime.currentTimeMillis()),
+1:557bbbc:                                                                                      reportIntervalMillis,
+1:557bbbc:                                                                                      reportIntervalMillis,
+1:557bbbc:                                                                                      TimeUnit.MILLISECONDS);
+1:557bbbc:     }
+1:557bbbc: 
+1:557bbbc:     public void cancel()
+1:557bbbc:     {
+1:557bbbc:         reportingTask.cancel(false);
+1:557bbbc:     }
+1:557bbbc: 
+1:6966fcd:     static void addFailedOperation(Monitorable operation, long now)
+1:557bbbc:     {
+1:6966fcd:         instance.failedOperationsQueue.offer(new FailedOperation(operation, now));
+1:557bbbc:     }
+1:557bbbc: 
+1:6966fcd:     static void addSlowOperation(Monitorable operation, long now)
+1:557bbbc:     {
+1:6966fcd:         instance.slowOperationsQueue.offer(new SlowOperation(operation, now));
+1:557bbbc:     }
+1:557bbbc: 
+1:557bbbc:     @VisibleForTesting
+1:557bbbc:     List<String> getFailedOperations()
+1:557bbbc:     {
+1:6966fcd:         return getLogMessages(failedOperationsQueue.popOperations());
+1:6966fcd:     }
+1:6966fcd: 
+1:6966fcd:     @VisibleForTesting
+1:6966fcd:     List<String> getSlowOperations()
+1:6966fcd:     {
+1:6966fcd:         return getLogMessages(slowOperationsQueue.popOperations());
+1:6966fcd:     }
+1:6966fcd: 
+1:6966fcd:     private List<String> getLogMessages(AggregatedOperations operations)
+1:6966fcd:     {
+1:6966fcd:         String ret = operations.getLogMessage();
+1:557bbbc:         return ret.isEmpty() ? Collections.emptyList() : Arrays.asList(ret.split("\n"));
+1:557bbbc:     }
+1:557bbbc: 
+1:557bbbc:     @VisibleForTesting
+1:6966fcd:     private void logOperations(long now)
+1:557bbbc:     {
+1:6966fcd:         logSlowOperations(now);
+1:6966fcd:         logFailedOperations(now);
+1:6966fcd: 
+1:6966fcd:         lastLogTime = now;
+1:6966fcd:     }
+1:6966fcd: 
+1:6966fcd:     @VisibleForTesting
+1:6966fcd:     boolean logFailedOperations(long now)
+1:6966fcd:     {
+1:6966fcd:         AggregatedOperations failedOperations = failedOperationsQueue.popOperations();
+1:557bbbc:         if (!failedOperations.isEmpty())
+1:557bbbc:         {
+1:557bbbc:             long elapsed = now - lastLogTime;
+1:6966fcd:             noSpamLogger.warn("Some operations timed out, details available at debug level (debug.log)");
+1:557bbbc: 
+1:557bbbc:             if (logger.isDebugEnabled())
+1:557bbbc:                 logger.debug("{} operations timed out in the last {} msecs:{}{}",
+2:557bbbc:                             failedOperations.num(),
+1:557bbbc:                             elapsed,
+1:557bbbc:                             LINE_SEPARATOR,
+1:557bbbc:                             failedOperations.getLogMessage());
+1:6966fcd:             return true;
+1:557bbbc:         }
+1:557bbbc: 
+1:6966fcd:         return false;
+1:557bbbc:     }
+1:557bbbc: 
+1:6966fcd:     @VisibleForTesting
+1:6966fcd:     boolean logSlowOperations(long now)
+1:557bbbc:     {
+1:6966fcd:         AggregatedOperations slowOperations = slowOperationsQueue.popOperations();
+1:6966fcd:         if (!slowOperations.isEmpty())
+1:6966fcd:         {
+1:6966fcd:             long elapsed = now - lastLogTime;
+1:6966fcd:             noSpamLogger.info("Some operations were slow, details available at debug level (debug.log)");
+1:557bbbc: 
+1:6966fcd:             if (logger.isDebugEnabled())
+1:6966fcd:                 logger.debug("{} operations were slow in the last {} msecs:{}{}",
+1:6966fcd:                              slowOperations.num(),
+1:6966fcd:                              elapsed,
+1:6966fcd:                              LINE_SEPARATOR,
+1:6966fcd:                              slowOperations.getLogMessage());
+1:6966fcd:             return true;
+1:6966fcd:         }
+1:6966fcd:         return false;
+1:6966fcd:     }
+1:6966fcd: 
+1:6966fcd:     /**
+1:6966fcd:      * A wrapper for a queue that can be either bounded, in which case
+1:6966fcd:      * we increment a counter if we exceed the queue size, or unbounded.
+1:6966fcd:      */
+1:6966fcd:     private static final class OperationsQueue
+1:6966fcd:     {
+1:6966fcd:         /** The max operations on the queue. If this value is zero then logging is disabled
+1:6966fcd:          * and the queue will always be empty. If this value is negative then the queue is unbounded.
+1:6966fcd:          */
+1:6966fcd:         private final int maxOperations;
+1:6966fcd: 
+1:6966fcd:         /**
+1:6966fcd:          * The operations queue, it can be either bounded or unbounded depending on the value of maxOperations.
+1:6966fcd:          */
+1:6966fcd:         private final BlockingQueue<Operation> queue;
+1:6966fcd: 
+1:6966fcd:         /**
+1:6966fcd:          * If we fail to add an operation to the queue then we increment this value. We reset this value
+1:6966fcd:          * when the queue is emptied.
+1:6966fcd:          */
+1:6966fcd:         private final AtomicLong numDroppedOperations;
+1:6966fcd: 
+1:6966fcd:         OperationsQueue(int maxOperations)
+1:6966fcd:         {
+1:6966fcd:             this.maxOperations = maxOperations;
+1:6966fcd:             this.queue = maxOperations > 0 ? new ArrayBlockingQueue<>(maxOperations) : new LinkedBlockingQueue<>();
+1:6966fcd:             this.numDroppedOperations = new AtomicLong();
+1:6966fcd:         }
+1:6966fcd: 
+1:6966fcd:         /**
+1:6966fcd:          * Add an operation to the queue, if possible, or increment the dropped counter.
+1:6966fcd:          *
+1:6966fcd:          * @param operation - the operations to add
+1:6966fcd:          */
+1:6966fcd:         private void offer(Operation operation)
+1:6966fcd:         {
+1:6966fcd:             if (maxOperations == 0)
+1:6966fcd:                 return; // logging of operations is disabled
+1:6966fcd: 
+1:6966fcd:             if (!queue.offer(operation))
+1:6966fcd:                 numDroppedOperations.incrementAndGet();
+1:6966fcd:         }
+1:6966fcd: 
+1:6966fcd: 
+1:6966fcd:         /**
+1:6966fcd:          * Return all operations in the queue, aggregated by name, and reset
+1:6966fcd:          * the counter for dropped operations.
+1:6966fcd:          *
+1:6966fcd:          * @return - the aggregated operations
+1:6966fcd:          */
+1:6966fcd:         private AggregatedOperations popOperations()
+1:6966fcd:         {
+1:6966fcd:             Map<String, Operation> operations = new HashMap<>();
+1:6966fcd: 
+1:6966fcd:             Operation operation;
+1:6966fcd:             while((operation = queue.poll()) != null)
+1:6966fcd:             {
+1:6966fcd:                 Operation existing = operations.get(operation.name());
+1:6966fcd:                 if (existing != null)
+1:6966fcd:                     existing.add(operation);
+1:6966fcd:                 else
+1:6966fcd:                     operations.put(operation.name(), operation);
+1:6966fcd:             }
+1:6966fcd:             return new AggregatedOperations(operations, numDroppedOperations.getAndSet(0L));
+1:6966fcd:         }
+1:6966fcd:     }
+1:6966fcd: 
+1:6966fcd:     /**
+1:6966fcd:      * Convert a map of aggregated operations into a log message that
+1:6966fcd:      * includes the information of whether some operations were dropped.
+1:6966fcd:      */
+1:6966fcd:     private static final class AggregatedOperations
+1:6966fcd:     {
+1:6966fcd:         private final Map<String, Operation> operations;
+1:6966fcd:         private final long numDropped;
+1:6966fcd: 
+1:6966fcd:         AggregatedOperations(Map<String, Operation> operations, long numDropped)
+1:557bbbc:         {
+1:557bbbc:             this.operations = operations;
+1:557bbbc:             this.numDropped = numDropped;
+1:557bbbc:         }
+1:557bbbc: 
+1:557bbbc:         public boolean isEmpty()
+1:557bbbc:         {
+1:557bbbc:             return operations.isEmpty() && numDropped == 0;
+1:557bbbc:         }
+1:557bbbc: 
+1:557bbbc:         public long num()
+1:557bbbc:         {
+1:557bbbc:             return operations.size() + numDropped;
+1:557bbbc:         }
+1:557bbbc: 
+1:6966fcd:         String getLogMessage()
+1:557bbbc:         {
+1:557bbbc:             if (isEmpty())
+1:557bbbc:                 return "";
+1:557bbbc: 
+1:557bbbc:             final StringBuilder ret = new StringBuilder();
+1:557bbbc:             operations.values().forEach(o -> addOperation(ret, o));
+1:557bbbc: 
+1:557bbbc:             if (numDropped > 0)
+1:557bbbc:                 ret.append(LINE_SEPARATOR)
+1:557bbbc:                    .append("... (")
+1:557bbbc:                    .append(numDropped)
+1:557bbbc:                    .append(" were dropped)");
+1:557bbbc: 
+1:557bbbc:             return ret.toString();
+1:557bbbc:         }
+1:557bbbc: 
+1:6966fcd:         private static void addOperation(StringBuilder ret, Operation operation)
+1:557bbbc:         {
+1:557bbbc:             if (ret.length() > 0)
+1:557bbbc:                 ret.append(LINE_SEPARATOR);
+1:557bbbc: 
+1:557bbbc:             ret.append(operation.getLogMessage());
+1:557bbbc:         }
+1:557bbbc:     }
+1:557bbbc: 
+1:6966fcd:     /**
+1:6966fcd:      * A wrapper class for an operation that either failed (timed-out) or
+1:6966fcd:      * was reported as slow. Because the same operation (query) may execute
+1:6966fcd:      * multiple times, we aggregate the number of times an operation with the
+1:6966fcd:      * same name (CQL query text) is reported and store the average, min and max
+1:6966fcd:      * times.
+1:6966fcd:      */
+1:6966fcd:     protected abstract static class Operation
+1:557bbbc:     {
+1:6966fcd:         /** The operation that was reported as slow or timed out */
+1:6966fcd:         final Monitorable operation;
+1:6966fcd: 
+1:6966fcd:         /** The number of times the operation was reported */
+1:6966fcd:         int numTimesReported;
+1:6966fcd: 
+1:6966fcd:         /** The total time spent by this operation */
+1:6966fcd:         long totalTime;
+1:6966fcd: 
+1:6966fcd:         /** The maximum time spent by this operation */
+1:6966fcd:         long maxTime;
+1:6966fcd: 
+1:6966fcd:         /** The minimum time spent by this operation */
+1:6966fcd:         long minTime;
+1:6966fcd: 
+1:6966fcd:         /** The name of the operation, i.e. the SELECT query CQL,
+1:6966fcd:          * this is set lazily as it takes time to build the query CQL */
+1:557bbbc:         private String name;
+1:557bbbc: 
+1:6966fcd:         Operation(Monitorable operation, long failedAt)
+1:557bbbc:         {
+1:557bbbc:             this.operation = operation;
+1:6966fcd:             numTimesReported = 1;
+1:9d9a1a1:             totalTime = failedAt - operation.constructionTime();
+1:557bbbc:             minTime = totalTime;
+1:557bbbc:             maxTime = totalTime;
+1:557bbbc:         }
+1:557bbbc: 
+1:557bbbc:         public String name()
+1:557bbbc:         {
+1:557bbbc:             if (name == null)
+1:557bbbc:                 name = operation.name();
+1:557bbbc:             return name;
+1:557bbbc:         }
+1:557bbbc: 
+1:6966fcd:         void add(Operation operation)
+1:557bbbc:         {
+1:6966fcd:             numTimesReported++;
+1:557bbbc:             totalTime += operation.totalTime;
+1:557bbbc:             maxTime = Math.max(maxTime, operation.maxTime);
+1:557bbbc:             minTime = Math.min(minTime, operation.minTime);
+1:557bbbc:         }
+1:557bbbc: 
+1:6966fcd:         public abstract String getLogMessage();
+1:6966fcd:     }
+1:6966fcd: 
+1:6966fcd:     /**
+1:6966fcd:      * An operation (query) that timed out.
+1:6966fcd:      */
+1:6966fcd:     private final static class FailedOperation extends Operation
+1:6966fcd:     {
+1:6966fcd:         FailedOperation(Monitorable operation, long failedAt)
+1:6966fcd:         {
+1:6966fcd:             super(operation, failedAt);
+1:6966fcd:         }
+1:6966fcd: 
+2:557bbbc:         public String getLogMessage()
+1:557bbbc:         {
+1:6966fcd:             if (numTimesReported == 1)
+1:6966fcd:                 return String.format("<%s>, total time %d msec, timeout %d %s",
+1:557bbbc:                                      name(),
+1:557bbbc:                                      totalTime,
+1:557bbbc:                                      operation.timeout(),
+1:9d9a1a1:                                      operation.isCrossNode() ? "msec/cross-node" : "msec");
+2:557bbbc:             else
+1:6966fcd:                 return String.format("<%s> timed out %d times, avg/min/max %d/%d/%d msec, timeout %d %s",
+1:557bbbc:                                      name(),
+1:6966fcd:                                      numTimesReported,
+1:6966fcd:                                      totalTime / numTimesReported,
+1:557bbbc:                                      minTime,
+1:557bbbc:                                      maxTime,
+1:557bbbc:                                      operation.timeout(),
+1:9d9a1a1:                                      operation.isCrossNode() ? "msec/cross-node" : "msec");
+1:557bbbc:         }
+1:557bbbc:     }
+1:6966fcd: 
+1:6966fcd:     /**
+1:6966fcd:      * An operation (query) that was reported as slow.
+1:6966fcd:      */
+1:6966fcd:     private final static class SlowOperation extends Operation
+1:6966fcd:     {
+1:6966fcd:         SlowOperation(Monitorable operation, long failedAt)
+1:6966fcd:         {
+1:6966fcd:             super(operation, failedAt);
+1:6966fcd:         }
+1:6966fcd: 
+1:6966fcd:         public String getLogMessage()
+1:6966fcd:         {
+1:6966fcd:             if (numTimesReported == 1)
+1:6966fcd:                 return String.format("<%s>, time %d msec - slow timeout %d %s",
+1:6966fcd:                                      name(),
+1:6966fcd:                                      totalTime,
+1:6966fcd:                                      operation.slowTimeout(),
+1:9d9a1a1:                                      operation.isCrossNode() ? "msec/cross-node" : "msec");
+1:6966fcd:             else
+1:6966fcd:                 return String.format("<%s>, was slow %d times: avg/min/max %d/%d/%d msec - slow timeout %d %s",
+1:6966fcd:                                      name(),
+1:6966fcd:                                      numTimesReported,
+1:6966fcd:                                      totalTime / numTimesReported,
+1:6966fcd:                                      minTime,
+1:6966fcd:                                      maxTime,
+1:6966fcd:                                      operation.slowTimeout(),
+1:9d9a1a1:                                      operation.isCrossNode() ? "msec/cross-node" : "msec");
+1:6966fcd:         }
+1:6966fcd:     }
+1:557bbbc: }
+============================================================================
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:9d9a1a1
+/////////////////////////////////////////////////////////////////////////
+1:             totalTime = failedAt - operation.constructionTime();
+/////////////////////////////////////////////////////////////////////////
+1:                                      operation.isCrossNode() ? "msec/cross-node" : "msec");
+/////////////////////////////////////////////////////////////////////////
+1:                                      operation.isCrossNode() ? "msec/cross-node" : "msec");
+/////////////////////////////////////////////////////////////////////////
+1:                                      operation.isCrossNode() ? "msec/cross-node" : "msec");
+/////////////////////////////////////////////////////////////////////////
+1:                                      operation.isCrossNode() ? "msec/cross-node" : "msec");
+author:Shogo Hoshii
+-------------------------------------------------------------------------------
+commit:6966fcd
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.NoSpamLogger;
+1:  * Since CASSANDRA-12403 we also log queries that were slow.
+1: class MonitoringTask
+1:     private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 5L, TimeUnit.MINUTES);
+/////////////////////////////////////////////////////////////////////////
+1:     private final OperationsQueue failedOperationsQueue;
+1:     private final OperationsQueue slowOperationsQueue;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         this.failedOperationsQueue = new OperationsQueue(maxOperations);
+1:         this.slowOperationsQueue = new OperationsQueue(maxOperations);
+1: 
+1:         this.reportingTask = ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(() -> logOperations(ApproximateTime.currentTimeMillis()),
+/////////////////////////////////////////////////////////////////////////
+1:     static void addFailedOperation(Monitorable operation, long now)
+1:         instance.failedOperationsQueue.offer(new FailedOperation(operation, now));
+1:     static void addSlowOperation(Monitorable operation, long now)
+1:         instance.slowOperationsQueue.offer(new SlowOperation(operation, now));
+1:         return getLogMessages(failedOperationsQueue.popOperations());
+1:     }
+1: 
+1:     @VisibleForTesting
+1:     List<String> getSlowOperations()
+1:     {
+1:         return getLogMessages(slowOperationsQueue.popOperations());
+1:     }
+1: 
+1:     private List<String> getLogMessages(AggregatedOperations operations)
+1:     {
+1:         String ret = operations.getLogMessage();
+1:     private void logOperations(long now)
+1:         logSlowOperations(now);
+1:         logFailedOperations(now);
+1: 
+1:         lastLogTime = now;
+1:     }
+1: 
+1:     @VisibleForTesting
+1:     boolean logFailedOperations(long now)
+1:     {
+1:         AggregatedOperations failedOperations = failedOperationsQueue.popOperations();
+1:             noSpamLogger.warn("Some operations timed out, details available at debug level (debug.log)");
+/////////////////////////////////////////////////////////////////////////
+1:             return true;
+1:         return false;
+1:     @VisibleForTesting
+1:     boolean logSlowOperations(long now)
+1:         AggregatedOperations slowOperations = slowOperationsQueue.popOperations();
+1:         if (!slowOperations.isEmpty())
+1:         {
+1:             long elapsed = now - lastLogTime;
+1:             noSpamLogger.info("Some operations were slow, details available at debug level (debug.log)");
+1:             if (logger.isDebugEnabled())
+1:                 logger.debug("{} operations were slow in the last {} msecs:{}{}",
+1:                              slowOperations.num(),
+1:                              elapsed,
+1:                              LINE_SEPARATOR,
+1:                              slowOperations.getLogMessage());
+1:             return true;
+1:         }
+1:         return false;
+1:     }
+1: 
+1:     /**
+1:      * A wrapper for a queue that can be either bounded, in which case
+1:      * we increment a counter if we exceed the queue size, or unbounded.
+1:      */
+1:     private static final class OperationsQueue
+1:     {
+1:         /** The max operations on the queue. If this value is zero then logging is disabled
+1:          * and the queue will always be empty. If this value is negative then the queue is unbounded.
+1:          */
+1:         private final int maxOperations;
+1: 
+1:         /**
+1:          * The operations queue, it can be either bounded or unbounded depending on the value of maxOperations.
+1:          */
+1:         private final BlockingQueue<Operation> queue;
+1: 
+1:         /**
+1:          * If we fail to add an operation to the queue then we increment this value. We reset this value
+1:          * when the queue is emptied.
+1:          */
+1:         private final AtomicLong numDroppedOperations;
+1: 
+1:         OperationsQueue(int maxOperations)
+1:         {
+1:             this.maxOperations = maxOperations;
+1:             this.queue = maxOperations > 0 ? new ArrayBlockingQueue<>(maxOperations) : new LinkedBlockingQueue<>();
+1:             this.numDroppedOperations = new AtomicLong();
+1:         }
+1: 
+1:         /**
+1:          * Add an operation to the queue, if possible, or increment the dropped counter.
+1:          *
+1:          * @param operation - the operations to add
+1:          */
+1:         private void offer(Operation operation)
+1:         {
+1:             if (maxOperations == 0)
+1:                 return; // logging of operations is disabled
+1: 
+1:             if (!queue.offer(operation))
+1:                 numDroppedOperations.incrementAndGet();
+1:         }
+1: 
+1: 
+1:         /**
+1:          * Return all operations in the queue, aggregated by name, and reset
+1:          * the counter for dropped operations.
+1:          *
+1:          * @return - the aggregated operations
+1:          */
+1:         private AggregatedOperations popOperations()
+1:         {
+1:             Map<String, Operation> operations = new HashMap<>();
+1: 
+1:             Operation operation;
+1:             while((operation = queue.poll()) != null)
+1:             {
+1:                 Operation existing = operations.get(operation.name());
+1:                 if (existing != null)
+1:                     existing.add(operation);
+1:                 else
+1:                     operations.put(operation.name(), operation);
+1:             }
+1:             return new AggregatedOperations(operations, numDroppedOperations.getAndSet(0L));
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Convert a map of aggregated operations into a log message that
+1:      * includes the information of whether some operations were dropped.
+1:      */
+1:     private static final class AggregatedOperations
+1:     {
+1:         private final Map<String, Operation> operations;
+1:         private final long numDropped;
+1: 
+1:         AggregatedOperations(Map<String, Operation> operations, long numDropped)
+/////////////////////////////////////////////////////////////////////////
+1:         String getLogMessage()
+/////////////////////////////////////////////////////////////////////////
+1:         private static void addOperation(StringBuilder ret, Operation operation)
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * A wrapper class for an operation that either failed (timed-out) or
+1:      * was reported as slow. Because the same operation (query) may execute
+1:      * multiple times, we aggregate the number of times an operation with the
+1:      * same name (CQL query text) is reported and store the average, min and max
+1:      * times.
+1:      */
+1:     protected abstract static class Operation
+1:         /** The operation that was reported as slow or timed out */
+1:         final Monitorable operation;
+1: 
+1:         /** The number of times the operation was reported */
+1:         int numTimesReported;
+1: 
+1:         /** The total time spent by this operation */
+1:         long totalTime;
+1: 
+1:         /** The maximum time spent by this operation */
+1:         long maxTime;
+1: 
+1:         /** The minimum time spent by this operation */
+1:         long minTime;
+1: 
+1:         /** The name of the operation, i.e. the SELECT query CQL,
+1:          * this is set lazily as it takes time to build the query CQL */
+1:         Operation(Monitorable operation, long failedAt)
+1:             numTimesReported = 1;
+/////////////////////////////////////////////////////////////////////////
+1:         void add(Operation operation)
+1:             numTimesReported++;
+1:         public abstract String getLogMessage();
+1:     }
+1: 
+1:     /**
+1:      * An operation (query) that timed out.
+1:      */
+1:     private final static class FailedOperation extends Operation
+1:     {
+1:         FailedOperation(Monitorable operation, long failedAt)
+1:         {
+1:             super(operation, failedAt);
+1:         }
+1: 
+1:             if (numTimesReported == 1)
+1:                 return String.format("<%s>, total time %d msec, timeout %d %s",
+1:                 return String.format("<%s> timed out %d times, avg/min/max %d/%d/%d msec, timeout %d %s",
+1:                                      numTimesReported,
+1:                                      totalTime / numTimesReported,
+1: 
+1:     /**
+1:      * An operation (query) that was reported as slow.
+1:      */
+1:     private final static class SlowOperation extends Operation
+1:     {
+1:         SlowOperation(Monitorable operation, long failedAt)
+1:         {
+1:             super(operation, failedAt);
+1:         }
+1: 
+1:         public String getLogMessage()
+1:         {
+1:             if (numTimesReported == 1)
+1:                 return String.format("<%s>, time %d msec - slow timeout %d %s",
+1:                                      name(),
+1:                                      totalTime,
+1:                                      operation.slowTimeout(),
+0:                                      operation.constructionTime().isCrossNode ? "msec/cross-node" : "msec");
+1:             else
+1:                 return String.format("<%s>, was slow %d times: avg/min/max %d/%d/%d msec - slow timeout %d %s",
+1:                                      name(),
+1:                                      numTimesReported,
+1:                                      totalTime / numTimesReported,
+1:                                      minTime,
+1:                                      maxTime,
+1:                                      operation.slowTimeout(),
+0:                                      operation.constructionTime().isCrossNode ? "msec/cross-node" : "msec");
+1:         }
+1:     }
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:f6ca482
+/////////////////////////////////////////////////////////////////////////
+1:     private static final int REPORT_INTERVAL_MS = Math.max(0, Integer.parseInt(System.getProperty(Config.PROPERTY_PREFIX + "monitoring_report_interval_ms", "5000")));
+1:     private static final int MAX_OPERATIONS = Integer.parseInt(System.getProperty(Config.PROPERTY_PREFIX + "monitoring_max_operations", "50"));
+author:Stefania Alborghetti
+-------------------------------------------------------------------------------
+commit:557bbbc
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: 
+1: package org.apache.cassandra.db.monitoring;
+1: 
+1: import java.util.Arrays;
+1: import java.util.Collections;
+1: import java.util.HashMap;
+1: import java.util.List;
+1: import java.util.Map;
+1: import java.util.concurrent.ArrayBlockingQueue;
+1: import java.util.concurrent.BlockingQueue;
+1: import java.util.concurrent.LinkedBlockingQueue;
+1: import java.util.concurrent.ScheduledFuture;
+1: import java.util.concurrent.TimeUnit;
+1: import java.util.concurrent.atomic.AtomicLong;
+1: 
+1: import com.google.common.annotations.VisibleForTesting;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import org.apache.cassandra.concurrent.ScheduledExecutors;
+1: import org.apache.cassandra.config.Config;
+1: 
+1: import static java.lang.System.getProperty;
+1: 
+1: /**
+1:  * A task for monitoring in progress operations, currently only read queries, and aborting them if they time out.
+1:  * We also log timed out operations, see CASSANDRA-7392.
+1:  */
+0: public class MonitoringTask
+1: {
+1:     private static final String LINE_SEPARATOR = getProperty("line.separator");
+1:     private static final Logger logger = LoggerFactory.getLogger(MonitoringTask.class);
+1: 
+1:     /**
+1:      * Defines the interval for reporting any operations that have timed out.
+1:      */
+0:     private static final int REPORT_INTERVAL_MS = Math.max(0, Integer.valueOf(System.getProperty(Config.PROPERTY_PREFIX + "monitoring_report_interval_ms", "5000")));
+1: 
+1:     /**
+1:      * Defines the maximum number of unique timed out queries that will be reported in the logs.
+1:      * Use a negative number to remove any limit.
+1:      */
+0:     private static final int MAX_OPERATIONS = Integer.valueOf(System.getProperty(Config.PROPERTY_PREFIX + "monitoring_max_operations", "50"));
+1: 
+1:     @VisibleForTesting
+1:     static MonitoringTask instance = make(REPORT_INTERVAL_MS, MAX_OPERATIONS);
+1: 
+0:     private final int maxOperations;
+1:     private final ScheduledFuture<?> reportingTask;
+0:     private final BlockingQueue<FailedOperation> operationsQueue;
+0:     private final AtomicLong numDroppedOperations;
+1:     private long lastLogTime;
+1: 
+1:     @VisibleForTesting
+1:     static MonitoringTask make(int reportIntervalMillis, int maxTimedoutOperations)
+1:     {
+1:         if (instance != null)
+1:         {
+1:             instance.cancel();
+1:             instance = null;
+1:         }
+1: 
+1:         return new MonitoringTask(reportIntervalMillis, maxTimedoutOperations);
+1:     }
+1: 
+1:     private MonitoringTask(int reportIntervalMillis, int maxOperations)
+1:     {
+0:         this.maxOperations = maxOperations;
+0:         this.operationsQueue = maxOperations > 0 ? new ArrayBlockingQueue<>(maxOperations) : new LinkedBlockingQueue<>();
+0:         this.numDroppedOperations = new AtomicLong();
+1:         this.lastLogTime = ApproximateTime.currentTimeMillis();
+1: 
+1:         logger.info("Scheduling monitoring task with report interval of {} ms, max operations {}", reportIntervalMillis, maxOperations);
+0:         this.reportingTask = ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(() -> logFailedOperations(ApproximateTime.currentTimeMillis()),
+1:                                                                                      reportIntervalMillis,
+1:                                                                                      reportIntervalMillis,
+1:                                                                                      TimeUnit.MILLISECONDS);
+1:     }
+1: 
+1:     public void cancel()
+1:     {
+1:         reportingTask.cancel(false);
+1:     }
+1: 
+0:     public static void addFailedOperation(Monitorable operation, long now)
+1:     {
+0:         instance.innerAddFailedOperation(operation, now);
+1:     }
+1: 
+0:     private void innerAddFailedOperation(Monitorable operation, long now)
+1:     {
+0:         if (maxOperations == 0)
+0:             return; // logging of failed operations disabled
+1: 
+0:         if (!operationsQueue.offer(new FailedOperation(operation, now)))
+0:             numDroppedOperations.incrementAndGet();
+1:     }
+1: 
+1:     @VisibleForTesting
+0:     FailedOperations aggregateFailedOperations()
+1:     {
+0:         Map<String, FailedOperation> operations = new HashMap<>();
+1: 
+0:         FailedOperation failedOperation;
+0:         while((failedOperation = operationsQueue.poll()) != null)
+1:         {
+0:             FailedOperation existing = operations.get(failedOperation.name());
+0:             if (existing != null)
+0:                 existing.addTimeout(failedOperation);
+1:             else
+0:                 operations.put(failedOperation.name(), failedOperation);
+1:         }
+1: 
+0:         return new FailedOperations(operations, numDroppedOperations.getAndSet(0L));
+1:     }
+1: 
+1:     @VisibleForTesting
+1:     List<String> getFailedOperations()
+1:     {
+0:         FailedOperations failedOperations = aggregateFailedOperations();
+0:         String ret = failedOperations.getLogMessage();
+0:         lastLogTime = ApproximateTime.currentTimeMillis();
+1:         return ret.isEmpty() ? Collections.emptyList() : Arrays.asList(ret.split("\n"));
+1:     }
+1: 
+1:     @VisibleForTesting
+0:     void logFailedOperations(long now)
+1:     {
+0:         FailedOperations failedOperations = aggregateFailedOperations();
+1:         if (!failedOperations.isEmpty())
+1:         {
+1:             long elapsed = now - lastLogTime;
+0:             logger.warn("{} operations timed out in the last {} msecs, operation list available at debug log level",
+1:                         failedOperations.num(),
+0:                         elapsed);
+1: 
+1:             if (logger.isDebugEnabled())
+1:                 logger.debug("{} operations timed out in the last {} msecs:{}{}",
+1:                             failedOperations.num(),
+1:                             elapsed,
+1:                             LINE_SEPARATOR,
+1:                             failedOperations.getLogMessage());
+1:         }
+1: 
+0:         lastLogTime = now;
+1:     }
+1: 
+0:     private static final class FailedOperations
+1:     {
+0:         public final Map<String, FailedOperation> operations;
+0:         public final long numDropped;
+1: 
+0:         FailedOperations(Map<String, FailedOperation> operations, long numDropped)
+1:         {
+1:             this.operations = operations;
+1:             this.numDropped = numDropped;
+1:         }
+1: 
+1:         public boolean isEmpty()
+1:         {
+1:             return operations.isEmpty() && numDropped == 0;
+1:         }
+1: 
+1:         public long num()
+1:         {
+1:             return operations.size() + numDropped;
+1:         }
+1: 
+1:         public String getLogMessage()
+1:         {
+1:             if (isEmpty())
+1:                 return "";
+1: 
+1:             final StringBuilder ret = new StringBuilder();
+1:             operations.values().forEach(o -> addOperation(ret, o));
+1: 
+1:             if (numDropped > 0)
+1:                 ret.append(LINE_SEPARATOR)
+1:                    .append("... (")
+1:                    .append(numDropped)
+1:                    .append(" were dropped)");
+1: 
+1:             return ret.toString();
+1:         }
+1: 
+0:         private static void addOperation(StringBuilder ret, FailedOperation operation)
+1:         {
+1:             if (ret.length() > 0)
+1:                 ret.append(LINE_SEPARATOR);
+1: 
+1:             ret.append(operation.getLogMessage());
+1:         }
+1:     }
+1: 
+0:     private final static class FailedOperation
+1:     {
+0:         public final Monitorable operation;
+0:         public int numTimeouts;
+0:         public long totalTime;
+0:         public long maxTime;
+0:         public long minTime;
+1:         private String name;
+1: 
+0:         FailedOperation(Monitorable operation, long failedAt)
+1:         {
+1:             this.operation = operation;
+0:             numTimeouts = 1;
+0:             totalTime = failedAt - operation.constructionTime().timestamp;
+1:             minTime = totalTime;
+1:             maxTime = totalTime;
+1:         }
+1: 
+1:         public String name()
+1:         {
+1:             if (name == null)
+1:                 name = operation.name();
+1:             return name;
+1:         }
+1: 
+0:         void addTimeout(FailedOperation operation)
+1:         {
+0:             numTimeouts++;
+1:             totalTime += operation.totalTime;
+1:             maxTime = Math.max(maxTime, operation.maxTime);
+1:             minTime = Math.min(minTime, operation.minTime);
+1:         }
+1: 
+1:         public String getLogMessage()
+1:         {
+0:             if (numTimeouts == 1)
+0:                 return String.format("%s: total time %d msec - timeout %d %s",
+1:                                      name(),
+1:                                      totalTime,
+1:                                      operation.timeout(),
+0:                                      operation.constructionTime().isCrossNode ? "msec/cross-node" : "msec");
+1:             else
+0:                 return String.format("%s (timed out %d times): total time avg/min/max %d/%d/%d msec - timeout %d %s",
+1:                                      name(),
+0:                                      numTimeouts,
+0:                                      totalTime / numTimeouts,
+1:                                      minTime,
+1:                                      maxTime,
+1:                                      operation.timeout(),
+0:                                      operation.constructionTime().isCrossNode ? "msec/cross-node" : "msec");
+1:         }
+1:     }
+1: }
+============================================================================

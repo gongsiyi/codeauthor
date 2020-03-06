@@ -1,0 +1,574 @@
+1:5250d7f: /*
+1:5250d7f:  * Licensed to the Apache Software Foundation (ASF) under one
+1:5250d7f:  * or more contributor license agreements.  See the NOTICE file
+1:5250d7f:  * distributed with this work for additional information
+1:5250d7f:  * regarding copyright ownership.  The ASF licenses this file
+1:5250d7f:  * to you under the Apache License, Version 2.0 (the
+1:5250d7f:  * "License"); you may not use this file except in compliance
+1:5250d7f:  * with the License.  You may obtain a copy of the License at
+1:5250d7f:  *
+1:5250d7f:  *    http://www.apache.org/licenses/LICENSE-2.0
+1:5250d7f:  *
+1:5250d7f:  * Unless required by applicable law or agreed to in writing,
+1:5250d7f:  * software distributed under the License is distributed on an
+1:5250d7f:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+1:5250d7f:  * KIND, either express or implied.  See the License for the
+1:5250d7f:  * specific language governing permissions and limitations
+1:5250d7f:  * under the License.
+1:5250d7f:  */
+1:5250d7f: package org.apache.cassandra.utils.btree;
+1:5250d7f: 
+1:5250d7f: import java.util.Arrays;
+1:5250d7f: import java.util.Comparator;
+1:5250d7f: 
+1:5250d7f: import static org.apache.cassandra.utils.btree.BTree.*;
+1:5250d7f: 
+1:5250d7f: /**
+1:5250d7f:  * Supports two basic operations for moving around a BTree, either forwards or backwards:
+1:5250d7f:  * moveOne(), and seekTo()
+1:5250d7f:  *
+1:5250d7f:  * These two methods, along with movement to the start/end, permit us to construct any desired
+1:5250d7f:  * movement around a btree, without much cognitive burden.
+1:5250d7f:  *
+1:5250d7f:  * This TreeCursor is (and has its methods) package private. This is to avoid polluting the BTreeSearchIterator
+1:5250d7f:  * that extends it, and uses its functionality. If this class is useful for wider consumption, a public extension
+1:5250d7f:  * class can be provided, that just makes all of its methods public.
+1:5250d7f:  */
+1:5250d7f: class TreeCursor<K> extends NodeCursor<K>
+1:5250d7f: {
+1:5250d7f:     // TODO: spend some time optimising compiler inlining decisions: many of these methods have only one primary call-site
+1:5250d7f: 
+1:5250d7f:     NodeCursor<K> cur;
+1:5250d7f: 
+1:5250d7f:     TreeCursor(Comparator<? super K> comparator, Object[] node)
+1:5250d7f:     {
+1:5250d7f:         super(node, null, comparator);
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * Move the cursor to either the first or last item in the btree
+1:5250d7f:      * @param start true if should move to the first item; false moves to the last
+1:5250d7f:      */
+1:5250d7f:     void reset(boolean start)
+1:5250d7f:     {
+2:5250d7f:         cur = root();
+1:5250d7f:         root().inChild = false;
+1:5250d7f:         // this is a corrupt position, but we ensure we never use it except to start our search from
+1:5250d7f:         root().position = start ? -1 : getKeyEnd(root().node);
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * move the Cursor one item, either forwards or backwards
+1:5250d7f:      * @param forwards direction of travel
+1:5250d7f:      * @return false iff the cursor is exhausted in the direction of travel
+1:5250d7f:      */
+1:5250d7f:     int moveOne(boolean forwards)
+1:5250d7f:     {
+2:5250d7f:         NodeCursor<K> cur = this.cur;
+1:5250d7f:         if (cur.isLeaf())
+1:5250d7f:         {
+1:5250d7f:             // if we're a leaf, we try to step forwards inside ourselves
+1:5250d7f:             if (cur.advanceLeafNode(forwards))
+1:5250d7f:                 return cur.globalLeafIndex();
+1:5250d7f: 
+1:5250d7f:             // if we fail, we just find our bounding parent
+1:5250d7f:             this.cur = cur = moveOutOfLeaf(forwards, cur, root());
+1:5250d7f:             return cur.globalIndex();
+1:5250d7f:         }
+1:5250d7f: 
+1:5250d7f:         // otherwise we descend directly into our next child
+1:5250d7f:         if (forwards)
+1:5250d7f:             ++cur.position;
+1:5250d7f:         cur = cur.descend();
+1:5250d7f: 
+1:5250d7f:         // and go to its first item
+1:5250d7f:         NodeCursor<K> next;
+1:5250d7f:         while ( null != (next = cur.descendToFirstChild(forwards)) )
+1:5250d7f:             cur = next;
+1:5250d7f: 
+1:5250d7f:         this.cur = cur;
+1:5250d7f:         return cur.globalLeafIndex();
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * seeks from the current position, forwards or backwards, for the provided key
+1:5250d7f:      * while the direction could be inferred (or ignored), it is required so that (e.g.) we do not infinitely loop on bad inputs
+1:aef7169:      * if there is no such key, it moves to the key that would naturally follow/succeed it (i.e. it behaves as ceil when ascending; floor when descending)
+1:5250d7f:      */
+1:aef7169:     boolean seekTo(K key, boolean forwards, boolean skipOne)
+1:5250d7f:     {
+1:5250d7f:         NodeCursor<K> cur = this.cur;
+1:5250d7f: 
+1:5250d7f:         /**
+1:5250d7f:          * decide if we will "try one" value by itself, as a sequential access;
+1:5250d7f:          * we actually *require* that we try the "current key" for any node before we call seekInNode on it.
+1:5250d7f:          *
+1:5250d7f:          * if we are already on a value, we just check it irregardless of if it is a leaf or not;
+1:5250d7f:          * if we are not, we have already excluded it (as we have consumed it), so:
+1:5250d7f:          *    if we are on a branch we consider that good enough;
+1:5250d7f:          *    otherwise, we move onwards one, and we try the new value
+1:5250d7f:          *
+1:5250d7f:          */
+1:5250d7f:         boolean tryOne = !skipOne;
+1:5250d7f:         if ((!tryOne & cur.isLeaf()) && !(tryOne = (cur.advanceLeafNode(forwards) || (cur = moveOutOfLeaf(forwards, cur, null)) != null)))
+1:5250d7f:         {
+1:5250d7f:             // we moved out of the tree; return out-of-bounds
+1:5250d7f:             this.cur = root();
+1:aef7169:             return false;
+1:5250d7f:         }
+1:5250d7f: 
+1:5250d7f:         if (tryOne)
+1:5250d7f:         {
+1:5250d7f:             // we're presently on a value we can (and *must*) cheaply test
+1:5250d7f:             K test = cur.value();
+1:5250d7f: 
+1:5250d7f:             int cmp;
+1:5250d7f:             if (key == test) cmp = 0; // check object identity first, since we utilise that in some places and it's very cheap
+1:639d4b2:             else cmp = comparator.compare(test, key); // order of provision matters for asymmetric comparators
+1:639d4b2:             if (forwards ? cmp >= 0 : cmp <= 0)
+1:5250d7f:             {
+1:5250d7f:                 // we've either matched, or excluded the value from being present
+1:5250d7f:                 this.cur = cur;
+1:aef7169:                 return cmp == 0;
+1:5250d7f:             }
+1:5250d7f:         }
+1:5250d7f: 
+1:5250d7f:         // if we failed to match with the cheap test, first look to see if we're even in the correct sub-tree
+1:5250d7f:         while (cur != root())
+1:5250d7f:         {
+1:5250d7f:             NodeCursor<K> bound = cur.boundIterator(forwards);
+1:5250d7f:             if (bound == null)
+1:5250d7f:                 break; // we're all that's left
+1:5250d7f: 
+1:b44a773:             int cmpbound = comparator.compare(bound.bound(forwards), key); // order of provision matters for asymmetric comparators
+1:b44a773:             if (forwards ? cmpbound > 0 : cmpbound < 0)
+1:5250d7f:                 break; //  already in correct sub-tree
+1:5250d7f: 
+1:5250d7f:             // bound is on-or-before target, so ascend to that bound and continue looking upwards
+1:5250d7f:             cur = bound;
+1:5250d7f:             cur.safeAdvanceIntoBranchFromChild(forwards);
+1:5250d7f:             if (cmpbound == 0) // it was an exact match, so terminate here
+1:5250d7f:             {
+1:5250d7f:                 this.cur = cur;
+1:aef7169:                 return true;
+1:5250d7f:             }
+1:5250d7f:         }
+1:5250d7f: 
+1:5250d7f:         // we must now be able to find our target in the sub-tree rooted at cur
+1:5250d7f:         boolean match;
+1:5250d7f:         while (!(match = cur.seekInNode(key, forwards)) && !cur.isLeaf())
+1:5250d7f:         {
+1:5250d7f:             cur = cur.descend();
+1:5250d7f:             cur.position = forwards ? -1 : getKeyEnd(cur.node);
+1:5250d7f:         }
+1:5250d7f: 
+1:5250d7f:         if (!match)
+1:5250d7f:             cur = ensureValidLocation(forwards, cur);
+1:5250d7f: 
+1:5250d7f:         this.cur = cur;
+1:5250d7f:         assert !cur.inChild;
+1:aef7169:         return match;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * ensures a leaf node we have seeked in, is not positioned outside of its bounds,
+1:5250d7f:      * by moving us into its parents (if any); if it is the root, we're permitted to be out-of-bounds
+1:5250d7f:      * as this indicates exhaustion
+1:5250d7f:      */
+1:5250d7f:     private NodeCursor<K> ensureValidLocation(boolean forwards, NodeCursor<K> cur)
+1:5250d7f:     {
+1:5250d7f:         assert cur.isLeaf();
+1:5250d7f:         int position = cur.position;
+1:5250d7f:         // if we're out of bounds of the leaf, move once in direction of travel
+1:5250d7f:         if ((position < 0) | (position >= getLeafKeyEnd(cur.node)))
+1:5250d7f:             cur = moveOutOfLeaf(forwards, cur, root());
+1:5250d7f:         return cur;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * move out of a leaf node that is currently out of (its own) bounds
+1:aef7169:      * @return null if we're now out-of-bounds of the whole tree
+1:5250d7f:      */
+1:5250d7f:     private <K> NodeCursor<K> moveOutOfLeaf(boolean forwards, NodeCursor<K> cur, NodeCursor<K> ifFail)
+1:5250d7f:     {
+1:5250d7f:         while (true)
+1:5250d7f:         {
+1:5250d7f:             cur = cur.parent;
+1:5250d7f:             if (cur == null)
+1:5250d7f:             {
+1:5250d7f:                 root().inChild = false;
+1:5250d7f:                 return ifFail;
+1:5250d7f:             }
+1:5250d7f:             if (cur.advanceIntoBranchFromChild(forwards))
+1:5250d7f:                 break;
+1:5250d7f:         }
+1:5250d7f:         cur.inChild = false;
+1:5250d7f:         return cur;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * resets the cursor and seeks to the specified position; does not assume locality or take advantage of the cursor's current position
+1:5250d7f:      */
+1:5250d7f:     void seekTo(int index)
+1:5250d7f:     {
+1:5250d7f:         if ((index < 0) | (index >= BTree.size(rootNode())))
+1:5250d7f:         {
+1:5250d7f:             if ((index < -1) | (index > BTree.size(rootNode())))
+1:5250d7f:                 throw new IndexOutOfBoundsException(index + " not in range [0.." + BTree.size(rootNode()) + ")");
+1:5250d7f:             reset(index == -1);
+1:5250d7f:             return;
+1:5250d7f:         }
+1:5250d7f: 
+1:0f5e780:         NodeCursor<K> cur = root();
+1:5250d7f:         assert cur.nodeOffset == 0;
+1:5250d7f:         while (true)
+1:5250d7f:         {
+1:5250d7f:             int relativeIndex = index - cur.nodeOffset; // index within subtree rooted at cur
+1:5250d7f:             Object[] node = cur.node;
+1:5250d7f: 
+1:5250d7f:             if (cur.isLeaf())
+1:5250d7f:             {
+1:5250d7f:                 assert relativeIndex < getLeafKeyEnd(node);
+1:5250d7f:                 cur.position = relativeIndex;
+1:5250d7f:                 this.cur = cur;
+1:5250d7f:                 return;
+1:5250d7f:             }
+1:5250d7f: 
+1:5250d7f:             int[] sizeMap = getSizeMap(node);
+1:5250d7f:             int boundary = Arrays.binarySearch(sizeMap, relativeIndex);
+1:5250d7f:             if (boundary >= 0)
+1:5250d7f:             {
+1:5250d7f:                 // exact match, in this branch node
+1:5250d7f:                 assert boundary < sizeMap.length - 1;
+1:5250d7f:                 cur.position = boundary;
+1:5250d7f:                 cur.inChild = false;
+1:5250d7f:                 this.cur = cur;
+1:5250d7f:                 return;
+1:5250d7f:             }
+1:5250d7f: 
+1:5250d7f:             cur.inChild = true;
+1:5250d7f:             cur.position = -1 -boundary;
+1:5250d7f:             cur = cur.descend();
+1:5250d7f:         }
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     private NodeCursor<K> root()
+1:5250d7f:     {
+1:5250d7f:         return this;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     Object[] rootNode()
+1:5250d7f:     {
+1:5250d7f:         return this.node;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     K currentValue()
+1:5250d7f:     {
+1:5250d7f:         return cur.value();
+1:5250d7f:     }
+1:5250d7f: }
+============================================================================
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:0f5e780
+/////////////////////////////////////////////////////////////////////////
+1:         NodeCursor<K> cur = root();
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:aef7169
+/////////////////////////////////////////////////////////////////////////
+1:      * if there is no such key, it moves to the key that would naturally follow/succeed it (i.e. it behaves as ceil when ascending; floor when descending)
+1:     boolean seekTo(K key, boolean forwards, boolean skipOne)
+/////////////////////////////////////////////////////////////////////////
+1:             return false;
+/////////////////////////////////////////////////////////////////////////
+1:                 return cmp == 0;
+/////////////////////////////////////////////////////////////////////////
+1:                 return true;
+/////////////////////////////////////////////////////////////////////////
+1:         return match;
+/////////////////////////////////////////////////////////////////////////
+1:      * @return null if we're now out-of-bounds of the whole tree
+commit:b44a773
+/////////////////////////////////////////////////////////////////////////
+1:             int cmpbound = comparator.compare(bound.bound(forwards), key); // order of provision matters for asymmetric comparators
+1:             if (forwards ? cmpbound > 0 : cmpbound < 0)
+commit:639d4b2
+/////////////////////////////////////////////////////////////////////////
+1:             else cmp = comparator.compare(test, key); // order of provision matters for asymmetric comparators
+1:             if (forwards ? cmp >= 0 : cmp <= 0)
+commit:5250d7f
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *    http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing,
+1:  * software distributed under the License is distributed on an
+1:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+1:  * KIND, either express or implied.  See the License for the
+1:  * specific language governing permissions and limitations
+1:  * under the License.
+1:  */
+1: package org.apache.cassandra.utils.btree;
+1: 
+1: import java.util.Arrays;
+1: import java.util.Comparator;
+1: 
+1: import static org.apache.cassandra.utils.btree.BTree.*;
+1: 
+1: /**
+1:  * Supports two basic operations for moving around a BTree, either forwards or backwards:
+1:  * moveOne(), and seekTo()
+1:  *
+1:  * These two methods, along with movement to the start/end, permit us to construct any desired
+1:  * movement around a btree, without much cognitive burden.
+1:  *
+1:  * This TreeCursor is (and has its methods) package private. This is to avoid polluting the BTreeSearchIterator
+1:  * that extends it, and uses its functionality. If this class is useful for wider consumption, a public extension
+1:  * class can be provided, that just makes all of its methods public.
+1:  */
+1: class TreeCursor<K> extends NodeCursor<K>
+1: {
+1:     // TODO: spend some time optimising compiler inlining decisions: many of these methods have only one primary call-site
+1: 
+1:     NodeCursor<K> cur;
+1: 
+1:     TreeCursor(Comparator<? super K> comparator, Object[] node)
+1:     {
+1:         super(node, null, comparator);
+1:     }
+1: 
+1:     /**
+1:      * Move the cursor to either the first or last item in the btree
+1:      * @param start true if should move to the first item; false moves to the last
+1:      */
+1:     void reset(boolean start)
+1:     {
+1:         cur = root();
+1:         root().inChild = false;
+1:         // this is a corrupt position, but we ensure we never use it except to start our search from
+1:         root().position = start ? -1 : getKeyEnd(root().node);
+1:     }
+1: 
+1:     /**
+1:      * move the Cursor one item, either forwards or backwards
+1:      * @param forwards direction of travel
+1:      * @return false iff the cursor is exhausted in the direction of travel
+1:      */
+1:     int moveOne(boolean forwards)
+1:     {
+1:         NodeCursor<K> cur = this.cur;
+1:         if (cur.isLeaf())
+1:         {
+1:             // if we're a leaf, we try to step forwards inside ourselves
+1:             if (cur.advanceLeafNode(forwards))
+1:                 return cur.globalLeafIndex();
+1: 
+1:             // if we fail, we just find our bounding parent
+1:             this.cur = cur = moveOutOfLeaf(forwards, cur, root());
+1:             return cur.globalIndex();
+1:         }
+1: 
+1:         // otherwise we descend directly into our next child
+1:         if (forwards)
+1:             ++cur.position;
+1:         cur = cur.descend();
+1: 
+1:         // and go to its first item
+1:         NodeCursor<K> next;
+1:         while ( null != (next = cur.descendToFirstChild(forwards)) )
+1:             cur = next;
+1: 
+1:         this.cur = cur;
+1:         return cur.globalLeafIndex();
+1:     }
+1: 
+1:     /**
+1:      * seeks from the current position, forwards or backwards, for the provided key
+1:      * while the direction could be inferred (or ignored), it is required so that (e.g.) we do not infinitely loop on bad inputs
+0:      * if there is no such key, it moves to the key that would naturally proceed it (i.e. it behaves as ceil when ascending; floor when descending)
+1:      */
+0:     int seekTo(K key, boolean forwards, boolean skipOne)
+1:     {
+1:         NodeCursor<K> cur = this.cur;
+1: 
+1:         /**
+1:          * decide if we will "try one" value by itself, as a sequential access;
+1:          * we actually *require* that we try the "current key" for any node before we call seekInNode on it.
+1:          *
+1:          * if we are already on a value, we just check it irregardless of if it is a leaf or not;
+1:          * if we are not, we have already excluded it (as we have consumed it), so:
+1:          *    if we are on a branch we consider that good enough;
+1:          *    otherwise, we move onwards one, and we try the new value
+1:          *
+1:          */
+1:         boolean tryOne = !skipOne;
+1:         if ((!tryOne & cur.isLeaf()) && !(tryOne = (cur.advanceLeafNode(forwards) || (cur = moveOutOfLeaf(forwards, cur, null)) != null)))
+1:         {
+1:             // we moved out of the tree; return out-of-bounds
+1:             this.cur = root();
+0:             return forwards ? -1 - size(rootNode()) : -1;
+1:         }
+1: 
+1:         if (tryOne)
+1:         {
+1:             // we're presently on a value we can (and *must*) cheaply test
+1:             K test = cur.value();
+1: 
+1:             int cmp;
+1:             if (key == test) cmp = 0; // check object identity first, since we utilise that in some places and it's very cheap
+0:             else cmp = comparator.compare(key, test);
+0:             if (forwards ? cmp <= 0 : cmp >= 0)
+1:             {
+1:                 // we've either matched, or excluded the value from being present
+0:                 int index = cur.globalIndex();
+1:                 this.cur = cur;
+0:                 return cmp == 0 ? index : -1 -index;
+1:             }
+1:         }
+1: 
+1:         // if we failed to match with the cheap test, first look to see if we're even in the correct sub-tree
+1:         while (cur != root())
+1:         {
+1:             NodeCursor<K> bound = cur.boundIterator(forwards);
+1:             if (bound == null)
+1:                 break; // we're all that's left
+1: 
+0:             int cmpbound = comparator.compare(key, bound.bound(forwards));
+0:             if (forwards ? cmpbound < 0 : cmpbound > 0)
+1:                 break; //  already in correct sub-tree
+1: 
+1:             // bound is on-or-before target, so ascend to that bound and continue looking upwards
+1:             cur = bound;
+1:             cur.safeAdvanceIntoBranchFromChild(forwards);
+1:             if (cmpbound == 0) // it was an exact match, so terminate here
+1:             {
+1:                 this.cur = cur;
+0:                 return cur.globalBranchIndex();
+1:             }
+1:         }
+1: 
+1:         // we must now be able to find our target in the sub-tree rooted at cur
+1:         boolean match;
+1:         while (!(match = cur.seekInNode(key, forwards)) && !cur.isLeaf())
+1:         {
+1:             cur = cur.descend();
+1:             cur.position = forwards ? -1 : getKeyEnd(cur.node);
+1:         }
+1: 
+1:         if (!match)
+1:             cur = ensureValidLocation(forwards, cur);
+1: 
+1:         this.cur = cur;
+1:         assert !cur.inChild;
+0:         int index = cur.globalIndex();
+0:         return match ? index : -1 -index;
+1:     }
+1: 
+1:     /**
+1:      * ensures a leaf node we have seeked in, is not positioned outside of its bounds,
+1:      * by moving us into its parents (if any); if it is the root, we're permitted to be out-of-bounds
+1:      * as this indicates exhaustion
+1:      */
+1:     private NodeCursor<K> ensureValidLocation(boolean forwards, NodeCursor<K> cur)
+1:     {
+1:         assert cur.isLeaf();
+1:         int position = cur.position;
+1:         // if we're out of bounds of the leaf, move once in direction of travel
+1:         if ((position < 0) | (position >= getLeafKeyEnd(cur.node)))
+1:             cur = moveOutOfLeaf(forwards, cur, root());
+1:         return cur;
+1:     }
+1: 
+1:     /**
+1:      * move out of a leaf node that is currently out of (its own) bounds
+0:      * @return null if we're now out-of-bounds of the whole true
+1:      */
+1:     private <K> NodeCursor<K> moveOutOfLeaf(boolean forwards, NodeCursor<K> cur, NodeCursor<K> ifFail)
+1:     {
+1:         while (true)
+1:         {
+1:             cur = cur.parent;
+1:             if (cur == null)
+1:             {
+1:                 root().inChild = false;
+1:                 return ifFail;
+1:             }
+1:             if (cur.advanceIntoBranchFromChild(forwards))
+1:                 break;
+1:         }
+1:         cur.inChild = false;
+1:         return cur;
+1:     }
+1: 
+1:     /**
+1:      * resets the cursor and seeks to the specified position; does not assume locality or take advantage of the cursor's current position
+1:      */
+1:     void seekTo(int index)
+1:     {
+1:         if ((index < 0) | (index >= BTree.size(rootNode())))
+1:         {
+1:             if ((index < -1) | (index > BTree.size(rootNode())))
+1:                 throw new IndexOutOfBoundsException(index + " not in range [0.." + BTree.size(rootNode()) + ")");
+1:             reset(index == -1);
+1:             return;
+1:         }
+1: 
+1:         NodeCursor<K> cur = this.cur;
+1:         cur = root();
+1:         assert cur.nodeOffset == 0;
+1:         while (true)
+1:         {
+1:             int relativeIndex = index - cur.nodeOffset; // index within subtree rooted at cur
+1:             Object[] node = cur.node;
+1: 
+1:             if (cur.isLeaf())
+1:             {
+1:                 assert relativeIndex < getLeafKeyEnd(node);
+1:                 cur.position = relativeIndex;
+1:                 this.cur = cur;
+1:                 return;
+1:             }
+1: 
+1:             int[] sizeMap = getSizeMap(node);
+1:             int boundary = Arrays.binarySearch(sizeMap, relativeIndex);
+1:             if (boundary >= 0)
+1:             {
+1:                 // exact match, in this branch node
+1:                 assert boundary < sizeMap.length - 1;
+1:                 cur.position = boundary;
+1:                 cur.inChild = false;
+1:                 this.cur = cur;
+1:                 return;
+1:             }
+1: 
+1:             cur.inChild = true;
+1:             cur.position = -1 -boundary;
+1:             cur = cur.descend();
+1:         }
+1:     }
+1: 
+1:     private NodeCursor<K> root()
+1:     {
+1:         return this;
+1:     }
+1: 
+1:     Object[] rootNode()
+1:     {
+1:         return this.node;
+1:     }
+1: 
+1:     K currentValue()
+1:     {
+1:         return cur.value();
+1:     }
+1: }
+============================================================================

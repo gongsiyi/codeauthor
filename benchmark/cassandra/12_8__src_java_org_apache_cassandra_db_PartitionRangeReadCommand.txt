@@ -1,0 +1,856 @@
+1:a991b64: /*
+1:a991b64:  * Licensed to the Apache Software Foundation (ASF) under one
+1:a991b64:  * or more contributor license agreements.  See the NOTICE file
+1:a991b64:  * distributed with this work for additional information
+1:a991b64:  * regarding copyright ownership.  The ASF licenses this file
+1:a991b64:  * to you under the Apache License, Version 2.0 (the
+1:a991b64:  * "License"); you may not use this file except in compliance
+1:a991b64:  * with the License.  You may obtain a copy of the License at
+1:a991b64:  *
+1:a991b64:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:a991b64:  *
+1:a991b64:  * Unless required by applicable law or agreed to in writing, software
+1:a991b64:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:a991b64:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:a991b64:  * See the License for the specific language governing permissions and
+1:a991b64:  * limitations under the License.
+1:a991b64:  */
+1:a991b64: package org.apache.cassandra.db;
+3:a991b64: 
+1:a991b64: import java.io.IOException;
+1:a991b64: import java.util.ArrayList;
+1:a991b64: import java.util.List;
+1:e097efc: import java.util.Optional;
+1:a991b64: 
+1:a991b64: import com.google.common.collect.Iterables;
+1:a991b64: 
+1:a991b64: import org.apache.cassandra.config.CFMetaData;
+1:a991b64: import org.apache.cassandra.config.DatabaseDescriptor;
+1:a991b64: import org.apache.cassandra.db.filter.*;
+1:ad8cad7: import org.apache.cassandra.db.lifecycle.View;
+1:a991b64: import org.apache.cassandra.db.partitions.*;
+1:6094974: import org.apache.cassandra.db.rows.BaseRowIterator;
+1:6094974: import org.apache.cassandra.db.transform.Transformation;
+1:a991b64: import org.apache.cassandra.dht.AbstractBounds;
+1:a991b64: import org.apache.cassandra.exceptions.RequestExecutionException;
+1:0626be8: import org.apache.cassandra.index.Index;
+1:a991b64: import org.apache.cassandra.io.sstable.format.SSTableReader;
+1:2457599: import org.apache.cassandra.io.util.DataInputPlus;
+1:a991b64: import org.apache.cassandra.io.util.DataOutputPlus;
+1:0bd5170: import org.apache.cassandra.metrics.TableMetrics;
+1:8c64cef: import org.apache.cassandra.net.MessageOut;
+1:8c64cef: import org.apache.cassandra.net.MessagingService;
+1:e097efc: import org.apache.cassandra.schema.IndexMetadata;
+1:0626be8: import org.apache.cassandra.service.ClientState;
+1:0626be8: import org.apache.cassandra.service.StorageProxy;
+1:a991b64: import org.apache.cassandra.service.pager.*;
+1:a991b64: import org.apache.cassandra.thrift.ThriftResultsMerger;
+1:a991b64: import org.apache.cassandra.tracing.Tracing;
+1:e0adc16: import org.apache.cassandra.transport.ProtocolVersion;
+1:a991b64: import org.apache.cassandra.utils.FBUtilities;
+1:a991b64: 
+1:a991b64: /**
+1:a991b64:  * A read command that selects a (part of a) range of partitions.
+1:a991b64:  */
+1:a991b64: public class PartitionRangeReadCommand extends ReadCommand
+1:a991b64: {
+1:a991b64:     protected static final SelectionDeserializer selectionDeserializer = new Deserializer();
+1:a991b64: 
+1:a991b64:     private final DataRange dataRange;
+1:6f0c12f:     private int oldestUnrepairedTombstone = Integer.MAX_VALUE;
+1:a991b64: 
+1:a991b64:     public PartitionRangeReadCommand(boolean isDigest,
+1:782a1c3:                                      int digestVersion,
+1:a991b64:                                      boolean isForThrift,
+1:a991b64:                                      CFMetaData metadata,
+1:a991b64:                                      int nowInSec,
+1:a991b64:                                      ColumnFilter columnFilter,
+1:a991b64:                                      RowFilter rowFilter,
+1:a991b64:                                      DataLimits limits,
+1:e097efc:                                      DataRange dataRange,
+1:e097efc:                                      Optional<IndexMetadata> index)
+1:a991b64:     {
+1:782a1c3:         super(Kind.PARTITION_RANGE, isDigest, digestVersion, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits);
+1:a991b64:         this.dataRange = dataRange;
+1:e097efc:         this.index = index;
+1:a991b64:     }
+1:8c64cef: 
+1:a991b64:     public PartitionRangeReadCommand(CFMetaData metadata,
+1:a991b64:                                      int nowInSec,
+1:a991b64:                                      ColumnFilter columnFilter,
+1:a991b64:                                      RowFilter rowFilter,
+1:a991b64:                                      DataLimits limits,
+1:e097efc:                                      DataRange dataRange,
+1:e097efc:                                      Optional<IndexMetadata> index)
+1:8c64cef:     {
+1:e097efc:         this(false, 0, false, metadata, nowInSec, columnFilter, rowFilter, limits, dataRange, index);
+1:8c64cef:     }
+1:be45eb6: 
+1:a991b64:     /**
+1:a991b64:      * Creates a new read command that query all the data in the table.
+1:a991b64:      *
+1:a991b64:      * @param metadata the table to query.
+1:a991b64:      * @param nowInSec the time in seconds to use are "now" for this query.
+1:a991b64:      *
+1:a991b64:      * @return a newly created read command that queries everything in the table.
+1:a991b64:      */
+1:a991b64:     public static PartitionRangeReadCommand allDataRead(CFMetaData metadata, int nowInSec)
+1:a991b64:     {
+1:a991b64:         return new PartitionRangeReadCommand(metadata,
+1:a991b64:                                              nowInSec,
+1:a991b64:                                              ColumnFilter.all(metadata),
+1:a991b64:                                              RowFilter.NONE,
+1:a991b64:                                              DataLimits.NONE,
+1:e097efc:                                              DataRange.allData(metadata.partitioner),
+1:e097efc:                                              Optional.empty());
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public DataRange dataRange()
+1:a991b64:     {
+1:a991b64:         return dataRange;
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public ClusteringIndexFilter clusteringIndexFilter(DecoratedKey key)
+1:a991b64:     {
+1:a991b64:         return dataRange.clusteringIndexFilter(key);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public boolean isNamesQuery()
+1:a991b64:     {
+1:a991b64:         return dataRange.isNamesQuery();
+1:a991b64:     }
+1:a991b64: 
+1:4205011:     /**
+1:4205011:      * Returns an equivalent command but that only queries data within the provided range.
+1:4205011:      *
+1:4205011:      * @param range the sub-range to restrict the command to. This method <b>assumes</b> that this is a proper sub-range
+1:4205011:      * of the command this is applied to.
+1:4205011:      * @param isRangeContinuation whether {@code range} is a direct continuation of whatever previous range we have
+1:4205011:      * queried. This matters for the {@code DataLimits} that may contain states when we do paging and in the context of
+1:4205011:      * parallel queries: that state only make sense if the range queried is indeed the follow-up of whatever range we've
+1:4205011:      * previously query (that yield said state). In practice this means that ranges for which {@code isRangeContinuation}
+1:4205011:      * is false may have to be slightly pessimistic when counting data and may include a little bit than necessary, and
+1:4205011:      * this should be dealt with post-query (in the case of {@code StorageProxy.getRangeSlice()}, which uses this method
+1:4205011:      * for replica queries, this is dealt with by re-counting results on the coordinator). Note that if this is the
+1:4205011:      * first range we queried, then the {@code DataLimits} will have not state and the value of this parameter doesn't
+1:4205011:      * matter.
+1:4205011:      */
+1:4205011:     public PartitionRangeReadCommand forSubRange(AbstractBounds<PartitionPosition> range, boolean isRangeContinuation)
+1:a991b64:     {
+1:4205011:         DataRange newRange = dataRange().forSubRange(range);
+1:4205011:         // If we're not a continuation of whatever range we've previously queried, we should ignore the states of the
+1:4205011:         // DataLimits as it's either useless, or misleading. This is particularly important for GROUP BY queries, where
+1:4205011:         // DataLimits.CQLGroupByLimits.GroupByAwareCounter assumes that if GroupingState.hasClustering(), then we're in
+1:4205011:         // the middle of a group, but we can't make that assumption if we query and range "in advance" of where we are
+1:4205011:         // on the ring.
+1:4205011:         DataLimits newLimits = isRangeContinuation ? limits() : limits().withoutState();
+1:4205011:         return new PartitionRangeReadCommand(isDigestQuery(), digestVersion(), isForThrift(), metadata(), nowInSec(), columnFilter(), rowFilter(), newLimits, newRange, index);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public PartitionRangeReadCommand copy()
+1:a991b64:     {
+1:e097efc:         return new PartitionRangeReadCommand(isDigestQuery(), digestVersion(), isForThrift(), metadata(), nowInSec(), columnFilter(), rowFilter(), limits(), dataRange(), index);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public PartitionRangeReadCommand withUpdatedLimit(DataLimits newLimits)
+1:a991b64:     {
+1:e097efc:         return new PartitionRangeReadCommand(metadata(), nowInSec(), columnFilter(), rowFilter(), newLimits, dataRange(), index);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public long getTimeout()
+1:a991b64:     {
+1:a991b64:         return DatabaseDescriptor.getRangeRpcTimeout();
+1:a991b64:     }
+1:a991b64: 
+1:5a4253b:     public boolean selectsKey(DecoratedKey key)
+1:a991b64:     {
+1:5a4253b:         if (!dataRange().contains(key))
+1:a991b64:             return false;
+1:a991b64: 
+1:5a4253b:         return rowFilter().partitionKeyRestrictionsAreSatisfiedBy(key, metadata().getKeyValidator());
+1:5a4253b:     }
+1:5a4253b: 
+1:5a4253b:     public boolean selectsClustering(DecoratedKey key, Clustering clustering)
+1:5a4253b:     {
+1:a991b64:         if (clustering == Clustering.STATIC_CLUSTERING)
+1:a991b64:             return !columnFilter().fetchedColumns().statics.isEmpty();
+1:a991b64: 
+1:5a4253b:         if (!dataRange().clusteringIndexFilter(key).selects(clustering))
+1:5a4253b:             return false;
+1:5a4253b:         return rowFilter().clusteringKeyRestrictionsAreSatisfiedBy(clustering);
+1:a991b64:     }
+1:a991b64: 
+1:aa83c94:     public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestExecutionException
+1:a991b64:     {
+1:aa83c94:         return StorageProxy.getRangeSlice(this, consistency, queryStartNanoTime);
+1:a991b64:     }
+1:a991b64: 
+1:e0adc16:     public QueryPager getPager(PagingState pagingState, ProtocolVersion protocolVersion)
+1:a991b64:     {
+1:474d3bf:             return new PartitionRangeQueryPager(this, pagingState, protocolVersion);
+1:a991b64:     }
+1:a991b64: 
+1:0bd5170:     protected void recordLatency(TableMetrics metric, long latencyNanos)
+1:a991b64:     {
+1:a991b64:         metric.rangeLatency.addNano(latencyNanos);
+1:a991b64:     }
+1:a991b64: 
+1:557bbbc:     protected UnfilteredPartitionIterator queryStorage(final ColumnFamilyStore cfs, ReadExecutionController executionController)
+1:a991b64:     {
+1:5b0566a:         ColumnFamilyStore.ViewFragment view = cfs.select(View.selectLive(dataRange().keyRange()));
+1:a991b64:         Tracing.trace("Executing seq scan across {} sstables for {}", view.sstables.size(), dataRange().keyRange().getString(metadata().getKeyValidator()));
+1:a991b64: 
+1:a991b64:         // fetch data from current memtable, historical memtables, and SSTables in the correct order.
+1:a991b64:         final List<UnfilteredPartitionIterator> iterators = new ArrayList<>(Iterables.size(view.memtables) + view.sstables.size());
+1:a991b64: 
+1:a991b64:         try
+1:a991b64:         {
+1:a991b64:             for (Memtable memtable : view.memtables)
+1:a991b64:             {
+1:a991b64:                 @SuppressWarnings("resource") // We close on exception and on closing the result returned by this method
+1:6f0c12f:                 Memtable.MemtableUnfilteredPartitionIterator iter = memtable.makePartitionIterator(columnFilter(), dataRange(), isForThrift());
+1:6f0c12f:                 oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, iter.getMinLocalDeletionTime());
+1:a991b64:                 iterators.add(isForThrift() ? ThriftResultsMerger.maybeWrap(iter, metadata(), nowInSec()) : iter);
+1:a991b64:             }
+1:a991b64: 
+1:a991b64:             for (SSTableReader sstable : view.sstables)
+1:a991b64:             {
+1:a991b64:                 @SuppressWarnings("resource") // We close on exception and on closing the result returned by this method
+1:a991b64:                 UnfilteredPartitionIterator iter = sstable.getScanner(columnFilter(), dataRange(), isForThrift());
+1:a991b64:                 iterators.add(isForThrift() ? ThriftResultsMerger.maybeWrap(iter, metadata(), nowInSec()) : iter);
+1:6f0c12f:                 if (!sstable.isRepaired())
+1:6f0c12f:                     oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, sstable.getMinLocalDeletionTime());
+1:a991b64:             }
+1:a991b64:             return checkCacheFilter(UnfilteredPartitionIterators.mergeLazily(iterators, nowInSec()), cfs);
+1:a991b64:         }
+1:a991b64:         catch (RuntimeException | Error e)
+1:a991b64:         {
+1:a991b64:             try
+1:a991b64:             {
+1:a991b64:                 FBUtilities.closeAll(iterators);
+1:a991b64:             }
+1:a991b64:             catch (Exception suppressed)
+1:a991b64:             {
+1:a991b64:                 e.addSuppressed(suppressed);
+1:a991b64:             }
+1:a991b64: 
+1:a991b64:             throw e;
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: 
+1:6f0c12f:     @Override
+1:6f0c12f:     protected int oldestUnrepairedTombstone()
+1:6f0c12f:     {
+1:6f0c12f:         return oldestUnrepairedTombstone;
+1:6f0c12f:     }
+1:6f0c12f: 
+1:a991b64:     private UnfilteredPartitionIterator checkCacheFilter(UnfilteredPartitionIterator iter, final ColumnFamilyStore cfs)
+1:a991b64:     {
+1:6094974:         class CacheFilter extends Transformation
+1:a991b64:         {
+1:a991b64:             @Override
+1:6094974:             public BaseRowIterator applyToPartition(BaseRowIterator iter)
+1:a991b64:             {
+1:a991b64:                 // Note that we rely on the fact that until we actually advance 'iter', no really costly operation is actually done
+1:a991b64:                 // (except for reading the partition key from the index file) due to the call to mergeLazily in queryStorage.
+1:a991b64:                 DecoratedKey dk = iter.partitionKey();
+1:a991b64: 
+1:a991b64:                 // Check if this partition is in the rowCache and if it is, if  it covers our filter
+1:a991b64:                 CachedPartition cached = cfs.getRawCachedPartition(dk);
+1:a991b64:                 ClusteringIndexFilter filter = dataRange().clusteringIndexFilter(dk);
+1:a991b64: 
+1:a991b64:                 if (cached != null && cfs.isFilterFullyCoveredBy(filter, limits(), cached, nowInSec()))
+1:a991b64:                 {
+1:a991b64:                     // We won't use 'iter' so close it now.
+1:a991b64:                     iter.close();
+1:a991b64: 
+1:a991b64:                     return filter.getUnfilteredRowIterator(columnFilter(), cached);
+1:a991b64:                 }
+1:a991b64: 
+1:a991b64:                 return iter;
+1:6094974:             }
+1:a991b64:         }
+1:6094974:         return Transformation.apply(iter, new CacheFilter());
+1:a991b64:     }
+1:a991b64: 
+1:be45eb6:     public MessageOut<ReadCommand> createMessage(int version)
+1:a991b64:     {
+1:be45eb6:         return dataRange().isPaging()
+1:fbd287a:              ? new MessageOut<>(MessagingService.Verb.PAGED_RANGE, this, pagedRangeSerializer)
+1:fbd287a:              : new MessageOut<>(MessagingService.Verb.RANGE_SLICE, this, rangeSliceSerializer);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     protected void appendCQLWhereClause(StringBuilder sb)
+1:a991b64:     {
+1:a991b64:         if (dataRange.isUnrestricted() && rowFilter().isEmpty())
+1:a991b64:             return;
+1:a991b64: 
+1:a991b64:         sb.append(" WHERE ");
+1:a991b64:         // We put the row filter first because the data range can end by "ORDER BY"
+1:a991b64:         if (!rowFilter().isEmpty())
+1:a991b64:         {
+1:a991b64:             sb.append(rowFilter());
+1:a991b64:             if (!dataRange.isUnrestricted())
+1:a991b64:                 sb.append(" AND ");
+1:a991b64:         }
+1:a991b64:         if (!dataRange.isUnrestricted())
+1:a991b64:             sb.append(dataRange.toCQLString(metadata()));
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:a991b64:      * Allow to post-process the result of the query after it has been reconciled on the coordinator
+1:a991b64:      * but before it is passed to the CQL layer to return the ResultSet.
+1:a991b64:      *
+1:a991b64:      * See CASSANDRA-8717 for why this exists.
+1:a991b64:      */
+1:a991b64:     public PartitionIterator postReconciliationProcessing(PartitionIterator result)
+1:a991b64:     {
+1:a991b64:         ColumnFamilyStore cfs = Keyspace.open(metadata().ksName).getColumnFamilyStore(metadata().cfName);
+1:e097efc:         Index index = getIndex(cfs);
+1:0626be8:         return index == null ? result : index.postProcessorFor(this).apply(result, this);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     @Override
+1:a991b64:     public String toString()
+1:a991b64:     {
+1:a991b64:         return String.format("Read(%s.%s columns=%s rowfilter=%s limits=%s %s)",
+1:a991b64:                              metadata().ksName,
+1:a991b64:                              metadata().cfName,
+1:a991b64:                              columnFilter(),
+1:a991b64:                              rowFilter(),
+1:a991b64:                              limits(),
+1:a991b64:                              dataRange().toString(metadata()));
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     protected void serializeSelection(DataOutputPlus out, int version) throws IOException
+1:a991b64:     {
+1:a991b64:         DataRange.serializer.serialize(dataRange(), out, version, metadata());
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     protected long selectionSerializedSize(int version)
+1:a991b64:     {
+1:a991b64:         return DataRange.serializer.serializedSize(dataRange(), version, metadata());
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     private static class Deserializer extends SelectionDeserializer
+1:a991b64:     {
+1:e097efc:         public ReadCommand deserialize(DataInputPlus in, int version, boolean isDigest, int digestVersion, boolean isForThrift, CFMetaData metadata, int nowInSec, ColumnFilter columnFilter, RowFilter rowFilter, DataLimits limits, Optional<IndexMetadata> index)
+1:a991b64:         throws IOException
+1:a991b64:         {
+1:a991b64:             DataRange range = DataRange.serializer.deserialize(in, version, metadata);
+1:e097efc:             return new PartitionRangeReadCommand(isDigest, digestVersion, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, range, index);
+1:2457599:         }
+1:a991b64:     }
+1:a991b64: }
+============================================================================
+author:Stefania Alborghetti
+-------------------------------------------------------------------------------
+commit:e0adc16
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.transport.ProtocolVersion;
+/////////////////////////////////////////////////////////////////////////
+1:     public QueryPager getPager(PagingState pagingState, ProtocolVersion protocolVersion)
+commit:557bbbc
+/////////////////////////////////////////////////////////////////////////
+1:     protected UnfilteredPartitionIterator queryStorage(final ColumnFamilyStore cfs, ReadExecutionController executionController)
+commit:0bd5170
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.metrics.TableMetrics;
+/////////////////////////////////////////////////////////////////////////
+1:     protected void recordLatency(TableMetrics metric, long latencyNanos)
+author:Geoffrey Yu
+-------------------------------------------------------------------------------
+commit:aa83c94
+/////////////////////////////////////////////////////////////////////////
+1:     public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestExecutionException
+1:         return StorageProxy.getRangeSlice(this, consistency, queryStartNanoTime);
+author:Benjamin Lerer
+-------------------------------------------------------------------------------
+commit:4205011
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Returns an equivalent command but that only queries data within the provided range.
+1:      *
+1:      * @param range the sub-range to restrict the command to. This method <b>assumes</b> that this is a proper sub-range
+1:      * of the command this is applied to.
+1:      * @param isRangeContinuation whether {@code range} is a direct continuation of whatever previous range we have
+1:      * queried. This matters for the {@code DataLimits} that may contain states when we do paging and in the context of
+1:      * parallel queries: that state only make sense if the range queried is indeed the follow-up of whatever range we've
+1:      * previously query (that yield said state). In practice this means that ranges for which {@code isRangeContinuation}
+1:      * is false may have to be slightly pessimistic when counting data and may include a little bit than necessary, and
+1:      * this should be dealt with post-query (in the case of {@code StorageProxy.getRangeSlice()}, which uses this method
+1:      * for replica queries, this is dealt with by re-counting results on the coordinator). Note that if this is the
+1:      * first range we queried, then the {@code DataLimits} will have not state and the value of this parameter doesn't
+1:      * matter.
+1:      */
+1:     public PartitionRangeReadCommand forSubRange(AbstractBounds<PartitionPosition> range, boolean isRangeContinuation)
+1:         DataRange newRange = dataRange().forSubRange(range);
+1:         // If we're not a continuation of whatever range we've previously queried, we should ignore the states of the
+1:         // DataLimits as it's either useless, or misleading. This is particularly important for GROUP BY queries, where
+1:         // DataLimits.CQLGroupByLimits.GroupByAwareCounter assumes that if GroupingState.hasClustering(), then we're in
+1:         // the middle of a group, but we can't make that assumption if we query and range "in advance" of where we are
+1:         // on the ring.
+1:         DataLimits newLimits = isRangeContinuation ? limits() : limits().withoutState();
+1:         return new PartitionRangeReadCommand(isDigestQuery(), digestVersion(), isForThrift(), metadata(), nowInSec(), columnFilter(), rowFilter(), newLimits, newRange, index);
+commit:fb4eb5a
+commit:fbd287a
+/////////////////////////////////////////////////////////////////////////
+1:              ? new MessageOut<>(MessagingService.Verb.PAGED_RANGE, this, pagedRangeSerializer)
+1:              : new MessageOut<>(MessagingService.Verb.RANGE_SLICE, this, rangeSliceSerializer);
+commit:5b85022
+commit:474d3bf
+/////////////////////////////////////////////////////////////////////////
+1:             return new PartitionRangeQueryPager(this, pagingState, protocolVersion);
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:087264f
+/////////////////////////////////////////////////////////////////////////
+author:Marcus Eriksson
+-------------------------------------------------------------------------------
+commit:574e8df
+commit:5b0566a
+/////////////////////////////////////////////////////////////////////////
+1:         ColumnFamilyStore.ViewFragment view = cfs.select(View.selectLive(dataRange().keyRange()));
+commit:6f0c12f
+/////////////////////////////////////////////////////////////////////////
+1:     private int oldestUnrepairedTombstone = Integer.MAX_VALUE;
+/////////////////////////////////////////////////////////////////////////
+1:                 Memtable.MemtableUnfilteredPartitionIterator iter = memtable.makePartitionIterator(columnFilter(), dataRange(), isForThrift());
+1:                 oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, iter.getMinLocalDeletionTime());
+/////////////////////////////////////////////////////////////////////////
+1:                 if (!sstable.isRepaired())
+1:                     oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, sstable.getMinLocalDeletionTime());
+/////////////////////////////////////////////////////////////////////////
+1:     @Override
+1:     protected int oldestUnrepairedTombstone()
+1:     {
+1:         return oldestUnrepairedTombstone;
+1:     }
+1: 
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:928e4c2
+commit:6094974
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.rows.BaseRowIterator;
+1: import org.apache.cassandra.db.transform.Transformation;
+/////////////////////////////////////////////////////////////////////////
+1:         class CacheFilter extends Transformation
+1:             public BaseRowIterator applyToPartition(BaseRowIterator iter)
+/////////////////////////////////////////////////////////////////////////
+1:         }
+1:         return Transformation.apply(iter, new CacheFilter());
+commit:ad8cad7
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.lifecycle.SSTableSet;
+1: import org.apache.cassandra.db.lifecycle.View;
+/////////////////////////////////////////////////////////////////////////
+0:         ColumnFamilyStore.ViewFragment view = cfs.select(View.select(SSTableSet.LIVE, dataRange().keyRange()));
+author:Tyler Hobbs
+-------------------------------------------------------------------------------
+commit:5a4253b
+/////////////////////////////////////////////////////////////////////////
+1:     public boolean selectsKey(DecoratedKey key)
+1:         if (!dataRange().contains(key))
+1:         return rowFilter().partitionKeyRestrictionsAreSatisfiedBy(key, metadata().getKeyValidator());
+1:     }
+1: 
+1:     public boolean selectsClustering(DecoratedKey key, Clustering clustering)
+1:     {
+1:         if (!dataRange().clusteringIndexFilter(key).selects(clustering))
+1:             return false;
+1:         return rowFilter().clusteringKeyRestrictionsAreSatisfiedBy(clustering);
+commit:8c64cef
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.net.MessageOut;
+1: import org.apache.cassandra.net.MessagingService;
+/////////////////////////////////////////////////////////////////////////
+0:     @SuppressWarnings("deprecation")
+0:     protected MessageOut<ReadCommand> createLegacyMessage()
+1:     {
+0:         if (this.dataRange.isPaging())
+0:             return new MessageOut<>(MessagingService.Verb.PAGED_RANGE, this, legacyPagedRangeCommandSerializer);
+0:         else
+0:             return new MessageOut<>(MessagingService.Verb.RANGE_SLICE, this, legacyRangeSliceCommandSerializer);
+1:     }
+1: 
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:b99c863
+/////////////////////////////////////////////////////////////////////////
+0:     public QueryPager getPager(PagingState pagingState, int protocolVersion)
+0:             return new RangeNamesQueryPager(this, pagingState, protocolVersion);
+0:             return new RangeSliceQueryPager(this, pagingState, protocolVersion);
+commit:782a1c3
+/////////////////////////////////////////////////////////////////////////
+1:                                      int digestVersion,
+/////////////////////////////////////////////////////////////////////////
+1:         super(Kind.PARTITION_RANGE, isDigest, digestVersion, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits);
+/////////////////////////////////////////////////////////////////////////
+0:         this(false, 0, false, metadata, nowInSec, columnFilter, rowFilter, limits, dataRange);
+/////////////////////////////////////////////////////////////////////////
+0:         return new PartitionRangeReadCommand(isDigestQuery(), digestVersion(), isForThrift(), metadata(), nowInSec(), columnFilter(), rowFilter(), limits(), dataRange().forSubRange(range));
+0:         return new PartitionRangeReadCommand(isDigestQuery(), digestVersion(), isForThrift(), metadata(), nowInSec(), columnFilter(), rowFilter(), limits(), dataRange());
+/////////////////////////////////////////////////////////////////////////
+0:         public ReadCommand deserialize(DataInputPlus in, int version, boolean isDigest, int digestVersion, boolean isForThrift, CFMetaData metadata, int nowInSec, ColumnFilter columnFilter, RowFilter rowFilter, DataLimits limits)
+0:             return new PartitionRangeReadCommand(isDigest, digestVersion, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, range);
+commit:be45eb6
+/////////////////////////////////////////////////////////////////////////
+1:     public MessageOut<ReadCommand> createMessage(int version)
+0:         if (version >= MessagingService.VERSION_30)
+0:             return new MessageOut<>(MessagingService.Verb.RANGE_SLICE, this, serializer);
+1: 
+1:         return dataRange().isPaging()
+0:              ? new MessageOut<>(MessagingService.Verb.PAGED_RANGE, this, legacyPagedRangeCommandSerializer)
+0:              : new MessageOut<>(MessagingService.Verb.RANGE_SLICE, this, legacyRangeSliceCommandSerializer);
+commit:2457599
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.io.util.DataInputPlus;
+/////////////////////////////////////////////////////////////////////////
+0:         public ReadCommand deserialize(DataInputPlus in, int version, boolean isDigest, boolean isForThrift, CFMetaData metadata, int nowInSec, ColumnFilter columnFilter, RowFilter rowFilter, DataLimits limits)
+1:     }
+commit:a991b64
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.db;
+1: 
+0: import java.io.DataInput;
+1: import java.io.IOException;
+1: import java.util.ArrayList;
+1: import java.util.List;
+1: 
+1: import com.google.common.collect.Iterables;
+1: 
+1: import org.apache.cassandra.config.CFMetaData;
+1: import org.apache.cassandra.config.DatabaseDescriptor;
+0: import org.apache.cassandra.db.rows.*;
+1: import org.apache.cassandra.db.filter.*;
+1: import org.apache.cassandra.db.partitions.*;
+0: import org.apache.cassandra.db.index.SecondaryIndexSearcher;
+1: import org.apache.cassandra.dht.AbstractBounds;
+1: import org.apache.cassandra.exceptions.RequestExecutionException;
+1: import org.apache.cassandra.io.util.DataOutputPlus;
+1: import org.apache.cassandra.io.sstable.format.SSTableReader;
+0: import org.apache.cassandra.metrics.ColumnFamilyMetrics;
+0: import org.apache.cassandra.service.*;
+1: import org.apache.cassandra.service.pager.*;
+1: import org.apache.cassandra.thrift.ThriftResultsMerger;
+1: import org.apache.cassandra.tracing.Tracing;
+1: import org.apache.cassandra.utils.FBUtilities;
+1: 
+1: /**
+1:  * A read command that selects a (part of a) range of partitions.
+1:  */
+1: public class PartitionRangeReadCommand extends ReadCommand
+1: {
+1:     protected static final SelectionDeserializer selectionDeserializer = new Deserializer();
+1: 
+1:     private final DataRange dataRange;
+1: 
+1:     public PartitionRangeReadCommand(boolean isDigest,
+1:                                      boolean isForThrift,
+1:                                      CFMetaData metadata,
+1:                                      int nowInSec,
+1:                                      ColumnFilter columnFilter,
+1:                                      RowFilter rowFilter,
+1:                                      DataLimits limits,
+0:                                      DataRange dataRange)
+1:     {
+0:         super(Kind.PARTITION_RANGE, isDigest, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits);
+1:         this.dataRange = dataRange;
+1:     }
+1: 
+1:     public PartitionRangeReadCommand(CFMetaData metadata,
+1:                                      int nowInSec,
+1:                                      ColumnFilter columnFilter,
+1:                                      RowFilter rowFilter,
+1:                                      DataLimits limits,
+0:                                      DataRange dataRange)
+1:     {
+0:         this(false, false, metadata, nowInSec, columnFilter, rowFilter, limits, dataRange);
+1:     }
+1: 
+1:     /**
+1:      * Creates a new read command that query all the data in the table.
+1:      *
+1:      * @param metadata the table to query.
+1:      * @param nowInSec the time in seconds to use are "now" for this query.
+1:      *
+1:      * @return a newly created read command that queries everything in the table.
+1:      */
+1:     public static PartitionRangeReadCommand allDataRead(CFMetaData metadata, int nowInSec)
+1:     {
+1:         return new PartitionRangeReadCommand(metadata,
+1:                                              nowInSec,
+1:                                              ColumnFilter.all(metadata),
+1:                                              RowFilter.NONE,
+1:                                              DataLimits.NONE,
+0:                                              DataRange.allData(StorageService.getPartitioner()));
+1:     }
+1: 
+1:     public DataRange dataRange()
+1:     {
+1:         return dataRange;
+1:     }
+1: 
+1:     public ClusteringIndexFilter clusteringIndexFilter(DecoratedKey key)
+1:     {
+1:         return dataRange.clusteringIndexFilter(key);
+1:     }
+1: 
+1:     public boolean isNamesQuery()
+1:     {
+1:         return dataRange.isNamesQuery();
+1:     }
+1: 
+0:     public PartitionRangeReadCommand forSubRange(AbstractBounds<PartitionPosition> range)
+1:     {
+0:         return new PartitionRangeReadCommand(isDigestQuery(), isForThrift(), metadata(), nowInSec(), columnFilter(), rowFilter(), limits(), dataRange().forSubRange(range));
+1:     }
+1: 
+1:     public PartitionRangeReadCommand copy()
+1:     {
+0:         return new PartitionRangeReadCommand(isDigestQuery(), isForThrift(), metadata(), nowInSec(), columnFilter(), rowFilter(), limits(), dataRange());
+1:     }
+1: 
+1:     public PartitionRangeReadCommand withUpdatedLimit(DataLimits newLimits)
+1:     {
+0:         return new PartitionRangeReadCommand(metadata(), nowInSec(), columnFilter(), rowFilter(), newLimits, dataRange());
+1:     }
+1: 
+1:     public long getTimeout()
+1:     {
+1:         return DatabaseDescriptor.getRangeRpcTimeout();
+1:     }
+1: 
+0:     public boolean selects(DecoratedKey partitionKey, Clustering clustering)
+1:     {
+0:         if (!dataRange().contains(partitionKey))
+1:             return false;
+1: 
+1:         if (clustering == Clustering.STATIC_CLUSTERING)
+1:             return !columnFilter().fetchedColumns().statics.isEmpty();
+1: 
+0:         return dataRange().clusteringIndexFilter(partitionKey).selects(clustering);
+1:     }
+1: 
+0:     public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState) throws RequestExecutionException
+1:     {
+0:         return StorageProxy.getRangeSlice(this, consistency);
+1:     }
+1: 
+0:     public QueryPager getPager(PagingState pagingState)
+1:     {
+0:         if (isNamesQuery())
+0:             return new RangeNamesQueryPager(this, pagingState);
+0:         else
+0:             return new RangeSliceQueryPager(this, pagingState);
+1:     }
+1: 
+0:     protected void recordLatency(ColumnFamilyMetrics metric, long latencyNanos)
+1:     {
+1:         metric.rangeLatency.addNano(latencyNanos);
+1:     }
+1: 
+0:     protected UnfilteredPartitionIterator queryStorage(final ColumnFamilyStore cfs, ReadOrderGroup orderGroup)
+1:     {
+0:         ColumnFamilyStore.ViewFragment view = cfs.select(cfs.viewFilter(dataRange().keyRange()));
+1:         Tracing.trace("Executing seq scan across {} sstables for {}", view.sstables.size(), dataRange().keyRange().getString(metadata().getKeyValidator()));
+1: 
+1:         // fetch data from current memtable, historical memtables, and SSTables in the correct order.
+1:         final List<UnfilteredPartitionIterator> iterators = new ArrayList<>(Iterables.size(view.memtables) + view.sstables.size());
+1: 
+1:         try
+1:         {
+1:             for (Memtable memtable : view.memtables)
+1:             {
+1:                 @SuppressWarnings("resource") // We close on exception and on closing the result returned by this method
+0:                 UnfilteredPartitionIterator iter = memtable.makePartitionIterator(columnFilter(), dataRange(), isForThrift());
+1:                 iterators.add(isForThrift() ? ThriftResultsMerger.maybeWrap(iter, metadata(), nowInSec()) : iter);
+1:             }
+1: 
+1:             for (SSTableReader sstable : view.sstables)
+1:             {
+1:                 @SuppressWarnings("resource") // We close on exception and on closing the result returned by this method
+1:                 UnfilteredPartitionIterator iter = sstable.getScanner(columnFilter(), dataRange(), isForThrift());
+1:                 iterators.add(isForThrift() ? ThriftResultsMerger.maybeWrap(iter, metadata(), nowInSec()) : iter);
+1:             }
+1: 
+1:             return checkCacheFilter(UnfilteredPartitionIterators.mergeLazily(iterators, nowInSec()), cfs);
+1:         }
+1:         catch (RuntimeException | Error e)
+1:         {
+1:             try
+1:             {
+1:                 FBUtilities.closeAll(iterators);
+1:             }
+1:             catch (Exception suppressed)
+1:             {
+1:                 e.addSuppressed(suppressed);
+1:             }
+1: 
+1:             throw e;
+1:         }
+1:     }
+1: 
+1:     private UnfilteredPartitionIterator checkCacheFilter(UnfilteredPartitionIterator iter, final ColumnFamilyStore cfs)
+1:     {
+0:         return new WrappingUnfilteredPartitionIterator(iter)
+1:         {
+1:             @Override
+0:             public UnfilteredRowIterator computeNext(UnfilteredRowIterator iter)
+1:             {
+1:                 // Note that we rely on the fact that until we actually advance 'iter', no really costly operation is actually done
+1:                 // (except for reading the partition key from the index file) due to the call to mergeLazily in queryStorage.
+1:                 DecoratedKey dk = iter.partitionKey();
+1: 
+1:                 // Check if this partition is in the rowCache and if it is, if  it covers our filter
+1:                 CachedPartition cached = cfs.getRawCachedPartition(dk);
+1:                 ClusteringIndexFilter filter = dataRange().clusteringIndexFilter(dk);
+1: 
+1:                 if (cached != null && cfs.isFilterFullyCoveredBy(filter, limits(), cached, nowInSec()))
+1:                 {
+1:                     // We won't use 'iter' so close it now.
+1:                     iter.close();
+1: 
+1:                     return filter.getUnfilteredRowIterator(columnFilter(), cached);
+1:                 }
+1: 
+1:                 return iter;
+1:             }
+0:         };
+1:     }
+1: 
+1:     protected void appendCQLWhereClause(StringBuilder sb)
+1:     {
+1:         if (dataRange.isUnrestricted() && rowFilter().isEmpty())
+1:             return;
+1: 
+1:         sb.append(" WHERE ");
+1:         // We put the row filter first because the data range can end by "ORDER BY"
+1:         if (!rowFilter().isEmpty())
+1:         {
+1:             sb.append(rowFilter());
+1:             if (!dataRange.isUnrestricted())
+1:                 sb.append(" AND ");
+1:         }
+1:         if (!dataRange.isUnrestricted())
+1:             sb.append(dataRange.toCQLString(metadata()));
+1:     }
+1: 
+1:     /**
+1:      * Allow to post-process the result of the query after it has been reconciled on the coordinator
+1:      * but before it is passed to the CQL layer to return the ResultSet.
+1:      *
+1:      * See CASSANDRA-8717 for why this exists.
+1:      */
+1:     public PartitionIterator postReconciliationProcessing(PartitionIterator result)
+1:     {
+1:         ColumnFamilyStore cfs = Keyspace.open(metadata().ksName).getColumnFamilyStore(metadata().cfName);
+0:         SecondaryIndexSearcher searcher = getIndexSearcher(cfs);
+0:         return searcher == null ? result : searcher.postReconciliationProcessing(rowFilter(), result);
+1:     }
+1: 
+1:     @Override
+1:     public String toString()
+1:     {
+1:         return String.format("Read(%s.%s columns=%s rowfilter=%s limits=%s %s)",
+1:                              metadata().ksName,
+1:                              metadata().cfName,
+1:                              columnFilter(),
+1:                              rowFilter(),
+1:                              limits(),
+1:                              dataRange().toString(metadata()));
+1:     }
+1: 
+1:     protected void serializeSelection(DataOutputPlus out, int version) throws IOException
+1:     {
+1:         DataRange.serializer.serialize(dataRange(), out, version, metadata());
+1:     }
+1: 
+1:     protected long selectionSerializedSize(int version)
+1:     {
+1:         return DataRange.serializer.serializedSize(dataRange(), version, metadata());
+1:     }
+1: 
+1:     private static class Deserializer extends SelectionDeserializer
+1:     {
+0:         public ReadCommand deserialize(DataInput in, int version, boolean isDigest, boolean isForThrift, CFMetaData metadata, int nowInSec, ColumnFilter columnFilter, RowFilter rowFilter, DataLimits limits)
+1:         throws IOException
+1:         {
+1:             DataRange range = DataRange.serializer.deserialize(in, version, metadata);
+0:             return new PartitionRangeReadCommand(isDigest, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, range);
+1:         }
+0:     };
+1: }
+author:Sam Tunnicliffe
+-------------------------------------------------------------------------------
+commit:e097efc
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.Optional;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.schema.IndexMetadata;
+/////////////////////////////////////////////////////////////////////////
+1:                                      DataRange dataRange,
+1:                                      Optional<IndexMetadata> index)
+1:         this.index = index;
+/////////////////////////////////////////////////////////////////////////
+1:                                      DataRange dataRange,
+1:                                      Optional<IndexMetadata> index)
+1:         this(false, 0, false, metadata, nowInSec, columnFilter, rowFilter, limits, dataRange, index);
+/////////////////////////////////////////////////////////////////////////
+1:                                              DataRange.allData(metadata.partitioner),
+1:                                              Optional.empty());
+/////////////////////////////////////////////////////////////////////////
+0:         return new PartitionRangeReadCommand(isDigestQuery(), digestVersion(), isForThrift(), metadata(), nowInSec(), columnFilter(), rowFilter(), limits(), dataRange().forSubRange(range), index);
+1:         return new PartitionRangeReadCommand(isDigestQuery(), digestVersion(), isForThrift(), metadata(), nowInSec(), columnFilter(), rowFilter(), limits(), dataRange(), index);
+1:         return new PartitionRangeReadCommand(metadata(), nowInSec(), columnFilter(), rowFilter(), newLimits, dataRange(), index);
+/////////////////////////////////////////////////////////////////////////
+1:         Index index = getIndex(cfs);
+/////////////////////////////////////////////////////////////////////////
+1:         public ReadCommand deserialize(DataInputPlus in, int version, boolean isDigest, int digestVersion, boolean isForThrift, CFMetaData metadata, int nowInSec, ColumnFilter columnFilter, RowFilter rowFilter, DataLimits limits, Optional<IndexMetadata> index)
+1:             return new PartitionRangeReadCommand(isDigest, digestVersion, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, range, index);
+commit:0626be8
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.filter.*;
+0: import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+1: import org.apache.cassandra.index.Index;
+0: import org.apache.cassandra.io.sstable.format.SSTableReader;
+1: import org.apache.cassandra.service.ClientState;
+1: import org.apache.cassandra.service.StorageProxy;
+/////////////////////////////////////////////////////////////////////////
+0:         Index index = getIndex(cfs, false);
+1:         return index == null ? result : index.postProcessorFor(this).apply(result, this);
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:0a08525
+/////////////////////////////////////////////////////////////////////////
+0:                                              DataRange.allData(metadata.partitioner));
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:a22ce89
+/////////////////////////////////////////////////////////////////////////
+0:                                              DataRange.allData(StorageService.getPartitioner()));
+author:Branimir Lambov
+-------------------------------------------------------------------------------
+commit:69f77cb
+/////////////////////////////////////////////////////////////////////////
+0:                                              DataRange.allData(metadata.partitioner));
+============================================================================

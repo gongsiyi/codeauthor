@@ -1,0 +1,504 @@
+1:96d41f0: /*
+1:96d41f0:  * Licensed to the Apache Software Foundation (ASF) under one
+1:96d41f0:  * or more contributor license agreements.  See the NOTICE file
+1:96d41f0:  * distributed with this work for additional information
+1:96d41f0:  * regarding copyright ownership.  The ASF licenses this file
+1:96d41f0:  * to you under the Apache License, Version 2.0 (the
+1:96d41f0:  * "License"); you may not use this file except in compliance
+1:96d41f0:  * with the License.  You may obtain a copy of the License at
+1:96d41f0:  *
+1:96d41f0:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:96d41f0:  *
+1:96d41f0:  * Unless required by applicable law or agreed to in writing, software
+1:96d41f0:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:96d41f0:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:96d41f0:  * See the License for the specific language governing permissions and
+1:96d41f0:  * limitations under the License.
+1:96d41f0:  */
+1:96d41f0: package org.apache.cassandra.hints;
+1:96d41f0: 
+1:96d41f0: import java.io.IOException;
+1:96d41f0: import java.nio.ByteBuffer;
+1:96d41f0: import java.util.Iterator;
+1:96d41f0: import java.util.concurrent.*;
+1:96d41f0: 
+1:96d41f0: import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+1:96d41f0: import org.apache.cassandra.config.DatabaseDescriptor;
+1:96d41f0: import org.apache.cassandra.io.FSWriteError;
+1:96d41f0: 
+1:96d41f0: /**
+1:96d41f0:  * A single threaded executor that exclusively writes all the hints and otherwise manipulate the writers.
+1:96d41f0:  *
+1:96d41f0:  * Flushing demultiplexes the provided {@link HintsBuffer} and sequentially writes to each {@link HintsWriter},
+1:96d41f0:  * using the same shared write buffer. In the near future, when CASSANDRA-9428 (compression) is implemented,
+1:96d41f0:  * will also share a compression buffer.
+1:96d41f0:  */
+1:96d41f0: final class HintsWriteExecutor
+1:96d41f0: {
+1:c20566f:     static final int WRITE_BUFFER_SIZE = 256 << 10;
+1:96d41f0: 
+1:96d41f0:     private final HintsCatalog catalog;
+1:96d41f0:     private final ByteBuffer writeBuffer;
+1:96d41f0:     private final ExecutorService executor;
+1:96d41f0: 
+1:96d41f0:     HintsWriteExecutor(HintsCatalog catalog)
+1:96d41f0:     {
+1:96d41f0:         this.catalog = catalog;
+1:96d41f0: 
+1:96d41f0:         writeBuffer = ByteBuffer.allocateDirect(WRITE_BUFFER_SIZE);
+1:96d41f0:         executor = DebuggableThreadPoolExecutor.createWithFixedPoolSize("HintsWriteExecutor", 1);
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     /*
+1:96d41f0:      * Should be very fast (worst case scenario - write a few 10s of megabytes to disk).
+1:96d41f0:      */
+1:96d41f0:     void shutdownBlocking()
+1:96d41f0:     {
+1:96d41f0:         executor.shutdown();
+1:96d41f0:         try
+1:96d41f0:         {
+1:96d41f0:             executor.awaitTermination(1, TimeUnit.MINUTES);
+1:96d41f0:         }
+1:96d41f0:         catch (InterruptedException e)
+1:96d41f0:         {
+1:96d41f0:             throw new AssertionError(e);
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     /**
+1:96d41f0:      * Flush the provided buffer, recycle it and offer it back to the pool.
+1:96d41f0:      */
+1:e777301:     Future<?> flushBuffer(HintsBuffer buffer, HintsBufferPool bufferPool)
+1:96d41f0:     {
+1:96d41f0:         return executor.submit(new FlushBufferTask(buffer, bufferPool));
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     /**
+1:96d41f0:      * Flush the current buffer, but without clearing/recycling it.
+1:96d41f0:      */
+1:e777301:     Future<?> flushBufferPool(HintsBufferPool bufferPool)
+1:96d41f0:     {
+1:96d41f0:         return executor.submit(new FlushBufferPoolTask(bufferPool));
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     /**
+1:96d41f0:      * Flush the current buffer just for the specified hints stores. Without clearing/recycling it.
+1:96d41f0:      */
+1:e777301:     Future<?> flushBufferPool(HintsBufferPool bufferPool, Iterable<HintsStore> stores)
+1:96d41f0:     {
+1:96d41f0:         return executor.submit(new PartiallyFlushBufferPoolTask(bufferPool, stores));
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     void fsyncWritersBlockingly(Iterable<HintsStore> stores)
+1:96d41f0:     {
+1:96d41f0:         try
+1:96d41f0:         {
+1:96d41f0:             executor.submit(new FsyncWritersTask(stores)).get();
+1:96d41f0:         }
+1:96d41f0:         catch (InterruptedException | ExecutionException e)
+1:96d41f0:         {
+1:96d41f0:             throw new RuntimeException(e);
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:e777301:     Future<?> closeWriter(HintsStore store)
+1:96d41f0:     {
+1:96d41f0:         return executor.submit(store::closeWriter);
+1:96d41f0:     }
+1:96d41f0: 
+1:e777301:     Future<?> closeAllWriters()
+1:96d41f0:     {
+1:96d41f0:         return executor.submit(() -> catalog.stores().forEach(HintsStore::closeWriter));
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private final class FlushBufferTask implements Runnable
+1:96d41f0:     {
+1:96d41f0:         private final HintsBuffer buffer;
+1:96d41f0:         private final HintsBufferPool bufferPool;
+1:96d41f0: 
+1:96d41f0:         FlushBufferTask(HintsBuffer buffer, HintsBufferPool bufferPool)
+1:96d41f0:         {
+1:96d41f0:             this.buffer = buffer;
+1:96d41f0:             this.bufferPool = bufferPool;
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         public void run()
+1:96d41f0:         {
+1:96d41f0:             buffer.waitForModifications();
+1:96d41f0: 
+1:96d41f0:             try
+1:96d41f0:             {
+1:96d41f0:                 flush(buffer);
+1:96d41f0:             }
+1:96d41f0:             finally
+1:96d41f0:             {
+1:96d41f0:                 HintsBuffer recycledBuffer = buffer.recycle();
+1:037d24e:                 bufferPool.offer(recycledBuffer);
+1:96d41f0:             }
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private final class FlushBufferPoolTask implements Runnable
+1:96d41f0:     {
+1:96d41f0:         private final HintsBufferPool bufferPool;
+1:96d41f0: 
+1:96d41f0:         FlushBufferPoolTask(HintsBufferPool bufferPool)
+1:96d41f0:         {
+1:96d41f0:             this.bufferPool = bufferPool;
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         public void run()
+1:96d41f0:         {
+1:96d41f0:             HintsBuffer buffer = bufferPool.currentBuffer();
+1:96d41f0:             buffer.waitForModifications();
+1:96d41f0:             flush(buffer);
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private final class PartiallyFlushBufferPoolTask implements Runnable
+1:96d41f0:     {
+1:96d41f0:         private final HintsBufferPool bufferPool;
+1:96d41f0:         private final Iterable<HintsStore> stores;
+1:96d41f0: 
+1:96d41f0:         PartiallyFlushBufferPoolTask(HintsBufferPool bufferPool, Iterable<HintsStore> stores)
+1:96d41f0:         {
+1:96d41f0:             this.bufferPool = bufferPool;
+1:96d41f0:             this.stores = stores;
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         public void run()
+1:96d41f0:         {
+1:96d41f0:             HintsBuffer buffer = bufferPool.currentBuffer();
+1:96d41f0:             buffer.waitForModifications();
+1:96d41f0:             stores.forEach(store -> flush(buffer.consumingHintsIterator(store.hostId), store));
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private final class FsyncWritersTask implements Runnable
+1:96d41f0:     {
+1:96d41f0:         private final Iterable<HintsStore> stores;
+1:96d41f0: 
+1:96d41f0:         FsyncWritersTask(Iterable<HintsStore> stores)
+1:96d41f0:         {
+1:96d41f0:             this.stores = stores;
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         public void run()
+1:96d41f0:         {
+1:96d41f0:             stores.forEach(HintsStore::fsyncWriter);
+1:96d41f0:             catalog.fsyncDirectory();
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private void flush(HintsBuffer buffer)
+1:96d41f0:     {
+1:96d41f0:         buffer.hostIds().forEach(hostId -> flush(buffer.consumingHintsIterator(hostId), catalog.get(hostId)));
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private void flush(Iterator<ByteBuffer> iterator, HintsStore store)
+1:96d41f0:     {
+1:96d41f0:         while (true)
+1:96d41f0:         {
+1:1f62608:             if (iterator.hasNext())
+1:1f62608:                 flushInternal(iterator, store);
+1:96d41f0: 
+1:96d41f0:             if (!iterator.hasNext())
+1:96d41f0:                 break;
+1:96d41f0: 
+1:96d41f0:             // exceeded the size limit for an individual file, but still have more to write
+1:96d41f0:             // close the current writer and continue flushing to a new one in the next iteration
+1:96d41f0:             store.closeWriter();
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:e777301:     @SuppressWarnings("resource")   // writer not closed here
+1:96d41f0:     private void flushInternal(Iterator<ByteBuffer> iterator, HintsStore store)
+1:96d41f0:     {
+1:96d41f0:         long maxHintsFileSize = DatabaseDescriptor.getMaxHintsFileSize();
+1:96d41f0: 
+1:96d41f0:         HintsWriter writer = store.getOrOpenWriter();
+1:96d41f0: 
+1:96d41f0:         try (HintsWriter.Session session = writer.newSession(writeBuffer))
+1:96d41f0:         {
+1:96d41f0:             while (iterator.hasNext())
+1:96d41f0:             {
+1:96d41f0:                 session.append(iterator.next());
+1:96d41f0:                 if (session.position() >= maxHintsFileSize)
+1:96d41f0:                     break;
+1:96d41f0:             }
+1:96d41f0:         }
+1:96d41f0:         catch (IOException e)
+1:96d41f0:         {
+1:96d41f0:             throw new FSWriteError(e, writer.descriptor().fileName());
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: }
+============================================================================
+author:Ariel Weisberg
+-------------------------------------------------------------------------------
+commit:037d24e
+/////////////////////////////////////////////////////////////////////////
+1:                 bufferPool.offer(recycledBuffer);
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:1f62608
+/////////////////////////////////////////////////////////////////////////
+1:             if (iterator.hasNext())
+1:                 flushInternal(iterator, store);
+commit:96d41f0
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.hints;
+1: 
+1: import java.io.IOException;
+1: import java.nio.ByteBuffer;
+1: import java.util.Iterator;
+1: import java.util.concurrent.*;
+1: 
+1: import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+1: import org.apache.cassandra.config.DatabaseDescriptor;
+1: import org.apache.cassandra.io.FSWriteError;
+1: 
+1: /**
+1:  * A single threaded executor that exclusively writes all the hints and otherwise manipulate the writers.
+1:  *
+1:  * Flushing demultiplexes the provided {@link HintsBuffer} and sequentially writes to each {@link HintsWriter},
+1:  * using the same shared write buffer. In the near future, when CASSANDRA-9428 (compression) is implemented,
+1:  * will also share a compression buffer.
+1:  */
+1: final class HintsWriteExecutor
+1: {
+0:     private static final int WRITE_BUFFER_SIZE = 256 << 10;
+1: 
+1:     private final HintsCatalog catalog;
+1:     private final ByteBuffer writeBuffer;
+1:     private final ExecutorService executor;
+1: 
+1:     HintsWriteExecutor(HintsCatalog catalog)
+1:     {
+1:         this.catalog = catalog;
+1: 
+1:         writeBuffer = ByteBuffer.allocateDirect(WRITE_BUFFER_SIZE);
+1:         executor = DebuggableThreadPoolExecutor.createWithFixedPoolSize("HintsWriteExecutor", 1);
+1:     }
+1: 
+1:     /*
+1:      * Should be very fast (worst case scenario - write a few 10s of megabytes to disk).
+1:      */
+1:     void shutdownBlocking()
+1:     {
+1:         executor.shutdown();
+1:         try
+1:         {
+1:             executor.awaitTermination(1, TimeUnit.MINUTES);
+1:         }
+1:         catch (InterruptedException e)
+1:         {
+1:             throw new AssertionError(e);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Flush the provided buffer, recycle it and offer it back to the pool.
+1:      */
+0:     Future flushBuffer(HintsBuffer buffer, HintsBufferPool bufferPool)
+1:     {
+1:         return executor.submit(new FlushBufferTask(buffer, bufferPool));
+1:     }
+1: 
+1:     /**
+1:      * Flush the current buffer, but without clearing/recycling it.
+1:      */
+0:     Future flushBufferPool(HintsBufferPool bufferPool)
+1:     {
+1:         return executor.submit(new FlushBufferPoolTask(bufferPool));
+1:     }
+1: 
+1:     /**
+1:      * Flush the current buffer just for the specified hints stores. Without clearing/recycling it.
+1:      */
+0:     Future flushBufferPool(HintsBufferPool bufferPool, Iterable<HintsStore> stores)
+1:     {
+1:         return executor.submit(new PartiallyFlushBufferPoolTask(bufferPool, stores));
+1:     }
+1: 
+1:     void fsyncWritersBlockingly(Iterable<HintsStore> stores)
+1:     {
+1:         try
+1:         {
+1:             executor.submit(new FsyncWritersTask(stores)).get();
+1:         }
+1:         catch (InterruptedException | ExecutionException e)
+1:         {
+1:             throw new RuntimeException(e);
+1:         }
+1:     }
+1: 
+0:     Future closeWriter(HintsStore store)
+1:     {
+1:         return executor.submit(store::closeWriter);
+1:     }
+1: 
+0:     Future closeAllWriters()
+1:     {
+1:         return executor.submit(() -> catalog.stores().forEach(HintsStore::closeWriter));
+1:     }
+1: 
+1:     private final class FlushBufferTask implements Runnable
+1:     {
+1:         private final HintsBuffer buffer;
+1:         private final HintsBufferPool bufferPool;
+1: 
+1:         FlushBufferTask(HintsBuffer buffer, HintsBufferPool bufferPool)
+1:         {
+1:             this.buffer = buffer;
+1:             this.bufferPool = bufferPool;
+1:         }
+1: 
+1:         public void run()
+1:         {
+1:             buffer.waitForModifications();
+1: 
+1:             try
+1:             {
+1:                 flush(buffer);
+1:             }
+1:             finally
+1:             {
+1:                 HintsBuffer recycledBuffer = buffer.recycle();
+0:                 if (!bufferPool.offer(recycledBuffer))
+0:                     recycledBuffer.free();
+1:             }
+1:         }
+1:     }
+1: 
+1:     private final class FlushBufferPoolTask implements Runnable
+1:     {
+1:         private final HintsBufferPool bufferPool;
+1: 
+1:         FlushBufferPoolTask(HintsBufferPool bufferPool)
+1:         {
+1:             this.bufferPool = bufferPool;
+1:         }
+1: 
+1:         public void run()
+1:         {
+1:             HintsBuffer buffer = bufferPool.currentBuffer();
+1:             buffer.waitForModifications();
+1:             flush(buffer);
+1:         }
+1:     }
+1: 
+1:     private final class PartiallyFlushBufferPoolTask implements Runnable
+1:     {
+1:         private final HintsBufferPool bufferPool;
+1:         private final Iterable<HintsStore> stores;
+1: 
+1:         PartiallyFlushBufferPoolTask(HintsBufferPool bufferPool, Iterable<HintsStore> stores)
+1:         {
+1:             this.bufferPool = bufferPool;
+1:             this.stores = stores;
+1:         }
+1: 
+1:         public void run()
+1:         {
+1:             HintsBuffer buffer = bufferPool.currentBuffer();
+1:             buffer.waitForModifications();
+1:             stores.forEach(store -> flush(buffer.consumingHintsIterator(store.hostId), store));
+1:         }
+1:     }
+1: 
+1:     private final class FsyncWritersTask implements Runnable
+1:     {
+1:         private final Iterable<HintsStore> stores;
+1: 
+1:         FsyncWritersTask(Iterable<HintsStore> stores)
+1:         {
+1:             this.stores = stores;
+1:         }
+1: 
+1:         public void run()
+1:         {
+1:             stores.forEach(HintsStore::fsyncWriter);
+1:             catalog.fsyncDirectory();
+1:         }
+1:     }
+1: 
+1:     private void flush(HintsBuffer buffer)
+1:     {
+1:         buffer.hostIds().forEach(hostId -> flush(buffer.consumingHintsIterator(hostId), catalog.get(hostId)));
+1:     }
+1: 
+1:     private void flush(Iterator<ByteBuffer> iterator, HintsStore store)
+1:     {
+1:         while (true)
+1:         {
+0:             flushInternal(iterator, store);
+1: 
+1:             if (!iterator.hasNext())
+1:                 break;
+1: 
+1:             // exceeded the size limit for an individual file, but still have more to write
+1:             // close the current writer and continue flushing to a new one in the next iteration
+1:             store.closeWriter();
+1:         }
+1:     }
+1: 
+1:     private void flushInternal(Iterator<ByteBuffer> iterator, HintsStore store)
+1:     {
+1:         long maxHintsFileSize = DatabaseDescriptor.getMaxHintsFileSize();
+1: 
+0:         @SuppressWarnings("resource")
+1:         HintsWriter writer = store.getOrOpenWriter();
+1: 
+1:         try (HintsWriter.Session session = writer.newSession(writeBuffer))
+1:         {
+1:             while (iterator.hasNext())
+1:             {
+1:                 session.append(iterator.next());
+1:                 if (session.position() >= maxHintsFileSize)
+1:                     break;
+1:             }
+1:         }
+1:         catch (IOException e)
+1:         {
+1:             throw new FSWriteError(e, writer.descriptor().fileName());
+1:         }
+1:     }
+1: }
+author:Blake Eggleston
+-------------------------------------------------------------------------------
+commit:c20566f
+/////////////////////////////////////////////////////////////////////////
+1:     static final int WRITE_BUFFER_SIZE = 256 << 10;
+author:Branimir Lambov
+-------------------------------------------------------------------------------
+commit:e777301
+/////////////////////////////////////////////////////////////////////////
+1:     Future<?> flushBuffer(HintsBuffer buffer, HintsBufferPool bufferPool)
+/////////////////////////////////////////////////////////////////////////
+1:     Future<?> flushBufferPool(HintsBufferPool bufferPool)
+/////////////////////////////////////////////////////////////////////////
+1:     Future<?> flushBufferPool(HintsBufferPool bufferPool, Iterable<HintsStore> stores)
+/////////////////////////////////////////////////////////////////////////
+1:     Future<?> closeWriter(HintsStore store)
+1:     Future<?> closeAllWriters()
+/////////////////////////////////////////////////////////////////////////
+1:     @SuppressWarnings("resource")   // writer not closed here
+============================================================================

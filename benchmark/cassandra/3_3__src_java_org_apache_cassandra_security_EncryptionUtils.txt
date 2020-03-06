@@ -1,0 +1,658 @@
+1:7374e9b: /*
+1:7374e9b:  * Licensed to the Apache Software Foundation (ASF) under one
+1:7374e9b:  * or more contributor license agreements.  See the NOTICE file
+1:7374e9b:  * distributed with this work for additional information
+1:7374e9b:  * regarding copyright ownership.  The ASF licenses this file
+1:7374e9b:  * to you under the Apache License, Version 2.0 (the
+1:7374e9b:  * "License"); you may not use this file except in compliance
+1:7374e9b:  * with the License.  You may obtain a copy of the License at
+1:7374e9b:  *
+1:7374e9b:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:7374e9b:  *
+1:7374e9b:  * Unless required by applicable law or agreed to in writing, software
+1:7374e9b:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:7374e9b:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:7374e9b:  * See the License for the specific language governing permissions and
+1:7374e9b:  * limitations under the License.
+1:7374e9b:  */
+1:7374e9b: package org.apache.cassandra.security;
+1:7374e9b: 
+1:7374e9b: import java.io.IOException;
+1:7374e9b: import java.nio.ByteBuffer;
+1:7374e9b: import java.nio.channels.ReadableByteChannel;
+1:7374e9b: import java.nio.channels.WritableByteChannel;
+1:7374e9b: import javax.crypto.BadPaddingException;
+1:7374e9b: import javax.crypto.Cipher;
+1:7374e9b: import javax.crypto.IllegalBlockSizeException;
+1:7374e9b: import javax.crypto.ShortBufferException;
+1:7374e9b: 
+1:7374e9b: import com.google.common.base.Preconditions;
+1:7374e9b: 
+1:7374e9b: import org.apache.cassandra.db.commitlog.EncryptedSegment;
+1:7374e9b: import org.apache.cassandra.io.compress.ICompressor;
+1:90033b9: import org.apache.cassandra.io.util.ChannelProxy;
+1:7374e9b: import org.apache.cassandra.io.util.FileDataInput;
+1:7374e9b: import org.apache.cassandra.utils.ByteBufferUtil;
+1:7374e9b: 
+1:7374e9b: /**
+1:7374e9b:  * Encryption and decryption functions specific to the commit log.
+1:7374e9b:  * See comments in {@link EncryptedSegment} for details on the binary format.
+1:7374e9b:  * The normal, and expected, invocation pattern is to compress then encrypt the data on the encryption pass,
+1:7374e9b:  * then decrypt and uncompress the data on the decrypt pass.
+1:7374e9b:  */
+1:7374e9b: public class EncryptionUtils
+1:7374e9b: {
+1:7374e9b:     public static final int COMPRESSED_BLOCK_HEADER_SIZE = 4;
+1:7374e9b:     public static final int ENCRYPTED_BLOCK_HEADER_SIZE = 8;
+1:7374e9b: 
+1:7374e9b:     private static final ThreadLocal<ByteBuffer> reusableBuffers = new ThreadLocal<ByteBuffer>()
+1:7374e9b:     {
+1:7374e9b:         protected ByteBuffer initialValue()
+1:7374e9b:         {
+1:7374e9b:             return ByteBuffer.allocate(ENCRYPTED_BLOCK_HEADER_SIZE);
+1:7374e9b:         }
+1:7374e9b:     };
+1:7374e9b: 
+1:7374e9b:     /**
+1:7374e9b:      * Compress the raw data, as well as manage sizing of the {@code outputBuffer}; if the buffer is not big enough,
+1:7374e9b:      * deallocate current, and allocate a large enough buffer.
+1:7374e9b:      * Write the two header lengths (plain text length, compressed length) to the beginning of the buffer as we want those
+1:7374e9b:      * values encapsulated in the encrypted block, as well.
+1:7374e9b:      *
+1:7374e9b:      * @return the byte buffer that was actaully written to; it may be the {@code outputBuffer} if it had enough capacity,
+1:7374e9b:      * or it may be a new, larger instance. Callers should capture the return buffer (if calling multiple times).
+1:7374e9b:      */
+1:7374e9b:     public static ByteBuffer compress(ByteBuffer inputBuffer, ByteBuffer outputBuffer, boolean allowBufferResize, ICompressor compressor) throws IOException
+1:7374e9b:     {
+1:7374e9b:         int inputLength = inputBuffer.remaining();
+1:7374e9b:         final int compressedLength = compressor.initialCompressedBufferLength(inputLength);
+1:7374e9b:         outputBuffer = ByteBufferUtil.ensureCapacity(outputBuffer, compressedLength + COMPRESSED_BLOCK_HEADER_SIZE, allowBufferResize);
+1:7374e9b: 
+1:7374e9b:         outputBuffer.putInt(inputLength);
+1:7374e9b:         compressor.compress(inputBuffer, outputBuffer);
+1:7374e9b:         outputBuffer.flip();
+1:7374e9b: 
+1:7374e9b:         return outputBuffer;
+1:7374e9b:     }
+1:7374e9b: 
+1:7374e9b:     /**
+1:7374e9b:      * Encrypt the input data, and writes out to the same input buffer; if the buffer is not big enough,
+1:7374e9b:      * deallocate current, and allocate a large enough buffer.
+1:7374e9b:      * Writes the cipher text and headers out to the channel, as well.
+1:7374e9b:      *
+1:7374e9b:      * Note: channel is a parameter as we cannot write header info to the output buffer as we assume the input and output
+1:7374e9b:      * buffers can be the same buffer (and writing the headers to a shared buffer will corrupt any input data). Hence,
+1:7374e9b:      * we write out the headers directly to the channel, and then the cipher text (once encrypted).
+1:7374e9b:      */
+1:7374e9b:     public static ByteBuffer encryptAndWrite(ByteBuffer inputBuffer, WritableByteChannel channel, boolean allowBufferResize, Cipher cipher) throws IOException
+1:7374e9b:     {
+1:7374e9b:         final int plainTextLength = inputBuffer.remaining();
+1:7374e9b:         final int encryptLength = cipher.getOutputSize(plainTextLength);
+1:7374e9b:         ByteBuffer outputBuffer = inputBuffer.duplicate();
+1:7374e9b:         outputBuffer = ByteBufferUtil.ensureCapacity(outputBuffer, encryptLength, allowBufferResize);
+1:7374e9b: 
+1:7374e9b:         // it's unfortunate that we need to allocate a small buffer here just for the headers, but if we reuse the input buffer
+1:7374e9b:         // for the output, then we would overwrite the first n bytes of the real data with the header data.
+1:7374e9b:         ByteBuffer intBuf = ByteBuffer.allocate(ENCRYPTED_BLOCK_HEADER_SIZE);
+1:7374e9b:         intBuf.putInt(0, encryptLength);
+1:7374e9b:         intBuf.putInt(4, plainTextLength);
+1:7374e9b:         channel.write(intBuf);
+1:7374e9b: 
+1:7374e9b:         try
+1:7374e9b:         {
+1:7374e9b:             cipher.doFinal(inputBuffer, outputBuffer);
+1:7374e9b:         }
+1:7374e9b:         catch (ShortBufferException | IllegalBlockSizeException | BadPaddingException e)
+1:7374e9b:         {
+1:7374e9b:             throw new IOException("failed to encrypt commit log block", e);
+1:7374e9b:         }
+1:7374e9b: 
+1:7374e9b:         outputBuffer.position(0).limit(encryptLength);
+1:7374e9b:         channel.write(outputBuffer);
+1:7374e9b:         outputBuffer.position(0).limit(encryptLength);
+1:7374e9b: 
+1:7374e9b:         return outputBuffer;
+1:7374e9b:     }
+1:7374e9b: 
+1:05660a5:     @SuppressWarnings("resource")
+1:7374e9b:     public static ByteBuffer encrypt(ByteBuffer inputBuffer, ByteBuffer outputBuffer, boolean allowBufferResize, Cipher cipher) throws IOException
+1:7374e9b:     {
+1:7374e9b:         Preconditions.checkNotNull(outputBuffer, "output buffer may not be null");
+1:7374e9b:         return encryptAndWrite(inputBuffer, new ChannelAdapter(outputBuffer), allowBufferResize, cipher);
+1:7374e9b:     }
+1:7374e9b: 
+1:7374e9b:     /**
+1:7374e9b:      * Decrypt the input data, as well as manage sizing of the {@code outputBuffer}; if the buffer is not big enough,
+1:7374e9b:      * deallocate current, and allocate a large enough buffer.
+1:7374e9b:      *
+1:7374e9b:      * @return the byte buffer that was actaully written to; it may be the {@code outputBuffer} if it had enough capacity,
+1:7374e9b:      * or it may be a new, larger instance. Callers should capture the return buffer (if calling multiple times).
+1:7374e9b:      */
+1:7374e9b:     public static ByteBuffer decrypt(ReadableByteChannel channel, ByteBuffer outputBuffer, boolean allowBufferResize, Cipher cipher) throws IOException
+1:7374e9b:     {
+1:7374e9b:         ByteBuffer metadataBuffer = reusableBuffers.get();
+1:7374e9b:         if (metadataBuffer.capacity() < ENCRYPTED_BLOCK_HEADER_SIZE)
+1:7374e9b:         {
+1:7374e9b:             metadataBuffer = ByteBufferUtil.ensureCapacity(metadataBuffer, ENCRYPTED_BLOCK_HEADER_SIZE, true);
+1:7374e9b:             reusableBuffers.set(metadataBuffer);
+1:7374e9b:         }
+1:7374e9b: 
+1:7374e9b:         metadataBuffer.position(0).limit(ENCRYPTED_BLOCK_HEADER_SIZE);
+1:7374e9b:         channel.read(metadataBuffer);
+1:7374e9b:         if (metadataBuffer.remaining() < ENCRYPTED_BLOCK_HEADER_SIZE)
+1:7374e9b:             throw new IllegalStateException("could not read encrypted blocked metadata header");
+1:7374e9b:         int encryptedLength = metadataBuffer.getInt();
+1:7374e9b:         // this is the length of the compressed data
+1:7374e9b:         int plainTextLength = metadataBuffer.getInt();
+1:7374e9b: 
+1:7374e9b:         outputBuffer = ByteBufferUtil.ensureCapacity(outputBuffer, Math.max(plainTextLength, encryptedLength), allowBufferResize);
+1:7374e9b:         outputBuffer.position(0).limit(encryptedLength);
+1:7374e9b:         channel.read(outputBuffer);
+1:7374e9b: 
+1:7374e9b:         ByteBuffer dupe = outputBuffer.duplicate();
+1:7374e9b:         dupe.clear();
+1:7374e9b: 
+1:7374e9b:         try
+1:7374e9b:         {
+1:7374e9b:             cipher.doFinal(outputBuffer, dupe);
+1:7374e9b:         }
+1:7374e9b:         catch (ShortBufferException | IllegalBlockSizeException | BadPaddingException e)
+1:7374e9b:         {
+1:7374e9b:             throw new IOException("failed to decrypt commit log block", e);
+1:7374e9b:         }
+1:7374e9b: 
+1:7374e9b:         dupe.position(0).limit(plainTextLength);
+1:7374e9b:         return dupe;
+1:7374e9b:     }
+1:7374e9b: 
+1:7374e9b:     // path used when decrypting commit log files
+1:05660a5:     @SuppressWarnings("resource")
+1:7374e9b:     public static ByteBuffer decrypt(FileDataInput fileDataInput, ByteBuffer outputBuffer, boolean allowBufferResize, Cipher cipher) throws IOException
+1:7374e9b:     {
+1:7374e9b:         return decrypt(new DataInputReadChannel(fileDataInput), outputBuffer, allowBufferResize, cipher);
+1:7374e9b:     }
+1:7374e9b: 
+1:7374e9b:     /**
+1:7374e9b:      * Uncompress the input data, as well as manage sizing of the {@code outputBuffer}; if the buffer is not big enough,
+1:7374e9b:      * deallocate current, and allocate a large enough buffer.
+1:7374e9b:      *
+1:7374e9b:      * @return the byte buffer that was actaully written to; it may be the {@code outputBuffer} if it had enough capacity,
+1:7374e9b:      * or it may be a new, larger instance. Callers should capture the return buffer (if calling multiple times).
+1:7374e9b:      */
+1:7374e9b:     public static ByteBuffer uncompress(ByteBuffer inputBuffer, ByteBuffer outputBuffer, boolean allowBufferResize, ICompressor compressor) throws IOException
+1:7374e9b:     {
+1:7374e9b:         int outputLength = inputBuffer.getInt();
+1:7374e9b:         outputBuffer = ByteBufferUtil.ensureCapacity(outputBuffer, outputLength, allowBufferResize);
+1:7374e9b:         compressor.uncompress(inputBuffer, outputBuffer);
+1:7374e9b:         outputBuffer.position(0).limit(outputLength);
+1:7374e9b: 
+1:7374e9b:         return outputBuffer;
+1:7374e9b:     }
+1:7374e9b: 
+1:7374e9b:     public static int uncompress(byte[] input, int inputOffset, int inputLength, byte[] output, int outputOffset, ICompressor compressor) throws IOException
+1:7374e9b:     {
+1:7374e9b:         int outputLength = readInt(input, inputOffset);
+1:7374e9b:         inputOffset += 4;
+1:7374e9b:         inputLength -= 4;
+1:7374e9b: 
+1:7374e9b:         if (output.length - outputOffset < outputLength)
+1:7374e9b:         {
+1:7374e9b:             String msg = String.format("buffer to uncompress into is not large enough; buf size = %d, buf offset = %d, target size = %s",
+1:7374e9b:                                        output.length, outputOffset, outputLength);
+1:7374e9b:             throw new IllegalStateException(msg);
+1:7374e9b:         }
+1:7374e9b: 
+1:7374e9b:         return compressor.uncompress(input, inputOffset, inputLength, output, outputOffset);
+1:7374e9b:     }
+1:7374e9b: 
+1:7374e9b:     private static int readInt(byte[] input, int inputOffset)
+1:7374e9b:     {
+1:7374e9b:         return  (input[inputOffset + 3] & 0xFF)
+1:7374e9b:                 | ((input[inputOffset + 2] & 0xFF) << 8)
+1:7374e9b:                 | ((input[inputOffset + 1] & 0xFF) << 16)
+1:7374e9b:                 | ((input[inputOffset] & 0xFF) << 24);
+1:7374e9b:     }
+1:7374e9b: 
+1:7374e9b:     /**
+1:7374e9b:      * A simple {@link java.nio.channels.Channel} adapter for ByteBuffers.
+1:7374e9b:      */
+1:7374e9b:     private static final class ChannelAdapter implements WritableByteChannel
+1:7374e9b:     {
+1:7374e9b:         private final ByteBuffer buffer;
+1:7374e9b: 
+1:7374e9b:         private ChannelAdapter(ByteBuffer buffer)
+1:7374e9b:         {
+1:7374e9b:             this.buffer = buffer;
+1:7374e9b:         }
+1:7374e9b: 
+1:7374e9b:         public int write(ByteBuffer src)
+1:7374e9b:         {
+1:7374e9b:             int count = src.remaining();
+1:7374e9b:             buffer.put(src);
+1:7374e9b:             return count;
+1:7374e9b:         }
+1:7374e9b: 
+1:7374e9b:         public boolean isOpen()
+1:7374e9b:         {
+1:7374e9b:             return true;
+1:7374e9b:         }
+1:7374e9b: 
+1:7374e9b:         public void close()
+1:7374e9b:         {
+1:7374e9b:             // nop
+1:7374e9b:         }
+1:7374e9b:     }
+1:cee22ad: 
+1:7374e9b:     private static class DataInputReadChannel implements ReadableByteChannel
+1:7374e9b:     {
+1:7374e9b:         private final FileDataInput fileDataInput;
+1:90033b9: 
+1:7374e9b:         private DataInputReadChannel(FileDataInput dataInput)
+1:7374e9b:         {
+1:7374e9b:             this.fileDataInput = dataInput;
+1:7374e9b:         }
+1:7374e9b: 
+1:7374e9b:         public int read(ByteBuffer dst) throws IOException
+1:7374e9b:         {
+1:7374e9b:             int readLength = dst.remaining();
+1:7374e9b:             // we should only be performing encrypt/decrypt operations with on-heap buffers, so calling BB.array() should be legit here
+1:7374e9b:             fileDataInput.readFully(dst.array(), dst.position(), readLength);
+1:7374e9b:             return readLength;
+1:7374e9b:         }
+1:7374e9b: 
+1:7374e9b:         public boolean isOpen()
+1:7374e9b:         {
+1:7374e9b:             try
+1:7374e9b:             {
+1:7374e9b:                 return fileDataInput.isEOF();
+1:7374e9b:             }
+1:7374e9b:             catch (IOException e)
+1:7374e9b:             {
+1:7374e9b:                 return true;
+1:7374e9b:             }
+1:7374e9b:         }
+1:7374e9b: 
+1:7374e9b:         public void close()
+1:7374e9b:         {
+1:7374e9b:             // nop
+1:7374e9b:         }
+1:7374e9b:     }
+1:7374e9b: 
+1:90033b9:     public static class ChannelProxyReadChannel implements ReadableByteChannel
+1:90033b9:     {
+1:90033b9:         private final ChannelProxy channelProxy;
+1:90033b9:         private volatile long currentPosition;
+1:90033b9: 
+1:90033b9:         public ChannelProxyReadChannel(ChannelProxy channelProxy, long currentPosition)
+1:90033b9:         {
+1:90033b9:             this.channelProxy = channelProxy;
+1:90033b9:             this.currentPosition = currentPosition;
+1:90033b9:         }
+1:90033b9: 
+1:90033b9:         public int read(ByteBuffer dst) throws IOException
+1:90033b9:         {
+1:90033b9:             int bytesRead = channelProxy.read(dst, currentPosition);
+1:90033b9:             dst.flip();
+1:90033b9:             currentPosition += bytesRead;
+1:90033b9:             return bytesRead;
+1:90033b9:         }
+1:90033b9: 
+1:90033b9:         public long getCurrentPosition()
+1:90033b9:         {
+1:90033b9:             return currentPosition;
+1:90033b9:         }
+1:90033b9: 
+1:90033b9:         public boolean isOpen()
+1:90033b9:         {
+1:90033b9:             return channelProxy.isCleanedUp();
+1:90033b9:         }
+1:90033b9: 
+1:90033b9:         public void close()
+1:90033b9:         {
+1:90033b9:             // nop
+1:90033b9:         }
+1:7374e9b: 
+1:cee22ad:         public void setPosition(long sourcePosition)
+1:cee22ad:         {
+1:cee22ad:             this.currentPosition = sourcePosition;
+1:cee22ad:         }
+1:90033b9:     }
+1:7374e9b: }
+============================================================================
+author:Sam Tunnicliffe
+-------------------------------------------------------------------------------
+commit:05660a5
+/////////////////////////////////////////////////////////////////////////
+1:     @SuppressWarnings("resource")
+/////////////////////////////////////////////////////////////////////////
+1:     @SuppressWarnings("resource")
+author:Stefan Podkowinski
+-------------------------------------------------------------------------------
+commit:cee22ad
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         public void setPosition(long sourcePosition)
+1:         {
+1:             this.currentPosition = sourcePosition;
+1:         }
+author:Jason Brown
+-------------------------------------------------------------------------------
+commit:90033b9
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.io.util.ChannelProxy;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     public static class ChannelProxyReadChannel implements ReadableByteChannel
+1:     {
+1:         private final ChannelProxy channelProxy;
+1:         private volatile long currentPosition;
+1: 
+1:         public ChannelProxyReadChannel(ChannelProxy channelProxy, long currentPosition)
+1:         {
+1:             this.channelProxy = channelProxy;
+1:             this.currentPosition = currentPosition;
+1:         }
+1: 
+1:         public int read(ByteBuffer dst) throws IOException
+1:         {
+1:             int bytesRead = channelProxy.read(dst, currentPosition);
+1:             dst.flip();
+1:             currentPosition += bytesRead;
+1:             return bytesRead;
+1:         }
+1: 
+1:         public long getCurrentPosition()
+1:         {
+1:             return currentPosition;
+1:         }
+1: 
+1:         public boolean isOpen()
+1:         {
+1:             return channelProxy.isCleanedUp();
+1:         }
+1: 
+1:         public void close()
+1:         {
+1:             // nop
+1:         }
+1:     }
+commit:7374e9b
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.security;
+1: 
+1: import java.io.IOException;
+1: import java.nio.ByteBuffer;
+1: import java.nio.channels.ReadableByteChannel;
+1: import java.nio.channels.WritableByteChannel;
+1: import javax.crypto.BadPaddingException;
+1: import javax.crypto.Cipher;
+1: import javax.crypto.IllegalBlockSizeException;
+1: import javax.crypto.ShortBufferException;
+1: 
+1: import com.google.common.base.Preconditions;
+1: 
+1: import org.apache.cassandra.db.commitlog.EncryptedSegment;
+1: import org.apache.cassandra.io.compress.ICompressor;
+1: import org.apache.cassandra.io.util.FileDataInput;
+1: import org.apache.cassandra.utils.ByteBufferUtil;
+1: 
+1: /**
+1:  * Encryption and decryption functions specific to the commit log.
+1:  * See comments in {@link EncryptedSegment} for details on the binary format.
+1:  * The normal, and expected, invocation pattern is to compress then encrypt the data on the encryption pass,
+1:  * then decrypt and uncompress the data on the decrypt pass.
+1:  */
+1: public class EncryptionUtils
+1: {
+1:     public static final int COMPRESSED_BLOCK_HEADER_SIZE = 4;
+1:     public static final int ENCRYPTED_BLOCK_HEADER_SIZE = 8;
+1: 
+1:     private static final ThreadLocal<ByteBuffer> reusableBuffers = new ThreadLocal<ByteBuffer>()
+1:     {
+1:         protected ByteBuffer initialValue()
+1:         {
+1:             return ByteBuffer.allocate(ENCRYPTED_BLOCK_HEADER_SIZE);
+1:         }
+1:     };
+1: 
+1:     /**
+1:      * Compress the raw data, as well as manage sizing of the {@code outputBuffer}; if the buffer is not big enough,
+1:      * deallocate current, and allocate a large enough buffer.
+1:      * Write the two header lengths (plain text length, compressed length) to the beginning of the buffer as we want those
+1:      * values encapsulated in the encrypted block, as well.
+1:      *
+1:      * @return the byte buffer that was actaully written to; it may be the {@code outputBuffer} if it had enough capacity,
+1:      * or it may be a new, larger instance. Callers should capture the return buffer (if calling multiple times).
+1:      */
+1:     public static ByteBuffer compress(ByteBuffer inputBuffer, ByteBuffer outputBuffer, boolean allowBufferResize, ICompressor compressor) throws IOException
+1:     {
+1:         int inputLength = inputBuffer.remaining();
+1:         final int compressedLength = compressor.initialCompressedBufferLength(inputLength);
+1:         outputBuffer = ByteBufferUtil.ensureCapacity(outputBuffer, compressedLength + COMPRESSED_BLOCK_HEADER_SIZE, allowBufferResize);
+1: 
+1:         outputBuffer.putInt(inputLength);
+1:         compressor.compress(inputBuffer, outputBuffer);
+1:         outputBuffer.flip();
+1: 
+1:         return outputBuffer;
+1:     }
+1: 
+1:     /**
+1:      * Encrypt the input data, and writes out to the same input buffer; if the buffer is not big enough,
+1:      * deallocate current, and allocate a large enough buffer.
+1:      * Writes the cipher text and headers out to the channel, as well.
+1:      *
+1:      * Note: channel is a parameter as we cannot write header info to the output buffer as we assume the input and output
+1:      * buffers can be the same buffer (and writing the headers to a shared buffer will corrupt any input data). Hence,
+1:      * we write out the headers directly to the channel, and then the cipher text (once encrypted).
+1:      */
+1:     public static ByteBuffer encryptAndWrite(ByteBuffer inputBuffer, WritableByteChannel channel, boolean allowBufferResize, Cipher cipher) throws IOException
+1:     {
+1:         final int plainTextLength = inputBuffer.remaining();
+1:         final int encryptLength = cipher.getOutputSize(plainTextLength);
+1:         ByteBuffer outputBuffer = inputBuffer.duplicate();
+1:         outputBuffer = ByteBufferUtil.ensureCapacity(outputBuffer, encryptLength, allowBufferResize);
+1: 
+1:         // it's unfortunate that we need to allocate a small buffer here just for the headers, but if we reuse the input buffer
+1:         // for the output, then we would overwrite the first n bytes of the real data with the header data.
+1:         ByteBuffer intBuf = ByteBuffer.allocate(ENCRYPTED_BLOCK_HEADER_SIZE);
+1:         intBuf.putInt(0, encryptLength);
+1:         intBuf.putInt(4, plainTextLength);
+1:         channel.write(intBuf);
+1: 
+1:         try
+1:         {
+1:             cipher.doFinal(inputBuffer, outputBuffer);
+1:         }
+1:         catch (ShortBufferException | IllegalBlockSizeException | BadPaddingException e)
+1:         {
+1:             throw new IOException("failed to encrypt commit log block", e);
+1:         }
+1: 
+1:         outputBuffer.position(0).limit(encryptLength);
+1:         channel.write(outputBuffer);
+1:         outputBuffer.position(0).limit(encryptLength);
+1: 
+1:         return outputBuffer;
+1:     }
+1: 
+1:     public static ByteBuffer encrypt(ByteBuffer inputBuffer, ByteBuffer outputBuffer, boolean allowBufferResize, Cipher cipher) throws IOException
+1:     {
+1:         Preconditions.checkNotNull(outputBuffer, "output buffer may not be null");
+1:         return encryptAndWrite(inputBuffer, new ChannelAdapter(outputBuffer), allowBufferResize, cipher);
+1:     }
+1: 
+1:     /**
+1:      * Decrypt the input data, as well as manage sizing of the {@code outputBuffer}; if the buffer is not big enough,
+1:      * deallocate current, and allocate a large enough buffer.
+1:      *
+1:      * @return the byte buffer that was actaully written to; it may be the {@code outputBuffer} if it had enough capacity,
+1:      * or it may be a new, larger instance. Callers should capture the return buffer (if calling multiple times).
+1:      */
+1:     public static ByteBuffer decrypt(ReadableByteChannel channel, ByteBuffer outputBuffer, boolean allowBufferResize, Cipher cipher) throws IOException
+1:     {
+1:         ByteBuffer metadataBuffer = reusableBuffers.get();
+1:         if (metadataBuffer.capacity() < ENCRYPTED_BLOCK_HEADER_SIZE)
+1:         {
+1:             metadataBuffer = ByteBufferUtil.ensureCapacity(metadataBuffer, ENCRYPTED_BLOCK_HEADER_SIZE, true);
+1:             reusableBuffers.set(metadataBuffer);
+1:         }
+1: 
+1:         metadataBuffer.position(0).limit(ENCRYPTED_BLOCK_HEADER_SIZE);
+1:         channel.read(metadataBuffer);
+1:         if (metadataBuffer.remaining() < ENCRYPTED_BLOCK_HEADER_SIZE)
+1:             throw new IllegalStateException("could not read encrypted blocked metadata header");
+1:         int encryptedLength = metadataBuffer.getInt();
+1:         // this is the length of the compressed data
+1:         int plainTextLength = metadataBuffer.getInt();
+1: 
+1:         outputBuffer = ByteBufferUtil.ensureCapacity(outputBuffer, Math.max(plainTextLength, encryptedLength), allowBufferResize);
+1:         outputBuffer.position(0).limit(encryptedLength);
+1:         channel.read(outputBuffer);
+1: 
+1:         ByteBuffer dupe = outputBuffer.duplicate();
+1:         dupe.clear();
+1: 
+1:         try
+1:         {
+1:             cipher.doFinal(outputBuffer, dupe);
+1:         }
+1:         catch (ShortBufferException | IllegalBlockSizeException | BadPaddingException e)
+1:         {
+1:             throw new IOException("failed to decrypt commit log block", e);
+1:         }
+1: 
+1:         dupe.position(0).limit(plainTextLength);
+1:         return dupe;
+1:     }
+1: 
+1:     // path used when decrypting commit log files
+1:     public static ByteBuffer decrypt(FileDataInput fileDataInput, ByteBuffer outputBuffer, boolean allowBufferResize, Cipher cipher) throws IOException
+1:     {
+1:         return decrypt(new DataInputReadChannel(fileDataInput), outputBuffer, allowBufferResize, cipher);
+1:     }
+1: 
+1:     /**
+1:      * Uncompress the input data, as well as manage sizing of the {@code outputBuffer}; if the buffer is not big enough,
+1:      * deallocate current, and allocate a large enough buffer.
+1:      *
+1:      * @return the byte buffer that was actaully written to; it may be the {@code outputBuffer} if it had enough capacity,
+1:      * or it may be a new, larger instance. Callers should capture the return buffer (if calling multiple times).
+1:      */
+1:     public static ByteBuffer uncompress(ByteBuffer inputBuffer, ByteBuffer outputBuffer, boolean allowBufferResize, ICompressor compressor) throws IOException
+1:     {
+1:         int outputLength = inputBuffer.getInt();
+1:         outputBuffer = ByteBufferUtil.ensureCapacity(outputBuffer, outputLength, allowBufferResize);
+1:         compressor.uncompress(inputBuffer, outputBuffer);
+1:         outputBuffer.position(0).limit(outputLength);
+1: 
+1:         return outputBuffer;
+1:     }
+1: 
+1:     public static int uncompress(byte[] input, int inputOffset, int inputLength, byte[] output, int outputOffset, ICompressor compressor) throws IOException
+1:     {
+1:         int outputLength = readInt(input, inputOffset);
+1:         inputOffset += 4;
+1:         inputLength -= 4;
+1: 
+1:         if (output.length - outputOffset < outputLength)
+1:         {
+1:             String msg = String.format("buffer to uncompress into is not large enough; buf size = %d, buf offset = %d, target size = %s",
+1:                                        output.length, outputOffset, outputLength);
+1:             throw new IllegalStateException(msg);
+1:         }
+1: 
+1:         return compressor.uncompress(input, inputOffset, inputLength, output, outputOffset);
+1:     }
+1: 
+1:     private static int readInt(byte[] input, int inputOffset)
+1:     {
+1:         return  (input[inputOffset + 3] & 0xFF)
+1:                 | ((input[inputOffset + 2] & 0xFF) << 8)
+1:                 | ((input[inputOffset + 1] & 0xFF) << 16)
+1:                 | ((input[inputOffset] & 0xFF) << 24);
+1:     }
+1: 
+1:     /**
+1:      * A simple {@link java.nio.channels.Channel} adapter for ByteBuffers.
+1:      */
+1:     private static final class ChannelAdapter implements WritableByteChannel
+1:     {
+1:         private final ByteBuffer buffer;
+1: 
+1:         private ChannelAdapter(ByteBuffer buffer)
+1:         {
+1:             this.buffer = buffer;
+1:         }
+1: 
+1:         public int write(ByteBuffer src)
+1:         {
+1:             int count = src.remaining();
+1:             buffer.put(src);
+1:             return count;
+1:         }
+1: 
+1:         public boolean isOpen()
+1:         {
+1:             return true;
+1:         }
+1: 
+1:         public void close()
+1:         {
+1:             // nop
+1:         }
+1:     }
+1: 
+1:     private static class DataInputReadChannel implements ReadableByteChannel
+1:     {
+1:         private final FileDataInput fileDataInput;
+1: 
+1:         private DataInputReadChannel(FileDataInput dataInput)
+1:         {
+1:             this.fileDataInput = dataInput;
+1:         }
+1: 
+1:         public int read(ByteBuffer dst) throws IOException
+1:         {
+1:             int readLength = dst.remaining();
+1:             // we should only be performing encrypt/decrypt operations with on-heap buffers, so calling BB.array() should be legit here
+1:             fileDataInput.readFully(dst.array(), dst.position(), readLength);
+1:             return readLength;
+1:         }
+1: 
+1:         public boolean isOpen()
+1:         {
+1:             try
+1:             {
+1:                 return fileDataInput.isEOF();
+1:             }
+1:             catch (IOException e)
+1:             {
+1:                 return true;
+1:             }
+1:         }
+1: 
+1:         public void close()
+1:         {
+1:             // nop
+1:         }
+1:     }
+1: }
+============================================================================

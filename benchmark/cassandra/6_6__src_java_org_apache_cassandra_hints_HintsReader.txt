@@ -1,0 +1,771 @@
+1:96d41f0: /*
+1:96d41f0:  * Licensed to the Apache Software Foundation (ASF) under one
+1:96d41f0:  * or more contributor license agreements.  See the NOTICE file
+1:96d41f0:  * distributed with this work for additional information
+1:96d41f0:  * regarding copyright ownership.  The ASF licenses this file
+1:96d41f0:  * to you under the Apache License, Version 2.0 (the
+1:96d41f0:  * "License"); you may not use this file except in compliance
+1:96d41f0:  * with the License.  You may obtain a copy of the License at
+1:96d41f0:  *
+1:96d41f0:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:96d41f0:  *
+1:96d41f0:  * Unless required by applicable law or agreed to in writing, software
+1:96d41f0:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:96d41f0:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:96d41f0:  * See the License for the specific language governing permissions and
+1:96d41f0:  * limitations under the License.
+1:96d41f0:  */
+1:96d41f0: package org.apache.cassandra.hints;
+1:96d41f0: 
+1:96d41f0: import java.io.File;
+1:96d41f0: import java.io.IOException;
+1:96d41f0: import java.nio.ByteBuffer;
+1:96d41f0: import java.util.Iterator;
+1:96d41f0: 
+1:96d41f0: import javax.annotation.Nullable;
+1:96d41f0: 
+1:ce63ccc: import com.google.common.primitives.Ints;
+1:96d41f0: import com.google.common.util.concurrent.RateLimiter;
+1:96d41f0: 
+1:96d41f0: import org.slf4j.Logger;
+1:96d41f0: import org.slf4j.LoggerFactory;
+1:96d41f0: 
+1:96d41f0: import org.apache.cassandra.db.UnknownColumnFamilyException;
+1:96d41f0: import org.apache.cassandra.io.FSReadError;
+1:96d41f0: import org.apache.cassandra.utils.AbstractIterator;
+1:96d41f0: import org.apache.cassandra.utils.ByteBufferUtil;
+1:96d41f0: import org.apache.cassandra.utils.CLibrary;
+1:96d41f0: 
+1:96d41f0: /**
+1:96d41f0:  * A paged non-compressed hints reader that provides two iterators:
+1:96d41f0:  * - a 'raw' ByteBuffer iterator that doesn't deserialize the hints, but returns the pre-encoded hints verbatim
+1:96d41f0:  * - a decoded iterator, that deserializes the underlying bytes into {@link Hint} instances.
+1:96d41f0:  *
+1:96d41f0:  * The former is an optimisation for when the messaging version of the file matches the messaging version of the destination
+1:96d41f0:  * node. Extra decoding and reencoding is a waste of effort in this scenario, so we avoid it.
+1:96d41f0:  *
+1:96d41f0:  * The latter is required for dispatch of hints to nodes that have a different messaging version, and in general is just an
+1:96d41f0:  * easy way to enable backward and future compatibilty.
+1:96d41f0:  */
+1:c20566f: class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
+1:96d41f0: {
+1:96d41f0:     private static final Logger logger = LoggerFactory.getLogger(HintsReader.class);
+1:96d41f0: 
+1:96d41f0:     // don't read more than 512 KB of hints at a time.
+1:96d41f0:     private static final int PAGE_SIZE = 512 << 10;
+1:96d41f0: 
+1:96d41f0:     private final HintsDescriptor descriptor;
+1:96d41f0:     private final File file;
+1:ce63ccc:     private final ChecksummedDataInput input;
+1:96d41f0: 
+1:96d41f0:     // we pass the RateLimiter into HintsReader itself because it's cheaper to calculate the size before the hint is deserialized
+1:96d41f0:     @Nullable
+1:96d41f0:     private final RateLimiter rateLimiter;
+1:96d41f0: 
+1:c20566f:     protected HintsReader(HintsDescriptor descriptor, File file, ChecksummedDataInput reader, RateLimiter rateLimiter)
+1:96d41f0:     {
+1:96d41f0:         this.descriptor = descriptor;
+1:96d41f0:         this.file = file;
+1:ce63ccc:         this.input = reader;
+1:96d41f0:         this.rateLimiter = rateLimiter;
+1:96d41f0:     }
+1:96d41f0: 
+1:e777301:     @SuppressWarnings("resource") // HintsReader owns input
+1:96d41f0:     static HintsReader open(File file, RateLimiter rateLimiter)
+1:96d41f0:     {
+1:ce63ccc:         ChecksummedDataInput reader = ChecksummedDataInput.open(file);
+1:96d41f0:         try
+1:96d41f0:         {
+1:96d41f0:             HintsDescriptor descriptor = HintsDescriptor.deserialize(reader);
+1:c20566f:             if (descriptor.isCompressed())
+1:c20566f:             {
+1:c20566f:                 // since the hints descriptor is always uncompressed, it needs to be read with the normal ChecksummedDataInput.
+1:c20566f:                 // The compressed input is instantiated with the uncompressed input's position
+1:c20566f:                 reader = CompressedChecksummedDataInput.upgradeInput(reader, descriptor.createCompressor());
+1:c20566f:             }
+1:90033b9:             else if (descriptor.isEncrypted())
+1:90033b9:                 reader = EncryptedChecksummedDataInput.upgradeInput(reader, descriptor.getCipher(), descriptor.createCompressor());
+1:96d41f0:             return new HintsReader(descriptor, file, reader, rateLimiter);
+1:96d41f0:         }
+1:96d41f0:         catch (IOException e)
+1:96d41f0:         {
+1:e777301:             reader.close();
+1:96d41f0:             throw new FSReadError(e, file);
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     static HintsReader open(File file)
+1:96d41f0:     {
+1:96d41f0:         return open(file, null);
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     public void close()
+1:96d41f0:     {
+1:e777301:         input.close();
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     public HintsDescriptor descriptor()
+1:96d41f0:     {
+1:96d41f0:         return descriptor;
+1:96d41f0:     }
+1:96d41f0: 
+1:cee22ad:     void seek(InputPosition newPosition)
+1:96d41f0:     {
+1:cee22ad:         input.seek(newPosition);
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     public Iterator<Page> iterator()
+1:96d41f0:     {
+1:96d41f0:         return new PagesIterator();
+1:96d41f0:     }
+1:96d41f0: 
+1:c20566f:     public ChecksummedDataInput getInput()
+1:c20566f:     {
+1:c20566f:         return input;
+1:c20566f:     }
+1:c20566f: 
+1:96d41f0:     final class Page
+1:96d41f0:     {
+1:cee22ad:         public final InputPosition position;
+1:96d41f0: 
+1:cee22ad:         private Page(InputPosition inputPosition)
+1:96d41f0:         {
+1:cee22ad:             this.position = inputPosition;
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         Iterator<Hint> hintsIterator()
+1:96d41f0:         {
+1:cee22ad:             return new HintsIterator(position);
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         Iterator<ByteBuffer> buffersIterator()
+1:96d41f0:         {
+1:cee22ad:             return new BuffersIterator(position);
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     final class PagesIterator extends AbstractIterator<Page>
+1:96d41f0:     {
+1:96d41f0:         @SuppressWarnings("resource")
+1:96d41f0:         protected Page computeNext()
+1:96d41f0:         {
+1:cee22ad:             input.tryUncacheRead();
+1:96d41f0: 
+1:c20566f:             if (input.isEOF())
+1:96d41f0:                 return endOfData();
+1:96d41f0: 
+1:cee22ad:             return new Page(input.getSeekPosition());
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     /**
+1:96d41f0:      * A decoding iterator that deserializes the hints as it goes.
+1:96d41f0:      */
+1:96d41f0:     final class HintsIterator extends AbstractIterator<Hint>
+1:96d41f0:     {
+1:cee22ad:         private final InputPosition offset;
+1:96d41f0: 
+1:cee22ad:         HintsIterator(InputPosition offset)
+1:96d41f0:         {
+1:96d41f0:             super();
+2:96d41f0:             this.offset = offset;
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         protected Hint computeNext()
+1:96d41f0:         {
+1:96d41f0:             Hint hint;
+1:96d41f0: 
+1:96d41f0:             do
+1:96d41f0:             {
+1:cee22ad:                 InputPosition position = input.getSeekPosition();
+1:96d41f0: 
+1:c20566f:                 if (input.isEOF())
+1:96d41f0:                     return endOfData(); // reached EOF
+1:96d41f0: 
+1:cee22ad:                 if (position.subtract(offset) >= PAGE_SIZE)
+1:96d41f0:                     return endOfData(); // read page size or more bytes
+1:96d41f0: 
+1:96d41f0:                 try
+1:96d41f0:                 {
+1:96d41f0:                     hint = computeNextInternal();
+1:96d41f0:                 }
+1:96d41f0:                 catch (IOException e)
+1:96d41f0:                 {
+1:96d41f0:                     throw new FSReadError(e, file);
+1:96d41f0:                 }
+1:96d41f0:             }
+1:96d41f0:             while (hint == null);
+1:96d41f0: 
+1:96d41f0:             return hint;
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         private Hint computeNextInternal() throws IOException
+1:96d41f0:         {
+1:ce63ccc:             input.resetCrc();
+1:ce63ccc:             input.resetLimit();
+1:96d41f0: 
+1:ce63ccc:             int size = input.readInt();
+1:96d41f0: 
+1:96d41f0:             // if we cannot corroborate the size via crc, then we cannot safely skip this hint
+1:ce63ccc:             if (!input.checkCrc())
+1:96d41f0:                 throw new IOException("Digest mismatch exception");
+1:96d41f0: 
+1:96d41f0:             return readHint(size);
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         private Hint readHint(int size) throws IOException
+1:96d41f0:         {
+1:96d41f0:             if (rateLimiter != null)
+1:96d41f0:                 rateLimiter.acquire(size);
+1:ce63ccc:             input.limit(size);
+1:96d41f0: 
+1:96d41f0:             Hint hint;
+1:96d41f0:             try
+1:96d41f0:             {
+1:ce63ccc:                 hint = Hint.serializer.deserialize(input, descriptor.messagingVersion());
+1:ce63ccc:                 input.checkLimit(0);
+1:96d41f0:             }
+1:96d41f0:             catch (UnknownColumnFamilyException e)
+1:96d41f0:             {
+1:96d41f0:                 logger.warn("Failed to read a hint for {} - table with id {} is unknown in file {}",
+1:96d41f0:                             descriptor.hostId,
+1:96d41f0:                             e.cfId,
+1:96d41f0:                             descriptor.fileName());
+1:ce63ccc:                 input.skipBytes(Ints.checkedCast(size - input.bytesPastLimit()));
+1:96d41f0: 
+1:96d41f0:                 return null;
+1:96d41f0:             }
+1:96d41f0: 
+1:ce63ccc:             if (input.checkCrc())
+1:96d41f0:                 return hint;
+1:96d41f0: 
+1:96d41f0:             // log a warning and skip the corrupted entry
+1:96d41f0:             logger.warn("Failed to read a hint for {} - digest mismatch for hint at position {} in file {}",
+1:96d41f0:                         descriptor.hostId,
+1:ce63ccc:                         input.getPosition() - size - 4,
+1:96d41f0:                         descriptor.fileName());
+1:96d41f0:             return null;
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     /**
+1:96d41f0:      * A verbatim iterator that simply returns the underlying ByteBuffers.
+1:96d41f0:      */
+1:96d41f0:     final class BuffersIterator extends AbstractIterator<ByteBuffer>
+1:96d41f0:     {
+1:cee22ad:         private final InputPosition offset;
+1:96d41f0: 
+1:cee22ad:         BuffersIterator(InputPosition offset)
+1:96d41f0:         {
+1:96d41f0:             super();
+1:96d41f0:             this.offset = offset;
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         protected ByteBuffer computeNext()
+1:96d41f0:         {
+1:96d41f0:             ByteBuffer buffer;
+1:96d41f0: 
+1:96d41f0:             do
+1:96d41f0:             {
+1:cee22ad:                 InputPosition position = input.getSeekPosition();
+1:96d41f0: 
+1:c20566f:                 if (input.isEOF())
+1:96d41f0:                     return endOfData(); // reached EOF
+1:96d41f0: 
+1:cee22ad:                 if (position.subtract(offset) >= PAGE_SIZE)
+1:96d41f0:                     return endOfData(); // read page size or more bytes
+1:96d41f0: 
+1:96d41f0:                 try
+1:96d41f0:                 {
+1:96d41f0:                     buffer = computeNextInternal();
+1:96d41f0:                 }
+1:96d41f0:                 catch (IOException e)
+1:96d41f0:                 {
+1:96d41f0:                     throw new FSReadError(e, file);
+1:96d41f0:                 }
+1:96d41f0:             }
+1:96d41f0:             while (buffer == null);
+1:96d41f0: 
+1:96d41f0:             return buffer;
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         private ByteBuffer computeNextInternal() throws IOException
+1:96d41f0:         {
+1:ce63ccc:             input.resetCrc();
+1:ce63ccc:             input.resetLimit();
+1:96d41f0: 
+1:ce63ccc:             int size = input.readInt();
+1:96d41f0: 
+1:96d41f0:             // if we cannot corroborate the size via crc, then we cannot safely skip this hint
+1:ce63ccc:             if (!input.checkCrc())
+1:96d41f0:                 throw new IOException("Digest mismatch exception");
+1:96d41f0: 
+1:96d41f0:             return readBuffer(size);
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         private ByteBuffer readBuffer(int size) throws IOException
+1:96d41f0:         {
+1:96d41f0:             if (rateLimiter != null)
+1:96d41f0:                 rateLimiter.acquire(size);
+1:ce63ccc:             input.limit(size);
+1:96d41f0: 
+1:ce63ccc:             ByteBuffer buffer = ByteBufferUtil.read(input, size);
+1:ce63ccc:             if (input.checkCrc())
+1:96d41f0:                 return buffer;
+1:96d41f0: 
+1:96d41f0:             // log a warning and skip the corrupted entry
+1:96d41f0:             logger.warn("Failed to read a hint for {} - digest mismatch for hint at position {} in file {}",
+1:96d41f0:                         descriptor.hostId,
+1:ce63ccc:                         input.getPosition() - size - 4,
+1:96d41f0:                         descriptor.fileName());
+1:96d41f0:             return null;
+1:96d41f0:         }
+1:96d41f0:     }
+1:96d41f0: }
+============================================================================
+author:Stefan Podkowinski
+-------------------------------------------------------------------------------
+commit:cee22ad
+/////////////////////////////////////////////////////////////////////////
+1:     void seek(InputPosition newPosition)
+1:         input.seek(newPosition);
+/////////////////////////////////////////////////////////////////////////
+1:         public final InputPosition position;
+1:         private Page(InputPosition inputPosition)
+1:             this.position = inputPosition;
+1:             return new HintsIterator(position);
+1:             return new BuffersIterator(position);
+/////////////////////////////////////////////////////////////////////////
+1:             input.tryUncacheRead();
+1:             return new Page(input.getSeekPosition());
+/////////////////////////////////////////////////////////////////////////
+1:         private final InputPosition offset;
+1:         HintsIterator(InputPosition offset)
+/////////////////////////////////////////////////////////////////////////
+1:                 InputPosition position = input.getSeekPosition();
+1:                 if (position.subtract(offset) >= PAGE_SIZE)
+/////////////////////////////////////////////////////////////////////////
+1:         private final InputPosition offset;
+1:         BuffersIterator(InputPosition offset)
+/////////////////////////////////////////////////////////////////////////
+1:                 InputPosition position = input.getSeekPosition();
+1:                 if (position.subtract(offset) >= PAGE_SIZE)
+author:Branimir Lambov
+-------------------------------------------------------------------------------
+commit:30bb255
+/////////////////////////////////////////////////////////////////////////
+0:         throw new UnsupportedOperationException("Hints are not seekable.");
+/////////////////////////////////////////////////////////////////////////
+0:             CLibrary.trySkipCache(input.getChannel().getFileDescriptor(), 0, input.getSourcePosition(), input.getPath());
+0:             return new Page(input.getSourcePosition());
+/////////////////////////////////////////////////////////////////////////
+0:                 long position = input.getSourcePosition();
+/////////////////////////////////////////////////////////////////////////
+0:                 long position = input.getSourcePosition();
+commit:e777301
+/////////////////////////////////////////////////////////////////////////
+1:     @SuppressWarnings("resource") // HintsReader owns input
+/////////////////////////////////////////////////////////////////////////
+1:             reader.close();
+/////////////////////////////////////////////////////////////////////////
+1:         input.close();
+author:Jason Brown
+-------------------------------------------------------------------------------
+commit:90033b9
+/////////////////////////////////////////////////////////////////////////
+1:             else if (descriptor.isEncrypted())
+1:                 reader = EncryptedChecksummedDataInput.upgradeInput(reader, descriptor.getCipher(), descriptor.createCompressor());
+author:Blake Eggleston
+-------------------------------------------------------------------------------
+commit:c20566f
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
+/////////////////////////////////////////////////////////////////////////
+1:     protected HintsReader(HintsDescriptor descriptor, File file, ChecksummedDataInput reader, RateLimiter rateLimiter)
+/////////////////////////////////////////////////////////////////////////
+1:             if (descriptor.isCompressed())
+1:             {
+1:                 // since the hints descriptor is always uncompressed, it needs to be read with the normal ChecksummedDataInput.
+1:                 // The compressed input is instantiated with the uncompressed input's position
+1:                 reader = CompressedChecksummedDataInput.upgradeInput(reader, descriptor.createCompressor());
+1:             }
+/////////////////////////////////////////////////////////////////////////
+1:     public ChecksummedDataInput getInput()
+1:     {
+1:         return input;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             if (input.isEOF())
+/////////////////////////////////////////////////////////////////////////
+1:                 if (input.isEOF())
+/////////////////////////////////////////////////////////////////////////
+1:                 if (input.isEOF())
+author:Stefania Alborghetti
+-------------------------------------------------------------------------------
+commit:ce63ccc
+/////////////////////////////////////////////////////////////////////////
+1: import com.google.common.primitives.Ints;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private final ChecksummedDataInput input;
+0:     private HintsReader(HintsDescriptor descriptor, File file, ChecksummedDataInput reader, RateLimiter rateLimiter)
+1:         this.input = reader;
+1:         ChecksummedDataInput reader = ChecksummedDataInput.open(file);
+/////////////////////////////////////////////////////////////////////////
+0:             FileUtils.closeQuietly(reader);
+/////////////////////////////////////////////////////////////////////////
+0:         FileUtils.closeQuietly(input);
+/////////////////////////////////////////////////////////////////////////
+0:         input.seek(newPosition);
+/////////////////////////////////////////////////////////////////////////
+0:             CLibrary.trySkipCache(input.getChannel().getFileDescriptor(), 0, input.getFilePointer(), input.getPath());
+0:             if (input.length() == input.getFilePointer())
+0:             return new Page(input.getFilePointer());
+/////////////////////////////////////////////////////////////////////////
+0:                 long position = input.getFilePointer();
+0:                 if (input.length() == position)
+/////////////////////////////////////////////////////////////////////////
+1:             input.resetCrc();
+1:             input.resetLimit();
+1:             int size = input.readInt();
+1:             if (!input.checkCrc())
+/////////////////////////////////////////////////////////////////////////
+1:             input.limit(size);
+1:                 hint = Hint.serializer.deserialize(input, descriptor.messagingVersion());
+1:                 input.checkLimit(0);
+/////////////////////////////////////////////////////////////////////////
+1:                 input.skipBytes(Ints.checkedCast(size - input.bytesPastLimit()));
+1:             if (input.checkCrc())
+1:                         input.getPosition() - size - 4,
+/////////////////////////////////////////////////////////////////////////
+0:                 long position = input.getFilePointer();
+0:                 if (input.length() == position)
+/////////////////////////////////////////////////////////////////////////
+1:             input.resetCrc();
+1:             input.resetLimit();
+1:             int size = input.readInt();
+1:             if (!input.checkCrc())
+/////////////////////////////////////////////////////////////////////////
+1:             input.limit(size);
+1:             ByteBuffer buffer = ByteBufferUtil.read(input, size);
+1:             if (input.checkCrc())
+1:                         input.getPosition() - size - 4,
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:96d41f0
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.hints;
+1: 
+1: import java.io.File;
+1: import java.io.IOException;
+1: import java.nio.ByteBuffer;
+1: import java.util.Iterator;
+1: 
+1: import javax.annotation.Nullable;
+1: 
+1: import com.google.common.util.concurrent.RateLimiter;
+1: 
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import org.apache.cassandra.db.UnknownColumnFamilyException;
+1: import org.apache.cassandra.io.FSReadError;
+0: import org.apache.cassandra.io.util.FileUtils;
+0: import org.apache.cassandra.io.util.RandomAccessReader;
+1: import org.apache.cassandra.utils.AbstractIterator;
+1: import org.apache.cassandra.utils.ByteBufferUtil;
+1: import org.apache.cassandra.utils.CLibrary;
+1: 
+1: /**
+1:  * A paged non-compressed hints reader that provides two iterators:
+1:  * - a 'raw' ByteBuffer iterator that doesn't deserialize the hints, but returns the pre-encoded hints verbatim
+1:  * - a decoded iterator, that deserializes the underlying bytes into {@link Hint} instances.
+1:  *
+1:  * The former is an optimisation for when the messaging version of the file matches the messaging version of the destination
+1:  * node. Extra decoding and reencoding is a waste of effort in this scenario, so we avoid it.
+1:  *
+1:  * The latter is required for dispatch of hints to nodes that have a different messaging version, and in general is just an
+1:  * easy way to enable backward and future compatibilty.
+1:  */
+0: final class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
+1: {
+1:     private static final Logger logger = LoggerFactory.getLogger(HintsReader.class);
+1: 
+1:     // don't read more than 512 KB of hints at a time.
+1:     private static final int PAGE_SIZE = 512 << 10;
+1: 
+1:     private final HintsDescriptor descriptor;
+1:     private final File file;
+0:     private final RandomAccessReader reader;
+0:     private final ChecksummedDataInput crcInput;
+1: 
+1:     // we pass the RateLimiter into HintsReader itself because it's cheaper to calculate the size before the hint is deserialized
+1:     @Nullable
+1:     private final RateLimiter rateLimiter;
+1: 
+0:     private HintsReader(HintsDescriptor descriptor, File file, RandomAccessReader reader, RateLimiter rateLimiter)
+1:     {
+1:         this.descriptor = descriptor;
+1:         this.file = file;
+0:         this.reader = reader;
+0:         this.crcInput = ChecksummedDataInput.wrap(reader);
+1:         this.rateLimiter = rateLimiter;
+1:     }
+1: 
+1:     static HintsReader open(File file, RateLimiter rateLimiter)
+1:     {
+0:         RandomAccessReader reader = RandomAccessReader.open(file);
+1:         try
+1:         {
+1:             HintsDescriptor descriptor = HintsDescriptor.deserialize(reader);
+1:             return new HintsReader(descriptor, file, reader, rateLimiter);
+1:         }
+1:         catch (IOException e)
+1:         {
+0:             reader.close();
+1:             throw new FSReadError(e, file);
+1:         }
+1:     }
+1: 
+1:     static HintsReader open(File file)
+1:     {
+1:         return open(file, null);
+1:     }
+1: 
+1:     public void close()
+1:     {
+0:         FileUtils.closeQuietly(reader);
+1:     }
+1: 
+1:     public HintsDescriptor descriptor()
+1:     {
+1:         return descriptor;
+1:     }
+1: 
+0:     void seek(long newPosition)
+1:     {
+0:         reader.seek(newPosition);
+1:     }
+1: 
+1:     public Iterator<Page> iterator()
+1:     {
+1:         return new PagesIterator();
+1:     }
+1: 
+1:     final class Page
+1:     {
+0:         public final long offset;
+1: 
+0:         private Page(long offset)
+1:         {
+1:             this.offset = offset;
+1:         }
+1: 
+1:         Iterator<Hint> hintsIterator()
+1:         {
+0:             return new HintsIterator(offset);
+1:         }
+1: 
+1:         Iterator<ByteBuffer> buffersIterator()
+1:         {
+0:             return new BuffersIterator(offset);
+1:         }
+1:     }
+1: 
+1:     final class PagesIterator extends AbstractIterator<Page>
+1:     {
+1:         @SuppressWarnings("resource")
+1:         protected Page computeNext()
+1:         {
+0:             CLibrary.trySkipCache(reader.getChannel().getFileDescriptor(), 0, reader.getFilePointer(), reader.getPath());
+1: 
+0:             if (reader.length() == reader.getFilePointer())
+1:                 return endOfData();
+1: 
+0:             return new Page(reader.getFilePointer());
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * A decoding iterator that deserializes the hints as it goes.
+1:      */
+1:     final class HintsIterator extends AbstractIterator<Hint>
+1:     {
+0:         private final long offset;
+1: 
+0:         HintsIterator(long offset)
+1:         {
+1:             super();
+1:             this.offset = offset;
+1:         }
+1: 
+1:         protected Hint computeNext()
+1:         {
+1:             Hint hint;
+1: 
+1:             do
+1:             {
+0:                 long position = reader.getFilePointer();
+1: 
+0:                 if (reader.length() == position)
+1:                     return endOfData(); // reached EOF
+1: 
+0:                 if (position - offset >= PAGE_SIZE)
+1:                     return endOfData(); // read page size or more bytes
+1: 
+1:                 try
+1:                 {
+1:                     hint = computeNextInternal();
+1:                 }
+1:                 catch (IOException e)
+1:                 {
+1:                     throw new FSReadError(e, file);
+1:                 }
+1:             }
+1:             while (hint == null);
+1: 
+1:             return hint;
+1:         }
+1: 
+1:         private Hint computeNextInternal() throws IOException
+1:         {
+0:             crcInput.resetCrc();
+0:             crcInput.resetLimit();
+1: 
+0:             int size = crcInput.readInt();
+1: 
+1:             // if we cannot corroborate the size via crc, then we cannot safely skip this hint
+0:             if (reader.readInt() != crcInput.getCrc())
+1:                 throw new IOException("Digest mismatch exception");
+1: 
+1:             return readHint(size);
+1:         }
+1: 
+1:         private Hint readHint(int size) throws IOException
+1:         {
+1:             if (rateLimiter != null)
+1:                 rateLimiter.acquire(size);
+0:             crcInput.limit(size);
+1: 
+1:             Hint hint;
+1:             try
+1:             {
+0:                 hint = Hint.serializer.deserialize(crcInput, descriptor.messagingVersion());
+1:             }
+1:             catch (UnknownColumnFamilyException e)
+1:             {
+1:                 logger.warn("Failed to read a hint for {} - table with id {} is unknown in file {}",
+1:                             descriptor.hostId,
+1:                             e.cfId,
+1:                             descriptor.fileName());
+0:                 reader.skipBytes(crcInput.bytesRemaining());
+1: 
+1:                 return null;
+1:             }
+1: 
+0:             if (reader.readInt() == crcInput.getCrc())
+1:                 return hint;
+1: 
+1:             // log a warning and skip the corrupted entry
+1:             logger.warn("Failed to read a hint for {} - digest mismatch for hint at position {} in file {}",
+1:                         descriptor.hostId,
+0:                         crcInput.getPosition() - size - 4,
+1:                         descriptor.fileName());
+1:             return null;
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * A verbatim iterator that simply returns the underlying ByteBuffers.
+1:      */
+1:     final class BuffersIterator extends AbstractIterator<ByteBuffer>
+1:     {
+0:         private final long offset;
+1: 
+0:         BuffersIterator(long offset)
+1:         {
+1:             super();
+1:             this.offset = offset;
+1:         }
+1: 
+1:         protected ByteBuffer computeNext()
+1:         {
+1:             ByteBuffer buffer;
+1: 
+1:             do
+1:             {
+0:                 long position = reader.getFilePointer();
+1: 
+0:                 if (reader.length() == position)
+1:                     return endOfData(); // reached EOF
+1: 
+0:                 if (position - offset >= PAGE_SIZE)
+1:                     return endOfData(); // read page size or more bytes
+1: 
+1:                 try
+1:                 {
+1:                     buffer = computeNextInternal();
+1:                 }
+1:                 catch (IOException e)
+1:                 {
+1:                     throw new FSReadError(e, file);
+1:                 }
+1:             }
+1:             while (buffer == null);
+1: 
+1:             return buffer;
+1:         }
+1: 
+1:         private ByteBuffer computeNextInternal() throws IOException
+1:         {
+0:             crcInput.resetCrc();
+0:             crcInput.resetLimit();
+1: 
+0:             int size = crcInput.readInt();
+1: 
+1:             // if we cannot corroborate the size via crc, then we cannot safely skip this hint
+0:             if (reader.readInt() != crcInput.getCrc())
+1:                 throw new IOException("Digest mismatch exception");
+1: 
+1:             return readBuffer(size);
+1:         }
+1: 
+1:         private ByteBuffer readBuffer(int size) throws IOException
+1:         {
+1:             if (rateLimiter != null)
+1:                 rateLimiter.acquire(size);
+0:             crcInput.limit(size);
+1: 
+0:             ByteBuffer buffer = ByteBufferUtil.read(crcInput, size);
+0:             if (reader.readInt() == crcInput.getCrc())
+1:                 return buffer;
+1: 
+1:             // log a warning and skip the corrupted entry
+1:             logger.warn("Failed to read a hint for {} - digest mismatch for hint at position {} in file {}",
+1:                         descriptor.hostId,
+0:                         crcInput.getPosition() - size - 4,
+1:                         descriptor.fileName());
+1:             return null;
+1:         }
+1:     }
+1: }
+============================================================================

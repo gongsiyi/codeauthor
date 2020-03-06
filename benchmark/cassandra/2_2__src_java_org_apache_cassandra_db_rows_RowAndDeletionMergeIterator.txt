@@ -1,0 +1,397 @@
+1:2457599: /*
+1:2457599:  * Licensed to the Apache Software Foundation (ASF) under one
+1:2457599:  * or more contributor license agreements.  See the NOTICE file
+1:2457599:  * distributed with this work for additional information
+1:2457599:  * regarding copyright ownership.  The ASF licenses this file
+1:2457599:  * to you under the Apache License, Version 2.0 (the
+1:2457599:  * "License"); you may not use this file except in compliance
+1:2457599:  * with the License.  You may obtain a copy of the License at
+1:2457599:  *
+1:2457599:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:2457599:  *
+1:2457599:  * Unless required by applicable law or agreed to in writing, software
+1:2457599:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:2457599:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:2457599:  * See the License for the specific language governing permissions and
+1:2457599:  * limitations under the License.
+1:2457599:  */
+1:2457599: package org.apache.cassandra.db.rows;
+1:2457599: 
+1:2457599: import java.util.Comparator;
+1:2457599: import java.util.Iterator;
+1:2457599: 
+1:2457599: import org.apache.cassandra.config.CFMetaData;
+1:2457599: import org.apache.cassandra.db.*;
+1:2457599: import org.apache.cassandra.db.filter.ColumnFilter;
+1:2457599: 
+1:2457599: /**
+1:2457599:  * An iterator that merges a source of rows with the range tombstone and partition level deletion of a give partition.
+1:2457599:  * <p>
+1:2457599:  * This is used by our {@code Partition} implementations to produce a {@code UnfilteredRowIterator} by merging the rows
+1:2457599:  * and deletion infos that are kept separate. This has also 2 additional role:
+1:2457599:  *   1) this make sure the row returned only includes the columns selected for the resulting iterator.
+1:2457599:  *   2) this (optionally) remove any data that can be shadowed (see commet on 'removeShadowedData' below for more details)
+1:2457599:  */
+1:2457599: public class RowAndDeletionMergeIterator extends AbstractUnfilteredRowIterator
+1:2457599: {
+1:2457599:     // For some of our Partition implementation, we can't guarantee that the deletion information (partition level
+1:2457599:     // deletion and range tombstones) don't shadow data in the rows. If that is the case, this class also take
+1:2457599:     // cares of skipping such shadowed data (since it is the contract of an UnfilteredRowIterator that it doesn't
+1:2457599:     // shadow its own data). Sometimes however, we know this can't happen, in which case we can skip that step.
+1:2457599:     private final boolean removeShadowedData;
+1:2457599:     private final Comparator<Clusterable> comparator;
+1:2457599:     private final ColumnFilter selection;
+1:2457599: 
+1:2457599:     private final Iterator<Row> rows;
+1:2457599:     private Row nextRow;
+1:2457599: 
+1:2457599:     private final Iterator<RangeTombstone> ranges;
+1:2457599:     private RangeTombstone nextRange;
+1:2457599: 
+1:2457599:     // The currently open tombstone. Note that unless this is null, there is no point in checking nextRange.
+1:2457599:     private RangeTombstone openRange;
+1:2457599: 
+1:2457599:     public RowAndDeletionMergeIterator(CFMetaData metadata,
+1:2457599:                                        DecoratedKey partitionKey,
+1:2457599:                                        DeletionTime partitionLevelDeletion,
+1:2457599:                                        ColumnFilter selection,
+1:2457599:                                        Row staticRow,
+1:2457599:                                        boolean isReversed,
+1:c055ab9:                                        EncodingStats stats,
+1:2457599:                                        Iterator<Row> rows,
+1:2457599:                                        Iterator<RangeTombstone> ranges,
+1:2457599:                                        boolean removeShadowedData)
+1:2457599:     {
+1:2457599:         super(metadata, partitionKey, partitionLevelDeletion, selection.fetchedColumns(), staticRow, isReversed, stats);
+1:2457599:         this.comparator = isReversed ? metadata.comparator.reversed() : metadata.comparator;
+1:2457599:         this.selection = selection;
+1:2457599:         this.removeShadowedData = removeShadowedData;
+1:2457599:         this.rows = rows;
+1:2457599:         this.ranges = ranges;
+1:2457599:     }
+1:2457599: 
+1:2457599:     protected Unfiltered computeNext()
+1:2457599:     {
+1:2457599:         while (true)
+1:2457599:         {
+1:2457599:             updateNextRow();
+1:2457599:             if (nextRow == null)
+1:2457599:             {
+1:2457599:                 if (openRange != null)
+1:2457599:                     return closeOpenedRange();
+1:2457599: 
+1:2457599:                 updateNextRange();
+1:2457599:                 return nextRange == null ? endOfData() : openRange();
+1:2457599:             }
+1:2457599: 
+1:2457599:             // We have a next row
+1:2457599: 
+1:2457599:             if (openRange == null)
+1:2457599:             {
+1:2457599:                 // We have no currently open tombstone range. So check if we have a next range and if it sorts before this row.
+1:2457599:                 // If it does, the opening of that range should go first. Otherwise, the row goes first.
+1:2457599:                 updateNextRange();
+1:2457599:                 if (nextRange != null && comparator.compare(openBound(nextRange), nextRow.clustering()) < 0)
+1:2457599:                     return openRange();
+1:2457599: 
+1:2457599:                 Row row = consumeNextRow();
+1:2457599:                 // it's possible for the row to be fully shadowed by the current range tombstone
+1:2457599:                 if (row != null)
+1:2457599:                     return row;
+1:2457599:             }
+1:2457599:             else
+1:2457599:             {
+1:2457599:                 // We have both a next row and a currently opened tombstone. Check which goes first between the range closing and the row.
+1:2457599:                 if (comparator.compare(closeBound(openRange), nextRow.clustering()) < 0)
+1:2457599:                     return closeOpenedRange();
+1:2457599: 
+1:2457599:                 Row row = consumeNextRow();
+1:2457599:                 if (row != null)
+1:2457599:                     return row;
+1:2457599:             }
+1:2457599:         }
+1:2457599:     }
+1:2457599: 
+1:2457599:     private void updateNextRow()
+1:2457599:     {
+1:2457599:         if (nextRow == null && rows.hasNext())
+1:2457599:             nextRow = rows.next();
+1:2457599:     }
+1:2457599: 
+1:2457599:     private void updateNextRange()
+1:2457599:     {
+1:2457599:         while (nextRange == null && ranges.hasNext())
+1:2457599:         {
+1:2457599:             nextRange = ranges.next();
+1:2457599:             if (removeShadowedData && partitionLevelDeletion().supersedes(nextRange.deletionTime()))
+1:2457599:                 nextRange = null;
+1:2457599:         }
+1:2457599:     }
+1:2457599: 
+1:2457599:     private Row consumeNextRow()
+1:2457599:     {
+1:2457599:         Row row = nextRow;
+1:2457599:         nextRow = null;
+1:2457599:         if (!removeShadowedData)
+1:2457599:             return row.filter(selection, metadata());
+1:2457599: 
+1:2457599:         DeletionTime activeDeletion = openRange == null ? partitionLevelDeletion() : openRange.deletionTime();
+1:2457599:         return row.filter(selection, activeDeletion, false, metadata());
+1:2457599:     }
+1:2457599: 
+1:2457599:     private RangeTombstone consumeNextRange()
+1:2457599:     {
+1:2457599:         RangeTombstone range = nextRange;
+1:2457599:         nextRange = null;
+1:2457599:         return range;
+1:2457599:     }
+1:2457599: 
+1:2457599:     private RangeTombstone consumeOpenRange()
+1:2457599:     {
+1:2457599:         RangeTombstone range = openRange;
+1:2457599:         openRange = null;
+1:2457599:         return range;
+1:2457599:     }
+1:2457599: 
+1:2cc26eb:     private ClusteringBound openBound(RangeTombstone range)
+1:2457599:     {
+1:2457599:         return range.deletedSlice().open(isReverseOrder());
+1:2457599:     }
+1:2457599: 
+1:2cc26eb:     private ClusteringBound closeBound(RangeTombstone range)
+1:2457599:     {
+1:2457599:         return range.deletedSlice().close(isReverseOrder());
+1:2457599:     }
+1:2457599: 
+1:2457599:     private RangeTombstoneMarker closeOpenedRange()
+1:2457599:     {
+1:2457599:         // Check if that close if actually a boundary between markers
+1:2457599:         updateNextRange();
+1:2457599:         RangeTombstoneMarker marker;
+1:2457599:         if (nextRange != null && comparator.compare(closeBound(openRange), openBound(nextRange)) == 0)
+1:2457599:         {
+1:2457599:             marker = RangeTombstoneBoundaryMarker.makeBoundary(isReverseOrder(), closeBound(openRange), openBound(nextRange), openRange.deletionTime(), nextRange.deletionTime());
+1:2457599:             openRange = consumeNextRange();
+1:2457599:         }
+1:2457599:         else
+1:2457599:         {
+1:2457599:             RangeTombstone toClose = consumeOpenRange();
+1:2457599:             marker = new RangeTombstoneBoundMarker(closeBound(toClose), toClose.deletionTime());
+1:2457599:         }
+1:2457599:         return marker;
+1:2457599:     }
+1:2457599: 
+1:2457599:     private RangeTombstoneMarker openRange()
+1:2457599:     {
+1:2457599:         assert openRange == null && nextRange != null;
+1:2457599:         openRange = consumeNextRange();
+1:2457599:         return new RangeTombstoneBoundMarker(openBound(openRange), openRange.deletionTime());
+1:2457599:     }
+1:2457599: 
+1:2457599: }
+============================================================================
+author:Branimir Lambov
+-------------------------------------------------------------------------------
+commit:2cc26eb
+/////////////////////////////////////////////////////////////////////////
+1:     private ClusteringBound openBound(RangeTombstone range)
+1:     private ClusteringBound closeBound(RangeTombstone range)
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:c055ab9
+/////////////////////////////////////////////////////////////////////////
+1:                                        EncodingStats stats,
+commit:2457599
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.db.rows;
+1: 
+1: import java.util.Comparator;
+1: import java.util.Iterator;
+1: 
+1: import org.apache.cassandra.config.CFMetaData;
+1: import org.apache.cassandra.db.*;
+1: import org.apache.cassandra.db.filter.ColumnFilter;
+1: 
+1: /**
+1:  * An iterator that merges a source of rows with the range tombstone and partition level deletion of a give partition.
+1:  * <p>
+1:  * This is used by our {@code Partition} implementations to produce a {@code UnfilteredRowIterator} by merging the rows
+1:  * and deletion infos that are kept separate. This has also 2 additional role:
+1:  *   1) this make sure the row returned only includes the columns selected for the resulting iterator.
+1:  *   2) this (optionally) remove any data that can be shadowed (see commet on 'removeShadowedData' below for more details)
+1:  */
+1: public class RowAndDeletionMergeIterator extends AbstractUnfilteredRowIterator
+1: {
+1:     // For some of our Partition implementation, we can't guarantee that the deletion information (partition level
+1:     // deletion and range tombstones) don't shadow data in the rows. If that is the case, this class also take
+1:     // cares of skipping such shadowed data (since it is the contract of an UnfilteredRowIterator that it doesn't
+1:     // shadow its own data). Sometimes however, we know this can't happen, in which case we can skip that step.
+1:     private final boolean removeShadowedData;
+1:     private final Comparator<Clusterable> comparator;
+1:     private final ColumnFilter selection;
+1: 
+1:     private final Iterator<Row> rows;
+1:     private Row nextRow;
+1: 
+1:     private final Iterator<RangeTombstone> ranges;
+1:     private RangeTombstone nextRange;
+1: 
+1:     // The currently open tombstone. Note that unless this is null, there is no point in checking nextRange.
+1:     private RangeTombstone openRange;
+1: 
+1:     public RowAndDeletionMergeIterator(CFMetaData metadata,
+1:                                        DecoratedKey partitionKey,
+1:                                        DeletionTime partitionLevelDeletion,
+1:                                        ColumnFilter selection,
+1:                                        Row staticRow,
+1:                                        boolean isReversed,
+0:                                        RowStats stats,
+1:                                        Iterator<Row> rows,
+1:                                        Iterator<RangeTombstone> ranges,
+1:                                        boolean removeShadowedData)
+1:     {
+1:         super(metadata, partitionKey, partitionLevelDeletion, selection.fetchedColumns(), staticRow, isReversed, stats);
+1:         this.comparator = isReversed ? metadata.comparator.reversed() : metadata.comparator;
+1:         this.selection = selection;
+1:         this.removeShadowedData = removeShadowedData;
+1:         this.rows = rows;
+1:         this.ranges = ranges;
+1:     }
+1: 
+1:     protected Unfiltered computeNext()
+1:     {
+1:         while (true)
+1:         {
+1:             updateNextRow();
+1:             if (nextRow == null)
+1:             {
+1:                 if (openRange != null)
+1:                     return closeOpenedRange();
+1: 
+1:                 updateNextRange();
+1:                 return nextRange == null ? endOfData() : openRange();
+1:             }
+1: 
+1:             // We have a next row
+1: 
+1:             if (openRange == null)
+1:             {
+1:                 // We have no currently open tombstone range. So check if we have a next range and if it sorts before this row.
+1:                 // If it does, the opening of that range should go first. Otherwise, the row goes first.
+1:                 updateNextRange();
+1:                 if (nextRange != null && comparator.compare(openBound(nextRange), nextRow.clustering()) < 0)
+1:                     return openRange();
+1: 
+1:                 Row row = consumeNextRow();
+1:                 // it's possible for the row to be fully shadowed by the current range tombstone
+1:                 if (row != null)
+1:                     return row;
+1:             }
+1:             else
+1:             {
+1:                 // We have both a next row and a currently opened tombstone. Check which goes first between the range closing and the row.
+1:                 if (comparator.compare(closeBound(openRange), nextRow.clustering()) < 0)
+1:                     return closeOpenedRange();
+1: 
+1:                 Row row = consumeNextRow();
+1:                 if (row != null)
+1:                     return row;
+1:             }
+1:         }
+1:     }
+1: 
+1:     private void updateNextRow()
+1:     {
+1:         if (nextRow == null && rows.hasNext())
+1:             nextRow = rows.next();
+1:     }
+1: 
+1:     private void updateNextRange()
+1:     {
+1:         while (nextRange == null && ranges.hasNext())
+1:         {
+1:             nextRange = ranges.next();
+1:             if (removeShadowedData && partitionLevelDeletion().supersedes(nextRange.deletionTime()))
+1:                 nextRange = null;
+1:         }
+1:     }
+1: 
+1:     private Row consumeNextRow()
+1:     {
+1:         Row row = nextRow;
+1:         nextRow = null;
+1:         if (!removeShadowedData)
+1:             return row.filter(selection, metadata());
+1: 
+1:         DeletionTime activeDeletion = openRange == null ? partitionLevelDeletion() : openRange.deletionTime();
+1:         return row.filter(selection, activeDeletion, false, metadata());
+1:     }
+1: 
+1:     private RangeTombstone consumeNextRange()
+1:     {
+1:         RangeTombstone range = nextRange;
+1:         nextRange = null;
+1:         return range;
+1:     }
+1: 
+1:     private RangeTombstone consumeOpenRange()
+1:     {
+1:         RangeTombstone range = openRange;
+1:         openRange = null;
+1:         return range;
+1:     }
+1: 
+0:     private Slice.Bound openBound(RangeTombstone range)
+1:     {
+1:         return range.deletedSlice().open(isReverseOrder());
+1:     }
+1: 
+0:     private Slice.Bound closeBound(RangeTombstone range)
+1:     {
+1:         return range.deletedSlice().close(isReverseOrder());
+1:     }
+1: 
+1:     private RangeTombstoneMarker closeOpenedRange()
+1:     {
+1:         // Check if that close if actually a boundary between markers
+1:         updateNextRange();
+1:         RangeTombstoneMarker marker;
+1:         if (nextRange != null && comparator.compare(closeBound(openRange), openBound(nextRange)) == 0)
+1:         {
+1:             marker = RangeTombstoneBoundaryMarker.makeBoundary(isReverseOrder(), closeBound(openRange), openBound(nextRange), openRange.deletionTime(), nextRange.deletionTime());
+1:             openRange = consumeNextRange();
+1:         }
+1:         else
+1:         {
+1:             RangeTombstone toClose = consumeOpenRange();
+1:             marker = new RangeTombstoneBoundMarker(closeBound(toClose), toClose.deletionTime());
+1:         }
+1:         return marker;
+1:     }
+1: 
+1:     private RangeTombstoneMarker openRange()
+1:     {
+1:         assert openRange == null && nextRange != null;
+1:         openRange = consumeNextRange();
+1:         return new RangeTombstoneBoundMarker(openBound(openRange), openRange.deletionTime());
+1:     }
+1: 
+1: }
+============================================================================

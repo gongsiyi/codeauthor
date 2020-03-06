@@ -1,0 +1,390 @@
+1:651fa21: /*
+1:651fa21: 
+1:651fa21:    Derby - Class org.apache.derby.impl.services.cache.BackgroundCleaner
+1:651fa21: 
+1:651fa21:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:651fa21:    contributor license agreements.  See the NOTICE file distributed with
+1:651fa21:    this work for additional information regarding copyright ownership.
+1:651fa21:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:651fa21:    (the "License"); you may not use this file except in compliance with
+1:651fa21:    the License.  You may obtain a copy of the License at
+1:651fa21: 
+1:651fa21:       http://www.apache.org/licenses/LICENSE-2.0
+1:651fa21: 
+1:651fa21:    Unless required by applicable law or agreed to in writing, software
+1:651fa21:    distributed under the License is distributed on an "AS IS" BASIS,
+1:651fa21:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:651fa21:    See the License for the specific language governing permissions and
+1:651fa21:    limitations under the License.
+1:651fa21: 
+1:651fa21:  */
+1:651fa21: 
+1:651fa21: package org.apache.derby.impl.services.cache;
+1:651fa21: 
+1:651fa21: import java.util.concurrent.ArrayBlockingQueue;
+1:651fa21: import java.util.concurrent.atomic.AtomicBoolean;
+1:651fa21: import org.apache.derby.iapi.error.StandardException;
+1:651fa21: import org.apache.derby.iapi.services.context.ContextManager;
+1:651fa21: import org.apache.derby.iapi.services.daemon.DaemonService;
+1:651fa21: import org.apache.derby.iapi.services.daemon.Serviceable;
+1:651fa21: 
+1:651fa21: /**
+1:29141b8:  * A background cleaner that {@code ConcurrentCache} can use to clean {@code
+1:29141b8:  * Cacheable}s asynchronously in a background instead of synchronously in the
+1:29141b8:  * user threads. It is normally used by the replacement algorithm in order to
+1:29141b8:  * make dirty {@code Cacheable}s clean and evictable in the future. When the
+1:651fa21:  * background cleaner is asked to clean an item, it puts the item in a queue
+1:651fa21:  * and requests to be serviced by a <code>DaemonService</code> running in a
+1:651fa21:  * separate thread.
+1:651fa21:  */
+1:651fa21: final class BackgroundCleaner implements Serviceable {
+1:651fa21: 
+1:651fa21:     /** The service thread which performs the clean operations. */
+1:651fa21:     private final DaemonService daemonService;
+1:651fa21: 
+1:651fa21:     /** Subscription number for this <code>Serviceable</code>. */
+1:651fa21:     private final int clientNumber;
+1:651fa21: 
+1:651fa21:     /**
+1:651fa21:      * Flag which tells whether the cleaner has a still unprocessed job
+1:651fa21:      * scheduled with the daemon service. If this flag is <code>true</code>,
+1:651fa21:      * calls to <code>serviceNow()</code> won't result in the cleaner being
+1:651fa21:      * serviced.
+1:651fa21:      */
+1:651fa21:     private final AtomicBoolean scheduled = new AtomicBoolean();
+1:651fa21: 
+1:651fa21:     /** A queue of cache entries that need to be cleaned. */
+1:651fa21:     private final ArrayBlockingQueue<CacheEntry> queue;
+1:651fa21: 
+1:d8bdc4c:     /**
+1:d8bdc4c:      * Flag which tells whether the cleaner should try to shrink the cache
+1:d8bdc4c:      * the next time it wakes up.
+1:d8bdc4c:      */
+1:d8bdc4c:     private volatile boolean shrink;
+1:d8bdc4c: 
+1:651fa21:     /** The cache manager owning this cleaner. */
+1:651fa21:     private final ConcurrentCache cacheManager;
+1:651fa21: 
+1:651fa21:     /**
+1:651fa21:      * Create a background cleaner instance and subscribe it to a daemon
+1:651fa21:      * service.
+1:651fa21:      *
+1:651fa21:      * @param cache the cache manager that owns the cleaner
+1:651fa21:      * @param daemon the daemon service which perfoms the work
+1:651fa21:      * @param queueSize the maximum number of entries to keep in the queue
+1:651fa21:      * (must be greater than 0)
+1:651fa21:      */
+1:651fa21:     BackgroundCleaner(
+1:651fa21:             ConcurrentCache cache, DaemonService daemon, int queueSize) {
+1:651fa21:         queue = new ArrayBlockingQueue<CacheEntry>(queueSize);
+1:651fa21:         daemonService = daemon;
+1:651fa21:         cacheManager = cache;
+1:651fa21:         // subscribe with the onDemandOnly flag
+1:651fa21:         clientNumber = daemon.subscribe(this, true);
+1:651fa21:     }
+1:651fa21: 
+1:651fa21:     /**
+1:651fa21:      * Try to schedule a clean operation in the background cleaner.
+1:651fa21:      *
+1:651fa21:      * @param entry the entry that needs to be cleaned
+1:651fa21:      * @return <code>true</code> if the entry has been scheduled for clean,
+1:651fa21:      * <code>false</code> if the background cleaner can't clean the entry (its
+1:651fa21:      * queue is full)
+1:651fa21:      */
+1:d8bdc4c:     boolean scheduleClean(CacheEntry entry) {
+1:651fa21:         final boolean queued = queue.offer(entry);
+1:651fa21:         if (queued) {
+1:651fa21:             requestService();
+1:651fa21:         }
+1:651fa21:         return queued;
+1:651fa21:     }
+1:651fa21: 
+1:651fa21:     /**
+1:d8bdc4c:      * Request that the cleaner tries to shrink the cache the next time it
+1:d8bdc4c:      * wakes up.
+1:d8bdc4c:      */
+1:d8bdc4c:     void scheduleShrink() {
+1:d8bdc4c:         shrink = true;
+1:d8bdc4c:         requestService();
+1:d8bdc4c:     }
+1:d8bdc4c: 
+1:d8bdc4c:     /**
+1:651fa21:      * Notify the daemon service that the cleaner needs to be serviced.
+1:651fa21:      */
+1:651fa21:     private void requestService() {
+1:651fa21:         // Calling serviceNow() doesn't have any effect if we have already
+1:651fa21:         // called it and the request hasn't been processed yet. Therefore, we
+1:651fa21:         // only call serviceNow() if we can atomically change scheduled from
+1:651fa21:         // false to true. If the cleaner is waiting for service (schedule is
+1:651fa21:         // true), we don't need to call serviceNow() since the cleaner will
+1:651fa21:         // re-request service when it finishes its current operation and
+1:651fa21:         // detects that there is more work in the queue.
+1:651fa21:         if (scheduled.compareAndSet(false, true)) {
+1:651fa21:             daemonService.serviceNow(clientNumber);
+1:651fa21:         }
+1:651fa21:     }
+1:651fa21: 
+1:651fa21:     /**
+1:651fa21:      * Stop subscribing to the daemon service.
+1:651fa21:      */
+1:651fa21:     void unsubscribe() {
+1:651fa21:         daemonService.unsubscribe(clientNumber);
+1:651fa21:     }
+1:651fa21: 
+1:651fa21:     /**
+1:651fa21:      * Clean the first entry in the queue. If there is more work, re-request
+1:651fa21:      * service from the daemon service.
+1:651fa21:      *
+1:651fa21:      * @param context ignored
+1:651fa21:      * @return status for the performed work (normally
+1:651fa21:      * <code>Serviceable.DONE</code>)
+1:651fa21:      * @throws StandardException if <code>Cacheable.clean()</code> fails
+1:651fa21:      */
+1:651fa21:     public int performWork(ContextManager context) throws StandardException {
+1:651fa21:         // allow others to schedule more work
+1:651fa21:         scheduled.set(false);
+1:d8bdc4c: 
+1:d8bdc4c:         // First, try to shrink the cache if requested.
+1:d8bdc4c:         if (shrink) {
+1:d8bdc4c:             shrink = false;
+1:d8bdc4c:             cacheManager.getReplacementPolicy().doShrink();
+1:d8bdc4c:         }
+1:d8bdc4c: 
+1:d8bdc4c:         // See if there are objects waiting to be cleaned.
+1:651fa21:         CacheEntry e = queue.poll();
+1:651fa21:         if (e != null) {
+1:651fa21:             try {
+1:651fa21:                 cacheManager.cleanEntry(e);
+1:651fa21:             } finally {
+1:d8bdc4c:                 if (!queue.isEmpty() || shrink) {
+1:651fa21:                     // We have more work in the queue. Request service again.
+1:651fa21:                     requestService();
+1:651fa21:                 }
+1:651fa21:             }
+1:651fa21:         }
+1:651fa21:         return Serviceable.DONE;
+1:651fa21:     }
+1:651fa21: 
+1:651fa21:     /**
+1:651fa21:      * Indicate that we want to be serviced ASAP.
+1:651fa21:      * @return <code>true</code>
+1:651fa21:      */
+1:651fa21:     public boolean serviceASAP() {
+1:651fa21:         return true;
+1:651fa21:     }
+1:651fa21: 
+1:651fa21:     /**
+1:651fa21:      * Indicate that we don't want the work to happen immediately in the
+1:651fa21:      * user thread.
+1:651fa21:      * @return <code>false</code>
+1:651fa21:      */
+1:651fa21:     public boolean serviceImmediately() {
+1:29141b8:         // This method isn't actually used by BasicDaemon, but we still need to
+1:29141b8:         // implement it in order to satisfy the Serviceable interface.
+1:651fa21:         return false;
+1:651fa21:     }
+1:651fa21: }
+============================================================================
+author:Knut Anders Hatlen
+-------------------------------------------------------------------------------
+commit:29141b8
+/////////////////////////////////////////////////////////////////////////
+1:  * A background cleaner that {@code ConcurrentCache} can use to clean {@code
+1:  * Cacheable}s asynchronously in a background instead of synchronously in the
+1:  * user threads. It is normally used by the replacement algorithm in order to
+1:  * make dirty {@code Cacheable}s clean and evictable in the future. When the
+/////////////////////////////////////////////////////////////////////////
+1:         // This method isn't actually used by BasicDaemon, but we still need to
+1:         // implement it in order to satisfy the Serviceable interface.
+commit:d8bdc4c
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Flag which tells whether the cleaner should try to shrink the cache
+1:      * the next time it wakes up.
+1:      */
+1:     private volatile boolean shrink;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     boolean scheduleClean(CacheEntry entry) {
+/////////////////////////////////////////////////////////////////////////
+1:      * Request that the cleaner tries to shrink the cache the next time it
+1:      * wakes up.
+1:      */
+1:     void scheduleShrink() {
+1:         shrink = true;
+1:         requestService();
+1:     }
+1: 
+1:     /**
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         // First, try to shrink the cache if requested.
+1:         if (shrink) {
+1:             shrink = false;
+1:             cacheManager.getReplacementPolicy().doShrink();
+1:         }
+1: 
+1:         // See if there are objects waiting to be cleaned.
+1:                 if (!queue.isEmpty() || shrink) {
+commit:651fa21
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1: 
+1:    Derby - Class org.apache.derby.impl.services.cache.BackgroundCleaner
+1: 
+1:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:    contributor license agreements.  See the NOTICE file distributed with
+1:    this work for additional information regarding copyright ownership.
+1:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:    (the "License"); you may not use this file except in compliance with
+1:    the License.  You may obtain a copy of the License at
+1: 
+1:       http://www.apache.org/licenses/LICENSE-2.0
+1: 
+1:    Unless required by applicable law or agreed to in writing, software
+1:    distributed under the License is distributed on an "AS IS" BASIS,
+1:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:    See the License for the specific language governing permissions and
+1:    limitations under the License.
+1: 
+1:  */
+1: 
+1: package org.apache.derby.impl.services.cache;
+1: 
+1: import java.util.concurrent.ArrayBlockingQueue;
+1: import java.util.concurrent.atomic.AtomicBoolean;
+1: import org.apache.derby.iapi.error.StandardException;
+1: import org.apache.derby.iapi.services.context.ContextManager;
+1: import org.apache.derby.iapi.services.daemon.DaemonService;
+1: import org.apache.derby.iapi.services.daemon.Serviceable;
+1: 
+1: /**
+0:  * A background cleaner which can be used by <code>ConcurrentCache</code> so
+0:  * that it doesn't have to wait for clean operations to finish. When the
+1:  * background cleaner is asked to clean an item, it puts the item in a queue
+1:  * and requests to be serviced by a <code>DaemonService</code> running in a
+1:  * separate thread.
+1:  */
+1: final class BackgroundCleaner implements Serviceable {
+1: 
+1:     /** The service thread which performs the clean operations. */
+1:     private final DaemonService daemonService;
+1: 
+1:     /** Subscription number for this <code>Serviceable</code>. */
+1:     private final int clientNumber;
+1: 
+1:     /**
+1:      * Flag which tells whether the cleaner has a still unprocessed job
+1:      * scheduled with the daemon service. If this flag is <code>true</code>,
+1:      * calls to <code>serviceNow()</code> won't result in the cleaner being
+1:      * serviced.
+1:      */
+1:     private final AtomicBoolean scheduled = new AtomicBoolean();
+1: 
+1:     /** A queue of cache entries that need to be cleaned. */
+1:     private final ArrayBlockingQueue<CacheEntry> queue;
+1: 
+1:     /** The cache manager owning this cleaner. */
+1:     private final ConcurrentCache cacheManager;
+1: 
+1:     /**
+1:      * Create a background cleaner instance and subscribe it to a daemon
+1:      * service.
+1:      *
+1:      * @param cache the cache manager that owns the cleaner
+1:      * @param daemon the daemon service which perfoms the work
+1:      * @param queueSize the maximum number of entries to keep in the queue
+1:      * (must be greater than 0)
+1:      */
+1:     BackgroundCleaner(
+1:             ConcurrentCache cache, DaemonService daemon, int queueSize) {
+1:         queue = new ArrayBlockingQueue<CacheEntry>(queueSize);
+1:         daemonService = daemon;
+1:         cacheManager = cache;
+1:         // subscribe with the onDemandOnly flag
+1:         clientNumber = daemon.subscribe(this, true);
+1:     }
+1: 
+1:     /**
+1:      * Try to schedule a clean operation in the background cleaner.
+1:      *
+1:      * @param entry the entry that needs to be cleaned
+1:      * @return <code>true</code> if the entry has been scheduled for clean,
+1:      * <code>false</code> if the background cleaner can't clean the entry (its
+1:      * queue is full)
+1:      */
+0:     boolean scheduleWork(CacheEntry entry) {
+1:         final boolean queued = queue.offer(entry);
+1:         if (queued) {
+1:             requestService();
+1:         }
+1:         return queued;
+1:     }
+1: 
+1:     /**
+1:      * Notify the daemon service that the cleaner needs to be serviced.
+1:      */
+1:     private void requestService() {
+1:         // Calling serviceNow() doesn't have any effect if we have already
+1:         // called it and the request hasn't been processed yet. Therefore, we
+1:         // only call serviceNow() if we can atomically change scheduled from
+1:         // false to true. If the cleaner is waiting for service (schedule is
+1:         // true), we don't need to call serviceNow() since the cleaner will
+1:         // re-request service when it finishes its current operation and
+1:         // detects that there is more work in the queue.
+1:         if (scheduled.compareAndSet(false, true)) {
+1:             daemonService.serviceNow(clientNumber);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Stop subscribing to the daemon service.
+1:      */
+1:     void unsubscribe() {
+1:         daemonService.unsubscribe(clientNumber);
+1:     }
+1: 
+1:     /**
+1:      * Clean the first entry in the queue. If there is more work, re-request
+1:      * service from the daemon service.
+1:      *
+1:      * @param context ignored
+1:      * @return status for the performed work (normally
+1:      * <code>Serviceable.DONE</code>)
+1:      * @throws StandardException if <code>Cacheable.clean()</code> fails
+1:      */
+1:     public int performWork(ContextManager context) throws StandardException {
+1:         // allow others to schedule more work
+1:         scheduled.set(false);
+1:         CacheEntry e = queue.poll();
+1:         if (e != null) {
+1:             try {
+1:                 cacheManager.cleanEntry(e);
+1:             } finally {
+0:                 if (!queue.isEmpty()) {
+1:                     // We have more work in the queue. Request service again.
+1:                     requestService();
+1:                 }
+1:             }
+1:         }
+1:         return Serviceable.DONE;
+1:     }
+1: 
+1:     /**
+1:      * Indicate that we want to be serviced ASAP.
+1:      * @return <code>true</code>
+1:      */
+1:     public boolean serviceASAP() {
+1:         return true;
+1:     }
+1: 
+1:     /**
+1:      * Indicate that we don't want the work to happen immediately in the
+1:      * user thread.
+1:      * @return <code>false</code>
+1:      */
+1:     public boolean serviceImmediately() {
+1:         return false;
+1:     }
+1: }
+============================================================================

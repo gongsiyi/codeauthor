@@ -1,0 +1,1052 @@
+1:72790dc: /*
+1:72790dc:  * Licensed to the Apache Software Foundation (ASF) under one
+1:72790dc:  * or more contributor license agreements.  See the NOTICE file
+1:72790dc:  * distributed with this work for additional information
+1:72790dc:  * regarding copyright ownership.  The ASF licenses this file
+1:72790dc:  * to you under the Apache License, Version 2.0 (the
+1:72790dc:  * "License"); you may not use this file except in compliance
+1:72790dc:  * with the License.  You may obtain a copy of the License at
+1:72790dc:  *
+1:72790dc:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:72790dc:  *
+1:72790dc:  * Unless required by applicable law or agreed to in writing, software
+1:72790dc:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:72790dc:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:72790dc:  * See the License for the specific language governing permissions and
+1:72790dc:  * limitations under the License.
+1:72790dc:  */
+1:72790dc: package org.apache.cassandra.index.sasi.plan;
+1:72790dc: 
+1:72790dc: import java.io.IOException;
+1:72790dc: import java.nio.ByteBuffer;
+1:72790dc: import java.util.*;
+1:72790dc: 
+1:72790dc: import org.apache.cassandra.config.ColumnDefinition;
+1:72790dc: import org.apache.cassandra.config.ColumnDefinition.Kind;
+1:72790dc: import org.apache.cassandra.cql3.Operator;
+1:72790dc: import org.apache.cassandra.db.filter.RowFilter;
+1:72790dc: import org.apache.cassandra.db.rows.Row;
+1:72790dc: import org.apache.cassandra.db.rows.Unfiltered;
+1:72790dc: import org.apache.cassandra.index.sasi.conf.ColumnIndex;
+1:72790dc: import org.apache.cassandra.index.sasi.analyzer.AbstractAnalyzer;
+1:72790dc: import org.apache.cassandra.index.sasi.disk.Token;
+1:72790dc: import org.apache.cassandra.index.sasi.plan.Expression.Op;
+1:72790dc: import org.apache.cassandra.index.sasi.utils.RangeIntersectionIterator;
+1:72790dc: import org.apache.cassandra.index.sasi.utils.RangeIterator;
+1:72790dc: import org.apache.cassandra.index.sasi.utils.RangeUnionIterator;
+1:72790dc: 
+1:72790dc: import com.google.common.annotations.VisibleForTesting;
+1:72790dc: import com.google.common.collect.*;
+1:72790dc: import org.apache.cassandra.utils.FBUtilities;
+1:72790dc: 
+1:733d1ee: @SuppressWarnings("resource")
+1:72790dc: public class Operation extends RangeIterator<Long, Token>
+1:72790dc: {
+1:72790dc:     public enum OperationType
+1:72790dc:     {
+1:72790dc:         AND, OR;
+1:72790dc: 
+1:72790dc:         public boolean apply(boolean a, boolean b)
+1:72790dc:         {
+1:72790dc:             switch (this)
+1:72790dc:             {
+1:72790dc:                 case OR:
+1:72790dc:                     return a | b;
+1:72790dc: 
+1:72790dc:                 case AND:
+1:72790dc:                     return a & b;
+1:72790dc: 
+1:72790dc:                 default:
+1:72790dc:                     throw new AssertionError();
+1:72790dc:             }
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private final QueryController controller;
+1:72790dc: 
+1:72790dc:     protected final OperationType op;
+1:72790dc:     protected final ListMultimap<ColumnDefinition, Expression> expressions;
+1:72790dc:     protected final RangeIterator<Long, Token> range;
+1:72790dc: 
+1:72790dc:     protected Operation left, right;
+1:72790dc: 
+1:72790dc:     private Operation(OperationType operation,
+1:72790dc:                       QueryController controller,
+1:72790dc:                       ListMultimap<ColumnDefinition, Expression> expressions,
+1:72790dc:                       RangeIterator<Long, Token> range,
+1:72790dc:                       Operation left, Operation right)
+1:72790dc:     {
+1:72790dc:         super(range);
+1:72790dc: 
+1:72790dc:         this.op = operation;
+1:72790dc:         this.controller = controller;
+1:72790dc:         this.expressions = expressions;
+1:72790dc:         this.range = range;
+1:72790dc: 
+1:72790dc:         this.left = left;
+1:72790dc:         this.right = right;
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     /**
+1:72790dc:      * Recursive "satisfies" checks based on operation
+1:72790dc:      * and data from the lower level members using depth-first search
+1:72790dc:      * and bubbling the results back to the top level caller.
+1:72790dc:      *
+1:b7d1d44:      * Most of the work here is done by {@link #localSatisfiedBy(Unfiltered, Row, boolean)}
+1:72790dc:      * see it's comment for details, if there are no local expressions
+1:72790dc:      * assigned to Operation it will call satisfiedBy(Row) on it's children.
+1:72790dc:      *
+1:72790dc:      * Query: first_name = X AND (last_name = Y OR address = XYZ AND street = IL AND city = C) OR (state = 'CA' AND country = 'US')
+1:72790dc:      * Row: key1: (first_name: X, last_name: Z, address: XYZ, street: IL, city: C, state: NY, country:US)
+1:72790dc:      *
+1:72790dc:      * #1                       OR
+1:72790dc:      *                        /    \
+1:72790dc:      * #2       (first_name) AND   AND (state, country)
+1:72790dc:      *                          \
+1:72790dc:      * #3            (last_name) OR
+1:72790dc:      *                             \
+1:72790dc:      * #4                          AND (address, street, city)
+1:72790dc:      *
+1:72790dc:      *
+1:72790dc:      * Evaluation of the key1 is top-down depth-first search:
+1:72790dc:      *
+1:72790dc:      * --- going down ---
+1:72790dc:      * Level #1 is evaluated, OR expression has to pull results from it's children which are at level #2 and OR them together,
+1:72790dc:      * Level #2 AND (state, country) could be be evaluated right away, AND (first_name) refers to it's "right" child from level #3
+1:72790dc:      * Level #3 OR (last_name) requests results from level #4
+1:72790dc:      * Level #4 AND (address, street, city) does logical AND between it's 3 fields, returns result back to level #3.
+1:72790dc:      * --- bubbling up ---
+1:72790dc:      * Level #3 computes OR between AND (address, street, city) result and it's "last_name" expression
+1:72790dc:      * Level #2 computes AND between "first_name" and result of level #3, AND (state, country) which is already computed
+1:72790dc:      * Level #1 does OR between results of AND (first_name) and AND (state, country) and returns final result.
+1:72790dc:      *
+1:b7d1d44:      * @param currentCluster The row cluster to check.
+1:b7d1d44:      * @param staticRow The static row associated with current cluster.
+1:b7d1d44:      * @param allowMissingColumns allow columns value to be null.
+1:72790dc:      * @return true if give Row satisfied all of the expressions in the tree,
+1:72790dc:      *         false otherwise.
+1:72790dc:      */
+1:b7d1d44:     public boolean satisfiedBy(Unfiltered currentCluster, Row staticRow, boolean allowMissingColumns)
+1:72790dc:     {
+1:72790dc:         boolean sideL, sideR;
+1:72790dc: 
+1:72790dc:         if (expressions == null || expressions.isEmpty())
+1:72790dc:         {
+1:b7d1d44:             sideL =  left != null &&  left.satisfiedBy(currentCluster, staticRow, allowMissingColumns);
+1:b7d1d44:             sideR = right != null && right.satisfiedBy(currentCluster, staticRow, allowMissingColumns);
+1:72790dc: 
+1:72790dc:             // one of the expressions was skipped
+1:72790dc:             // because it had no indexes attached
+1:72790dc:             if (left == null)
+1:72790dc:                 return sideR;
+1:72790dc:         }
+1:72790dc:         else
+1:72790dc:         {
+1:b7d1d44:             sideL = localSatisfiedBy(currentCluster, staticRow, allowMissingColumns);
+1:72790dc: 
+1:72790dc:             // if there is no right it means that this expression
+1:72790dc:             // is last in the sequence, we can just return result from local expressions
+1:72790dc:             if (right == null)
+1:72790dc:                 return sideL;
+1:72790dc: 
+1:b7d1d44:             sideR = right.satisfiedBy(currentCluster, staticRow, allowMissingColumns);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc: 
+1:72790dc:         return op.apply(sideL, sideR);
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     /**
+1:72790dc:      * Check every expression in the analyzed list to figure out if the
+1:72790dc:      * columns in the give row match all of the based on the operation
+1:72790dc:      * set to the current operation node.
+1:72790dc:      *
+1:72790dc:      * The algorithm is as follows: for every given expression from analyzed
+1:72790dc:      * list get corresponding column from the Row:
+1:3928665:      *   - apply {@link Expression#isSatisfiedBy(ByteBuffer)}
+1:72790dc:      *     method to figure out if it's satisfied;
+1:72790dc:      *   - apply logical operation between boolean accumulator and current boolean result;
+1:72790dc:      *   - if result == false and node's operation is AND return right away;
+1:72790dc:      *
+1:72790dc:      * After all of the expressions have been evaluated return resulting accumulator variable.
+1:72790dc:      *
+1:72790dc:      * Example:
+1:72790dc:      *
+1:72790dc:      * Operation = (op: AND, columns: [first_name = p, 5 < age < 7, last_name: y])
+1:72790dc:      * Row = (first_name: pavel, last_name: y, age: 6, timestamp: 15)
+1:72790dc:      *
+1:72790dc:      * #1 get "first_name" = p (expressions)
+1:72790dc:      *      - row-get "first_name"                      => "pavel"
+1:72790dc:      *      - compare "pavel" against "p"               => true (current)
+1:72790dc:      *      - set accumulator current                   => true (because this is expression #1)
+1:72790dc:      *
+1:72790dc:      * #2 get "last_name" = y (expressions)
+1:72790dc:      *      - row-get "last_name"                       => "y"
+1:72790dc:      *      - compare "y" against "y"                   => true (current)
+1:72790dc:      *      - set accumulator to accumulator & current  => true
+1:72790dc:      *
+1:72790dc:      * #3 get 5 < "age" < 7 (expressions)
+1:72790dc:      *      - row-get "age"                             => "6"
+1:72790dc:      *      - compare 5 < 6 < 7                         => true (current)
+1:72790dc:      *      - set accumulator to accumulator & current  => true
+1:72790dc:      *
+1:72790dc:      * #4 return accumulator => true (row satisfied all of the conditions)
+1:72790dc:      *
+1:b7d1d44:      * @param currentCluster The row cluster to check.
+1:b7d1d44:      * @param staticRow The static row associated with current cluster.
+1:b7d1d44:      * @param allowMissingColumns allow columns value to be null.
+1:72790dc:      * @return true if give Row satisfied all of the analyzed expressions,
+1:72790dc:      *         false otherwise.
+1:72790dc:      */
+1:b7d1d44:     private boolean localSatisfiedBy(Unfiltered currentCluster, Row staticRow, boolean allowMissingColumns)
+1:72790dc:     {
+1:b7d1d44:         if (currentCluster == null || !currentCluster.isRow())
+1:72790dc:             return false;
+1:72790dc: 
+1:72790dc:         final int now = FBUtilities.nowInSeconds();
+1:72790dc:         boolean result = false;
+1:72790dc:         int idx = 0;
+1:72790dc: 
+1:72790dc:         for (ColumnDefinition column : expressions.keySet())
+1:72790dc:         {
+1:72790dc:             if (column.kind == Kind.PARTITION_KEY)
+1:72790dc:                 continue;
+1:72790dc: 
+1:b7d1d44:             ByteBuffer value = ColumnIndex.getValueOf(column, column.kind == Kind.STATIC ? staticRow : (Row) currentCluster, now);
+1:72790dc:             boolean isMissingColumn = value == null;
+1:72790dc: 
+1:72790dc:             if (!allowMissingColumns && isMissingColumn)
+1:72790dc:                 throw new IllegalStateException("All indexed columns should be included into the column slice, missing: " + column);
+1:72790dc: 
+1:72790dc:             boolean isMatch = false;
+1:72790dc:             // If there is a column with multiple expressions that effectively means an OR
+1:72790dc:             // e.g. comment = 'x y z' could be split into 'comment' EQ 'x', 'comment' EQ 'y', 'comment' EQ 'z'
+1:72790dc:             // by analyzer, in situation like that we only need to check if at least one of expressions matches,
+1:72790dc:             // and there is no hit on the NOT_EQ (if any) which are always at the end of the filter list.
+1:72790dc:             // Loop always starts from the end of the list, which makes it possible to break after the last
+1:72790dc:             // NOT_EQ condition on first EQ/RANGE condition satisfied, instead of checking every
+1:72790dc:             // single expression in the column filter list.
+1:72790dc:             List<Expression> filters = expressions.get(column);
+1:72790dc:             for (int i = filters.size() - 1; i >= 0; i--)
+1:72790dc:             {
+1:72790dc:                 Expression expression = filters.get(i);
+1:3928665:                 isMatch = !isMissingColumn && expression.isSatisfiedBy(value);
+1:72790dc:                 if (expression.getOp() == Op.NOT_EQ)
+1:72790dc:                 {
+1:72790dc:                     // since this is NOT_EQ operation we have to
+1:72790dc:                     // inverse match flag (to check against other expressions),
+1:72790dc:                     // and break in case of negative inverse because that means
+1:72790dc:                     // that it's a positive hit on the not-eq clause.
+1:72790dc:                     isMatch = !isMatch;
+1:72790dc:                     if (!isMatch)
+1:72790dc:                         break;
+1:72790dc:                 } // if it was a match on EQ/RANGE or column is missing
+1:72790dc:                 else if (isMatch || isMissingColumn)
+1:72790dc:                     break;
+1:72790dc:             }
+1:72790dc: 
+1:72790dc:             if (idx++ == 0)
+1:72790dc:             {
+1:72790dc:                 result = isMatch;
+1:72790dc:                 continue;
+1:72790dc:             }
+1:72790dc: 
+1:72790dc:             result = op.apply(result, isMatch);
+1:72790dc: 
+1:72790dc:             // exit early because we already got a single false
+1:72790dc:             if (op == OperationType.AND && !result)
+1:72790dc:                 return false;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         return idx == 0 || result;
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     @VisibleForTesting
+1:72790dc:     protected static ListMultimap<ColumnDefinition, Expression> analyzeGroup(QueryController controller,
+1:72790dc:                                                                              OperationType op,
+1:72790dc:                                                                              List<RowFilter.Expression> expressions)
+1:72790dc:     {
+1:72790dc:         ListMultimap<ColumnDefinition, Expression> analyzed = ArrayListMultimap.create();
+1:72790dc: 
+1:72790dc:         // sort all of the expressions in the operation by name and priority of the logical operator
+1:72790dc:         // this gives us an efficient way to handle inequality and combining into ranges without extra processing
+1:72790dc:         // and converting expressions from one type to another.
+1:72790dc:         Collections.sort(expressions, (a, b) -> {
+1:72790dc:             int cmp = a.column().compareTo(b.column());
+1:72790dc:             return cmp == 0 ? -Integer.compare(getPriority(a.operator()), getPriority(b.operator())) : cmp;
+1:72790dc:         });
+1:72790dc: 
+1:72790dc:         for (final RowFilter.Expression e : expressions)
+1:72790dc:         {
+1:72790dc:             ColumnIndex columnIndex = controller.getIndex(e);
+1:72790dc:             List<Expression> perColumn = analyzed.get(e.column());
+1:72790dc: 
+1:72790dc:             if (columnIndex == null)
+1:72790dc:                 columnIndex = new ColumnIndex(controller.getKeyValidator(), e.column(), null);
+1:72790dc: 
+1:72790dc:             AbstractAnalyzer analyzer = columnIndex.getAnalyzer();
+1:72790dc:             analyzer.reset(e.getIndexValue());
+1:72790dc: 
+1:3928665:             // EQ/LIKE_*/NOT_EQ can have multiple expressions e.g. text = "Hello World",
+1:72790dc:             // becomes text = "Hello" OR text = "World" because "space" is always interpreted as a split point (by analyzer),
+1:72790dc:             // NOT_EQ is made an independent expression only in case of pre-existing multiple EQ expressions, or
+1:72790dc:             // if there is no EQ operations and NOT_EQ is met or a single NOT_EQ expression present,
+1:72790dc:             // in such case we know exactly that there would be no more EQ/RANGE expressions for given column
+1:72790dc:             // since NOT_EQ has the lowest priority.
+1:3928665:             boolean isMultiExpression = false;
+1:3928665:             switch (e.operator())
+1:3928665:             {
+1:3928665:                 case EQ:
+1:479e8af:                     isMultiExpression = false;
+1:479e8af:                     break;
+1:479e8af: 
+1:3928665:                 case LIKE_PREFIX:
+1:3928665:                 case LIKE_SUFFIX:
+1:3928665:                 case LIKE_CONTAINS:
+1:479e8af:                 case LIKE_MATCHES:
+1:3928665:                     isMultiExpression = true;
+1:3928665:                     break;
+1:3928665: 
+1:3928665:                 case NEQ:
+1:3928665:                     isMultiExpression = (perColumn.size() == 0 || perColumn.size() > 1
+1:3928665:                                      || (perColumn.size() == 1 && perColumn.get(0).getOp() == Op.NOT_EQ));
+1:3928665:                     break;
+1:3928665:             }
+1:3928665: 
+1:3928665:             if (isMultiExpression)
+1:72790dc:             {
+1:72790dc:                 while (analyzer.hasNext())
+1:72790dc:                 {
+1:72790dc:                     final ByteBuffer token = analyzer.next();
+1:72790dc:                     perColumn.add(new Expression(controller, columnIndex).add(e.operator(), token));
+1:72790dc:                 }
+1:72790dc:             }
+1:72790dc:             else
+1:72790dc:             // "range" or not-equals operator, combines both bounds together into the single expression,
+1:72790dc:             // iff operation of the group is AND, otherwise we are forced to create separate expressions,
+1:72790dc:             // not-equals is combined with the range iff operator is AND.
+1:72790dc:             {
+1:72790dc:                 Expression range;
+1:72790dc:                 if (perColumn.size() == 0 || op != OperationType.AND)
+1:72790dc:                     perColumn.add((range = new Expression(controller, columnIndex)));
+1:72790dc:                 else
+1:72790dc:                     range = Iterables.getLast(perColumn);
+1:72790dc: 
+1:72790dc:                 while (analyzer.hasNext())
+1:72790dc:                     range.add(e.operator(), analyzer.next());
+1:72790dc:             }
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         return analyzed;
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private static int getPriority(Operator op)
+1:72790dc:     {
+1:72790dc:         switch (op)
+1:72790dc:         {
+1:72790dc:             case EQ:
+1:3928665:                 return 5;
+1:3928665: 
+1:3928665:             case LIKE_PREFIX:
+1:3928665:             case LIKE_SUFFIX:
+1:3928665:             case LIKE_CONTAINS:
+1:479e8af:             case LIKE_MATCHES:
+1:72790dc:                 return 4;
+1:72790dc: 
+1:72790dc:             case GTE:
+1:72790dc:             case GT:
+1:72790dc:                 return 3;
+1:72790dc: 
+1:72790dc:             case LTE:
+1:72790dc:             case LT:
+1:72790dc:                 return 2;
+1:72790dc: 
+1:72790dc:             case NEQ:
+1:72790dc:                 return 1;
+1:72790dc: 
+1:72790dc:             default:
+1:72790dc:                 return 0;
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     protected Token computeNext()
+1:72790dc:     {
+1:72790dc:         return range != null && range.hasNext() ? range.next() : endOfData();
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     protected void performSkipTo(Long nextToken)
+1:72790dc:     {
+1:72790dc:         if (range != null)
+1:72790dc:             range.skipTo(nextToken);
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     public void close() throws IOException
+1:72790dc:     {
+1:72790dc:         controller.releaseIndexes(this);
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     public static class Builder
+1:72790dc:     {
+1:72790dc:         private final QueryController controller;
+1:72790dc: 
+1:72790dc:         protected final OperationType op;
+1:72790dc:         protected final List<RowFilter.Expression> expressions;
+1:72790dc: 
+1:72790dc:         protected Builder left, right;
+1:72790dc: 
+1:72790dc:         public Builder(OperationType operation, QueryController controller, RowFilter.Expression... columns)
+1:72790dc:         {
+1:72790dc:             this.op = operation;
+1:72790dc:             this.controller = controller;
+1:72790dc:             this.expressions = new ArrayList<>();
+1:72790dc:             Collections.addAll(expressions, columns);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public Builder setRight(Builder operation)
+1:72790dc:         {
+1:72790dc:             this.right = operation;
+1:72790dc:             return this;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public Builder setLeft(Builder operation)
+1:72790dc:         {
+1:72790dc:             this.left = operation;
+1:72790dc:             return this;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void add(RowFilter.Expression e)
+1:72790dc:         {
+1:72790dc:             expressions.add(e);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void add(Collection<RowFilter.Expression> newExpressions)
+1:72790dc:         {
+1:72790dc:             if (expressions != null)
+1:72790dc:                 expressions.addAll(newExpressions);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public Operation complete()
+1:72790dc:         {
+1:72790dc:             if (!expressions.isEmpty())
+1:72790dc:             {
+1:72790dc:                 ListMultimap<ColumnDefinition, Expression> analyzedExpressions = analyzeGroup(controller, op, expressions);
+1:72790dc:                 RangeIterator.Builder<Long, Token> range = controller.getIndexes(op, analyzedExpressions.values());
+1:72790dc: 
+1:72790dc:                 Operation rightOp = null;
+1:72790dc:                 if (right != null)
+1:72790dc:                 {
+1:72790dc:                     rightOp = right.complete();
+1:72790dc:                     range.add(rightOp);
+1:72790dc:                 }
+1:72790dc: 
+1:72790dc:                 return new Operation(op, controller, analyzedExpressions, range.build(), null, rightOp);
+1:72790dc:             }
+1:72790dc:             else
+1:72790dc:             {
+1:72790dc:                 Operation leftOp = null, rightOp = null;
+1:72790dc:                 boolean leftIndexes = false, rightIndexes = false;
+1:72790dc: 
+1:72790dc:                 if (left != null)
+1:72790dc:                 {
+1:72790dc:                     leftOp = left.complete();
+1:72790dc:                     leftIndexes = leftOp != null && leftOp.range != null;
+1:72790dc:                 }
+1:72790dc: 
+1:72790dc:                 if (right != null)
+1:72790dc:                 {
+1:72790dc:                     rightOp = right.complete();
+1:72790dc:                     rightIndexes = rightOp != null && rightOp.range != null;
+1:72790dc:                 }
+1:72790dc: 
+1:72790dc:                 RangeIterator<Long, Token> join;
+1:72790dc:                 /**
+1:72790dc:                  * Operation should allow one of it's sub-trees to wrap no indexes, that is related  to the fact that we
+1:72790dc:                  * have to accept defined-but-not-indexed columns as well as key range as IndexExpressions.
+1:72790dc:                  *
+1:72790dc:                  * Two cases are possible:
+1:72790dc:                  *
+1:72790dc:                  * only left child produced indexed iterators, that could happen when there are two columns
+1:72790dc:                  * or key range on the right:
+1:72790dc:                  *
+1:72790dc:                  *                AND
+1:72790dc:                  *              /     \
+1:72790dc:                  *            OR       \
+1:72790dc:                  *           /   \     AND
+1:72790dc:                  *          a     b   /   \
+1:72790dc:                  *                  key   key
+1:72790dc:                  *
+1:72790dc:                  * only right child produced indexed iterators:
+1:72790dc:                  *
+1:72790dc:                  *               AND
+1:72790dc:                  *              /    \
+1:72790dc:                  *            AND     a
+1:72790dc:                  *           /   \
+1:72790dc:                  *         key  key
+1:72790dc:                  */
+1:72790dc:                 if (leftIndexes && !rightIndexes)
+1:72790dc:                     join = leftOp;
+1:72790dc:                 else if (!leftIndexes && rightIndexes)
+1:72790dc:                     join = rightOp;
+1:72790dc:                 else if (leftIndexes)
+1:72790dc:                 {
+1:72790dc:                     RangeIterator.Builder<Long, Token> builder = op == OperationType.OR
+1:72790dc:                                                 ? RangeUnionIterator.<Long, Token>builder()
+1:72790dc:                                                 : RangeIntersectionIterator.<Long, Token>builder();
+1:72790dc: 
+1:72790dc:                     join = builder.add(leftOp).add(rightOp).build();
+1:72790dc:                 }
+1:72790dc:                 else
+1:72790dc:                     throw new AssertionError("both sub-trees have 0 indexes.");
+1:72790dc: 
+1:72790dc:                 return new Operation(op, controller, null, join, leftOp, rightOp);
+1:72790dc:             }
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: }
+============================================================================
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:b7d1d44
+/////////////////////////////////////////////////////////////////////////
+1:      * Most of the work here is done by {@link #localSatisfiedBy(Unfiltered, Row, boolean)}
+/////////////////////////////////////////////////////////////////////////
+1:      * @param currentCluster The row cluster to check.
+1:      * @param staticRow The static row associated with current cluster.
+1:      * @param allowMissingColumns allow columns value to be null.
+1:     public boolean satisfiedBy(Unfiltered currentCluster, Row staticRow, boolean allowMissingColumns)
+1:             sideL =  left != null &&  left.satisfiedBy(currentCluster, staticRow, allowMissingColumns);
+1:             sideR = right != null && right.satisfiedBy(currentCluster, staticRow, allowMissingColumns);
+/////////////////////////////////////////////////////////////////////////
+1:             sideL = localSatisfiedBy(currentCluster, staticRow, allowMissingColumns);
+1:             sideR = right.satisfiedBy(currentCluster, staticRow, allowMissingColumns);
+/////////////////////////////////////////////////////////////////////////
+1:      * @param currentCluster The row cluster to check.
+1:      * @param staticRow The static row associated with current cluster.
+1:      * @param allowMissingColumns allow columns value to be null.
+1:     private boolean localSatisfiedBy(Unfiltered currentCluster, Row staticRow, boolean allowMissingColumns)
+1:         if (currentCluster == null || !currentCluster.isRow())
+/////////////////////////////////////////////////////////////////////////
+1:             ByteBuffer value = ColumnIndex.getValueOf(column, column.kind == Kind.STATIC ? staticRow : (Row) currentCluster, now);
+commit:479e8af
+/////////////////////////////////////////////////////////////////////////
+1:                     isMultiExpression = false;
+1:                     break;
+1: 
+1:                 case LIKE_MATCHES:
+/////////////////////////////////////////////////////////////////////////
+1:             case LIKE_MATCHES:
+commit:3928665
+/////////////////////////////////////////////////////////////////////////
+1:      *   - apply {@link Expression#isSatisfiedBy(ByteBuffer)}
+/////////////////////////////////////////////////////////////////////////
+1:                 isMatch = !isMissingColumn && expression.isSatisfiedBy(value);
+/////////////////////////////////////////////////////////////////////////
+1:             // EQ/LIKE_*/NOT_EQ can have multiple expressions e.g. text = "Hello World",
+1:             boolean isMultiExpression = false;
+1:             switch (e.operator())
+1:             {
+1:                 case EQ:
+1:                 case LIKE_PREFIX:
+1:                 case LIKE_SUFFIX:
+1:                 case LIKE_CONTAINS:
+1:                     isMultiExpression = true;
+1:                     break;
+1: 
+1:                 case NEQ:
+1:                     isMultiExpression = (perColumn.size() == 0 || perColumn.size() > 1
+1:                                      || (perColumn.size() == 1 && perColumn.get(0).getOp() == Op.NOT_EQ));
+1:                     break;
+1:             }
+1: 
+1:             if (isMultiExpression)
+/////////////////////////////////////////////////////////////////////////
+1:                 return 5;
+1: 
+1:             case LIKE_PREFIX:
+1:             case LIKE_SUFFIX:
+1:             case LIKE_CONTAINS:
+commit:72790dc
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.index.sasi.plan;
+1: 
+1: import java.io.IOException;
+1: import java.nio.ByteBuffer;
+1: import java.util.*;
+1: 
+1: import org.apache.cassandra.config.ColumnDefinition;
+1: import org.apache.cassandra.config.ColumnDefinition.Kind;
+1: import org.apache.cassandra.cql3.Operator;
+1: import org.apache.cassandra.db.filter.RowFilter;
+1: import org.apache.cassandra.db.rows.Row;
+1: import org.apache.cassandra.db.rows.Unfiltered;
+1: import org.apache.cassandra.index.sasi.conf.ColumnIndex;
+1: import org.apache.cassandra.index.sasi.analyzer.AbstractAnalyzer;
+1: import org.apache.cassandra.index.sasi.disk.Token;
+1: import org.apache.cassandra.index.sasi.plan.Expression.Op;
+1: import org.apache.cassandra.index.sasi.utils.RangeIntersectionIterator;
+1: import org.apache.cassandra.index.sasi.utils.RangeIterator;
+1: import org.apache.cassandra.index.sasi.utils.RangeUnionIterator;
+1: 
+1: import com.google.common.annotations.VisibleForTesting;
+1: import com.google.common.collect.*;
+1: import org.apache.cassandra.utils.FBUtilities;
+1: 
+1: public class Operation extends RangeIterator<Long, Token>
+1: {
+1:     public enum OperationType
+1:     {
+1:         AND, OR;
+1: 
+1:         public boolean apply(boolean a, boolean b)
+1:         {
+1:             switch (this)
+1:             {
+1:                 case OR:
+1:                     return a | b;
+1: 
+1:                 case AND:
+1:                     return a & b;
+1: 
+1:                 default:
+1:                     throw new AssertionError();
+1:             }
+1:         }
+1:     }
+1: 
+1:     private final QueryController controller;
+1: 
+1:     protected final OperationType op;
+1:     protected final ListMultimap<ColumnDefinition, Expression> expressions;
+1:     protected final RangeIterator<Long, Token> range;
+1: 
+1:     protected Operation left, right;
+1: 
+1:     private Operation(OperationType operation,
+1:                       QueryController controller,
+1:                       ListMultimap<ColumnDefinition, Expression> expressions,
+1:                       RangeIterator<Long, Token> range,
+1:                       Operation left, Operation right)
+1:     {
+1:         super(range);
+1: 
+1:         this.op = operation;
+1:         this.controller = controller;
+1:         this.expressions = expressions;
+1:         this.range = range;
+1: 
+1:         this.left = left;
+1:         this.right = right;
+1:     }
+1: 
+1:     /**
+1:      * Recursive "satisfies" checks based on operation
+1:      * and data from the lower level members using depth-first search
+1:      * and bubbling the results back to the top level caller.
+1:      *
+0:      * Most of the work here is done by {@link #localSatisfiedBy(Unfiltered, boolean)}
+1:      * see it's comment for details, if there are no local expressions
+1:      * assigned to Operation it will call satisfiedBy(Row) on it's children.
+1:      *
+1:      * Query: first_name = X AND (last_name = Y OR address = XYZ AND street = IL AND city = C) OR (state = 'CA' AND country = 'US')
+1:      * Row: key1: (first_name: X, last_name: Z, address: XYZ, street: IL, city: C, state: NY, country:US)
+1:      *
+1:      * #1                       OR
+1:      *                        /    \
+1:      * #2       (first_name) AND   AND (state, country)
+1:      *                          \
+1:      * #3            (last_name) OR
+1:      *                             \
+1:      * #4                          AND (address, street, city)
+1:      *
+1:      *
+1:      * Evaluation of the key1 is top-down depth-first search:
+1:      *
+1:      * --- going down ---
+1:      * Level #1 is evaluated, OR expression has to pull results from it's children which are at level #2 and OR them together,
+1:      * Level #2 AND (state, country) could be be evaluated right away, AND (first_name) refers to it's "right" child from level #3
+1:      * Level #3 OR (last_name) requests results from level #4
+1:      * Level #4 AND (address, street, city) does logical AND between it's 3 fields, returns result back to level #3.
+1:      * --- bubbling up ---
+1:      * Level #3 computes OR between AND (address, street, city) result and it's "last_name" expression
+1:      * Level #2 computes AND between "first_name" and result of level #3, AND (state, country) which is already computed
+1:      * Level #1 does OR between results of AND (first_name) and AND (state, country) and returns final result.
+1:      *
+0:      * @param row The row to check.
+1:      * @return true if give Row satisfied all of the expressions in the tree,
+1:      *         false otherwise.
+1:      */
+0:     public boolean satisfiedBy(Unfiltered row, boolean allowMissingColumns)
+1:     {
+1:         boolean sideL, sideR;
+1: 
+1:         if (expressions == null || expressions.isEmpty())
+1:         {
+0:             sideL =  left != null &&  left.satisfiedBy(row, allowMissingColumns);
+0:             sideR = right != null && right.satisfiedBy(row, allowMissingColumns);
+1: 
+1:             // one of the expressions was skipped
+1:             // because it had no indexes attached
+1:             if (left == null)
+1:                 return sideR;
+1:         }
+1:         else
+1:         {
+0:             sideL = localSatisfiedBy(row, allowMissingColumns);
+1: 
+1:             // if there is no right it means that this expression
+1:             // is last in the sequence, we can just return result from local expressions
+1:             if (right == null)
+1:                 return sideL;
+1: 
+0:             sideR = right.satisfiedBy(row, allowMissingColumns);
+1:         }
+1: 
+1: 
+1:         return op.apply(sideL, sideR);
+1:     }
+1: 
+1:     /**
+1:      * Check every expression in the analyzed list to figure out if the
+1:      * columns in the give row match all of the based on the operation
+1:      * set to the current operation node.
+1:      *
+1:      * The algorithm is as follows: for every given expression from analyzed
+1:      * list get corresponding column from the Row:
+0:      *   - apply {@link Expression#contains(ByteBuffer)}
+1:      *     method to figure out if it's satisfied;
+1:      *   - apply logical operation between boolean accumulator and current boolean result;
+1:      *   - if result == false and node's operation is AND return right away;
+1:      *
+1:      * After all of the expressions have been evaluated return resulting accumulator variable.
+1:      *
+1:      * Example:
+1:      *
+1:      * Operation = (op: AND, columns: [first_name = p, 5 < age < 7, last_name: y])
+1:      * Row = (first_name: pavel, last_name: y, age: 6, timestamp: 15)
+1:      *
+1:      * #1 get "first_name" = p (expressions)
+1:      *      - row-get "first_name"                      => "pavel"
+1:      *      - compare "pavel" against "p"               => true (current)
+1:      *      - set accumulator current                   => true (because this is expression #1)
+1:      *
+1:      * #2 get "last_name" = y (expressions)
+1:      *      - row-get "last_name"                       => "y"
+1:      *      - compare "y" against "y"                   => true (current)
+1:      *      - set accumulator to accumulator & current  => true
+1:      *
+1:      * #3 get 5 < "age" < 7 (expressions)
+1:      *      - row-get "age"                             => "6"
+1:      *      - compare 5 < 6 < 7                         => true (current)
+1:      *      - set accumulator to accumulator & current  => true
+1:      *
+1:      * #4 return accumulator => true (row satisfied all of the conditions)
+1:      *
+0:      * @param row The row to check.
+1:      * @return true if give Row satisfied all of the analyzed expressions,
+1:      *         false otherwise.
+1:      */
+0:     private boolean localSatisfiedBy(Unfiltered row, boolean allowMissingColumns)
+1:     {
+0:         if (row == null || !row.isRow())
+1:             return false;
+1: 
+1:         final int now = FBUtilities.nowInSeconds();
+1:         boolean result = false;
+1:         int idx = 0;
+1: 
+1:         for (ColumnDefinition column : expressions.keySet())
+1:         {
+1:             if (column.kind == Kind.PARTITION_KEY)
+1:                 continue;
+1: 
+0:             ByteBuffer value = ColumnIndex.getValueOf(column, (Row) row, now);
+1:             boolean isMissingColumn = value == null;
+1: 
+1:             if (!allowMissingColumns && isMissingColumn)
+1:                 throw new IllegalStateException("All indexed columns should be included into the column slice, missing: " + column);
+1: 
+1:             boolean isMatch = false;
+1:             // If there is a column with multiple expressions that effectively means an OR
+1:             // e.g. comment = 'x y z' could be split into 'comment' EQ 'x', 'comment' EQ 'y', 'comment' EQ 'z'
+1:             // by analyzer, in situation like that we only need to check if at least one of expressions matches,
+1:             // and there is no hit on the NOT_EQ (if any) which are always at the end of the filter list.
+1:             // Loop always starts from the end of the list, which makes it possible to break after the last
+1:             // NOT_EQ condition on first EQ/RANGE condition satisfied, instead of checking every
+1:             // single expression in the column filter list.
+1:             List<Expression> filters = expressions.get(column);
+1:             for (int i = filters.size() - 1; i >= 0; i--)
+1:             {
+1:                 Expression expression = filters.get(i);
+0:                 isMatch = !isMissingColumn && expression.contains(value);
+1:                 if (expression.getOp() == Op.NOT_EQ)
+1:                 {
+1:                     // since this is NOT_EQ operation we have to
+1:                     // inverse match flag (to check against other expressions),
+1:                     // and break in case of negative inverse because that means
+1:                     // that it's a positive hit on the not-eq clause.
+1:                     isMatch = !isMatch;
+1:                     if (!isMatch)
+1:                         break;
+1:                 } // if it was a match on EQ/RANGE or column is missing
+1:                 else if (isMatch || isMissingColumn)
+1:                     break;
+1:             }
+1: 
+1:             if (idx++ == 0)
+1:             {
+1:                 result = isMatch;
+1:                 continue;
+1:             }
+1: 
+1:             result = op.apply(result, isMatch);
+1: 
+1:             // exit early because we already got a single false
+1:             if (op == OperationType.AND && !result)
+1:                 return false;
+1:         }
+1: 
+1:         return idx == 0 || result;
+1:     }
+1: 
+1:     @VisibleForTesting
+1:     protected static ListMultimap<ColumnDefinition, Expression> analyzeGroup(QueryController controller,
+1:                                                                              OperationType op,
+1:                                                                              List<RowFilter.Expression> expressions)
+1:     {
+1:         ListMultimap<ColumnDefinition, Expression> analyzed = ArrayListMultimap.create();
+1: 
+1:         // sort all of the expressions in the operation by name and priority of the logical operator
+1:         // this gives us an efficient way to handle inequality and combining into ranges without extra processing
+1:         // and converting expressions from one type to another.
+1:         Collections.sort(expressions, (a, b) -> {
+1:             int cmp = a.column().compareTo(b.column());
+1:             return cmp == 0 ? -Integer.compare(getPriority(a.operator()), getPriority(b.operator())) : cmp;
+1:         });
+1: 
+1:         for (final RowFilter.Expression e : expressions)
+1:         {
+1:             ColumnIndex columnIndex = controller.getIndex(e);
+1:             List<Expression> perColumn = analyzed.get(e.column());
+1: 
+1:             if (columnIndex == null)
+1:                 columnIndex = new ColumnIndex(controller.getKeyValidator(), e.column(), null);
+1: 
+1:             AbstractAnalyzer analyzer = columnIndex.getAnalyzer();
+1:             analyzer.reset(e.getIndexValue());
+1: 
+0:             // EQ/NOT_EQ can have multiple expressions e.g. text = "Hello World",
+1:             // becomes text = "Hello" OR text = "World" because "space" is always interpreted as a split point (by analyzer),
+1:             // NOT_EQ is made an independent expression only in case of pre-existing multiple EQ expressions, or
+1:             // if there is no EQ operations and NOT_EQ is met or a single NOT_EQ expression present,
+1:             // in such case we know exactly that there would be no more EQ/RANGE expressions for given column
+1:             // since NOT_EQ has the lowest priority.
+0:             if (e.operator() == Operator.EQ
+0:                     || (e.operator() == Operator.NEQ
+0:                        && (perColumn.size() == 0 || perColumn.size() > 1
+0:                            || (perColumn.size() == 1 && perColumn.get(0).getOp() == Op.NOT_EQ))))
+1:             {
+1:                 while (analyzer.hasNext())
+1:                 {
+1:                     final ByteBuffer token = analyzer.next();
+1:                     perColumn.add(new Expression(controller, columnIndex).add(e.operator(), token));
+1:                 }
+1:             }
+1:             else
+1:             // "range" or not-equals operator, combines both bounds together into the single expression,
+1:             // iff operation of the group is AND, otherwise we are forced to create separate expressions,
+1:             // not-equals is combined with the range iff operator is AND.
+1:             {
+1:                 Expression range;
+1:                 if (perColumn.size() == 0 || op != OperationType.AND)
+1:                     perColumn.add((range = new Expression(controller, columnIndex)));
+1:                 else
+1:                     range = Iterables.getLast(perColumn);
+1: 
+1:                 while (analyzer.hasNext())
+1:                     range.add(e.operator(), analyzer.next());
+1:             }
+1:         }
+1: 
+1:         return analyzed;
+1:     }
+1: 
+1:     private static int getPriority(Operator op)
+1:     {
+1:         switch (op)
+1:         {
+1:             case EQ:
+1:                 return 4;
+1: 
+1:             case GTE:
+1:             case GT:
+1:                 return 3;
+1: 
+1:             case LTE:
+1:             case LT:
+1:                 return 2;
+1: 
+1:             case NEQ:
+1:                 return 1;
+1: 
+1:             default:
+1:                 return 0;
+1:         }
+1:     }
+1: 
+1:     protected Token computeNext()
+1:     {
+1:         return range != null && range.hasNext() ? range.next() : endOfData();
+1:     }
+1: 
+1:     protected void performSkipTo(Long nextToken)
+1:     {
+1:         if (range != null)
+1:             range.skipTo(nextToken);
+1:     }
+1: 
+1:     public void close() throws IOException
+1:     {
+1:         controller.releaseIndexes(this);
+1:     }
+1: 
+1:     public static class Builder
+1:     {
+1:         private final QueryController controller;
+1: 
+1:         protected final OperationType op;
+1:         protected final List<RowFilter.Expression> expressions;
+1: 
+1:         protected Builder left, right;
+1: 
+1:         public Builder(OperationType operation, QueryController controller, RowFilter.Expression... columns)
+1:         {
+1:             this.op = operation;
+1:             this.controller = controller;
+1:             this.expressions = new ArrayList<>();
+1:             Collections.addAll(expressions, columns);
+1:         }
+1: 
+1:         public Builder setRight(Builder operation)
+1:         {
+1:             this.right = operation;
+1:             return this;
+1:         }
+1: 
+1:         public Builder setLeft(Builder operation)
+1:         {
+1:             this.left = operation;
+1:             return this;
+1:         }
+1: 
+1:         public void add(RowFilter.Expression e)
+1:         {
+1:             expressions.add(e);
+1:         }
+1: 
+1:         public void add(Collection<RowFilter.Expression> newExpressions)
+1:         {
+1:             if (expressions != null)
+1:                 expressions.addAll(newExpressions);
+1:         }
+1: 
+1:         public Operation complete()
+1:         {
+1:             if (!expressions.isEmpty())
+1:             {
+1:                 ListMultimap<ColumnDefinition, Expression> analyzedExpressions = analyzeGroup(controller, op, expressions);
+1:                 RangeIterator.Builder<Long, Token> range = controller.getIndexes(op, analyzedExpressions.values());
+1: 
+1:                 Operation rightOp = null;
+1:                 if (right != null)
+1:                 {
+1:                     rightOp = right.complete();
+1:                     range.add(rightOp);
+1:                 }
+1: 
+1:                 return new Operation(op, controller, analyzedExpressions, range.build(), null, rightOp);
+1:             }
+1:             else
+1:             {
+1:                 Operation leftOp = null, rightOp = null;
+1:                 boolean leftIndexes = false, rightIndexes = false;
+1: 
+1:                 if (left != null)
+1:                 {
+1:                     leftOp = left.complete();
+1:                     leftIndexes = leftOp != null && leftOp.range != null;
+1:                 }
+1: 
+1:                 if (right != null)
+1:                 {
+1:                     rightOp = right.complete();
+1:                     rightIndexes = rightOp != null && rightOp.range != null;
+1:                 }
+1: 
+1:                 RangeIterator<Long, Token> join;
+1:                 /**
+1:                  * Operation should allow one of it's sub-trees to wrap no indexes, that is related  to the fact that we
+1:                  * have to accept defined-but-not-indexed columns as well as key range as IndexExpressions.
+1:                  *
+1:                  * Two cases are possible:
+1:                  *
+1:                  * only left child produced indexed iterators, that could happen when there are two columns
+1:                  * or key range on the right:
+1:                  *
+1:                  *                AND
+1:                  *              /     \
+1:                  *            OR       \
+1:                  *           /   \     AND
+1:                  *          a     b   /   \
+1:                  *                  key   key
+1:                  *
+1:                  * only right child produced indexed iterators:
+1:                  *
+1:                  *               AND
+1:                  *              /    \
+1:                  *            AND     a
+1:                  *           /   \
+1:                  *         key  key
+1:                  */
+1:                 if (leftIndexes && !rightIndexes)
+1:                     join = leftOp;
+1:                 else if (!leftIndexes && rightIndexes)
+1:                     join = rightOp;
+1:                 else if (leftIndexes)
+1:                 {
+1:                     RangeIterator.Builder<Long, Token> builder = op == OperationType.OR
+1:                                                 ? RangeUnionIterator.<Long, Token>builder()
+1:                                                 : RangeIntersectionIterator.<Long, Token>builder();
+1: 
+1:                     join = builder.add(leftOp).add(rightOp).build();
+1:                 }
+1:                 else
+1:                     throw new AssertionError("both sub-trees have 0 indexes.");
+1: 
+1:                 return new Operation(op, controller, null, join, leftOp, rightOp);
+1:             }
+1:         }
+1:     }
+1: }
+author:Jason Brown
+-------------------------------------------------------------------------------
+commit:733d1ee
+/////////////////////////////////////////////////////////////////////////
+1: @SuppressWarnings("resource")
+============================================================================

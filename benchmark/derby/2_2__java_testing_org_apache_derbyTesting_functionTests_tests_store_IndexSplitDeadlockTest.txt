@@ -1,0 +1,1925 @@
+1:1ee9da2: /*
+1:1ee9da2:  * Derby - Class org.apache.derbyTesting.functionTests.tests.store.IndexSplitDeadlockTest
+4:1ee9da2:  *
+1:1ee9da2:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:1ee9da2:  * contributor license agreements.  See the NOTICE file distributed with
+1:1ee9da2:  * this work for additional information regarding copyright ownership.
+1:1ee9da2:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:1ee9da2:  * (the "License"); you may not use this file except in compliance with
+1:1ee9da2:  * the License.  You may obtain a copy of the License at
+1:1ee9da2:  *
+1:1ee9da2:  *    http://www.apache.org/licenses/LICENSE-2.0
+1:1ee9da2:  *
+1:1ee9da2:  * Unless required by applicable law or agreed to in writing,
+1:1ee9da2:  * software distributed under the License is distributed on an
+1:1ee9da2:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+1:1ee9da2:  * either express or implied. See the License for the specific
+1:1ee9da2:  * language governing permissions and limitations under the License.
+4:1ee9da2:  */
+1:631e46c: 
+1:1ee9da2: package org.apache.derbyTesting.functionTests.tests.store;
+1:b1cd60e: 
+1:1ee9da2: import java.sql.Connection;
+1:1ee9da2: import java.sql.PreparedStatement;
+1:1ee9da2: import java.sql.ResultSet;
+1:1ee9da2: import java.sql.SQLException;
+1:1ee9da2: import java.sql.Statement;
+1:1ee9da2: import java.util.ArrayList;
+1:1ee9da2: import java.util.List;
+1:1ee9da2: import junit.framework.Test;
+1:d34116d: import org.apache.derbyTesting.functionTests.util.Barrier;
+1:1ee9da2: import org.apache.derbyTesting.junit.BaseJDBCTestCase;
+1:1ee9da2: import org.apache.derbyTesting.junit.CleanDatabaseTestSetup;
+1:1ee9da2: import org.apache.derbyTesting.junit.DatabasePropertyTestSetup;
+1:1ee9da2: import org.apache.derbyTesting.junit.JDBC;
+1:1ee9da2: import org.apache.derbyTesting.junit.TestConfiguration;
+14:1ee9da2: 
+1:d433373: /**
+1:1ee9da2:  * Test that executes the code paths changed by the fix for the index split
+1:1ee9da2:  * deadlock (DERBY-2991). The main purpose is to test that index scans are
+1:1ee9da2:  * able to reposition in cases where they release the latch on the leaf page
+1:1ee9da2:  * on which they are positioned (typically because they had to wait for a
+1:1ee9da2:  * lock, or because they returned control to the caller after fetching a
+1:1ee9da2:  * bulk of rows).
+1:d433373:  */
+1:1ee9da2: public class IndexSplitDeadlockTest extends BaseJDBCTestCase {
+1:1ee9da2: 
+1:f487e07:     /**
+1:f487e07:      * List of threads (AsyncThread objects) to wait for after running the test.
+1:f487e07:      */
+1:3f5c48a:     private List<AsyncThread> threads = new ArrayList<AsyncThread>();
+1:1ee9da2: 
+1:1ee9da2:     public IndexSplitDeadlockTest(String name) {
+1:1ee9da2:         super(name);
+1:631e46c:     }
+1:910eb10: 
+1:1ee9da2:     public static Test suite() {
+1:1ee9da2:         Test test = TestConfiguration.embeddedSuite(
+1:1ee9da2:                 IndexSplitDeadlockTest.class);
+1:910eb10: 
+1:b1cd60e:         // DERBY-4273: Include the lock table in the error message to help
+1:b1cd60e:         // debugging in case of lock timeouts.
+1:b1cd60e:         test = DatabasePropertyTestSetup.singleProperty(
+1:b1cd60e:                 test, "derby.locks.deadlockTrace", "true");
+1:910eb10: 
+1:1ee9da2:         test = new CleanDatabaseTestSetup(test);
+1:1ee9da2:         return test;
+1:910eb10:     }
+1:910eb10: 
+1:1ee9da2:     protected void tearDown() throws Exception {
+1:c5d9be3:         // Rollback all uncommitted operations so that we don't hold any
+1:c5d9be3:         // locks that may block the other threads.
+1:1ee9da2:         rollback();
+1:3f5c48a:         for (AsyncThread thread : threads) {
+1:f487e07:             thread.waitFor();
+1:910eb10:         }
+1:f487e07:         threads = null;
+1:910eb10: 
+1:c5d9be3:         // All the other threads have finished. Now, remove everything from
+1:c5d9be3:         // the APP schema so that we don't leave anything around for subsequent
+1:c5d9be3:         // tests.
+1:c5d9be3:         setAutoCommit(false); // required by JDBC.dropSchema()
+1:c5d9be3:         JDBC.dropSchema(getConnection().getMetaData(), "APP");
+1:631e46c: 
+1:1ee9da2:         super.tearDown();
+1:910eb10:     }
+1:b1cd60e: 
+1:1ee9da2:     // --------------------------------------------------------------------
+1:1ee9da2:     // Test cases for calls to BTreeScan.reposition() in BTreeMaxScan
+1:1ee9da2:     // --------------------------------------------------------------------
+1:c5d9be3: 
+1:1ee9da2:     // NOTE: There is a call in fetchMax() that cannot be reached because the
+1:1ee9da2:     // scan state is alway SCAN_INIT when that method is called, and it only
+1:1ee9da2:     // calls reposition() if the scan state is SCAN_INPROGRESS. Therefore,
+1:1ee9da2:     // there's no test case for fetchMax().
+1:1ee9da2: 
+1:1ee9da2:     public void testBTreeMaxScan_fetchMaxRowFromBeginning() throws Exception {
+1:3811800:         setAutoCommit(false);
+1:1ee9da2: 
+1:1ee9da2:         Statement s = createStatement();
+1:1ee9da2:         s.executeUpdate("create table max_scan(x int)");
+1:1ee9da2:         s.executeUpdate("create index idx on max_scan(x)");
+1:1ee9da2: 
+1:1ee9da2:         // We need to make sure that we have at least two leaf pages. Each
+1:1ee9da2:         // 4K index page can hold ~200 rows.
+1:1ee9da2:         PreparedStatement ins = prepareStatement(
+1:1ee9da2:                 "insert into max_scan values ?");
+1:1ee9da2:         for (int i = 0; i < 500; i++) {
+1:1ee9da2:             ins.setInt(1, i * 2);
+1:1ee9da2:             ins.executeUpdate();
+1:910eb10:         }
+1:1ee9da2:         commit();
+1:1ee9da2: 
+1:1ee9da2:         // Now make sure that the right-most leaf is empty, so that we must
+1:1ee9da2:         // fetch the max value from the beginning.
+1:1ee9da2:         s.executeUpdate("delete from max_scan where x > 50");
+1:1ee9da2: 
+1:1ee9da2:         // Obtain lock in another thread to block scans. Release lock after
+1:1ee9da2:         // two seconds.
+1:1ee9da2:         obstruct("update max_scan set x = x where x = 10", 2000);
+1:1ee9da2: 
+1:1ee9da2:         // Give the other thread time to obtain the lock.
+3:d433373:         Thread.sleep(1000);
+1:1ee9da2: 
+1:1ee9da2:         // Perform a max scan (from beginning because last page is empty).
+1:1ee9da2:         // Will force repositioning because we must wait for the lock and
+1:1ee9da2:         // release the latch.
+1:1ee9da2:         JDBC.assertSingleValueResultSet(s.executeQuery(
+1:1ee9da2:                 "select max(x) from max_scan --DERBY-PROPERTIES index=IDX"),
+1:1ee9da2:                 "50");
+1:631e46c:     }
+1:1ee9da2: 
+1:1ee9da2:     // --------------------------------------------------------------------
+1:1ee9da2:     // Test cases for calls to BTreeScan.reposition() in BTreeForwardScan
+1:1ee9da2:     // --------------------------------------------------------------------
+1:1ee9da2: 
+1:910eb10:     /**
+1:1ee9da2:      * Test first call to reposition() in BTreeForwardScan.fetchRows().
+1:1ee9da2:      * This call happens when a new batch of rows is requested from a scan
+1:1ee9da2:      * that's in progress.
+1:910eb10:      */
+1:d433373:     public void testBTreeForwardScan_fetchRows_resumeAfterSplit()
+1:d433373:             throws SQLException {
+1:1ee9da2: 
+1:1ee9da2:         // Create a table and an index and populate them
+1:1ee9da2:         Statement s = createStatement();
+1:1ee9da2:         s.executeUpdate("create table t (x int)");
+1:1ee9da2:         s.executeUpdate("create index idx on t(x)");
+1:1ee9da2:         PreparedStatement ins = prepareStatement("insert into t values ?");
+1:1ee9da2:         for (int i = 0; i < 400; i++) {
+1:1ee9da2:             ins.setInt(1, i);
+1:1ee9da2:             ins.executeUpdate();
+11:1ee9da2:         }
+1:1ee9da2: 
+1:1ee9da2:         // Start an index scan and fetch some rows so that it's in the
+1:1ee9da2:         // INPROGRESS state. Just fetch a small number of rows so that we
+1:1ee9da2:         // are still positioned on the left-most leaf page.
+1:d433373:         ResultSet rs = s.executeQuery(
+1:1ee9da2:                 "select * from t --DERBY-PROPERTIES index=IDX");
+1:1ee9da2:         for (int i = 0; i < 30; i++) {
+1:1ee9da2:             assertTrue(rs.next());
+1:1ee9da2:             assertEquals(i, rs.getInt(1));
+1:1ee9da2:         }
+1:1ee9da2: 
+1:1ee9da2:         // In another transaction, insert values smaller than the values
+1:1ee9da2:         // currently in the index. This causes a split of the left-most leaf.
+1:1ee9da2:         // Before DERBY-2991 we'd get a lock timeout here.
+1:1ee9da2:         Connection c2 = openDefaultConnection();
+1:1ee9da2:         Statement s2 = c2.createStatement();
+1:1ee9da2:         for (int i = 0; i < 300; i++) {
+1:1ee9da2:             s2.executeUpdate("insert into t values -1");
+1:1ee9da2:         }
+1:1ee9da2:         s2.close();
+1:1ee9da2:         c2.close();
+1:1ee9da2: 
+1:1ee9da2:         // Continue the index scan. This will trigger a full repositioning
+1:1ee9da2:         // from the root of the B-tree since the page on which we were
+1:1ee9da2:         // positioned has been split.
+1:1ee9da2:         for (int i = 30; i < 400; i++) {
+1:1ee9da2:             assertTrue(rs.next());
+1:1ee9da2:             assertEquals(i, rs.getInt(1));
+1:1ee9da2:         }
+1:1ee9da2:         assertFalse(rs.next());
+1:d433373:         rs.close();
+1:d433373:     }
+1:d433373: 
+1:910eb10:     /**
+1:d433373:      * Test that we can reposition on a holdable cursor after a commit and
+1:d433373:      * a split on the leaf page of the current position. This tests the
+1:d433373:      * second call to reposition() in BTreeForwardScan.fetchRows().
+1:910eb10:      */
+1:d433373:     public void testBTreeForwardScan_fetchRows_resumeScanAfterCommitAndSplit()
+1:d433373:             throws SQLException {
+1:d433373: 
+1:3811800:         setAutoCommit(false);
+1:d433373: 
+1:d433373:         // Create a table and an index and populate them
+1:d433373:         Statement s1 = createStatement();
+1:d433373:         s1.executeUpdate("create table t (x int)");
+1:d433373:         s1.executeUpdate("create index idx on t(x)");
+1:d433373:         PreparedStatement ins = prepareStatement("insert into t values ?");
+1:d433373:         for (int i = 0; i < 1000; i++) {
+1:d433373:             ins.setInt(1, i);
+1:d433373:             ins.executeUpdate();
+1:d433373:         }
+1:d433373:         commit();
+1:d433373: 
+1:d433373:         // Start an index scan with a holdable cursor, and fetch some rows
+1:d433373:         // to move the position to the middle of the index.
+1:d433373:         assertEquals("This test must use a holdable cursor",
+1:d433373:                      ResultSet.HOLD_CURSORS_OVER_COMMIT,
+1:d433373:                      s1.getResultSetHoldability());
+1:d433373:         ResultSet rs = s1.executeQuery(
+1:d433373:                 "select * from t --DERBY-PROPERTIES index=IDX");
+1:d433373:         for (int i = 0; i < 500; i++) {
+1:d433373:             assertTrue(rs.next());
+1:d433373:             assertEquals(i, rs.getInt(1));
+1:d433373:         }
+1:d433373:         commit();
+1:d433373: 
+1:d433373:         // Insert rows right before the one we're positioned on in order to
+1:d433373:         // split that page.
+1:d433373:         Statement s2 = createStatement();
+1:d433373:         for (int i = 0; i < 300; i++) {
+1:d433373:             s2.executeUpdate("insert into t values 498");
+1:d433373:         }
+1:d433373: 
+1:d433373:         // Check that the index scan can continue where we left it, even
+1:d433373:         // though we committed and released the latches.
+1:d433373:         for (int i = 500; i < 1000; i++) {
+1:d433373:             assertTrue(rs.next());
+1:d433373:             assertEquals(i, rs.getInt(1));
+1:d433373:         }
+1:d433373:         assertFalse(rs.next());
+1:d433373:         rs.close();
+1:d433373: 
+1:d433373:     }
+1:d433373: 
+1:910eb10:     /**
+1:d433373:      * Test that we can reposition on a holdable cursor after a commit and
+1:d433373:      * a compress that removes the leaf page of the current position. This
+1:d433373:      * tests the second call to reposition() in BTreeForwardScan.fetchRows().
+1:910eb10:      */
+1:d433373:     public void testBTreeForwardScan_fetchRows_resumeScanAfterCompress()
+1:d433373:             throws Exception {
+1:d433373: 
+1:3811800:         setAutoCommit(false);
+1:d433373: 
+1:d433373:         // Create a table and an index and populate them
+1:d433373:         Statement s1 = createStatement();
+1:d433373:         s1.executeUpdate("create table t (x int)");
+1:d433373:         s1.executeUpdate("create index idx on t(x)");
+1:d433373:         PreparedStatement ins = prepareStatement("insert into t values ?");
+1:d433373:         for (int i = 0; i < 1000; i++) {
+1:d433373:             ins.setInt(1, i);
+1:d433373:             ins.executeUpdate();
+1:d433373:         }
+1:d433373:         commit();
+1:d433373: 
+1:d433373:         // Start an index scan with a holdable cursor, and fetch some rows
+1:d433373:         // to move the position to the middle of the index.
+1:d433373:         assertEquals("This test must use a holdable cursor",
+1:d433373:                      ResultSet.HOLD_CURSORS_OVER_COMMIT,
+1:d433373:                      s1.getResultSetHoldability());
+1:d433373:         ResultSet rs = s1.executeQuery(
+1:d433373:                 "select * from t --DERBY-PROPERTIES index=IDX");
+1:d433373:         for (int i = 0; i < 500; i++) {
+1:d433373:             assertTrue(rs.next());
+1:d433373:             assertEquals(i, rs.getInt(1));
+1:d433373:         }
+1:d433373:         commit();
+1:d433373: 
+1:d433373:         // Delete all rows and compress the table so that the leaf page on
+1:d433373:         // which the result set is positioned disappears.
+1:d433373:         Statement s2 = createStatement();
+1:d433373:         s2.executeUpdate("delete from t");
+1:d433373:         commit();
+1:d433373:         // Sleep for a little while, otherwise SYSCS_INPLACE_COMPRESS_TABLE
+1:d433373:         // doesn't free any space in the index (waiting for the background
+1:d433373:         // thread to perform post-commit work?)
+1:f487e07:         Thread.sleep(1000);
+1:d433373:         s2.execute("call syscs_util.syscs_inplace_compress_table" +
+1:d433373:                    "('APP','T',1,1,1)");
+1:d433373:         commit();
+1:d433373: 
+1:d433373:         // Check that we are able to reposition. We may or may not see more
+1:d433373:         // rows, since some rows may still be available in the cache in the
+1:d433373:         // result set. The point of the code below is to see that calls to
+1:d433373:         // ResultSet.next() don't fail when the page has disappeared, not to
+1:d433373:         // test how many of the deleted rows are returned.
+1:d433373:         int expected = 500;
+1:d433373:         while (rs.next()) {
+1:d433373:             assertTrue(expected < 1000);
+1:d433373:             assertEquals(expected, rs.getInt(1));
+1:d433373:             expected++;
+1:d433373:         }
+1:d433373:         rs.close();
+1:d433373:     }
+1:d433373: 
+1:f487e07:     /**
+1:f487e07:      * Test that BTreeForwardScan.fetchRows() can reposition after releasing
+1:d433373:      * latches because it had to wait for a lock. This tests the third call
+1:f487e07:      * to reposition() in fetchRows(), which is only called if the index is
+1:d433373:      * unique.
+1:d433373:      */
+1:d433373:     public void testBTreeForwardScan_fetchRows_resumeAfterWait_unique()
+1:d433373:             throws Exception {
+1:3811800:         setAutoCommit(false);
+1:d433373: 
+1:d433373:         // Populate a table with a unique index
+1:d433373:         Statement s = createStatement();
+1:d433373:         s.executeUpdate("create table t (x int, constraint c primary key(x))");
+1:d433373:         PreparedStatement ins = prepareStatement("insert into t values ?");
+1:d433373:         for (int i = 0; i < 300; i++) {
+1:d433373:             ins.setInt(1, i);
+1:d433373:             ins.executeUpdate();
+1:d433373:         }
+1:d433373:         commit();
+1:d433373: 
+1:d433373:         // Hold a lock in a different thread to stop the index scan
+1:d433373:         obstruct("delete from t where x = 100", 2000);
+1:d433373: 
+1:f487e07:         // Give the other thread time to obtain the lock
+1:f487e07:         Thread.sleep(1000);
+1:d433373: 
+1:d433373:         // Perform an index scan. Will be blocked for a while when fetching
+1:f487e07:         // the row where x=100, but should be able to resume the scan.
+1:d433373:         ResultSet rs = s.executeQuery(
+1:f487e07:                 "select * from t --DERBY-PROPERTIES constraint=C");
+1:d433373:         for (int i = 0; i < 300; i++) {
+1:d433373:             assertTrue(rs.next());
+1:d433373:             assertEquals(i, rs.getInt(1));
+1:d433373:         }
+1:d433373:         assertFalse(rs.next());
+1:d433373:         rs.close();
+1:d433373:     }
+1:d433373: 
+1:f487e07:     /**
+1:f487e07:      * Test that BTreeForwardScan.fetchRows() can reposition after releasing
+1:f487e07:      * latches because it had to wait for a lock, and the leaf page on which
+1:f487e07:      * the scan is positioned has been split. This tests the third call
+1:f487e07:      * to reposition() in fetchRows(), which is only called if the index is
+1:f487e07:      * unique.
+1:f487e07:      */
+1:f487e07:     public void testBTreeForwardScan_fetchRows_resumeAfterWait_unique_split()
+1:f487e07:             throws Exception {
+1:3811800:         setAutoCommit(false);
+1:f487e07: 
+1:f487e07:         // Populate a table with a unique index
+1:f487e07:         Statement s = createStatement();
+1:f487e07:         s.executeUpdate("create table t (x int, constraint c primary key(x))");
+1:f487e07:         PreparedStatement ins = prepareStatement("insert into t values ?");
+1:f487e07:         for (int i = 0; i < 300; i++) {
+1:f487e07:             ins.setInt(1, i);
+1:f487e07:             ins.executeUpdate();
+1:f487e07:         }
+1:f487e07:         commit();
+1:f487e07: 
+1:631e46c:         // Object used for synchronization between the main thread and the
+1:910eb10:         // helper thread. The main thread uses it to tell the helper thread
+1:910eb10:         // that it has started the index scan. The helper thread uses it
+1:910eb10:         // to tell the main thread that it has locked row 40 and is ready to
+1:910eb10:         // insert more values. Both threads should wait until the other thread
+1:910eb10:         // has reached the barrier before continuing.
+1:910eb10:         final Barrier barrier = new Barrier(2);
+1:631e46c: 
+1:f487e07:         // Lock a row on the first page in a different thread to stop the
+1:f487e07:         // index scan. Then split the first leaf by inserting many values
+1:f487e07:         // less than zero.
+1:f487e07:         new AsyncThread(new AsyncTask() {
+1:f487e07:             public void doWork(Connection conn) throws Exception {
+1:f487e07:                 conn.setAutoCommit(false);
+1:f487e07:                 Statement s = conn.createStatement();
+1:f487e07:                 s.executeUpdate("update t set x = x where x = 40");
+1:f487e07:                 s.close();
+1:910eb10: 
+1:910eb10:                 // Tell the main thread that we've locked the row and that
+1:910eb10:                 // it can go ahead with the index scan. Wait here until the
+1:910eb10:                 // main thread has started the scan.
+1:910eb10:                 barrier.await();
+1:631e46c: 
+1:910eb10:                 // The main thread has started the index scan. Give it a
+1:631e46c:                 // second to get to the row we have locked.
+1:631e46c:                 Thread.sleep(1000L);
+1:631e46c: 
+1:f487e07:                 // Split the first leaf
+1:f487e07:                 PreparedStatement ps = conn.prepareStatement(
+1:f487e07:                         "insert into t values ?");
+1:f487e07:                 for (int i = -1; i > -300; i--) {
+1:f487e07:                     ps.setInt(1, i);
+1:f487e07:                     ps.executeUpdate();
+1:f487e07:                 }
+1:f487e07:                 ps.close();
+1:f487e07:                 conn.commit();
+1:f487e07:             }
+1:f487e07:         });
+1:631e46c: 
+1:631e46c:         // Prepare the index scan.
+1:910eb10:         ResultSet rs = s.executeQuery(
+1:631e46c:                 "select * from t --DERBY-PROPERTIES constraint=C");
+1:631e46c: 
+1:f487e07:         // Perform an index scan. Will be blocked for a while when fetching
+1:631e46c:         // the row where x=40, but should be able to resume the scan.
+1:f487e07:         for (int i = 0; i < 300; i++) {
+1:f487e07:             assertTrue(rs.next());
+1:f487e07:             assertEquals(i, rs.getInt(1));
+1:910eb10: 
+1:910eb10:             // Once we have fetched the first row, tell the helper thread we
+1:910eb10:             // have started the index scan, and wait until it has locked the
+1:910eb10:             // row that should block the scan (x=40).
+1:910eb10:             if (i == 0) {
+1:910eb10:                 barrier.await();
+1:910eb10:             }
+1:631e46c:         }
+1:f487e07:         assertFalse(rs.next());
+1:f487e07:         rs.close();
+1:631e46c:     }
+1:f487e07: 
+1:d433373:     /**
+1:d433373:      * Test that BTreeForwardScan.fetchRows() can reposition after releasing
+1:d433373:      * latches because it had to wait for a lock. This tests the fourth call
+1:d433373:      * to reposition() in fetchRows(), which is only called if the index is
+1:f487e07:      * non-unique.
+1:f487e07:      */
+1:d433373:     public void testBTreeForwardScan_fetchRows_resumeAfterWait_nonUnique()
+1:f487e07:             throws Exception {
+1:3811800:         setAutoCommit(false);
+1:f487e07: 
+1:f487e07:         // Populate a table with a non-unique index
+1:f487e07:         Statement s = createStatement();
+1:f487e07:         s.executeUpdate("create table t (x int)");
+1:f487e07:         s.executeUpdate("create index idx on t(x)");
+1:f487e07:         PreparedStatement ins = prepareStatement("insert into t values ?");
+1:f487e07:         for (int i = 0; i < 300; i++) {
+1:f487e07:             ins.setInt(1, i);
+1:f487e07:             ins.executeUpdate();
+1:f487e07:         }
+1:f487e07:         commit();
+1:f487e07: 
+1:d433373:         // Hold a lock in a different thread to stop the index scan
+1:d433373:         obstruct("delete from t where x = 100", 2000);
+1:f487e07: 
+1:f487e07:         // Give the other thread time to obtain the lock
+1:be4b84e:         Thread.sleep(1000);
+1:d433373: 
+1:d433373:         // Perform an index scan. Will be blocked for a while when fetching
+1:f487e07:         // the row where x=100, but should be able to resume the scan.
+1:f487e07:         ResultSet rs = s.executeQuery(
+1:d433373:                 "select * from t --DERBY-PROPERTIES index=IDX");
+1:d433373:         for (int i = 0; i < 300; i++) {
+1:d433373:             assertTrue(rs.next());
+1:d433373:             assertEquals(i, rs.getInt(1));
+1:f487e07:         }
+1:d433373:         assertFalse(rs.next());
+1:d433373:         rs.close();
+1:f487e07:     }
+1:d433373: 
+1:d433373:     /**
+1:d433373:      * Test that BTreeForwardScan.fetchRows() can reposition after releasing
+1:f487e07:      * latches because it had to wait for a lock, and the leaf page on which
+1:f487e07:      * the scan is positioned has been split. This tests the fourth call
+1:d433373:      * to reposition() in fetchRows(), which is only called if the index is
+1:d433373:      * non-unique.
+1:d433373:      */
+1:f487e07:     public void testBTreeForwardScan_fetchRows_resumeAfterWait_nonUnique_split()
+1:d433373:             throws Exception {
+1:3811800:         setAutoCommit(false);
+1:d433373: 
+1:d433373:         // Populate a table with a non-unique index
+1:d433373:         Statement s = createStatement();
+1:d433373:         s.executeUpdate("create table t (x int)");
+1:d433373:         s.executeUpdate("create index idx on t(x)");
+1:d433373:         PreparedStatement ins = prepareStatement("insert into t values ?");
+1:d433373:         for (int i = 0; i < 300; i++) {
+1:d433373:             ins.setInt(1, i);
+1:d433373:             ins.executeUpdate();
+1:f487e07:         }
+1:d433373:         commit();
+1:d433373: 
+1:910eb10:         // Object used for synchronization between main thread and helper
+1:910eb10:         // thread. They should both wait for the other thread to reach the
+1:910eb10:         // barrier point before continuing.
+1:910eb10:         final Barrier barrier = new Barrier(2);
+1:910eb10: 
+1:f487e07:         // Hold a lock in a different thread to stop the index scan, then
+1:f487e07:         // split the first leaf (on which the scan is positioned) before the
+1:f487e07:         // lock is released.
+1:f487e07:         new AsyncThread(new AsyncTask() {
+1:f487e07:             public void doWork(Connection conn) throws Exception {
+1:f487e07:                 conn.setAutoCommit(false);
+1:f487e07:                 Statement s = conn.createStatement();
+1:f487e07:                 s.executeUpdate("update t set x = x where x = 40");
+1:f487e07: 
+1:910eb10:                 // Tell the main thread we have locked the row, and wait for
+1:910eb10:                 // it to start the index scan.
+1:910eb10:                 barrier.await();
+1:910eb10: 
+1:910eb10:                 // Give the index scan time to get to the row we have locked.
+1:910eb10:                 Thread.sleep(1000);
+1:910eb10: 
+1:910eb10:                 // The index scan should be blocked now. Split the first leaf
+1:910eb10:                 // by inserting more values just before the lowest key, so
+1:910eb10:                 // that we can verify that the index scan is able to reposition
+1:910eb10:                 // correctly after a page split.
+1:910eb10:                 for (int i = 0; i < 300; i++) {
+1:910eb10:                     s.executeUpdate("insert into t values -1");
+1:f487e07:                 }
+1:f487e07:                 s.close();
+1:f487e07:                 conn.commit();
+1:f487e07:             }
+1:f487e07:         });
+1:f487e07: 
+1:f487e07:         // Perform an index scan. Will be blocked for a while when fetching
+1:910eb10:         // the row where x=40, but should be able to resume the scan after
+1:910eb10:         // the helper thread commits and releases its locks.
+1:f487e07:         ResultSet rs = s.executeQuery(
+1:f487e07:                 "select * from t --DERBY-PROPERTIES index=IDX");
+1:910eb10: 
+1:f487e07:         for (int i = 0; i < 300; i++) {
+1:f487e07:             assertTrue(rs.next());
+1:f487e07:             assertEquals(i, rs.getInt(1));
+1:910eb10: 
+1:910eb10:             // Once we have fetched the first row, tell the helper thread we
+1:910eb10:             // have started the index scan, and wait until it has locked the
+1:910eb10:             // row that should block the scan (x=40).
+1:910eb10:             if (i == 0) {
+1:910eb10:                 barrier.await();
+1:910eb10:             }
+1:f487e07:         }
+1:f487e07:         assertFalse(rs.next());
+1:f487e07:         rs.close();
+1:d433373:     }
+1:d433373: 
+1:1ee9da2:     // --------------------------------------------------------------------
+1:152b9a7:     // Test cases for calls to BTreeScan.reposition() in BTreeScan
+1:152b9a7:     // --------------------------------------------------------------------
+1:152b9a7: 
+1:152b9a7:     // There's a call to reposition() from positionAtDoneScanFromClose(), but
+1:152b9a7:     // I'm not sure how to reach it. According to the code coverage reports
+1:152b9a7:     // there's no other tests that reach that call to reposition().
+1:152b9a7:     //
+1:152b9a7:     // Not testing the first call to reposition() in delete() since it will
+1:152b9a7:     // be exercised by all code that deletes or modifies index rows, so it's
+1:152b9a7:     // already exercised by other tests. The existing tests do not make the
+1:152b9a7:     // this call do a full repositioning from the root of the B-tree, but
+1:152b9a7:     // this is very difficult to test because a page split needs to happen in
+1:152b9a7:     // the very short window between the scan releases the latch and delete()
+1:152b9a7:     // reobtains the latch.
+1:152b9a7:     //
+1:152b9a7:     // The other call to reposition() in delete() is only used if
+1:152b9a7:     // init_useUpdateLocks is true. No other tests reach that call, according
+1:152b9a7:     // to the code coverage reports, and I'm not sure how/if it can be
+1:152b9a7:     // reached from the public API. Leaving it untested for now.
+1:152b9a7:     //
+1:152b9a7:     // There's a call to reposition() in BTreeScan.doesCurrentPositionQualify()
+1:152b9a7:     // too. The only caller (except test code bypassing the public API) is
+1:152b9a7:     // TableScanResultSet.getCurrentRow(), which is only called from trigger
+1:152b9a7:     // code (for before and after result sets) and CurrentOfResultSets. It
+1:152b9a7:     // doesn't look like these will ever use a TableScanResultSet wrapping a
+1:152b9a7:     // index scan, so there's no test for this method here. (The method is
+1:152b9a7:     // exercised from T_b2i by using the internal API directly.)
+1:152b9a7:     //
+1:152b9a7:     // Same comment as above goes for BTreeScan.isCurrentPositionDeleted(), as
+1:152b9a7:     // it is used the same places as doesCurrentPositionQualify().
+1:152b9a7:     //
+1:152b9a7:     // The call to reposition() from BTreeScan.fetch() is also hard to reach.
+1:152b9a7:     // It can be reached from getConstraintDescriptorViaIndex(), which is
+1:152b9a7:     // frequently exercised by other tests, so I'm not adding a test case here.
+1:152b9a7:     // In order to test repositioning after a split in this method, we should
+1:152b9a7:     // rather have a test case calls the internal API directly (e.g., in
+1:152b9a7:     // T_b2i).
+1:152b9a7:     //
+1:152b9a7:     // Similarly, BTreeScan.reopenScan() has a call to reposition() that's
+1:152b9a7:     // exercised frequently by other tests, but to test a split right before
+1:152b9a7:     // the repositioning, we'd probably need to use the internal API for that
+1:152b9a7:     // method too.
+1:be4b84e: 
+1:152b9a7:     // --------------------------------------------------------------------
+1:be4b84e:     // Test cases for bugs related to saving position and repositioning
+1:be4b84e:     // --------------------------------------------------------------------
+1:be4b84e: 
+1:be4b84e:     /**
+1:be4b84e:      * Test that a max scan works when it needs to wait more than once in order
+1:be4b84e:      * to lock the last record in the index. This used to cause an assert
+1:be4b84e:      * failure in sane builds before DERBY-4193.
+1:be4b84e:      */
+1:be4b84e:     public void testMultipleLastKeyWaitsInMaxScan() throws Exception {
+1:be4b84e:         setAutoCommit(false);
+1:be4b84e: 
+1:be4b84e:         // Create a table with an index and a couple of rows.
+1:be4b84e:         Statement s = createStatement();
+1:be4b84e:         s.execute("create table max_scan(x int, y int)");
+1:be4b84e:         s.execute("create index idx on max_scan(x)");
+1:be4b84e:         s.execute("insert into max_scan(x) values 1,2,3");
+1:be4b84e:         commit();
+1:be4b84e: 
+1:be4b84e:         // Start a thread that (1) obtains an exclusive lock on the last
+1:be4b84e:         // row, (2) waits for the main thread to perform a max scan that will
+1:be4b84e:         // be blocked by the lock, (3) inserts values greater than the current
+1:be4b84e:         // max so that the main thread needs to rescan when it wakes up, (4)
+1:be4b84e:         // commit to allow the main thread to continue, and (5) immediately
+1:be4b84e:         // insert more rows greater than the previous max so that the main
+1:be4b84e:         // thread is likely to have to wait for a lock a second time.
+1:be4b84e:         new AsyncThread(new AsyncTask() {
+1:be4b84e:             public void doWork(Connection conn) throws Exception {
+1:be4b84e:                 conn.setAutoCommit(false);
+1:be4b84e:                 Statement s = conn.createStatement();
+1:be4b84e:                 s.execute("update max_scan set y = x where x = 3");
+1:be4b84e:                 s.close();
+1:be4b84e: 
+1:be4b84e:                 // Give the main thread time to start executing select max(x)
+1:be4b84e:                 // and wait for the lock.
+1:be4b84e:                 Thread.sleep(2000);
+1:be4b84e: 
+1:be4b84e:                 // Insert rows greater than the current max.
+1:be4b84e:                 PreparedStatement ps = conn.prepareStatement(
+1:be4b84e:                         "insert into max_scan(x) values 4");
+1:be4b84e:                 for (int i = 0; i < 300; i++) {
+1:be4b84e:                     ps.execute();
+1:be4b84e:                 }
+1:be4b84e: 
+1:be4b84e:                 // Commit and release locks to allow the main thread to
+1:be4b84e:                 // continue.
+1:be4b84e:                 conn.commit();
+1:be4b84e: 
+1:be4b84e:                 // Insert some more rows so that the main thread is likely to
+1:be4b84e:                 // have to wait again. Note that there is a possibility that
+1:be4b84e:                 // the main thread manages to obtain the lock on the last row
+1:be4b84e:                 // before we manage to insert a new row, in which case it
+1:be4b84e:                 // won't have to wait for us and we're not actually testing
+1:be4b84e:                 // a max scan that needs to wait more than once to lock the
+1:be4b84e:                 // last row.
+1:be4b84e:                 for (int i = 0; i < 300; i++) {
+1:be4b84e:                     ps.execute();
+1:be4b84e:                 }
+1:be4b84e: 
+1:be4b84e:                 // Block for a while before releasing locks, so that the main
+1:be4b84e:                 // thread will have to wait if it didn't obtain the lock on the
+1:be4b84e:                 // last row before we did.
+1:be4b84e:                 Thread.sleep(500);
+1:be4b84e:                 conn.commit();
+1:be4b84e: 
+1:be4b84e:                 ps.close();
+1:be4b84e:             }
+1:be4b84e:         });
+1:be4b84e: 
+1:be4b84e:         // Give the other thread a little while to start and obtain the
+1:dfb19f2:         // lock on the last record. We expect two locks in the lock table
+1:dfb19f2:         // when the other thread is ready. Don't wait more than a minute
+1:dfb19f2:         // as something must have gone wrong.
+1:dfb19f2:         int totalWait = 0;
+1:dfb19f2:         do {
+1:dfb19f2:             totalWait += 500;
+1:dfb19f2:             Thread.sleep(500);
+1:dfb19f2:         } while (numlocks() < 2 && totalWait < 60000);
+1:be4b84e:         // The last record should be locked now, so this call will have to
+1:be4b84e:         // wait initially. This statement used to cause an assert failure in
+1:be4b84e:         // debug builds before DERBY-4193.
+1:be4b84e:         JDBC.assertSingleValueResultSet(
+1:be4b84e:                 s.executeQuery("select max(x) from max_scan " +
+1:be4b84e:                                "--DERBY-PROPERTIES index=IDX"),
+1:be4b84e:                 "4");
+1:be4b84e:     }
+1:be4b84e: 
+1:be4b84e:     /**
+1:dfb19f2:      * Get the number of locks in the lock table 
+1:dfb19f2:      * @return number of locks
+1:dfb19f2:      * @throws SQLException
+1:dfb19f2:      */
+1:dfb19f2:     private int numlocks() throws SQLException {
+1:dfb19f2:         Statement s = createStatement();
+1:dfb19f2:         ResultSet rs = s.executeQuery("SELECT count(*) from syscs_diag.lock_table");
+1:dfb19f2:         rs.next();
+1:dfb19f2:         int num = rs.getInt(1);
+1:dfb19f2:         rs.close();
+1:dfb19f2:         return num;
+1:dfb19f2:     }
+1:dfb19f2:     
+1:dfb19f2:     /**
+1:be4b84e:      * Test that a forward scan works even in the case that it has to wait
+1:be4b84e:      * for the previous key lock more than once. This used to cause an assert
+1:be4b84e:      * failure in sane builds before DERBY-4193.
+1:be4b84e:      */
+1:be4b84e:     public void testMultiplePrevKeyWaitsInForwardScan() throws Exception {
+1:be4b84e:         setAutoCommit(false);
+1:be4b84e: 
+1:be4b84e:         // Isolation level should be serializable so that the scan needs
+1:be4b84e:         // a previous key lock.
+1:be4b84e:         getConnection().setTransactionIsolation(
+1:be4b84e:                 Connection.TRANSACTION_SERIALIZABLE);
+1:be4b84e: 
+1:be4b84e:         // Create a table with an index and a couple of rows.
+1:be4b84e:         Statement s = createStatement();
+1:be4b84e:         s.execute("create table fw_scan(x int)");
+1:be4b84e:         s.execute("create index idx on fw_scan(x)");
+1:be4b84e:         s.execute("insert into fw_scan(x) values 100,200,300");
+1:be4b84e:         commit();
+1:be4b84e: 
+1:be4b84e:         new AsyncThread(new AsyncTask() {
+1:be4b84e:             public void doWork(Connection conn) throws Exception {
+1:be4b84e:                 conn.setAutoCommit(false);
+1:be4b84e:                 PreparedStatement ps =
+1:be4b84e:                         conn.prepareStatement("insert into fw_scan values 1");
+1:be4b84e: 
+1:be4b84e:                 // Insert one row right before the first row to be returned
+1:be4b84e:                 // by the scan. This will be the previous key that the scan
+1:be4b84e:                 // will attempt to lock. Wait for two seconds to allow the
+1:be4b84e:                 // scan to start and attempt to lock the record.
+1:be4b84e:                 ps.execute();
+1:be4b84e:                 Thread.sleep(2000);
+1:be4b84e: 
+1:be4b84e:                 // Before we commit and release the lock, insert more rows
+1:be4b84e:                 // between the locked row and the first row of the scan, so
+1:be4b84e:                 // that another row holds the previous key for the scan when
+1:be4b84e:                 // it wakes up.
+1:be4b84e:                 for (int i = 0; i < 300; i++) {
+1:be4b84e:                     ps.execute();
+1:be4b84e:                 }
+1:be4b84e:                 conn.commit();
+1:be4b84e: 
+1:be4b84e:                 // The scan will wake up and try to lock the row that has
+1:be4b84e:                 // now become the row immediately to the left of its starting
+1:be4b84e:                 // position. Try to beat it to it so that it has to wait a
+1:be4b84e:                 // second time in order to obtain the previous key lock. This
+1:be4b84e:                 // used to trigger an assert failure in the scan before
+1:be4b84e:                 // DERBY-4193.
+1:be4b84e:                 for (int i = 0; i < 300; i++) {
+1:be4b84e:                     ps.execute();
+1:be4b84e:                 }
+1:be4b84e: 
+1:be4b84e:                 // Wait a little while to give the scan enough time to wake
+1:be4b84e:                 // up and make another attempt to lock the previous key before
+1:be4b84e:                 // we release the locks.
+1:be4b84e:                 Thread.sleep(500);
+1:be4b84e:                 conn.rollback();
+1:be4b84e:                 ps.close();
+1:be4b84e:             }
+1:be4b84e:         });
+1:be4b84e: 
+1:be4b84e:         // Give the other thread a second to start and obtain a lock that
+1:be4b84e:         // blocks the scan.
+1:be4b84e:         Thread.sleep(1000);
+1:be4b84e: 
+1:be4b84e:         // The key to the left of the first key to be returned by the scan
+1:be4b84e:         // should be locked now. This call will have to wait for the previous
+1:be4b84e:         // key lock at least once. If it has to wait a second time (dependent
+1:be4b84e:         // on the exact timing between this thread and the other thread) the
+1:be4b84e:         // assert error from DERBY-4193 will be exposed.
+1:be4b84e:         JDBC.assertSingleValueResultSet(
+1:be4b84e:                 s.executeQuery("select x from fw_scan " +
+1:be4b84e:                                "--DERBY-PROPERTIES index=IDX\n" +
+1:be4b84e:                                "where x >= 100 and x < 200"),
+1:be4b84e:                 "100");
+1:be4b84e:     }
+1:be4b84e: 
+1:be4b84e:     // --------------------------------------------------------------------
+1:1ee9da2:     // Helpers
+1:1ee9da2:     // --------------------------------------------------------------------
+1:152b9a7: 
+1:d433373:     /**
+1:1ee9da2:      * <p>
+1:1ee9da2:      * In a separate thread, and in a separate transaction, execute the
+1:1ee9da2:      * SQL text and wait for the specified period of time, before the
+1:1ee9da2:      * transaction is rolled back. This method can be used to hold locks
+1:1ee9da2:      * and thereby block the main thread for a certain amount of time.
+1:1ee9da2:      * </p>
+1:910eb10:      *
+1:1ee9da2:      * <p>
+1:1ee9da2:      * If an exception is thrown while executing the SQL, the exception is
+1:1ee9da2:      * stored and rethrown from the tearDown() method in the main execution
+1:1ee9da2:      * thread, so that it is detected by the JUnit framework.
+1:1ee9da2:      * </p>
+1:910eb10:      *
+2:1ee9da2:      * @param sql the SQL text to execute
+1:1ee9da2:      * @param blockMillis how many milliseconds to wait until the transaction
+1:1ee9da2:      * is rolled back
+1:d433373:      */
+1:f487e07:     private void obstruct(final String sql, final long blockMillis) {
+1:f487e07:         AsyncTask task = new AsyncTask() {
+1:f487e07:             public void doWork(Connection conn) throws Exception {
+1:f487e07:                 conn.setAutoCommit(false);
+1:f487e07:                 Statement s = conn.createStatement();
+1:f487e07:                 s.execute(sql);
+1:f487e07:                 s.close();
+1:f487e07:                 Thread.sleep(blockMillis);
+1:f487e07:             }
+1:f487e07:         };
+1:f487e07:         new AsyncThread(task);
+1:d433373:     }
+1:d433373: 
+4:1ee9da2:     /**
+1:f487e07:      * Interface that should be implemented by classes that define a
+1:f487e07:      * database task that is to be executed asynchronously in a separate
+1:f487e07:      * transaction.
+1:1ee9da2:      */
+1:f487e07:     private static interface AsyncTask {
+1:f487e07:         void doWork(Connection conn) throws Exception;
+1:f487e07:     }
+1:f487e07: 
+1:f487e07:     /**
+1:f487e07:      * Class that executes an {@code AsyncTask} object.
+1:f487e07:      */
+1:f487e07:     private class AsyncThread implements Runnable {
+1:f487e07: 
+1:f487e07:         private final Thread thread = new Thread(this);
+1:f487e07:         private final AsyncTask task;
+1:1ee9da2:         private Exception error;
+1:1ee9da2: 
+1:1ee9da2:         /**
+1:f487e07:          * Create an {@code AsyncThread} object and starts a thread executing
+1:f487e07:          * the task. Also put the {@code AsyncThread} object in the list of
+1:f487e07:          * threads in the parent object to make sure the thread is waited for
+1:f487e07:          * and its errors detected in the {@code tearDown()} method.
+1:f487e07:          *
+1:f487e07:          * @param task the task to perform
+1:1ee9da2:          */
+1:f487e07:         public AsyncThread(AsyncTask task) {
+1:f487e07:             this.task = task;
+1:1ee9da2:             thread.start();
+1:f487e07:             threads.add(this);
+1:1ee9da2:         }
+1:1ee9da2: 
+1:1ee9da2:         /**
+1:f487e07:          * Open a database connection and perform the task. Roll back the
+1:f487e07:          * transaction when finished. Any exception thrown will be caught and
+1:f487e07:          * rethrown when the {@code waitFor()} method is called.
+1:1ee9da2:          */
+1:1ee9da2:         public void run() {
+1:1ee9da2:             try {
+1:f487e07:                 Connection conn = openDefaultConnection();
+1:1ee9da2:                 try {
+1:f487e07:                     task.doWork(conn);
+1:1ee9da2:                 } finally {
+1:f487e07:                     JDBC.cleanup(conn);
+1:1ee9da2:                 }
+1:1ee9da2:             } catch (Exception e) {
+1:1ee9da2:                 error = e;
+1:1ee9da2:             }
+1:1ee9da2:         }
+1:1ee9da2: 
+1:1ee9da2:         /**
+1:f487e07:          * Wait for the thread to complete. If an error was thrown during
+1:f487e07:          * execution, rethrow the execption here.
+1:f487e07:          * @throws Exception if an error happened while performing the task
+1:1ee9da2:          */
+1:1ee9da2:         void waitFor() throws Exception {
+1:1ee9da2:             thread.join();
+1:f487e07:             if (error != null) {
+1:f487e07:                 throw error;
+1:1ee9da2:             }
+1:1ee9da2:         }
+1:1ee9da2:     }
+1:1ee9da2: }
+============================================================================
+author:Katherine Marsden
+-------------------------------------------------------------------------------
+commit:dfb19f2
+/////////////////////////////////////////////////////////////////////////
+1:         // lock on the last record. We expect two locks in the lock table
+1:         // when the other thread is ready. Don't wait more than a minute
+1:         // as something must have gone wrong.
+1:         int totalWait = 0;
+1:         do {
+1:             totalWait += 500;
+1:             Thread.sleep(500);
+1:         } while (numlocks() < 2 && totalWait < 60000);
+/////////////////////////////////////////////////////////////////////////
+1:      * Get the number of locks in the lock table 
+1:      * @return number of locks
+1:      * @throws SQLException
+1:      */
+1:     private int numlocks() throws SQLException {
+1:         Statement s = createStatement();
+1:         ResultSet rs = s.executeQuery("SELECT count(*) from syscs_diag.lock_table");
+1:         rs.next();
+1:         int num = rs.getInt(1);
+1:         rs.close();
+1:         return num;
+1:     }
+1:     
+1:     /**
+author:Knut Anders Hatlen
+-------------------------------------------------------------------------------
+commit:3f5c48a
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private List<AsyncThread> threads = new ArrayList<AsyncThread>();
+/////////////////////////////////////////////////////////////////////////
+1:         for (AsyncThread thread : threads) {
+commit:d34116d
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derbyTesting.functionTests.util.Barrier;
+/////////////////////////////////////////////////////////////////////////
+commit:910eb10
+/////////////////////////////////////////////////////////////////////////
+1:         // helper thread. The main thread uses it to tell the helper thread
+1:         // that it has started the index scan. The helper thread uses it
+1:         // to tell the main thread that it has locked row 40 and is ready to
+1:         // insert more values. Both threads should wait until the other thread
+1:         // has reached the barrier before continuing.
+1:         final Barrier barrier = new Barrier(2);
+/////////////////////////////////////////////////////////////////////////
+1:                 // Tell the main thread that we've locked the row and that
+1:                 // it can go ahead with the index scan. Wait here until the
+1:                 // main thread has started the scan.
+1:                 barrier.await();
+1:                 // The main thread has started the index scan. Give it a
+/////////////////////////////////////////////////////////////////////////
+1:         ResultSet rs = s.executeQuery(
+1: 
+1:             // Once we have fetched the first row, tell the helper thread we
+1:             // have started the index scan, and wait until it has locked the
+1:             // row that should block the scan (x=40).
+1:             if (i == 0) {
+1:                 barrier.await();
+1:             }
+/////////////////////////////////////////////////////////////////////////
+1:         // Object used for synchronization between main thread and helper
+1:         // thread. They should both wait for the other thread to reach the
+1:         // barrier point before continuing.
+1:         final Barrier barrier = new Barrier(2);
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:                 // Tell the main thread we have locked the row, and wait for
+1:                 // it to start the index scan.
+1:                 barrier.await();
+1: 
+1:                 // Give the index scan time to get to the row we have locked.
+1:                 Thread.sleep(1000);
+1: 
+1:                 // The index scan should be blocked now. Split the first leaf
+1:                 // by inserting more values just before the lowest key, so
+1:                 // that we can verify that the index scan is able to reposition
+1:                 // correctly after a page split.
+1:                 for (int i = 0; i < 300; i++) {
+1:                     s.executeUpdate("insert into t values -1");
+1:         // the row where x=40, but should be able to resume the scan after
+1:         // the helper thread commits and releases its locks.
+1: 
+1: 
+1:             // Once we have fetched the first row, tell the helper thread we
+1:             // have started the index scan, and wait until it has locked the
+1:             // row that should block the scan (x=40).
+1:             if (i == 0) {
+1:                 barrier.await();
+1:             }
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     /**
+0:      * A poor man's substitute for java.util.concurrent.CyclicBarrier.
+1:      */
+0:     private static class Barrier {
+0:         /** The number of parties that still haven't reached the barrier. */
+0:         private int n;
+1: 
+1:         /**
+0:          * Create a barrier that blocks until the specified number of threads
+0:          * have reached the barrier point.
+1:          *
+0:          * @param parties the number of parties to wait for at the barrier
+1:          */
+0:         Barrier(int parties) {
+0:             n = parties;
+1:         }
+1: 
+1:         /**
+0:          * Wait until all parties have reached the barrier.
+1:          *
+0:          * @throws InterruptedException if the thread is interrupted
+1:          */
+0:         synchronized void await() throws InterruptedException {
+0:             assertTrue("Too many parties at barrier", n > 0);
+1: 
+0:             n--;
+0:             notifyAll();
+1: 
+0:             while (n > 0) {
+0:                 wait();
+1:             }
+1:         }
+1:     }
+commit:631e46c
+/////////////////////////////////////////////////////////////////////////
+1:         // Object used for synchronization between the main thread and the
+0:         // helper thread. The main thread should increment the value to tell
+0:         // the helper thread that it's ready to start the index scan. The
+0:         // helper thread should increment it to tell the main thread that it
+0:         // has locked row 40 and is ready to insert more values.
+0:         final int[] syncObject = new int[1];
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:                 synchronized (syncObject) {
+0:                     // Tell the main thread that we've locked the row and that
+0:                     // it can go ahead with the index scan.
+0:                     syncObject[0]++;
+0:                     syncObject.notifyAll();
+1: 
+0:                     // Wait here until the main thread is actually ready to
+0:                     // start the scan.
+0:                     while (syncObject[0] < 2) {
+0:                         syncObject.wait();
+1:                     }
+1:                 }
+1: 
+0:                 // The main thread is ready to start the index scan. Give it a
+1:                 // second to get to the row we have locked.
+1:                 Thread.sleep(1000L);
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         // Prepare the index scan.
+0:         PreparedStatement scan = prepareStatement(
+1:                 "select * from t --DERBY-PROPERTIES constraint=C");
+1: 
+0:         synchronized (syncObject) {
+0:             // Tell the helper thread we're ready to start the scan.
+0:             syncObject[0]++;
+0:             syncObject.notifyAll();
+1: 
+0:             // Wait until the helper thread has obtained the lock.
+0:             while (syncObject[0] < 2) {
+0:                 syncObject.wait();
+1:             }
+1:         }
+1:         // the row where x=40, but should be able to resume the scan.
+0:         ResultSet rs = scan.executeQuery();
+commit:b1cd60e
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         // DERBY-4273: Include the lock table in the error message to help
+1:         // debugging in case of lock timeouts.
+1:         test = DatabasePropertyTestSetup.singleProperty(
+1:                 test, "derby.locks.deadlockTrace", "true");
+1: 
+commit:a665de1
+/////////////////////////////////////////////////////////////////////////
+commit:c5d9be3
+/////////////////////////////////////////////////////////////////////////
+1:         // Rollback all uncommitted operations so that we don't hold any
+1:         // locks that may block the other threads.
+/////////////////////////////////////////////////////////////////////////
+1:         // All the other threads have finished. Now, remove everything from
+1:         // the APP schema so that we don't leave anything around for subsequent
+1:         // tests.
+1:         setAutoCommit(false); // required by JDBC.dropSchema()
+1:         JDBC.dropSchema(getConnection().getMetaData(), "APP");
+1: 
+commit:be4b84e
+/////////////////////////////////////////////////////////////////////////
+1:     // Test cases for bugs related to saving position and repositioning
+1:     // --------------------------------------------------------------------
+1: 
+1:     /**
+1:      * Test that a max scan works when it needs to wait more than once in order
+1:      * to lock the last record in the index. This used to cause an assert
+1:      * failure in sane builds before DERBY-4193.
+1:      */
+1:     public void testMultipleLastKeyWaitsInMaxScan() throws Exception {
+1:         setAutoCommit(false);
+1: 
+1:         // Create a table with an index and a couple of rows.
+1:         Statement s = createStatement();
+1:         s.execute("create table max_scan(x int, y int)");
+1:         s.execute("create index idx on max_scan(x)");
+1:         s.execute("insert into max_scan(x) values 1,2,3");
+1:         commit();
+1: 
+1:         // Start a thread that (1) obtains an exclusive lock on the last
+1:         // row, (2) waits for the main thread to perform a max scan that will
+1:         // be blocked by the lock, (3) inserts values greater than the current
+1:         // max so that the main thread needs to rescan when it wakes up, (4)
+1:         // commit to allow the main thread to continue, and (5) immediately
+1:         // insert more rows greater than the previous max so that the main
+1:         // thread is likely to have to wait for a lock a second time.
+1:         new AsyncThread(new AsyncTask() {
+1:             public void doWork(Connection conn) throws Exception {
+1:                 conn.setAutoCommit(false);
+1:                 Statement s = conn.createStatement();
+1:                 s.execute("update max_scan set y = x where x = 3");
+1:                 s.close();
+1: 
+1:                 // Give the main thread time to start executing select max(x)
+1:                 // and wait for the lock.
+1:                 Thread.sleep(2000);
+1: 
+1:                 // Insert rows greater than the current max.
+1:                 PreparedStatement ps = conn.prepareStatement(
+1:                         "insert into max_scan(x) values 4");
+1:                 for (int i = 0; i < 300; i++) {
+1:                     ps.execute();
+1:                 }
+1: 
+1:                 // Commit and release locks to allow the main thread to
+1:                 // continue.
+1:                 conn.commit();
+1: 
+1:                 // Insert some more rows so that the main thread is likely to
+1:                 // have to wait again. Note that there is a possibility that
+1:                 // the main thread manages to obtain the lock on the last row
+1:                 // before we manage to insert a new row, in which case it
+1:                 // won't have to wait for us and we're not actually testing
+1:                 // a max scan that needs to wait more than once to lock the
+1:                 // last row.
+1:                 for (int i = 0; i < 300; i++) {
+1:                     ps.execute();
+1:                 }
+1: 
+1:                 // Block for a while before releasing locks, so that the main
+1:                 // thread will have to wait if it didn't obtain the lock on the
+1:                 // last row before we did.
+1:                 Thread.sleep(500);
+1:                 conn.commit();
+1: 
+1:                 ps.close();
+1:             }
+1:         });
+1: 
+1:         // Give the other thread a little while to start and obtain the
+0:         // lock on the last record.
+1:         Thread.sleep(1000);
+1: 
+1:         // The last record should be locked now, so this call will have to
+1:         // wait initially. This statement used to cause an assert failure in
+1:         // debug builds before DERBY-4193.
+1:         JDBC.assertSingleValueResultSet(
+1:                 s.executeQuery("select max(x) from max_scan " +
+1:                                "--DERBY-PROPERTIES index=IDX"),
+1:                 "4");
+1:     }
+1: 
+1:     /**
+1:      * Test that a forward scan works even in the case that it has to wait
+1:      * for the previous key lock more than once. This used to cause an assert
+1:      * failure in sane builds before DERBY-4193.
+1:      */
+1:     public void testMultiplePrevKeyWaitsInForwardScan() throws Exception {
+1:         setAutoCommit(false);
+1: 
+1:         // Isolation level should be serializable so that the scan needs
+1:         // a previous key lock.
+1:         getConnection().setTransactionIsolation(
+1:                 Connection.TRANSACTION_SERIALIZABLE);
+1: 
+1:         // Create a table with an index and a couple of rows.
+1:         Statement s = createStatement();
+1:         s.execute("create table fw_scan(x int)");
+1:         s.execute("create index idx on fw_scan(x)");
+1:         s.execute("insert into fw_scan(x) values 100,200,300");
+1:         commit();
+1: 
+1:         new AsyncThread(new AsyncTask() {
+1:             public void doWork(Connection conn) throws Exception {
+1:                 conn.setAutoCommit(false);
+1:                 PreparedStatement ps =
+1:                         conn.prepareStatement("insert into fw_scan values 1");
+1: 
+1:                 // Insert one row right before the first row to be returned
+1:                 // by the scan. This will be the previous key that the scan
+1:                 // will attempt to lock. Wait for two seconds to allow the
+1:                 // scan to start and attempt to lock the record.
+1:                 ps.execute();
+1:                 Thread.sleep(2000);
+1: 
+1:                 // Before we commit and release the lock, insert more rows
+1:                 // between the locked row and the first row of the scan, so
+1:                 // that another row holds the previous key for the scan when
+1:                 // it wakes up.
+1:                 for (int i = 0; i < 300; i++) {
+1:                     ps.execute();
+1:                 }
+1:                 conn.commit();
+1: 
+1:                 // The scan will wake up and try to lock the row that has
+1:                 // now become the row immediately to the left of its starting
+1:                 // position. Try to beat it to it so that it has to wait a
+1:                 // second time in order to obtain the previous key lock. This
+1:                 // used to trigger an assert failure in the scan before
+1:                 // DERBY-4193.
+1:                 for (int i = 0; i < 300; i++) {
+1:                     ps.execute();
+1:                 }
+1: 
+1:                 // Wait a little while to give the scan enough time to wake
+1:                 // up and make another attempt to lock the previous key before
+1:                 // we release the locks.
+1:                 Thread.sleep(500);
+1:                 conn.rollback();
+1:                 ps.close();
+1:             }
+1:         });
+1: 
+1:         // Give the other thread a second to start and obtain a lock that
+1:         // blocks the scan.
+1:         Thread.sleep(1000);
+1: 
+1:         // The key to the left of the first key to be returned by the scan
+1:         // should be locked now. This call will have to wait for the previous
+1:         // key lock at least once. If it has to wait a second time (dependent
+1:         // on the exact timing between this thread and the other thread) the
+1:         // assert error from DERBY-4193 will be exposed.
+1:         JDBC.assertSingleValueResultSet(
+1:                 s.executeQuery("select x from fw_scan " +
+1:                                "--DERBY-PROPERTIES index=IDX\n" +
+1:                                "where x >= 100 and x < 200"),
+1:                 "100");
+1:     }
+1: 
+1:     // --------------------------------------------------------------------
+commit:152b9a7
+/////////////////////////////////////////////////////////////////////////
+1:     // Test cases for calls to BTreeScan.reposition() in BTreeScan
+1:     // --------------------------------------------------------------------
+1: 
+1:     // There's a call to reposition() from positionAtDoneScanFromClose(), but
+1:     // I'm not sure how to reach it. According to the code coverage reports
+1:     // there's no other tests that reach that call to reposition().
+1:     //
+1:     // Not testing the first call to reposition() in delete() since it will
+1:     // be exercised by all code that deletes or modifies index rows, so it's
+1:     // already exercised by other tests. The existing tests do not make the
+1:     // this call do a full repositioning from the root of the B-tree, but
+1:     // this is very difficult to test because a page split needs to happen in
+1:     // the very short window between the scan releases the latch and delete()
+1:     // reobtains the latch.
+1:     //
+1:     // The other call to reposition() in delete() is only used if
+1:     // init_useUpdateLocks is true. No other tests reach that call, according
+1:     // to the code coverage reports, and I'm not sure how/if it can be
+1:     // reached from the public API. Leaving it untested for now.
+1:     //
+1:     // There's a call to reposition() in BTreeScan.doesCurrentPositionQualify()
+1:     // too. The only caller (except test code bypassing the public API) is
+1:     // TableScanResultSet.getCurrentRow(), which is only called from trigger
+1:     // code (for before and after result sets) and CurrentOfResultSets. It
+1:     // doesn't look like these will ever use a TableScanResultSet wrapping a
+1:     // index scan, so there's no test for this method here. (The method is
+1:     // exercised from T_b2i by using the internal API directly.)
+1:     //
+1:     // Same comment as above goes for BTreeScan.isCurrentPositionDeleted(), as
+1:     // it is used the same places as doesCurrentPositionQualify().
+1:     //
+1:     // The call to reposition() from BTreeScan.fetch() is also hard to reach.
+1:     // It can be reached from getConstraintDescriptorViaIndex(), which is
+1:     // frequently exercised by other tests, so I'm not adding a test case here.
+1:     // In order to test repositioning after a split in this method, we should
+1:     // rather have a test case calls the internal API directly (e.g., in
+1:     // T_b2i).
+1:     //
+1:     // Similarly, BTreeScan.reopenScan() has a call to reposition() that's
+1:     // exercised frequently by other tests, but to test a split right before
+1:     // the repositioning, we'd probably need to use the internal API for that
+1:     // method too.
+1: 
+1:     // --------------------------------------------------------------------
+commit:3811800
+/////////////////////////////////////////////////////////////////////////
+0:         setAutoCommit(false); // required by JDBC.dropSchema()
+/////////////////////////////////////////////////////////////////////////
+1:         setAutoCommit(false);
+/////////////////////////////////////////////////////////////////////////
+1:         setAutoCommit(false);
+/////////////////////////////////////////////////////////////////////////
+1:         setAutoCommit(false);
+/////////////////////////////////////////////////////////////////////////
+1:         setAutoCommit(false);
+/////////////////////////////////////////////////////////////////////////
+1:         setAutoCommit(false);
+/////////////////////////////////////////////////////////////////////////
+1:         setAutoCommit(false);
+/////////////////////////////////////////////////////////////////////////
+1:         setAutoCommit(false);
+commit:f487e07
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * List of threads (AsyncThread objects) to wait for after running the test.
+1:      */
+0:     private List threads = new ArrayList();
+/////////////////////////////////////////////////////////////////////////
+0:         // Go through all the threads and call waitFor() so that we
+0:         for (Iterator it = threads.iterator(); it.hasNext();) {
+0:             AsyncThread thread = (AsyncThread) it.next();
+1:             thread.waitFor();
+1:         threads = null;
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Test that BTreeForwardScan.fetchRows() can reposition after releasing
+1:      * latches because it had to wait for a lock, and the leaf page on which
+1:      * the scan is positioned has been split. This tests the third call
+1:      * to reposition() in fetchRows(), which is only called if the index is
+1:      * unique.
+1:      */
+1:     public void testBTreeForwardScan_fetchRows_resumeAfterWait_unique_split()
+1:             throws Exception {
+0:         getConnection().setAutoCommit(false);
+1: 
+1:         // Populate a table with a unique index
+1:         Statement s = createStatement();
+1:         s.executeUpdate("create table t (x int, constraint c primary key(x))");
+1:         PreparedStatement ins = prepareStatement("insert into t values ?");
+1:         for (int i = 0; i < 300; i++) {
+1:             ins.setInt(1, i);
+1:             ins.executeUpdate();
+1:         }
+1:         commit();
+1: 
+1:         // Lock a row on the first page in a different thread to stop the
+1:         // index scan. Then split the first leaf by inserting many values
+1:         // less than zero.
+1:         new AsyncThread(new AsyncTask() {
+1:             public void doWork(Connection conn) throws Exception {
+1:                 conn.setAutoCommit(false);
+1:                 Statement s = conn.createStatement();
+1:                 s.executeUpdate("update t set x = x where x = 40");
+1:                 s.close();
+0:                 // Give the index scan time to start and position on
+0:                 // the row we have locked. (Give it two seconds, since the
+0:                 // main thread sleeps for one second first before it starts
+0:                 // the index scan.)
+0:                 Thread.sleep(2000);
+1:                 // Split the first leaf
+1:                 PreparedStatement ps = conn.prepareStatement(
+1:                         "insert into t values ?");
+1:                 for (int i = -1; i > -300; i--) {
+1:                     ps.setInt(1, i);
+1:                     ps.executeUpdate();
+1:                 }
+1:                 ps.close();
+1:                 conn.commit();
+1:             }
+1:         });
+1: 
+1:         // Give the other thread time to obtain the lock
+1:         Thread.sleep(1000);
+1: 
+1:         // Perform an index scan. Will be blocked for a while when fetching
+1:         // the row where x=100, but should be able to resume the scan.
+1:         ResultSet rs = s.executeQuery(
+1:                 "select * from t --DERBY-PROPERTIES constraint=C");
+1:         for (int i = 0; i < 300; i++) {
+1:             assertTrue(rs.next());
+1:             assertEquals(i, rs.getInt(1));
+1:         }
+1:         assertFalse(rs.next());
+1:         rs.close();
+1:     }
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Test that BTreeForwardScan.fetchRows() can reposition after releasing
+1:      * latches because it had to wait for a lock, and the leaf page on which
+1:      * the scan is positioned has been split. This tests the fourth call
+1:      * to reposition() in fetchRows(), which is only called if the index is
+1:      * non-unique.
+1:      */
+1:     public void testBTreeForwardScan_fetchRows_resumeAfterWait_nonUnique_split()
+1:             throws Exception {
+0:         getConnection().setAutoCommit(false);
+1: 
+1:         // Populate a table with a non-unique index
+1:         Statement s = createStatement();
+1:         s.executeUpdate("create table t (x int)");
+1:         s.executeUpdate("create index idx on t(x)");
+1:         PreparedStatement ins = prepareStatement("insert into t values ?");
+1:         for (int i = 0; i < 300; i++) {
+1:             ins.setInt(1, i);
+1:             ins.executeUpdate();
+1:         }
+1:         commit();
+1: 
+1:         // Hold a lock in a different thread to stop the index scan, then
+1:         // split the first leaf (on which the scan is positioned) before the
+1:         // lock is released.
+1:         new AsyncThread(new AsyncTask() {
+1:             public void doWork(Connection conn) throws Exception {
+1:                 conn.setAutoCommit(false);
+1:                 Statement s = conn.createStatement();
+1:                 s.executeUpdate("update t set x = x where x = 40");
+0:                 // Give the index scan time to start and position on
+0:                 // the row we have locked. (Give it two seconds, since the
+0:                 // main thread sleeps for one second first before it starts
+0:                 // the index scan.)
+0:                 Thread.sleep(2000);
+0:                 // Split the first leaf by inserting more zeros
+0:                 for (int i = -1; i > -300; i--) {
+0:                     s.executeUpdate("insert into t values 0");
+1:                 }
+1:                 s.close();
+1:                 conn.commit();
+1:             }
+1:         });
+1: 
+1:         // Give the other thread time to obtain the lock
+1:         Thread.sleep(1000);
+1: 
+1:         // Perform an index scan. Will be blocked for a while when fetching
+1:         // the row where x=100, but should be able to resume the scan.
+1:         ResultSet rs = s.executeQuery(
+1:                 "select * from t --DERBY-PROPERTIES index=IDX");
+1:         for (int i = 0; i < 300; i++) {
+1:             assertTrue(rs.next());
+1:             assertEquals(i, rs.getInt(1));
+1:         }
+1:         assertFalse(rs.next());
+1:         rs.close();
+1:     }
+/////////////////////////////////////////////////////////////////////////
+1:     private void obstruct(final String sql, final long blockMillis) {
+1:         AsyncTask task = new AsyncTask() {
+1:             public void doWork(Connection conn) throws Exception {
+1:                 conn.setAutoCommit(false);
+1:                 Statement s = conn.createStatement();
+1:                 s.execute(sql);
+1:                 s.close();
+1:                 Thread.sleep(blockMillis);
+1:             }
+1:         };
+1:         new AsyncThread(task);
+1:      * Interface that should be implemented by classes that define a
+1:      * database task that is to be executed asynchronously in a separate
+1:      * transaction.
+1:     private static interface AsyncTask {
+1:         void doWork(Connection conn) throws Exception;
+1:     }
+1: 
+1:     /**
+1:      * Class that executes an {@code AsyncTask} object.
+1:      */
+1:     private class AsyncThread implements Runnable {
+1: 
+1:         private final Thread thread = new Thread(this);
+1:         private final AsyncTask task;
+1:          * Create an {@code AsyncThread} object and starts a thread executing
+1:          * the task. Also put the {@code AsyncThread} object in the list of
+1:          * threads in the parent object to make sure the thread is waited for
+1:          * and its errors detected in the {@code tearDown()} method.
+1:          *
+1:          * @param task the task to perform
+1:         public AsyncThread(AsyncTask task) {
+1:             this.task = task;
+1:             threads.add(this);
+1:          * Open a database connection and perform the task. Roll back the
+1:          * transaction when finished. Any exception thrown will be caught and
+1:          * rethrown when the {@code waitFor()} method is called.
+1:                 Connection conn = openDefaultConnection();
+1:                     task.doWork(conn);
+1:                     JDBC.cleanup(conn);
+/////////////////////////////////////////////////////////////////////////
+1:          * Wait for the thread to complete. If an error was thrown during
+1:          * execution, rethrow the execption here.
+1:          * @throws Exception if an error happened while performing the task
+1:             if (error != null) {
+1:                 throw error;
+commit:d433373
+/////////////////////////////////////////////////////////////////////////
+1:     public void testBTreeForwardScan_fetchRows_resumeAfterSplit()
+1:             throws SQLException {
+/////////////////////////////////////////////////////////////////////////
+1:         rs.close();
+1:     /**
+1:      * Test that we can reposition on a holdable cursor after a commit and
+1:      * a split on the leaf page of the current position. This tests the
+1:      * second call to reposition() in BTreeForwardScan.fetchRows().
+1:      */
+1:     public void testBTreeForwardScan_fetchRows_resumeScanAfterCommitAndSplit()
+1:             throws SQLException {
+1: 
+0:         getConnection().setAutoCommit(false);
+1: 
+1:         // Create a table and an index and populate them
+1:         Statement s1 = createStatement();
+1:         s1.executeUpdate("create table t (x int)");
+1:         s1.executeUpdate("create index idx on t(x)");
+1:         PreparedStatement ins = prepareStatement("insert into t values ?");
+1:         for (int i = 0; i < 1000; i++) {
+1:             ins.setInt(1, i);
+1:             ins.executeUpdate();
+1:         }
+1:         commit();
+1: 
+1:         // Start an index scan with a holdable cursor, and fetch some rows
+1:         // to move the position to the middle of the index.
+1:         assertEquals("This test must use a holdable cursor",
+1:                      ResultSet.HOLD_CURSORS_OVER_COMMIT,
+1:                      s1.getResultSetHoldability());
+1:         ResultSet rs = s1.executeQuery(
+1:                 "select * from t --DERBY-PROPERTIES index=IDX");
+1:         for (int i = 0; i < 500; i++) {
+1:             assertTrue(rs.next());
+1:             assertEquals(i, rs.getInt(1));
+1:         }
+1:         commit();
+1: 
+1:         // Insert rows right before the one we're positioned on in order to
+1:         // split that page.
+1:         Statement s2 = createStatement();
+1:         for (int i = 0; i < 300; i++) {
+1:             s2.executeUpdate("insert into t values 498");
+1:         }
+1: 
+1:         // Check that the index scan can continue where we left it, even
+1:         // though we committed and released the latches.
+1:         for (int i = 500; i < 1000; i++) {
+1:             assertTrue(rs.next());
+1:             assertEquals(i, rs.getInt(1));
+1:         }
+1:         assertFalse(rs.next());
+1:         rs.close();
+1: 
+1:     }
+1: 
+1:     /**
+1:      * Test that we can reposition on a holdable cursor after a commit and
+1:      * a compress that removes the leaf page of the current position. This
+1:      * tests the second call to reposition() in BTreeForwardScan.fetchRows().
+1:      */
+1:     public void testBTreeForwardScan_fetchRows_resumeScanAfterCompress()
+1:             throws Exception {
+1: 
+0:         getConnection().setAutoCommit(false);
+1: 
+1:         // Create a table and an index and populate them
+1:         Statement s1 = createStatement();
+1:         s1.executeUpdate("create table t (x int)");
+1:         s1.executeUpdate("create index idx on t(x)");
+1:         PreparedStatement ins = prepareStatement("insert into t values ?");
+1:         for (int i = 0; i < 1000; i++) {
+1:             ins.setInt(1, i);
+1:             ins.executeUpdate();
+1:         }
+1:         commit();
+1: 
+1:         // Start an index scan with a holdable cursor, and fetch some rows
+1:         // to move the position to the middle of the index.
+1:         assertEquals("This test must use a holdable cursor",
+1:                      ResultSet.HOLD_CURSORS_OVER_COMMIT,
+1:                      s1.getResultSetHoldability());
+1:         ResultSet rs = s1.executeQuery(
+1:                 "select * from t --DERBY-PROPERTIES index=IDX");
+1:         for (int i = 0; i < 500; i++) {
+1:             assertTrue(rs.next());
+1:             assertEquals(i, rs.getInt(1));
+1:         }
+1:         commit();
+1: 
+1:         // Delete all rows and compress the table so that the leaf page on
+1:         // which the result set is positioned disappears.
+1:         Statement s2 = createStatement();
+1:         s2.executeUpdate("delete from t");
+1:         commit();
+1:         // Sleep for a little while, otherwise SYSCS_INPLACE_COMPRESS_TABLE
+1:         // doesn't free any space in the index (waiting for the background
+1:         // thread to perform post-commit work?)
+1:         Thread.sleep(1000);
+1:         s2.execute("call syscs_util.syscs_inplace_compress_table" +
+1:                    "('APP','T',1,1,1)");
+1:         commit();
+1: 
+1:         // Check that we are able to reposition. We may or may not see more
+1:         // rows, since some rows may still be available in the cache in the
+1:         // result set. The point of the code below is to see that calls to
+1:         // ResultSet.next() don't fail when the page has disappeared, not to
+1:         // test how many of the deleted rows are returned.
+1:         int expected = 500;
+1:         while (rs.next()) {
+1:             assertTrue(expected < 1000);
+1:             assertEquals(expected, rs.getInt(1));
+1:             expected++;
+1:         }
+1:         rs.close();
+1:     }
+1: 
+1:     /**
+1:      * Test that BTreeForwardScan.fetchRows() can reposition after releasing
+1:      * latches because it had to wait for a lock. This tests the third call
+1:      * to reposition() in fetchRows(), which is only called if the index is
+1:      * unique.
+1:      */
+1:     public void testBTreeForwardScan_fetchRows_resumeAfterWait_unique()
+1:             throws Exception {
+0:         getConnection().setAutoCommit(false);
+1: 
+1:         // Populate a table with a unique index
+1:         Statement s = createStatement();
+1:         s.executeUpdate("create table t (x int, constraint c primary key(x))");
+1:         PreparedStatement ins = prepareStatement("insert into t values ?");
+1:         for (int i = 0; i < 300; i++) {
+1:             ins.setInt(1, i);
+1:             ins.executeUpdate();
+1:         }
+1:         commit();
+1: 
+1:         // Hold a lock in a different thread to stop the index scan
+1:         obstruct("delete from t where x = 100", 2000);
+1: 
+0:         // Give the other thread time to obtain the lock
+1:         Thread.sleep(1000);
+1: 
+1:         // Perform an index scan. Will be blocked for a while when fetching
+0:         // the row where x=100, but should be able to resume the scan.
+1:         ResultSet rs = s.executeQuery(
+0:                 "select * from t --DERBY-PROPERTIES constraint=C");
+1:         for (int i = 0; i < 300; i++) {
+1:             assertTrue(rs.next());
+1:             assertEquals(i, rs.getInt(1));
+1:         }
+1:         assertFalse(rs.next());
+1:         rs.close();
+1:     }
+1: 
+0:     // TODO: add a similar case as the one above, only that it should
+0:     // cause a split before the index scan wakes up
+1: 
+1:     /**
+1:      * Test that BTreeForwardScan.fetchRows() can reposition after releasing
+1:      * latches because it had to wait for a lock. This tests the fourth call
+1:      * to reposition() in fetchRows(), which is only called if the index is
+1:      * non-unique.
+1:      */
+1:     public void testBTreeForwardScan_fetchRows_resumeAfterWait_nonUnique()
+1:             throws Exception {
+0:         getConnection().setAutoCommit(false);
+1: 
+1:         // Populate a table with a non-unique index
+1:         Statement s = createStatement();
+1:         s.executeUpdate("create table t (x int)");
+1:         s.executeUpdate("create index idx on t(x)");
+1:         PreparedStatement ins = prepareStatement("insert into t values ?");
+1:         for (int i = 0; i < 300; i++) {
+1:             ins.setInt(1, i);
+1:             ins.executeUpdate();
+1:         }
+1:         commit();
+1: 
+1:         // Hold a lock in a different thread to stop the index scan
+1:         obstruct("delete from t where x = 100", 2000);
+1: 
+0:         // Give the other thread time to obtain the lock
+1:         Thread.sleep(1000);
+1: 
+1:         // Perform an index scan. Will be blocked for a while when fetching
+0:         // the row where x=100, but should be able to resume the scan.
+1:         ResultSet rs = s.executeQuery(
+1:                 "select * from t --DERBY-PROPERTIES index=IDX");
+1:         for (int i = 0; i < 300; i++) {
+1:             assertTrue(rs.next());
+1:             assertEquals(i, rs.getInt(1));
+1:         }
+1:         assertFalse(rs.next());
+1:         rs.close();
+1:     }
+1: 
+0:     // TODO: add a similar case as the one above, only that it should
+0:     // cause a split before the index scan wakes up
+1: 
+commit:1ee9da2
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Derby - Class org.apache.derbyTesting.functionTests.tests.store.IndexSplitDeadlockTest
+1:  *
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *    http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing,
+1:  * software distributed under the License is distributed on an
+1:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+1:  * either express or implied. See the License for the specific
+1:  * language governing permissions and limitations under the License.
+1:  */
+1: 
+1: package org.apache.derbyTesting.functionTests.tests.store;
+1: 
+1: import java.sql.Connection;
+1: import java.sql.PreparedStatement;
+1: import java.sql.ResultSet;
+1: import java.sql.SQLException;
+1: import java.sql.Statement;
+1: import java.util.ArrayList;
+0: import java.util.Iterator;
+1: import java.util.List;
+1: import junit.framework.Test;
+1: import org.apache.derbyTesting.junit.BaseJDBCTestCase;
+1: import org.apache.derbyTesting.junit.CleanDatabaseTestSetup;
+1: import org.apache.derbyTesting.junit.DatabasePropertyTestSetup;
+1: import org.apache.derbyTesting.junit.JDBC;
+1: import org.apache.derbyTesting.junit.TestConfiguration;
+1: 
+1: /**
+1:  * Test that executes the code paths changed by the fix for the index split
+1:  * deadlock (DERBY-2991). The main purpose is to test that index scans are
+1:  * able to reposition in cases where they release the latch on the leaf page
+1:  * on which they are positioned (typically because they had to wait for a
+1:  * lock, or because they returned control to the caller after fetching a
+1:  * bulk of rows).
+1:  */
+1: public class IndexSplitDeadlockTest extends BaseJDBCTestCase {
+1: 
+0:     /** List of obstructor threads to wait for after running the test. */
+0:     private List obstructors;
+1: 
+1:     public IndexSplitDeadlockTest(String name) {
+1:         super(name);
+1:     }
+1: 
+1:     public static Test suite() {
+1:         Test test = TestConfiguration.embeddedSuite(
+1:                 IndexSplitDeadlockTest.class);
+1:         test = new CleanDatabaseTestSetup(test);
+0:         test = DatabasePropertyTestSetup.setLockTimeouts(test, 2, 4);
+1:         return test;
+1:     }
+1: 
+1:     protected void tearDown() throws Exception {
+1:         rollback();
+0:         getConnection().setAutoCommit(false); // required by JDBC.dropSchema()
+0:         JDBC.dropSchema(getConnection().getMetaData(), "APP");
+1: 
+0:         // Go through all the obstructors and call waitFor() so that we
+0:         // detect errors that happened in another thread.
+0:         if (obstructors != null) {
+0:             for (Iterator it = obstructors.iterator(); it.hasNext(); ) {
+0:                 Obstructor o = (Obstructor) it.next();
+0:                 o.waitFor();
+1:             }
+1:         }
+0:         obstructors = null;
+1: 
+1:         super.tearDown();
+1:     }
+1: 
+1:     // --------------------------------------------------------------------
+1:     // Test cases for calls to BTreeScan.reposition() in BTreeMaxScan
+1:     // --------------------------------------------------------------------
+1: 
+1:     // NOTE: There is a call in fetchMax() that cannot be reached because the
+1:     // scan state is alway SCAN_INIT when that method is called, and it only
+1:     // calls reposition() if the scan state is SCAN_INPROGRESS. Therefore,
+1:     // there's no test case for fetchMax().
+1: 
+1:     public void testBTreeMaxScan_fetchMaxRowFromBeginning() throws Exception {
+0:         getConnection().setAutoCommit(false);
+1: 
+1:         Statement s = createStatement();
+1:         s.executeUpdate("create table max_scan(x int)");
+1:         s.executeUpdate("create index idx on max_scan(x)");
+1: 
+1:         // We need to make sure that we have at least two leaf pages. Each
+1:         // 4K index page can hold ~200 rows.
+1:         PreparedStatement ins = prepareStatement(
+1:                 "insert into max_scan values ?");
+1:         for (int i = 0; i < 500; i++) {
+1:             ins.setInt(1, i * 2);
+1:             ins.executeUpdate();
+1:         }
+1:         commit();
+1: 
+1:         // Now make sure that the right-most leaf is empty, so that we must
+1:         // fetch the max value from the beginning.
+1:         s.executeUpdate("delete from max_scan where x > 50");
+1: 
+1:         // Obtain lock in another thread to block scans. Release lock after
+1:         // two seconds.
+1:         obstruct("update max_scan set x = x where x = 10", 2000);
+1: 
+1:         // Give the other thread time to obtain the lock.
+0:         Thread.sleep(1000);
+1: 
+1:         // Perform a max scan (from beginning because last page is empty).
+1:         // Will force repositioning because we must wait for the lock and
+1:         // release the latch.
+1:         JDBC.assertSingleValueResultSet(s.executeQuery(
+1:                 "select max(x) from max_scan --DERBY-PROPERTIES index=IDX"),
+1:                 "50");
+1:     }
+1: 
+1:     // --------------------------------------------------------------------
+1:     // Test cases for calls to BTreeScan.reposition() in BTreeForwardScan
+1:     // --------------------------------------------------------------------
+1: 
+1:     /**
+1:      * Test first call to reposition() in BTreeForwardScan.fetchRows().
+1:      * This call happens when a new batch of rows is requested from a scan
+1:      * that's in progress.
+1:      */
+0:     public void testBTreeForwardScan_fetchRows1() throws SQLException {
+1: 
+1:         // Create a table and an index and populate them
+1:         Statement s = createStatement();
+1:         s.executeUpdate("create table t (x int)");
+1:         s.executeUpdate("create index idx on t(x)");
+1:         PreparedStatement ins = prepareStatement("insert into t values ?");
+1:         for (int i = 0; i < 400; i++) {
+1:             ins.setInt(1, i);
+1:             ins.executeUpdate();
+1:         }
+1: 
+1:         // Start an index scan and fetch some rows so that it's in the
+1:         // INPROGRESS state. Just fetch a small number of rows so that we
+1:         // are still positioned on the left-most leaf page.
+0:         ResultSet rs = s.executeQuery(
+1:                 "select * from t --DERBY-PROPERTIES index=IDX");
+1:         for (int i = 0; i < 30; i++) {
+1:             assertTrue(rs.next());
+1:             assertEquals(i, rs.getInt(1));
+1:         }
+1: 
+1:         // In another transaction, insert values smaller than the values
+1:         // currently in the index. This causes a split of the left-most leaf.
+1:         // Before DERBY-2991 we'd get a lock timeout here.
+1:         Connection c2 = openDefaultConnection();
+1:         Statement s2 = c2.createStatement();
+1:         for (int i = 0; i < 300; i++) {
+1:             s2.executeUpdate("insert into t values -1");
+1:         }
+1:         s2.close();
+1:         c2.close();
+1: 
+1:         // Continue the index scan. This will trigger a full repositioning
+1:         // from the root of the B-tree since the page on which we were
+1:         // positioned has been split.
+1:         for (int i = 30; i < 400; i++) {
+1:             assertTrue(rs.next());
+1:             assertEquals(i, rs.getInt(1));
+1:         }
+1:         assertFalse(rs.next());
+1:     }
+1: 
+1:     // --------------------------------------------------------------------
+1:     // Helpers
+1:     // --------------------------------------------------------------------
+1: 
+1:     /**
+1:      * <p>
+1:      * In a separate thread, and in a separate transaction, execute the
+1:      * SQL text and wait for the specified period of time, before the
+1:      * transaction is rolled back. This method can be used to hold locks
+1:      * and thereby block the main thread for a certain amount of time.
+1:      * </p>
+1:      *
+1:      * <p>
+1:      * If an exception is thrown while executing the SQL, the exception is
+1:      * stored and rethrown from the tearDown() method in the main execution
+1:      * thread, so that it is detected by the JUnit framework.
+1:      * </p>
+1:      *
+1:      * @param sql the SQL text to execute
+1:      * @param blockMillis how many milliseconds to wait until the transaction
+1:      * is rolled back
+1:      */
+0:     private void obstruct(String sql, long blockMillis) {
+0:         if (obstructors == null) {
+0:             obstructors = new ArrayList();
+1:         }
+0:         obstructors.add(new Obstructor(sql, blockMillis));
+1:     }
+1: 
+1:     /**
+0:      * Helper class for the obstruct() method. Executes SQL in a separate
+0:      * thread and stores any exceptions thrown.
+1:      */
+0:     private class Obstructor implements Runnable {
+0:         private final String sql;
+0:         private final long blockMillis;
+0:         private final Thread thread;
+1:         private Exception error;
+1: 
+1:         /**
+0:          * Create and start an obstructor thread.
+1:          * @param sql the SQL text to execute
+0:          * @param blockMillis the time in milliseconds to keep the
+0:          * transaction active
+1:          */
+0:         Obstructor(String sql, long blockMillis) {
+0:             this.sql = sql;
+0:             this.blockMillis = blockMillis;
+0:             thread = new Thread(this);
+1:             thread.start();
+1:         }
+1: 
+1:         /**
+0:          * Run the SQL in a separate transaction and block for the specified
+0:          * amount of time.
+1:          */
+1:         public void run() {
+1:             try {
+0:                 Connection c = openDefaultConnection();
+1:                 try {
+0:                     c.setAutoCommit(false);
+0:                     Statement s = c.createStatement();
+0:                     s.execute(sql);
+0:                     s.close();
+0:                     Thread.sleep(blockMillis);
+1:                 } finally {
+0:                     c.rollback();
+0:                     c.close();
+1:                 }
+1:             } catch (Exception e) {
+1:                 error = e;
+1:             }
+1:         }
+1: 
+1:         /**
+0:          * Wait for the obstructor thread to complete. If an error occurred
+0:          * while the thread was running, the exception will be rethrown by
+0:          * this method.
+1:          *
+0:          * @throws Exception if an error occurred while the thread was running
+1:          */
+1:         void waitFor() throws Exception {
+1:             thread.join();
+0:             Exception e = error;
+0:             error = null;
+0:             if (e != null) {
+0:                 throw e;
+1:             }
+1:         }
+1: 
+1:     }
+1: 
+1: }
+============================================================================

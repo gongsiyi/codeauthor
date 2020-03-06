@@ -1,0 +1,2892 @@
+1:a991b64: /*
+1:a991b64:  * Licensed to the Apache Software Foundation (ASF) under one
+1:a991b64:  * or more contributor license agreements.  See the NOTICE file
+1:a991b64:  * distributed with this work for additional information
+1:a991b64:  * regarding copyright ownership.  The ASF licenses this file
+1:a991b64:  * to you under the Apache License, Version 2.0 (the
+1:a991b64:  * "License"); you may not use this file except in compliance
+1:a991b64:  * with the License.  You may obtain a copy of the License at
+1:a991b64:  *
+1:a991b64:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:a991b64:  *
+1:a991b64:  * Unless required by applicable law or agreed to in writing, software
+1:a991b64:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:a991b64:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:a991b64:  * See the License for the specific language governing permissions and
+1:a991b64:  * limitations under the License.
+1:a991b64:  */
+1:a991b64: package org.apache.cassandra.db.partitions;
+30:a991b64: 
+1:a991b64: import java.io.IOException;
+1:a991b64: import java.nio.ByteBuffer;
+1:0626be8: import java.util.ArrayList;
+1:0626be8: import java.util.Iterator;
+1:0626be8: import java.util.List;
+1:a991b64: 
+1:a991b64: import com.google.common.collect.Iterables;
+1:8c64cef: import com.google.common.collect.Lists;
+1:a991b64: import org.slf4j.Logger;
+1:a991b64: import org.slf4j.LoggerFactory;
+1:a991b64: 
+1:a991b64: import org.apache.cassandra.config.CFMetaData;
+1:a991b64: import org.apache.cassandra.config.ColumnDefinition;
+1:a991b64: import org.apache.cassandra.db.*;
+1:a991b64: import org.apache.cassandra.db.filter.ColumnFilter;
+1:a991b64: import org.apache.cassandra.db.rows.*;
+1:0626be8: import org.apache.cassandra.io.util.*;
+1:a991b64: import org.apache.cassandra.net.MessagingService;
+1:a991b64: import org.apache.cassandra.utils.FBUtilities;
+1:e51f83b: import org.apache.cassandra.utils.btree.BTree;
+1:e51f83b: import org.apache.cassandra.utils.btree.UpdateFunction;
+1:a991b64: 
+1:a991b64: /**
+1:a991b64:  * Stores updates made on a partition.
+1:a991b64:  * <p>
+1:2457599:  * A PartitionUpdate object requires that all writes/additions are performed before we
+1:2457599:  * try to read the updates (attempts to write to the PartitionUpdate after a read method
+1:2457599:  * has been called will result in an exception being thrown). In other words, a Partition
+1:2457599:  * is mutable while it's written but becomes immutable as soon as it is read.
+1:a991b64:  * <p>
+1:2457599:  * A typical usage is to create a new update ({@code new PartitionUpdate(metadata, key, columns, capacity)})
+1:2457599:  * and then add rows and range tombstones through the {@code add()} methods (the partition
+1:2457599:  * level deletion time can also be set with {@code addPartitionDeletion()}). However, there
+1:2457599:  * is also a few static helper constructor methods for special cases ({@code emptyUpdate()},
+1:2457599:  * {@code fullPartitionDelete} and {@code singleRowUpdate}).
+1:a991b64:  */
+1:e51f83b: public class PartitionUpdate extends AbstractBTreePartition
+24:a991b64: {
+1:a991b64:     protected static final Logger logger = LoggerFactory.getLogger(PartitionUpdate.class);
+1:2457599: 
+1:a991b64:     public static final PartitionUpdateSerializer serializer = new PartitionUpdateSerializer();
+1:a991b64: 
+1:2457599:     private final int createdAtInSec = FBUtilities.nowInSeconds();
+1:a991b64: 
+1:2457599:     // Records whether this update is "built", i.e. if the build() method has been called, which
+1:2457599:     // happens when the update is read. Further writing is then rejected though a manual call
+1:2457599:     // to allowNewUpdates() allow new writes. We could make that more implicit but only triggers
+1:2457599:     // really requires that so we keep it simple for now).
+1:2457599:     private boolean isBuilt;
+1:2457599:     private boolean canReOpen = true;
+1:2457599: 
+1:e51f83b:     private Holder holder;
+1:e51f83b:     private BTree.Builder<Row> rowBuilder;
+1:e51f83b:     private MutableDeletionInfo deletionInfo;
+1:2457599: 
+1:2457599:     private final boolean canHaveShadowedData;
+1:2457599: 
+1:a991b64:     private PartitionUpdate(CFMetaData metadata,
+1:a991b64:                             DecoratedKey key,
+1:a991b64:                             PartitionColumns columns,
+1:2457599:                             MutableDeletionInfo deletionInfo,
+1:e51f83b:                             int initialRowCapacity,
+1:2457599:                             boolean canHaveShadowedData)
+1:a991b64:     {
+1:c3bc856:         super(metadata, key);
+1:2457599:         this.deletionInfo = deletionInfo;
+1:c3bc856:         this.holder = new Holder(columns, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+1:2457599:         this.canHaveShadowedData = canHaveShadowedData;
+1:e51f83b:         rowBuilder = builder(initialRowCapacity);
+23:a991b64:     }
+1:2457599: 
+1:e51f83b:     private PartitionUpdate(CFMetaData metadata,
+1:a991b64:                             DecoratedKey key,
+1:e51f83b:                             Holder holder,
+1:e51f83b:                             MutableDeletionInfo deletionInfo,
+1:e51f83b:                             boolean canHaveShadowedData)
+1:2457599:     {
+1:c3bc856:         super(metadata, key);
+1:e51f83b:         this.holder = holder;
+1:e51f83b:         this.deletionInfo = deletionInfo;
+1:e51f83b:         this.isBuilt = true;
+1:e51f83b:         this.canHaveShadowedData = canHaveShadowedData;
+1:2457599:     }
+1:2457599: 
+1:a991b64:     public PartitionUpdate(CFMetaData metadata,
+1:a991b64:                            DecoratedKey key,
+1:a991b64:                            PartitionColumns columns,
+2:a991b64:                            int initialRowCapacity)
+1:2457599:     {
+1:e51f83b:         this(metadata, key, columns, MutableDeletionInfo.live(), initialRowCapacity, true);
+1:2457599:     }
+1:2457599: 
+1:a991b64:     public PartitionUpdate(CFMetaData metadata,
+1:0a08525:                            ByteBuffer key,
+1:a991b64:                            PartitionColumns columns,
+1:a991b64:                            int initialRowCapacity)
+1:2457599:     {
+2:a991b64:         this(metadata,
+1:0a08525:              metadata.decorateKey(key),
+2:a991b64:              columns,
+2:a991b64:              initialRowCapacity);
+1:2457599:     }
+1:2457599: 
+1:2457599:     /**
+1:2457599:      * Creates a empty immutable partition update.
+1:2457599:      *
+1:2457599:      * @param metadata the metadata for the created update.
+1:2457599:      * @param key the partition key for the created update.
+1:2457599:      *
+1:2457599:      * @return the newly created empty (and immutable) update.
+1:2457599:      */
+1:2457599:     public static PartitionUpdate emptyUpdate(CFMetaData metadata, DecoratedKey key)
+1:a991b64:     {
+1:e51f83b:         MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
+1:c3bc856:         Holder holder = new Holder(PartitionColumns.NONE, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+1:c3bc856:         return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
+1:2457599:     }
+1:2457599: 
+1:2457599:     /**
+1:2457599:      * Creates an immutable partition update that entirely deletes a given partition.
+1:2457599:      *
+1:2457599:      * @param metadata the metadata for the created update.
+1:2457599:      * @param key the partition key for the partition that the created update should delete.
+1:2457599:      * @param timestamp the timestamp for the deletion.
+1:2457599:      * @param nowInSec the current time in seconds to use as local deletion time for the partition deletion.
+1:2457599:      *
+1:2457599:      * @return the newly created partition deletion update.
+1:2457599:      */
+1:2457599:     public static PartitionUpdate fullPartitionDelete(CFMetaData metadata, DecoratedKey key, long timestamp, int nowInSec)
+1:a991b64:     {
+1:e51f83b:         MutableDeletionInfo deletionInfo = new MutableDeletionInfo(timestamp, nowInSec);
+1:c3bc856:         Holder holder = new Holder(PartitionColumns.NONE, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+1:c3bc856:         return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
+1:2457599:     }
+1:2457599: 
+1:2457599:     /**
+1:2457599:      * Creates an immutable partition update that contains a single row update.
+1:2457599:      *
+1:2457599:      * @param metadata the metadata for the created update.
+1:0a08525:      * @param key the partition key for the partition to update.
+1:2457599:      * @param row the row for the update.
+1:2457599:      *
+1:2457599:      * @return the newly created partition update containing only {@code row}.
+1:2457599:      */
+1:2457599:     public static PartitionUpdate singleRowUpdate(CFMetaData metadata, DecoratedKey key, Row row)
+1:2457599:     {
+1:e51f83b:         MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
+1:e51f83b:         if (row.isStatic())
+1:a991b64:         {
+1:c3bc856:             Holder holder = new Holder(new PartitionColumns(Columns.from(row.columns()), Columns.NONE), BTree.empty(), deletionInfo, row, EncodingStats.NO_STATS);
+1:c3bc856:             return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
+1:2457599:         }
+3:a991b64:         else
+1:a991b64:         {
+1:c3bc856:             Holder holder = new Holder(new PartitionColumns(Columns.NONE, Columns.from(row.columns())), BTree.singleton(row), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+1:c3bc856:             return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
+1:a991b64:         }
+1:a991b64:     }
+1:2457599: 
+1:2457599:     /**
+1:0a08525:      * Creates an immutable partition update that contains a single row update.
+1:a991b64:      *
+1:a991b64:      * @param metadata the metadata for the created update.
+1:0a08525:      * @param key the partition key for the partition to update.
+1:0a08525:      * @param row the row for the update.
+1:a991b64:      *
+1:0a08525:      * @return the newly created partition update containing only {@code row}.
+1:a991b64:      */
+1:0a08525:     public static PartitionUpdate singleRowUpdate(CFMetaData metadata, ByteBuffer key, Row row)
+1:a991b64:     {
+1:0a08525:         return singleRowUpdate(metadata, metadata.decorateKey(key), row);
+1:a991b64:     }
+1:2457599: 
+1:2457599:     /**
+1:2457599:      * Turns the given iterator into an update.
+1:2457599:      *
+1:fd74a03:      * @param iterator the iterator to turn into updates.
+1:fd74a03:      * @param filter the column filter used when querying {@code iterator}. This is used to make
+1:fd74a03:      * sure we don't include data for which the value has been skipped while reading (as we would
+1:fd74a03:      * then be writing something incorrect).
+1:fd74a03:      *
+1:2457599:      * Warning: this method does not close the provided iterator, it is up to
+1:2457599:      * the caller to close it.
+1:2457599:      */
+1:fd74a03:     public static PartitionUpdate fromIterator(UnfilteredRowIterator iterator, ColumnFilter filter)
+1:2457599:     {
+1:fd74a03:         iterator = UnfilteredRowIterators.withOnlyQueriedData(iterator, filter);
+1:e51f83b:         Holder holder = build(iterator, 16);
+1:e51f83b:         MutableDeletionInfo deletionInfo = (MutableDeletionInfo) holder.deletionInfo;
+1:c3bc856:         return new PartitionUpdate(iterator.metadata(), iterator.partitionKey(), holder, deletionInfo, false);
+1:a991b64:     }
+1:2457599: 
+1:fd74a03:     /**
+1:fd74a03:      * Turns the given iterator into an update.
+1:fd74a03:      *
+1:fd74a03:      * @param iterator the iterator to turn into updates.
+1:fd74a03:      * @param filter the column filter used when querying {@code iterator}. This is used to make
+1:fd74a03:      * sure we don't include data for which the value has been skipped while reading (as we would
+1:fd74a03:      * then be writing something incorrect).
+1:fd74a03:      *
+1:fd74a03:      * Warning: this method does not close the provided iterator, it is up to
+1:fd74a03:      * the caller to close it.
+1:fd74a03:      */
+1:fd74a03:     public static PartitionUpdate fromIterator(RowIterator iterator, ColumnFilter filter)
+1:2457599:     {
+1:fd74a03:         iterator = RowIterators.withOnlyQueriedData(iterator, filter);
+1:e51f83b:         MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
+1:e51f83b:         Holder holder = build(iterator, deletionInfo, true, 16);
+1:c3bc856:         return new PartitionUpdate(iterator.metadata(), iterator.partitionKey(), holder, deletionInfo, false);
+1:a991b64:     }
+1:2457599: 
+1:2457599:     protected boolean canHaveShadowedData()
+1:a991b64:     {
+1:2457599:         return canHaveShadowedData;
+1:a991b64:     }
+1:2457599: 
+1:a991b64:     /**
+1:a991b64:      * Deserialize a partition update from a provided byte buffer.
+1:a991b64:      *
+1:a991b64:      * @param bytes the byte buffer that contains the serialized update.
+1:a991b64:      * @param version the version with which the update is serialized.
+1:a991b64:      * @param key the partition key for the update. This is only used if {@code version &lt 3.0}
+1:a991b64:      * and can be {@code null} otherwise.
+1:a991b64:      *
+1:a991b64:      * @return the deserialized update or {@code null} if {@code bytes == null}.
+1:a991b64:      */
+1:a991b64:     public static PartitionUpdate fromBytes(ByteBuffer bytes, int version, DecoratedKey key)
+1:a991b64:     {
+1:a991b64:         if (bytes == null)
+1:a991b64:             return null;
+1:2457599: 
+1:a991b64:         try
+1:a991b64:         {
+1:c4c9eae:             return serializer.deserialize(new DataInputBuffer(bytes, true),
+1:a991b64:                                           version,
+1:a991b64:                                           SerializationHelper.Flag.LOCAL,
+1:a991b64:                                           version < MessagingService.VERSION_30 ? key : null);
+1:a991b64:         }
+1:a991b64:         catch (IOException e)
+1:a991b64:         {
+1:a991b64:             throw new RuntimeException(e);
+1:a991b64:         }
+1:a991b64:     }
+1:2457599: 
+1:a991b64:     /**
+1:a991b64:      * Serialize a partition update as a byte buffer.
+1:a991b64:      *
+1:a991b64:      * @param update the partition update to serialize.
+1:a991b64:      * @param version the version to serialize the update into.
+1:a991b64:      *
+1:a991b64:      * @return a newly allocated byte buffer containing the serialized update.
+1:a991b64:      */
+1:a991b64:     public static ByteBuffer toBytes(PartitionUpdate update, int version)
+1:a991b64:     {
+1:a991b64:         try (DataOutputBuffer out = new DataOutputBuffer())
+1:a991b64:         {
+1:2457599:             serializer.serialize(update, out, version);
+1:063e917:             return out.asNewBuffer();
+1:a991b64:         }
+1:a991b64:         catch (IOException e)
+1:a991b64:         {
+1:a991b64:             throw new RuntimeException(e);
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:a991b64:      * Creates a partition update that entirely deletes a given partition.
+1:a991b64:      *
+1:a991b64:      * @param metadata the metadata for the created update.
+1:2457599:      * @param key the partition key for the partition that the created update should delete.
+1:a991b64:      * @param timestamp the timestamp for the deletion.
+1:a991b64:      * @param nowInSec the current time in seconds to use as local deletion time for the partition deletion.
+1:a991b64:      *
+1:a991b64:      * @return the newly created partition deletion update.
+1:a991b64:      */
+1:0a08525:     public static PartitionUpdate fullPartitionDelete(CFMetaData metadata, ByteBuffer key, long timestamp, int nowInSec)
+1:a991b64:     {
+1:0a08525:         return fullPartitionDelete(metadata, metadata.decorateKey(key), timestamp, nowInSec);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:a991b64:      * Merges the provided updates, yielding a new update that incorporates all those updates.
+1:a991b64:      *
+1:a991b64:      * @param updates the collection of updates to merge. This shouldn't be empty.
+1:a991b64:      *
+1:a991b64:      * @return a partition update that include (merge) all the updates from {@code updates}.
+1:a991b64:      */
+1:e51f83b:     public static PartitionUpdate merge(List<PartitionUpdate> updates)
+1:a991b64:     {
+1:a991b64:         assert !updates.isEmpty();
+1:2457599:         final int size = updates.size();
+1:2457599: 
+1:2457599:         if (size == 1)
+1:a991b64:             return Iterables.getOnlyElement(updates);
+1:2457599: 
+1:e51f83b:         int nowInSecs = FBUtilities.nowInSeconds();
+1:e51f83b:         List<UnfilteredRowIterator> asIterators = Lists.transform(updates, AbstractBTreePartition::unfilteredIterator);
+1:fd74a03:         return fromIterator(UnfilteredRowIterators.merge(asIterators, nowInSecs), ColumnFilter.all(updates.get(0).metadata()));
+1:a991b64:     }
+1:2457599: 
+1:a991b64:     /**
+1:2457599:      * Modify this update to set every timestamp for live data to {@code newTimestamp} and
+1:2457599:      * every deletion timestamp to {@code newTimestamp - 1}.
+1:2457599:      *
+1:2457599:      * There is no reason to use that expect on the Paxos code path, where we need ensure that
+1:2457599:      * anything inserted use the ballot timestamp (to respect the order of update decided by
+1:2457599:      * the Paxos algorithm). We use {@code newTimestamp - 1} for deletions because tombstones
+1:2457599:      * always win on timestamp equality and we don't want to delete our own insertions
+1:2457599:      * (typically, when we overwrite a collection, we first set a complex deletion to delete the
+1:2457599:      * previous collection before adding new elements. If we were to set that complex deletion
+1:2457599:      * to the same timestamp that the new elements, it would delete those elements). And since
+1:2457599:      * tombstones always wins on timestamp equality, using -1 guarantees our deletion will still
+1:2457599:      * delete anything from a previous update.
+1:2457599:      */
+1:2457599:     public void updateAllTimestamp(long newTimestamp)
+1:a991b64:     {
+1:e51f83b:         Holder holder = holder();
+1:2457599:         deletionInfo.updateAllTimestamp(newTimestamp - 1);
+1:e51f83b:         Object[] tree = BTree.<Row>transformAndFilter(holder.tree, (x) -> x.updateAllTimestamp(newTimestamp));
+1:e51f83b:         Row staticRow = holder.staticRow.updateAllTimestamp(newTimestamp);
+1:e51f83b:         EncodingStats newStats = EncodingStats.Collector.collect(staticRow, BTree.<Row>iterator(tree), deletionInfo);
+1:c3bc856:         this.holder = new Holder(holder.columns, tree, deletionInfo, staticRow, newStats);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:a991b64:      * The number of "operations" contained in the update.
+1:a991b64:      * <p>
+1:a991b64:      * This is used by {@code Memtable} to approximate how much work this update does. In practice, this
+1:a991b64:      * count how many rows are updated and how many ranges are deleted by the partition update.
+1:a991b64:      *
+1:a991b64:      * @return the number of "operations" performed by the update.
+1:a991b64:      */
+1:a991b64:     public int operationCount()
+1:a991b64:     {
+1:a991b64:         return rowCount()
+1:3615da5:              + (staticRow().isEmpty() ? 0 : 1)
+1:a991b64:              + deletionInfo.rangeCount()
+1:a991b64:              + (deletionInfo.getPartitionDeletion().isLive() ? 0 : 1);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:a991b64:      * The size of the data contained in this update.
+1:a991b64:      *
+1:a991b64:      * @return the size of the data contained in this update.
+1:a991b64:      */
+1:a991b64:     public int dataSize()
+1:a991b64:     {
+1:a991b64:         int size = 0;
+1:a991b64:         for (Row row : this)
+1:a991b64:         {
+1:a991b64:             size += row.clustering().dataSize();
+1:2457599:             for (ColumnData cd : row)
+1:2457599:                 size += cd.dataSize();
+1:a991b64:         }
+1:a991b64:         return size;
+1:a991b64:     }
+1:2457599: 
+1:2457599:     @Override
+1:c3bc856:     public PartitionColumns columns()
+1:2457599:     {
+1:c3bc856:         // The superclass implementation calls holder(), but that triggers a build of the PartitionUpdate. But since
+1:c3bc856:         // the columns are passed to the ctor, we know the holder always has the proper columns even if it doesn't have
+1:c3bc856:         // the built rows yet, so just bypass the holder() method.
+1:c3bc856:         return holder.columns;
+1:87ea6bc:     }
+1:2457599: 
+1:e51f83b:     protected Holder holder()
+1:2457599:     {
+1:2457599:         maybeBuild();
+1:e51f83b:         return holder;
+1:2457599:     }
+1:2457599: 
+1:c055ab9:     public EncodingStats stats()
+1:2457599:     {
+1:e51f83b:         return holder().stats;
+1:2457599:     }
+1:2457599: 
+1:a991b64:     /**
+1:a991b64:      * If a partition update has been read (and is thus unmodifiable), a call to this method
+1:a991b64:      * makes the update modifiable again.
+1:a991b64:      * <p>
+1:a991b64:      * Please note that calling this method won't result in optimal behavior in the sense that
+1:a991b64:      * even if very little is added to the update after this call, the whole update will be sorted
+1:a991b64:      * again on read. This should thus be used sparingly (and if it turns that we end up using
+1:a991b64:      * this often, we should consider optimizing the behavior).
+1:a991b64:      */
+1:a991b64:     public synchronized void allowNewUpdates()
+1:87ea6bc:     {
+1:2457599:         if (!canReOpen)
+1:2457599:             throw new IllegalStateException("You cannot do more updates on collectCounterMarks has been called");
+1:2457599: 
+1:a991b64:         // This is synchronized to make extra sure things work properly even if this is
+1:a991b64:         // called concurrently with sort() (which should be avoided in the first place, but
+1:a991b64:         // better safe than sorry).
+1:2457599:         isBuilt = false;
+1:e51f83b:         if (rowBuilder == null)
+1:e51f83b:             rowBuilder = builder(16);
+1:a991b64:     }
+1:87ea6bc: 
+1:e51f83b:     private BTree.Builder<Row> builder(int initialCapacity)
+1:a991b64:     {
+1:e51f83b:         return BTree.<Row>builder(metadata.comparator, initialCapacity)
+1:e51f83b:                     .setQuickResolver((a, b) ->
+1:e51f83b:                                       Rows.merge(a, b, createdAtInSec));
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:2457599:      * Returns an iterator that iterates over the rows of this update in clustering order.
+1:a991b64:      * <p>
+1:a991b64:      * Note that this might trigger a sorting of the update, and as such the update will not
+1:a991b64:      * be modifiable anymore after this call.
+1:a991b64:      *
+1:a991b64:      * @return an iterator over the rows of this update.
+1:a991b64:      */
+1:2457599:     @Override
+1:a991b64:     public Iterator<Row> iterator()
+1:a991b64:     {
+1:2457599:         maybeBuild();
+1:a991b64:         return super.iterator();
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:a991b64:      * Validates the data contained in this update.
+1:a991b64:      *
+1:8c64cef:      * @throws org.apache.cassandra.serializers.MarshalException if some of the data contained in this update is corrupted.
+1:a991b64:      */
+1:a991b64:     public void validate()
+1:a991b64:     {
+1:a991b64:         for (Row row : this)
+1:a991b64:         {
+1:a991b64:             metadata().comparator.validate(row.clustering());
+1:2457599:             for (ColumnData cd : row)
+1:2457599:                 cd.validate();
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:a991b64:      * The maximum timestamp used in this update.
+1:a991b64:      *
+1:a991b64:      * @return the maximum timestamp used in this update.
+1:a991b64:      */
+1:a991b64:     public long maxTimestamp()
+1:a991b64:     {
+1:2457599:         maybeBuild();
+1:2457599: 
+1:2457599:         long maxTimestamp = deletionInfo.maxTimestamp();
+1:2457599:         for (Row row : this)
+1:2457599:         {
+1:2457599:             maxTimestamp = Math.max(maxTimestamp, row.primaryKeyLivenessInfo().timestamp());
+1:2457599:             for (ColumnData cd : row)
+1:2457599:             {
+1:2457599:                 if (cd.column().isSimple())
+1:2457599:                 {
+1:2457599:                     maxTimestamp = Math.max(maxTimestamp, ((Cell)cd).timestamp());
+1:2457599:                 }
+1:2457599:                 else
+1:2457599:                 {
+1:2457599:                     ComplexColumnData complexData = (ComplexColumnData)cd;
+1:2457599:                     maxTimestamp = Math.max(maxTimestamp, complexData.complexDeletion().markedForDeleteAt());
+1:2457599:                     for (Cell cell : complexData)
+1:2457599:                         maxTimestamp = Math.max(maxTimestamp, cell.timestamp());
+1:2457599:                 }
+1:2457599:             }
+1:2457599:         }
+1:a991b64:         return maxTimestamp;
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:a991b64:      * For an update on a counter table, returns a list containing a {@code CounterMark} for
+1:a991b64:      * every counter contained in the update.
+1:a991b64:      *
+1:a991b64:      * @return a list with counter marks for every counter in this update.
+1:a991b64:      */
+1:a991b64:     public List<CounterMark> collectCounterMarks()
+1:a991b64:     {
+1:a991b64:         assert metadata().isCounter();
+2:2457599:         maybeBuild();
+1:2457599:         // We will take aliases on the rows of this update, and update them in-place. So we should be sure the
+1:a11f210:         // update is now immutable for all intent and purposes.
+1:2457599:         canReOpen = false;
+1:a991b64: 
+1:a11f210:         List<CounterMark> marks = new ArrayList<>();
+1:a11f210:         addMarksForRow(staticRow(), marks);
+1:a991b64:         for (Row row : this)
+1:a11f210:             addMarksForRow(row, marks);
+1:a11f210:         return marks;
+1:a11f210:     }
+1:a11f210: 
+1:a11f210:     private void addMarksForRow(Row row, List<CounterMark> marks)
+1:a11f210:     {
+1:a11f210:         for (Cell cell : row.cells())
+1:2457599:         {
+1:a11f210:             if (cell.isCounterCell())
+1:a11f210:                 marks.add(new CounterMark(row, cell.column(), cell.path()));
+1:2457599:         }
+1:a991b64:     }
+1:a991b64: 
+1:2457599:     private void assertNotBuilt()
+1:a991b64:     {
+1:2457599:         if (isBuilt)
+1:2457599:             throw new IllegalStateException("An update should not be written again once it has been read");
+1:2457599:     }
+1:2457599: 
+1:2457599:     public void addPartitionDeletion(DeletionTime deletionTime)
+1:2457599:     {
+1:2457599:         assertNotBuilt();
+1:2457599:         deletionInfo.add(deletionTime);
+1:2457599:     }
+1:2457599: 
+1:2457599:     public void add(RangeTombstone range)
+1:2457599:     {
+1:2457599:         assertNotBuilt();
+1:2457599:         deletionInfo.add(range, metadata.comparator);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:2457599:      * Adds a row to this update.
+1:a991b64:      *
+1:2457599:      * There is no particular assumption made on the order of row added to a partition update. It is further
+1:2457599:      * allowed to add the same row (more precisely, multiple row objects for the same clustering).
+1:a991b64:      *
+1:2457599:      * Note however that the columns contained in the added row must be a subset of the columns used when
+1:2457599:      * creating this update.
+1:2457599:      *
+1:2457599:      * @param row the row to add.
+1:a991b64:      */
+1:2457599:     public void add(Row row)
+1:a991b64:     {
+1:2457599:         if (row.isEmpty())
+1:2457599:             return;
+1:a991b64: 
+1:2457599:         assertNotBuilt();
+1:a991b64: 
+1:2457599:         if (row.isStatic())
+1:2457599:         {
+1:aa57626:             // this assert is expensive, and possibly of limited value; we should consider removing it
+1:aa57626:             // or introducing a new class of assertions for test purposes
+1:0d74c3e:             assert columns().statics.containsAll(row.columns()) : columns().statics + " is not superset of " + row.columns();
+1:e51f83b:             Row staticRow = holder.staticRow.isEmpty()
+1:2457599:                       ? row
+1:e51f83b:                       : Rows.merge(holder.staticRow, row, createdAtInSec);
+1:c3bc856:             holder = new Holder(holder.columns, holder.tree, holder.deletionInfo, staticRow, holder.stats);
+1:2457599:         }
+1:2457599:         else
+1:2457599:         {
+1:aa57626:             // this assert is expensive, and possibly of limited value; we should consider removing it
+1:aa57626:             // or introducing a new class of assertions for test purposes
+1:0d74c3e:             assert columns().regulars.containsAll(row.columns()) : columns().regulars + " is not superset of " + row.columns();
+1:e51f83b:             rowBuilder.add(row);
+1:2457599:         }
+1:a991b64:     }
+1:a991b64: 
+1:2457599:     private void maybeBuild()
+1:a991b64:     {
+1:2457599:         if (isBuilt)
+2:a991b64:             return;
+1:a991b64: 
+1:2457599:         build();
+1:a991b64:     }
+1:a991b64: 
+1:2457599:     private synchronized void build()
+1:a991b64:     {
+1:2457599:         if (isBuilt)
+1:a991b64:             return;
+1:a991b64: 
+1:e51f83b:         Holder holder = this.holder;
+1:e51f83b:         Object[] cur = holder.tree;
+1:e51f83b:         Object[] add = rowBuilder.build();
+1:e51f83b:         Object[] merged = BTree.<Row>merge(cur, add, metadata.comparator,
+1:e51f83b:                                            UpdateFunction.Simple.of((a, b) -> Rows.merge(a, b, createdAtInSec)));
+1:a991b64: 
+1:e51f83b:         assert deletionInfo == holder.deletionInfo;
+1:e51f83b:         EncodingStats newStats = EncodingStats.Collector.collect(holder.staticRow, BTree.<Row>iterator(merged), deletionInfo);
+1:a991b64: 
+1:c3bc856:         this.holder = new Holder(holder.columns, merged, holder.deletionInfo, holder.staticRow, newStats);
+1:e51f83b:         rowBuilder = null;
+1:2457599:         isBuilt = true;
+1:a991b64:     }
+1:a991b64: 
+1:2457599:     @Override
+1:270e986:     public String toString()
+1:a991b64:     {
+1:270e986:         if (isBuilt)
+1:270e986:             return super.toString();
+1:a991b64: 
+1:270e986:         // We intentionally override AbstractBTreePartition#toString() to avoid iterating over the rows in the
+1:270e986:         // partition, which can result in build() being triggered and lead to errors if the PartitionUpdate is later
+1:270e986:         // modified.
+1:a991b64: 
+1:270e986:         StringBuilder sb = new StringBuilder();
+1:270e986:         sb.append(String.format("[%s.%s] key=%s columns=%s",
+1:270e986:                                 metadata.ksName,
+1:270e986:                                 metadata.cfName,
+1:270e986:                                 metadata.getKeyValidator().getString(partitionKey().getKey()),
+1:270e986:                                 columns()));
+1:a991b64: 
+1:270e986:         sb.append("\n    deletionInfo=").append(deletionInfo);
+1:270e986:         sb.append(" (not built)");
+1:270e986:         return sb.toString();
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:2683806:      * Creates a new simple partition update builder.
+1:a991b64:      *
+1:2683806:      * @param metadata the metadata for the table this is a partition of.
+1:2683806:      * @param partitionKeyValues the values for partition key columns identifying this partition. The values for each
+1:2683806:      * partition key column can be passed either directly as {@code ByteBuffer} or using a "native" value (int for
+1:2683806:      * Int32Type, string for UTF8Type, ...). It is also allowed to pass a single {@code DecoratedKey} value directly.
+1:2683806:      * @return a newly created builder.
+1:a991b64:      */
+1:2683806:     public static SimpleBuilder simpleBuilder(CFMetaData metadata, Object... partitionKeyValues)
+1:a991b64:     {
+1:2683806:         return new SimpleBuilders.PartitionUpdateBuilder(metadata, partitionKeyValues);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:2683806:      * Interface for building partition updates geared towards human.
+1:a991b64:      * <p>
+1:2683806:      * This should generally not be used when performance matters too much, but provides a more convenient interface to
+1:2683806:      * build an update than using the class constructor when performance is not of the utmost importance.
+1:a991b64:      */
+1:2683806:     public interface SimpleBuilder
+1:a991b64:     {
+1:a991b64:         /**
+1:2683806:          * The metadata of the table this is a builder on.
+1:a991b64:          */
+1:2683806:         public CFMetaData metadata();
+1:a991b64: 
+1:a991b64:         /**
+1:2683806:          * Sets the timestamp to use for the following additions to this builder or any derived (row) builder.
+1:a991b64:          *
+1:2683806:          * @param timestamp the timestamp to use for following additions. If that timestamp hasn't been set, the current
+1:2683806:          * time in microseconds will be used.
+1:2683806:          * @return this builder.
+1:a991b64:          */
+1:2683806:         public SimpleBuilder timestamp(long timestamp);
+1:a991b64: 
+5:2683806:         /**
+1:2683806:          * Sets the ttl to use for the following additions to this builder or any derived (row) builder.
+1:a991b64:          *
+1:2683806:          * @param ttl the ttl to use for following additions. If that ttl hasn't been set, no ttl will be used.
+1:2683806:          * @return this builder.
+5:2683806:          */
+1:2683806:         public SimpleBuilder ttl(int ttl);
+1:a991b64: 
+1:2683806:         /**
+1:2683806:          * Sets the current time to use for the following additions to this builder or any derived (row) builder.
+4:2683806:          *
+1:2683806:          * @param nowInSec the current time to use for following additions. If the current time hasn't been set, the current
+1:2683806:          * time in seconds will be used.
+1:2683806:          * @return this builder.
+1:2683806:          */
+1:2683806:         public SimpleBuilder nowInSec(int nowInSec);
+1:a991b64: 
+1:2683806:         /**
+1:2683806:          * Adds the row identifier by the provided clustering and return a builder for that row.
+1:2683806:          *
+1:2683806:          * @param clusteringValues the value for the clustering columns of the row to add to this build. There may be no
+1:2683806:          * values if either the table has no clustering column, or if you want to edit the static row. Note that as a
+1:2683806:          * shortcut it is also allowed to pass a {@code Clustering} object directly, in which case that should be the
+1:2683806:          * only argument.
+1:2683806:          * @return a builder for the row identified by {@code clusteringValues}.
+1:2683806:          */
+1:2683806:         public Row.SimpleBuilder row(Object... clusteringValues);
+1:a991b64: 
+1:2683806:         /**
+1:2683806:          * Deletes the partition identified by this builder (using a partition level deletion).
+1:2683806:          *
+1:2683806:          * @return this builder.
+1:2683806:          */
+1:2683806:         public SimpleBuilder delete();
+1:a991b64: 
+1:2683806:         /**
+1:2683806:          * Adds a new range tombstone to this update, returning a builder for that range.
+1:2683806:          *
+1:2683806:          * @return the range tombstone builder for the newly added range.
+1:2683806:          */
+1:2683806:         public RangeTombstoneBuilder addRangeTombstone();
+1:a991b64: 
+1:2683806:         /**
+1:2683806:          * Build the update represented by this builder.
+1:2683806:          *
+1:2683806:          * @return the built update.
+1:2683806:          */
+1:2683806:         public PartitionUpdate build();
+1:a991b64: 
+1:2683806:         /**
+1:2683806:          * As shortcut for {@code new Mutation(build())}.
+1:2683806:          *
+1:2683806:          * @return the built update, wrapped in a {@code Mutation}.
+1:2683806:          */
+1:2683806:         public Mutation buildAsMutation();
+1:a991b64: 
+1:2683806:         /**
+1:2683806:          * Interface to build range tombstone.
+1:2683806:          *
+1:2683806:          * By default, if no other methods are called, the represented range is inclusive of both start and end and
+1:2683806:          * includes everything (its start is {@code BOTTOM} and it's end is {@code TOP}).
+1:2683806:          */
+1:2683806:         public interface RangeTombstoneBuilder
+1:a991b64:         {
+1:2683806:             /**
+1:2683806:              * Sets the start for the built range using the provided values.
+1:2683806:              *
+1:2683806:              * @param values the value for the start of the range. They act like the {@code clusteringValues} argument
+1:143a7d9:              * of the {@link SimpleBuilder#row(Object...)} method, except that it doesn't have to be a full
+1:2683806:              * clustering, it can only be a prefix.
+1:2683806:              * @return this builder.
+1:2683806:              */
+1:2683806:             public RangeTombstoneBuilder start(Object... values);
+1:a991b64: 
+1:2683806:             /**
+1:2683806:              * Sets the end for the built range using the provided values.
+1:2683806:              *
+1:2683806:              * @param values the value for the end of the range. They act like the {@code clusteringValues} argument
+1:143a7d9:              * of the {@link SimpleBuilder#row(Object...)} method, except that it doesn't have to be a full
+1:2683806:              * clustering, it can only be a prefix.
+1:2683806:              * @return this builder.
+1:2683806:              */
+1:2683806:             public RangeTombstoneBuilder end(Object... values);
+1:a991b64: 
+1:2683806:             /**
+1:2683806:              * Sets the start of this range as inclusive.
+2:2683806:              * <p>
+1:2683806:              * This is the default and don't need to be called, but can for explicitness.
+1:2683806:              *
+1:2683806:              * @return this builder.
+1:2683806:              */
+1:2683806:             public RangeTombstoneBuilder inclStart();
+1:a991b64: 
+1:2683806:             /**
+1:2683806:              * Sets the start of this range as exclusive.
+1:2683806:              *
+1:2683806:              * @return this builder.
+1:2683806:              */
+1:2683806:             public RangeTombstoneBuilder exclStart();
+1:a991b64: 
+1:2683806:             /**
+1:2683806:              * Sets the end of this range as inclusive.
+1:2683806:              * <p>
+1:2683806:              * This is the default and don't need to be called, but can for explicitness.
+1:2683806:              *
+1:2683806:              * @return this builder.
+1:2683806:              */
+1:2683806:             public RangeTombstoneBuilder inclEnd();
+1:a991b64: 
+1:2683806:             /**
+1:2683806:              * Sets the end of this range as exclusive.
+1:2683806:              *
+1:2683806:              * @return this builder.
+1:2683806:              */
+1:2683806:             public RangeTombstoneBuilder exclEnd();
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public static class PartitionUpdateSerializer
+1:a991b64:     {
+1:a991b64:         public void serialize(PartitionUpdate update, DataOutputPlus out, int version) throws IOException
+1:a991b64:         {
+1:4fb559b:             try (UnfilteredRowIterator iter = update.unfilteredIterator())
+1:a991b64:             {
+1:a991b64:                 assert !iter.isReverseOrder();
+1:a991b64: 
+2:a991b64:                 if (version < MessagingService.VERSION_30)
+1:a991b64:                 {
+1:3e37b4a:                     LegacyLayout.serializeAsLegacyPartition(null, iter, out, version);
+1:a991b64:                 }
+1:a991b64:                 else
+1:a991b64:                 {
+1:8a97969:                     CFMetaData.serializer.serialize(update.metadata(), out, version);
+1:e51f83b:                     UnfilteredRowIteratorSerializer.serializer.serialize(iter, null, out, version, update.rowCount());
+1:a991b64:                 }
+1:a991b64:             }
+1:a991b64:         }
+1:a991b64: 
+1:0a08525:         public PartitionUpdate deserialize(DataInputPlus in, int version, SerializationHelper.Flag flag, ByteBuffer key) throws IOException
+1:a991b64:         {
+1:0a08525:             if (version >= MessagingService.VERSION_30)
+1:a991b64:             {
+1:a991b64:                 assert key == null; // key is only there for the old format
+1:0a08525:                 return deserialize30(in, version, flag);
+1:a991b64:             }
+1:2457599:             else
+1:a991b64:             {
+1:a991b64:                 assert key != null;
+1:8c64cef:                 return deserializePre30(in, version, flag, key);
+1:a991b64:             }
+1:a991b64:         }
+1:a991b64: 
+1:0a08525:         // Used to share same decorated key between updates.
+1:0a08525:         public PartitionUpdate deserialize(DataInputPlus in, int version, SerializationHelper.Flag flag, DecoratedKey key) throws IOException
+1:a991b64:         {
+1:0a08525:             if (version >= MessagingService.VERSION_30)
+1:a991b64:             {
+1:0a08525:                 return deserialize30(in, version, flag);
+1:a991b64:             }
+1:a991b64:             else
+1:a991b64:             {
+1:0a08525:                 assert key != null;
+1:8c64cef:                 return deserializePre30(in, version, flag, key.getKey());
+1:a991b64:             }
+1:a991b64:         }
+1:a991b64: 
+1:0a08525:         private static PartitionUpdate deserialize30(DataInputPlus in, int version, SerializationHelper.Flag flag) throws IOException
+1:a991b64:         {
+1:8a97969:             CFMetaData metadata = CFMetaData.serializer.deserialize(in, version);
+1:fe388d4:             UnfilteredRowIteratorSerializer.Header header = UnfilteredRowIteratorSerializer.serializer.deserializeHeader(metadata, null, in, version, flag);
+1:2457599:             if (header.isEmpty)
+1:8a97969:                 return emptyUpdate(metadata, header.key);
+1:a991b64: 
+1:2457599:             assert !header.isReversed;
+1:2457599:             assert header.rowEstimate >= 0;
+1:a991b64: 
+1:8a97969:             MutableDeletionInfo.Builder deletionBuilder = MutableDeletionInfo.builder(header.partitionDeletion, metadata.comparator, false);
+1:e51f83b:             BTree.Builder<Row> rows = BTree.builder(metadata.comparator, header.rowEstimate);
+1:e51f83b:             rows.auto(false);
+1:a991b64: 
+1:8a97969:             try (UnfilteredRowIterator partition = UnfilteredRowIteratorSerializer.serializer.deserialize(in, version, metadata, flag, header))
+1:2457599:             {
+1:2457599:                 while (partition.hasNext())
+1:2457599:                 {
+1:2457599:                     Unfiltered unfiltered = partition.next();
+1:2457599:                     if (unfiltered.kind() == Unfiltered.Kind.ROW)
+1:2457599:                         rows.add((Row)unfiltered);
+1:2457599:                     else
+1:2457599:                         deletionBuilder.add((RangeTombstoneMarker)unfiltered);
+1:2457599:                 }
+1:2457599:             }
+1:2457599: 
+1:e51f83b:             MutableDeletionInfo deletionInfo = deletionBuilder.build();
+1:8a97969:             return new PartitionUpdate(metadata,
+1:2457599:                                        header.key,
+1:c3bc856:                                        new Holder(header.sHeader.columns(), rows.build(), deletionInfo, header.staticRow, header.sHeader.stats()),
+1:e51f83b:                                        deletionInfo,
+1:2457599:                                        false);
+1:2457599:         }
+1:2457599: 
+1:8c64cef:         private static PartitionUpdate deserializePre30(DataInputPlus in, int version, SerializationHelper.Flag flag, ByteBuffer key) throws IOException
+1:2457599:         {
+1:8c64cef:             try (UnfilteredRowIterator iterator = LegacyLayout.deserializeLegacyPartition(in, version, flag, key))
+1:2457599:             {
+1:8c64cef:                 assert iterator != null; // This is only used in mutation, and mutation have never allowed "null" column families
+1:fd74a03:                 return PartitionUpdate.fromIterator(iterator, ColumnFilter.all(iterator.metadata()));
+1:2457599:             }
+1:2457599:         }
+1:2457599: 
+1:03f72ac:         public long serializedSize(PartitionUpdate update, int version)
+1:2457599:         {
+1:4fb559b:             try (UnfilteredRowIterator iter = update.unfilteredIterator())
+1:2457599:             {
+1:a991b64:                 if (version < MessagingService.VERSION_30)
+1:3e37b4a:                     return LegacyLayout.serializedSizeAsLegacyPartition(null, iter, version);
+1:2457599: 
+1:8a97969:                 return CFMetaData.serializer.serializedSize(update.metadata(), version)
+1:e51f83b:                      + UnfilteredRowIteratorSerializer.serializer.serializedSize(iter, null, version, update.rowCount());
+1:2457599:             }
+1:2457599:         }
+1:2457599:     }
+1:2457599: 
+1:a991b64:     /**
+1:a991b64:      * A counter mark is basically a pointer to a counter update inside this partition update. That pointer allows
+1:a991b64:      * us to update the counter value based on the pre-existing value read during the read-before-write that counters
+1:a991b64:      * do. See {@link CounterMutation} to understand how this is used.
+1:a991b64:      */
+1:2457599:     public static class CounterMark
+1:2457599:     {
+1:2457599:         private final Row row;
+1:a991b64:         private final ColumnDefinition column;
+1:a991b64:         private final CellPath path;
+1:2457599: 
+1:2457599:         private CounterMark(Row row, ColumnDefinition column, CellPath path)
+1:a991b64:         {
+1:a991b64:             this.row = row;
+1:a991b64:             this.column = column;
+1:a991b64:             this.path = path;
+1:a991b64:         }
+1:2457599: 
+1:a991b64:         public Clustering clustering()
+1:a991b64:         {
+1:2457599:             return row.clustering();
+1:a991b64:         }
+1:2457599: 
+1:a991b64:         public ColumnDefinition column()
+1:a991b64:         {
+1:a991b64:             return column;
+1:a991b64:         }
+1:2457599: 
+1:a991b64:         public CellPath path()
+1:a991b64:         {
+1:a991b64:             return path;
+1:a991b64:         }
+1:2457599: 
+1:a991b64:         public ByteBuffer value()
+1:a991b64:         {
+1:2457599:             return path == null
+1:2457599:                  ? row.getCell(column).value()
+1:2457599:                  : row.getCell(column, path).value();
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         public void setValue(ByteBuffer value)
+1:a991b64:         {
+1:2457599:             // This is a bit of a giant hack as this is the only place where we mutate a Row object. This makes it more efficient
+1:2457599:             // for counters however and this won't be needed post-#6506 so that's probably fine.
+1:e51f83b:             assert row instanceof BTreeRow;
+1:e51f83b:             ((BTreeRow)row).setValue(column, path, value);
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: }
+============================================================================
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:143a7d9
+/////////////////////////////////////////////////////////////////////////
+1:              * of the {@link SimpleBuilder#row(Object...)} method, except that it doesn't have to be a full
+/////////////////////////////////////////////////////////////////////////
+1:              * of the {@link SimpleBuilder#row(Object...)} method, except that it doesn't have to be a full
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:b603720
+commit:f0fd9ad
+commit:a11f210
+/////////////////////////////////////////////////////////////////////////
+1:         // update is now immutable for all intent and purposes.
+1:         List<CounterMark> marks = new ArrayList<>();
+1:         addMarksForRow(staticRow(), marks);
+1:             addMarksForRow(row, marks);
+1:         return marks;
+1:     }
+1: 
+1:     private void addMarksForRow(Row row, List<CounterMark> marks)
+1:     {
+1:         for (Cell cell : row.cells())
+1:             if (cell.isCounterCell())
+1:                 marks.add(new CounterMark(row, cell.column(), cell.path()));
+commit:de405f2
+commit:3e37b4a
+/////////////////////////////////////////////////////////////////////////
+1:                     LegacyLayout.serializeAsLegacyPartition(null, iter, out, version);
+/////////////////////////////////////////////////////////////////////////
+1:                     return LegacyLayout.serializedSizeAsLegacyPartition(null, iter, version);
+commit:fd74a03
+/////////////////////////////////////////////////////////////////////////
+1:      * @param iterator the iterator to turn into updates.
+1:      * @param filter the column filter used when querying {@code iterator}. This is used to make
+1:      * sure we don't include data for which the value has been skipped while reading (as we would
+1:      * then be writing something incorrect).
+1:      *
+1:     public static PartitionUpdate fromIterator(UnfilteredRowIterator iterator, ColumnFilter filter)
+1:         iterator = UnfilteredRowIterators.withOnlyQueriedData(iterator, filter);
+1:     /**
+1:      * Turns the given iterator into an update.
+1:      *
+1:      * @param iterator the iterator to turn into updates.
+1:      * @param filter the column filter used when querying {@code iterator}. This is used to make
+1:      * sure we don't include data for which the value has been skipped while reading (as we would
+1:      * then be writing something incorrect).
+1:      *
+1:      * Warning: this method does not close the provided iterator, it is up to
+1:      * the caller to close it.
+1:      */
+1:     public static PartitionUpdate fromIterator(RowIterator iterator, ColumnFilter filter)
+1:         iterator = RowIterators.withOnlyQueriedData(iterator, filter);
+/////////////////////////////////////////////////////////////////////////
+1:         return fromIterator(UnfilteredRowIterators.merge(asIterators, nowInSecs), ColumnFilter.all(updates.get(0).metadata()));
+/////////////////////////////////////////////////////////////////////////
+1:                 return PartitionUpdate.fromIterator(iterator, ColumnFilter.all(iterator.metadata()));
+commit:c055ab9
+/////////////////////////////////////////////////////////////////////////
+0:     private EncodingStats stats; // will be null if isn't built
+/////////////////////////////////////////////////////////////////////////
+0:                             EncodingStats stats,
+/////////////////////////////////////////////////////////////////////////
+0:         return new PartitionUpdate(metadata, key, PartitionColumns.NONE, Rows.EMPTY_STATIC_ROW, Collections.<Row>emptyList(), MutableDeletionInfo.live(), EncodingStats.NO_STATS, true, false);
+/////////////////////////////////////////////////////////////////////////
+0:         return new PartitionUpdate(metadata, key, PartitionColumns.NONE, Rows.EMPTY_STATIC_ROW, Collections.<Row>emptyList(), new MutableDeletionInfo(timestamp, nowInSec), EncodingStats.NO_STATS, true, false);
+/////////////////////////////////////////////////////////////////////////
+0:              ? new PartitionUpdate(metadata, key, new PartitionColumns(row.columns(), Columns.NONE), row, Collections.<Row>emptyList(), MutableDeletionInfo.live(), EncodingStats.NO_STATS, true, false)
+0:              : new PartitionUpdate(metadata, key, new PartitionColumns(Columns.NONE, row.columns()), Rows.EMPTY_STATIC_ROW, Collections.singletonList(row), MutableDeletionInfo.live(), EncodingStats.NO_STATS, true, false);
+/////////////////////////////////////////////////////////////////////////
+0:         EncodingStats.Collector collector = new EncodingStats.Collector();
+/////////////////////////////////////////////////////////////////////////
+0:         EncodingStats stats = EncodingStats.NO_STATS;
+/////////////////////////////////////////////////////////////////////////
+1:     public EncodingStats stats()
+/////////////////////////////////////////////////////////////////////////
+0:         EncodingStats.Collector collector = new EncodingStats.Collector();
+commit:8a97969
+/////////////////////////////////////////////////////////////////////////
+1:             CFMetaData.serializer.serialize(update.metadata(), out, version);
+/////////////////////////////////////////////////////////////////////////
+1:             CFMetaData metadata = CFMetaData.serializer.deserialize(in, version);
+0:             UnfilteredRowIteratorSerializer.Header header = UnfilteredRowIteratorSerializer.serializer.deserializeHeader(in, version, metadata, flag);
+1:                 return emptyUpdate(metadata, header.key);
+1:             MutableDeletionInfo.Builder deletionBuilder = MutableDeletionInfo.builder(header.partitionDeletion, metadata.comparator, false);
+1:             try (UnfilteredRowIterator partition = UnfilteredRowIteratorSerializer.serializer.deserialize(in, version, metadata, flag, header))
+/////////////////////////////////////////////////////////////////////////
+1:             return new PartitionUpdate(metadata,
+/////////////////////////////////////////////////////////////////////////
+1:                 return CFMetaData.serializer.serializedSize(update.metadata(), version)
+0:                      + UnfilteredRowIteratorSerializer.serializer.serializedSize(iter, version, update.rows.size());
+commit:2457599
+/////////////////////////////////////////////////////////////////////////
+0: import com.google.common.collect.Iterators;
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.serializers.MarshalException;
+0: import org.apache.cassandra.utils.MergeIterator;
+1:  * A PartitionUpdate object requires that all writes/additions are performed before we
+1:  * try to read the updates (attempts to write to the PartitionUpdate after a read method
+1:  * has been called will result in an exception being thrown). In other words, a Partition
+1:  * is mutable while it's written but becomes immutable as soon as it is read.
+1:  * A typical usage is to create a new update ({@code new PartitionUpdate(metadata, key, columns, capacity)})
+1:  * and then add rows and range tombstones through the {@code add()} methods (the partition
+1:  * level deletion time can also be set with {@code addPartitionDeletion()}). However, there
+1:  * is also a few static helper constructor methods for special cases ({@code emptyUpdate()},
+1:  * {@code fullPartitionDelete} and {@code singleRowUpdate}).
+0: public class PartitionUpdate extends AbstractThreadUnsafePartition
+1:     private final int createdAtInSec = FBUtilities.nowInSeconds();
+1:     // Records whether this update is "built", i.e. if the build() method has been called, which
+1:     // happens when the update is read. Further writing is then rejected though a manual call
+1:     // to allowNewUpdates() allow new writes. We could make that more implicit but only triggers
+1:     // really requires that so we keep it simple for now).
+1:     private boolean isBuilt;
+1:     private boolean canReOpen = true;
+1: 
+0:     private final MutableDeletionInfo deletionInfo;
+0:     private RowStats stats; // will be null if isn't built
+1: 
+0:     private Row staticRow = Rows.EMPTY_STATIC_ROW;
+1: 
+1:     private final boolean canHaveShadowedData;
+0:                             Row staticRow,
+0:                             List<Row> rows,
+1:                             MutableDeletionInfo deletionInfo,
+0:                             RowStats stats,
+0:                             boolean isBuilt,
+1:                             boolean canHaveShadowedData)
+0:         super(metadata, key, columns, rows);
+0:         this.staticRow = staticRow;
+1:         this.deletionInfo = deletionInfo;
+0:         this.stats = stats;
+0:         this.isBuilt = isBuilt;
+1:         this.canHaveShadowedData = canHaveShadowedData;
+/////////////////////////////////////////////////////////////////////////
+0:         this(metadata, key, columns, Rows.EMPTY_STATIC_ROW, new ArrayList<>(initialRowCapacity), MutableDeletionInfo.live(), null, false, true);
+1:     /**
+1:      * Creates a empty immutable partition update.
+1:      *
+1:      * @param metadata the metadata for the created update.
+1:      * @param key the partition key for the created update.
+1:      *
+1:      * @return the newly created empty (and immutable) update.
+1:      */
+1:     public static PartitionUpdate emptyUpdate(CFMetaData metadata, DecoratedKey key)
+0:         return new PartitionUpdate(metadata, key, PartitionColumns.NONE, Rows.EMPTY_STATIC_ROW, Collections.<Row>emptyList(), MutableDeletionInfo.live(), RowStats.NO_STATS, true, false);
+1:     /**
+1:      * Creates an immutable partition update that entirely deletes a given partition.
+1:      *
+1:      * @param metadata the metadata for the created update.
+1:      * @param key the partition key for the partition that the created update should delete.
+1:      * @param timestamp the timestamp for the deletion.
+1:      * @param nowInSec the current time in seconds to use as local deletion time for the partition deletion.
+1:      *
+1:      * @return the newly created partition deletion update.
+1:      */
+1:     public static PartitionUpdate fullPartitionDelete(CFMetaData metadata, DecoratedKey key, long timestamp, int nowInSec)
+0:         return new PartitionUpdate(metadata, key, PartitionColumns.NONE, Rows.EMPTY_STATIC_ROW, Collections.<Row>emptyList(), new MutableDeletionInfo(timestamp, nowInSec), RowStats.NO_STATS, true, false);
+1:     }
+1: 
+1:     /**
+1:      * Creates an immutable partition update that contains a single row update.
+1:      *
+1:      * @param metadata the metadata for the created update.
+1:      * @param key the partition key for the partition that the created update should delete.
+1:      * @param row the row for the update.
+1:      *
+1:      * @return the newly created partition update containing only {@code row}.
+1:      */
+1:     public static PartitionUpdate singleRowUpdate(CFMetaData metadata, DecoratedKey key, Row row)
+1:     {
+0:         return row.isStatic()
+0:              ? new PartitionUpdate(metadata, key, new PartitionColumns(row.columns(), Columns.NONE), row, Collections.<Row>emptyList(), MutableDeletionInfo.live(), RowStats.NO_STATS, true, false)
+0:              : new PartitionUpdate(metadata, key, new PartitionColumns(Columns.NONE, row.columns()), Rows.EMPTY_STATIC_ROW, Collections.singletonList(row), MutableDeletionInfo.live(), RowStats.NO_STATS, true, false);
+1:     }
+1: 
+1:     /**
+1:      * Turns the given iterator into an update.
+1:      *
+1:      * Warning: this method does not close the provided iterator, it is up to
+1:      * the caller to close it.
+1:      */
+0:     public static PartitionUpdate fromIterator(UnfilteredRowIterator iterator)
+1:     {
+0:         CFMetaData metadata = iterator.metadata();
+0:         boolean reversed = iterator.isReverseOrder();
+1: 
+0:         List<Row> rows = new ArrayList<>();
+0:         MutableDeletionInfo.Builder deletionBuilder = MutableDeletionInfo.builder(iterator.partitionLevelDeletion(), metadata.comparator, reversed);
+1: 
+0:         while (iterator.hasNext())
+1:         {
+0:             Unfiltered unfiltered = iterator.next();
+1:             if (unfiltered.kind() == Unfiltered.Kind.ROW)
+1:                 rows.add((Row)unfiltered);
+1:             else
+1:                 deletionBuilder.add((RangeTombstoneMarker)unfiltered);
+1:         }
+1: 
+0:         if (reversed)
+0:             Collections.reverse(rows);
+1: 
+0:         return new PartitionUpdate(metadata, iterator.partitionKey(), iterator.columns(), iterator.staticRow(), rows, deletionBuilder.build(), iterator.stats(), true, false);
+1:     }
+1: 
+0:     public static PartitionUpdate fromIterator(RowIterator iterator)
+1:     {
+0:         CFMetaData metadata = iterator.metadata();
+0:         boolean reversed = iterator.isReverseOrder();
+1: 
+0:         List<Row> rows = new ArrayList<>();
+1: 
+0:         RowStats.Collector collector = new RowStats.Collector();
+1: 
+0:         while (iterator.hasNext())
+1:         {
+0:             Row row = iterator.next();
+0:             rows.add(row);
+0:             Rows.collectStats(row, collector);
+1:         }
+1: 
+0:         if (reversed)
+0:             Collections.reverse(rows);
+1: 
+0:         return new PartitionUpdate(metadata, iterator.partitionKey(), iterator.columns(), iterator.staticRow(), rows, MutableDeletionInfo.live(), collector.get(), true, false);
+1:     }
+1: 
+1:     protected boolean canHaveShadowedData()
+1:     {
+1:         return canHaveShadowedData;
+1:     }
+1: 
+0:     public Row staticRow()
+1:     {
+0:         return staticRow;
+1:     }
+1: 
+0:     public DeletionInfo deletionInfo()
+1:     {
+0:         return deletionInfo;
+/////////////////////////////////////////////////////////////////////////
+1:             serializer.serialize(update, out, version);
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         final int size = updates.size();
+1: 
+1:         if (size == 1)
+0:         // Used when merging row to decide of liveness
+0:         int nowInSec = FBUtilities.nowInSeconds();
+1: 
+0:         MutableDeletionInfo deletion = MutableDeletionInfo.live();
+0:         Row staticRow = Rows.EMPTY_STATIC_ROW;
+0:         List<Iterator<Row>> updateRowIterators = new ArrayList<>(size);
+0:         RowStats stats = RowStats.NO_STATS;
+1: 
+0:             deletion.add(update.deletionInfo());
+0:             if (!update.staticRow().isEmpty())
+0:                 staticRow = staticRow == Rows.EMPTY_STATIC_ROW ? update.staticRow() : Rows.merge(staticRow, update.staticRow(), nowInSec);
+0:             updateRowIterators.add(update.iterator());
+0:             stats = stats.mergeWith(update.stats());
+/////////////////////////////////////////////////////////////////////////
+0:         PartitionColumns columns = builder.build();
+1: 
+0:         final Row.Merger merger = new Row.Merger(size, nowInSec, columns.regulars);
+1: 
+0:         Iterator<Row> merged = MergeIterator.get(updateRowIterators, metadata.comparator, new MergeIterator.Reducer<Row, Row>()
+1:             @Override
+0:             public boolean trivialReduceIsTrivial()
+0:                 return true;
+1: 
+0:             public void reduce(int idx, Row current)
+1:             {
+0:                 merger.add(idx, current);
+1:             }
+1: 
+0:             protected Row getReduced()
+1:             {
+0:                 // Note that while merger.getRow() can theoretically return null, it won't in this case because
+0:                 // we don't pass an "activeDeletion".
+0:                 return merger.merge(DeletionTime.LIVE);
+1:             }
+1: 
+1:             @Override
+0:             protected void onKeyChange()
+1:             {
+0:                 merger.clear();
+1:             }
+0:         });
+1: 
+0:         List<Row> rows = new ArrayList<>();
+0:         Iterators.addAll(rows, merged);
+1: 
+0:         return new PartitionUpdate(metadata, key, columns, staticRow, rows, deletion, stats, true, true);
+1:     }
+1: 
+1:     /**
+1:      * Modify this update to set every timestamp for live data to {@code newTimestamp} and
+1:      * every deletion timestamp to {@code newTimestamp - 1}.
+1:      *
+1:      * There is no reason to use that expect on the Paxos code path, where we need ensure that
+1:      * anything inserted use the ballot timestamp (to respect the order of update decided by
+1:      * the Paxos algorithm). We use {@code newTimestamp - 1} for deletions because tombstones
+1:      * always win on timestamp equality and we don't want to delete our own insertions
+1:      * (typically, when we overwrite a collection, we first set a complex deletion to delete the
+1:      * previous collection before adding new elements. If we were to set that complex deletion
+1:      * to the same timestamp that the new elements, it would delete those elements). And since
+1:      * tombstones always wins on timestamp equality, using -1 guarantees our deletion will still
+1:      * delete anything from a previous update.
+1:      */
+1:     public void updateAllTimestamp(long newTimestamp)
+1:     {
+0:         // We know we won't be updating that update again after this call, and doing is post built is potentially
+0:         // slightly more efficient (things are more "compact"). So force a build if it hasn't happened yet.
+1:         maybeBuild();
+1: 
+1:         deletionInfo.updateAllTimestamp(newTimestamp - 1);
+1: 
+0:         if (!staticRow.isEmpty())
+0:             staticRow = staticRow.updateAllTimestamp(newTimestamp);
+1: 
+0:         for (int i = 0; i < rows.size(); i++)
+0:             rows.set(i, rows.get(i).updateAllTimestamp(newTimestamp));
+/////////////////////////////////////////////////////////////////////////
+0:         return rows.size()
+/////////////////////////////////////////////////////////////////////////
+1:             for (ColumnData cd : row)
+1:                 size += cd.dataSize();
+1:     @Override
+0:     public int rowCount()
+1:     {
+1:         maybeBuild();
+0:         return super.rowCount();
+1:     }
+1: 
+0:     public RowStats stats()
+1:     {
+1:         maybeBuild();
+0:         return stats;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         if (!canReOpen)
+1:             throw new IllegalStateException("You cannot do more updates on collectCounterMarks has been called");
+1: 
+1:         isBuilt = false;
+1:      * Returns an iterator that iterates over the rows of this update in clustering order.
+/////////////////////////////////////////////////////////////////////////
+1:         maybeBuild();
+1:         maybeBuild();
+/////////////////////////////////////////////////////////////////////////
+1:             for (ColumnData cd : row)
+1:                 cd.validate();
+/////////////////////////////////////////////////////////////////////////
+0:         maybeBuild();
+1: 
+1:         long maxTimestamp = deletionInfo.maxTimestamp();
+1:         for (Row row : this)
+1:         {
+1:             maxTimestamp = Math.max(maxTimestamp, row.primaryKeyLivenessInfo().timestamp());
+1:             for (ColumnData cd : row)
+1:             {
+1:                 if (cd.column().isSimple())
+1:                 {
+1:                     maxTimestamp = Math.max(maxTimestamp, ((Cell)cd).timestamp());
+1:                 }
+1:                 else
+1:                 {
+1:                     ComplexColumnData complexData = (ComplexColumnData)cd;
+1:                     maxTimestamp = Math.max(maxTimestamp, complexData.complexDeletion().markedForDeleteAt());
+1:                     for (Cell cell : complexData)
+1:                         maxTimestamp = Math.max(maxTimestamp, cell.timestamp());
+1:                 }
+1:             }
+1:         }
+/////////////////////////////////////////////////////////////////////////
+0:         maybeBuild();
+1:         // We will take aliases on the rows of this update, and update them in-place. So we should be sure the
+0:         // update is no immutable for all intent and purposes.
+1:         canReOpen = false;
+0:         for (Row row : rows)
+0:             for (Cell cell : row.cells())
+1:             {
+0:                     l.add(new CounterMark(row, cell.column(), cell.path()));
+1:             }
+1:     private void assertNotBuilt()
+1:         if (isBuilt)
+1:             throw new IllegalStateException("An update should not be written again once it has been read");
+1:     }
+1: 
+1:     public void addPartitionDeletion(DeletionTime deletionTime)
+1:     {
+1:         assertNotBuilt();
+1:         deletionInfo.add(deletionTime);
+1:     }
+1: 
+1:     public void add(RangeTombstone range)
+1:     {
+1:         assertNotBuilt();
+1:         deletionInfo.add(range, metadata.comparator);
+1:      * Adds a row to this update.
+1:      * There is no particular assumption made on the order of row added to a partition update. It is further
+1:      * allowed to add the same row (more precisely, multiple row objects for the same clustering).
+1:      * Note however that the columns contained in the added row must be a subset of the columns used when
+1:      * creating this update.
+1:      *
+1:      * @param row the row to add.
+1:     public void add(Row row)
+1:         if (row.isEmpty())
+1:             return;
+1:         assertNotBuilt();
+1:         if (row.isStatic())
+1:         {
+0:             // We test for == first because in most case it'll be true and that is faster
+0:             assert columns().statics == row.columns() || columns().statics.contains(row.columns());
+0:             staticRow = staticRow.isEmpty()
+1:                       ? row
+0:                       : Rows.merge(staticRow, row, createdAtInSec);
+1:         }
+1:         else
+1:         {
+0:             // We test for == first because in most case it'll be true and that is faster
+0:             assert columns().regulars == row.columns() || columns().regulars.contains(row.columns());
+0:             rows.add(row);
+1:         }
+/////////////////////////////////////////////////////////////////////////
+0:         return rows.size();
+1:     private void maybeBuild()
+1:         if (isBuilt)
+1:         build();
+1:     private synchronized void build()
+1:         if (isBuilt)
+0:         if (rows.size() <= 1)
+0:             finishBuild();
+0:         Comparator<Row> comparator = metadata.comparator.rowComparator();
+0:         // Sort the rows. Because the same row can have been added multiple times, we can still have duplicates after that
+0:         Collections.sort(rows, comparator);
+0:         // Now find the duplicates and merge them together
+0:         for (int current = 1; current < rows.size(); current++)
+0:             Row previousRow = rows.get(previous);
+0:             Row currentRow = rows.get(current);
+0:             int cmp = comparator.compare(previousRow, currentRow);
+0:                 rows.set(previous, Rows.merge(previousRow, currentRow, createdAtInSec));
+0:                 // current != previous, so move current just after previous if needs be
+0:                     rows.set(previous, currentRow);
+0:         for (int j = rows.size() - 1; j > previous; j--)
+0:             rows.remove(j);
+0:         finishBuild();
+0:     private void finishBuild()
+0:         RowStats.Collector collector = new RowStats.Collector();
+0:         deletionInfo.collectStats(collector);
+0:         for (Row row : rows)
+0:             Rows.collectStats(row, collector);
+0:         stats = collector.get();
+1:         isBuilt = true;
+/////////////////////////////////////////////////////////////////////////
+0:                 UnfilteredRowIteratorSerializer.serializer.serialize(iter, out, version, update.rows.size());
+/////////////////////////////////////////////////////////////////////////
+0:                 SerializationHelper helper = new SerializationHelper(metadata, version, flag);
+0:                     return PartitionUpdate.fromIterator(iterator);
+0:             UnfilteredRowIteratorSerializer.Header header = UnfilteredRowIteratorSerializer.serializer.deserializeHeader(in, version, flag);
+1:             if (header.isEmpty)
+0:                 return emptyUpdate(header.metadata, header.key);
+1:             assert !header.isReversed;
+1:             assert header.rowEstimate >= 0;
+0:             MutableDeletionInfo.Builder deletionBuilder = MutableDeletionInfo.builder(header.partitionDeletion, header.metadata.comparator, false);
+0:             List<Row> rows = new ArrayList<>(header.rowEstimate);
+0:             try (UnfilteredRowIterator partition = UnfilteredRowIteratorSerializer.serializer.deserialize(in, version, flag, header))
+1:             {
+1:                 while (partition.hasNext())
+1:                 {
+1:                     Unfiltered unfiltered = partition.next();
+0:                     if (unfiltered.kind() == Unfiltered.Kind.ROW)
+0:                         rows.add((Row)unfiltered);
+1:                     else
+0:                         deletionBuilder.add((RangeTombstoneMarker)unfiltered);
+1:                 }
+1:             }
+0:             return new PartitionUpdate(header.metadata,
+1:                                        header.key,
+0:                                        header.sHeader.columns(),
+0:                                        header.staticRow,
+0:                                        rows,
+0:                                        deletionBuilder.build(),
+0:                                        header.sHeader.stats(),
+0:                                        true,
+1:                                        false);
+/////////////////////////////////////////////////////////////////////////
+0:                 return UnfilteredRowIteratorSerializer.serializer.serializedSize(iter, version, update.rows.size());
+/////////////////////////////////////////////////////////////////////////
+1:     public static class CounterMark
+1:         private final Row row;
+1:         private CounterMark(Row row, ColumnDefinition column, CellPath path)
+/////////////////////////////////////////////////////////////////////////
+1:             return row.clustering();
+/////////////////////////////////////////////////////////////////////////
+1:             return path == null
+1:                  ? row.getCell(column).value()
+1:                  : row.getCell(column, path).value();
+1:             // This is a bit of a giant hack as this is the only place where we mutate a Row object. This makes it more efficient
+1:             // for counters however and this won't be needed post-#6506 so that's probably fine.
+0:             assert row instanceof ArrayBackedRow;
+0:             ((ArrayBackedRow)row).setValue(column, path, value);
+commit:87ea6bc
+/////////////////////////////////////////////////////////////////////////
+0:     @Override
+0:     public int rowCount()
+1:     {
+0:         maybeSort();
+0:         return super.rowCount();
+1:     }
+1: 
+commit:87c6daf
+/////////////////////////////////////////////////////////////////////////
+0:                 merge(current, previous, nowInSec);
+0:                     move(current, previous);
+commit:a991b64
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.db.partitions;
+1: 
+0: import java.io.DataInput;
+0: import java.io.DataInputStream;
+1: import java.io.IOException;
+1: import java.nio.ByteBuffer;
+0: import java.util.*;
+1: 
+1: import com.google.common.collect.Iterables;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import org.apache.cassandra.config.CFMetaData;
+1: import org.apache.cassandra.config.ColumnDefinition;
+1: import org.apache.cassandra.db.*;
+1: import org.apache.cassandra.db.filter.ColumnFilter;
+1: import org.apache.cassandra.db.rows.*;
+0: import org.apache.cassandra.db.index.SecondaryIndexManager;
+0: import org.apache.cassandra.io.util.DataOutputBuffer;
+0: import org.apache.cassandra.io.util.DataOutputPlus;
+1: import org.apache.cassandra.net.MessagingService;
+0: import org.apache.cassandra.utils.ByteBufferUtil;
+1: import org.apache.cassandra.utils.FBUtilities;
+0: import org.apache.cassandra.utils.Sorting;
+1: 
+1: /**
+1:  * Stores updates made on a partition.
+1:  * <p>
+0:  * A PartitionUpdate object requires that all writes are performed before we
+0:  * try to read the updates (attempts to write to the PartitionUpdate after a
+0:  * read method has been called will result in an exception being thrown).
+0:  * In other words, a Partition is mutable while we do a write and become
+0:  * immutable as soon as it is read.
+1:  * <p>
+0:  * Row updates are added to this update through the {@link #writer} method which
+0:  * returns a {@link Row.Writer}. Multiple rows can be added to this writer as required and
+0:  * those row do not have to added in (clustering) order, and the same row can be added
+0:  * multiple times. Further, for a given row, the writer actually supports intermingling
+0:  * the writing of cells for different complex cells (note that this is usually not supported
+0:  * by {@code Row.Writer} implementations, but is supported here because
+0:  * {@code ModificationStatement} requires that (because we could have multiple {@link Operation}
+0:  * on the same column in a given statement)).
+1:  */
+0: public class PartitionUpdate extends AbstractPartitionData implements Sorting.Sortable
+1: {
+1:     protected static final Logger logger = LoggerFactory.getLogger(PartitionUpdate.class);
+1: 
+0:     // Records whether the partition update has been sorted (it is the rows contained in the partition
+0:     // that are sorted since we don't require rows to be added in order). Sorting happens when the
+0:     // update is read, and writting is rejected as soon as the update is sorted (it's actually possible
+0:     // to manually allow new update by using allowNewUpdates(), and we could make that more implicit, but
+0:     // as only triggers really requires it, we keep it simple for now).
+0:     private boolean isSorted;
+1: 
+1:     public static final PartitionUpdateSerializer serializer = new PartitionUpdateSerializer();
+1: 
+0:     private final Writer writer;
+1: 
+0:     // Used by compare for the sake of implementing the Sorting.Sortable interface (which is in turn used
+0:     // to sort the rows of this update).
+0:     private final InternalReusableClustering p1 = new InternalReusableClustering();
+0:     private final InternalReusableClustering p2 = new InternalReusableClustering();
+1: 
+1:     private PartitionUpdate(CFMetaData metadata,
+1:                             DecoratedKey key,
+0:                             DeletionInfo delInfo,
+0:                             RowDataBlock data,
+1:                             PartitionColumns columns,
+1:                             int initialRowCapacity)
+1:     {
+0:         super(metadata, key, delInfo, columns, data, initialRowCapacity);
+0:         this.writer = createWriter();
+1:     }
+1: 
+1:     public PartitionUpdate(CFMetaData metadata,
+1:                            DecoratedKey key,
+0:                            DeletionInfo delInfo,
+1:                            PartitionColumns columns,
+1:                            int initialRowCapacity)
+1:     {
+1:         this(metadata,
+0:              key,
+0:              delInfo,
+0:              new RowDataBlock(columns.regulars, initialRowCapacity, true, metadata.isCounter()),
+1:              columns,
+1:              initialRowCapacity);
+1:     }
+1: 
+1:     public PartitionUpdate(CFMetaData metadata,
+1:                            DecoratedKey key,
+1:                            PartitionColumns columns,
+1:                            int initialRowCapacity)
+1:     {
+1:         this(metadata,
+0:              key,
+0:              DeletionInfo.live(),
+1:              columns,
+1:              initialRowCapacity);
+1:     }
+1: 
+0:     protected Writer createWriter()
+1:     {
+0:         return new RegularWriter();
+1:     }
+1: 
+0:     protected StaticWriter createStaticWriter()
+1:     {
+0:         return new StaticWriter();
+1:     }
+1: 
+1:     /**
+1:      * Deserialize a partition update from a provided byte buffer.
+1:      *
+1:      * @param bytes the byte buffer that contains the serialized update.
+1:      * @param version the version with which the update is serialized.
+1:      * @param key the partition key for the update. This is only used if {@code version &lt 3.0}
+1:      * and can be {@code null} otherwise.
+1:      *
+1:      * @return the deserialized update or {@code null} if {@code bytes == null}.
+1:      */
+1:     public static PartitionUpdate fromBytes(ByteBuffer bytes, int version, DecoratedKey key)
+1:     {
+1:         if (bytes == null)
+1:             return null;
+1: 
+1:         try
+1:         {
+0:             return serializer.deserialize(new DataInputStream(ByteBufferUtil.inputStream(bytes)),
+1:                                           version,
+1:                                           SerializationHelper.Flag.LOCAL,
+1:                                           version < MessagingService.VERSION_30 ? key : null);
+1:         }
+1:         catch (IOException e)
+1:         {
+1:             throw new RuntimeException(e);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Serialize a partition update as a byte buffer.
+1:      *
+1:      * @param update the partition update to serialize.
+1:      * @param version the version to serialize the update into.
+1:      *
+1:      * @return a newly allocated byte buffer containing the serialized update.
+1:      */
+1:     public static ByteBuffer toBytes(PartitionUpdate update, int version)
+1:     {
+1:         try (DataOutputBuffer out = new DataOutputBuffer())
+1:         {
+0:             serializer.serialize(update, out, MessagingService.current_version);
+0:             return ByteBuffer.wrap(out.getData(), 0, out.getLength());
+1:         }
+1:         catch (IOException e)
+1:         {
+1:             throw new RuntimeException(e);
+1:         }
+1:     }
+1: 
+1:     /**
+0:      * Creates a empty immutable partition update.
+1:      *
+1:      * @param metadata the metadata for the created update.
+0:      * @param key the partition key for the created update.
+1:      *
+0:      * @return the newly created empty (and immutable) update.
+1:      */
+0:     public static PartitionUpdate emptyUpdate(CFMetaData metadata, DecoratedKey key)
+1:     {
+0:         return new PartitionUpdate(metadata, key, PartitionColumns.NONE, 0)
+1:         {
+0:             public Row.Writer staticWriter()
+1:             {
+0:                 throw new UnsupportedOperationException();
+1:             }
+1: 
+0:             public Row.Writer writer()
+1:             {
+0:                 throw new UnsupportedOperationException();
+1:             }
+1: 
+0:             public void addPartitionDeletion(DeletionTime deletionTime)
+1:             {
+0:                 throw new UnsupportedOperationException();
+1:             }
+1: 
+0:             public void addRangeTombstone(RangeTombstone range)
+1:             {
+0:                 throw new UnsupportedOperationException();
+1:             }
+0:         };
+1:     }
+1: 
+1:     /**
+1:      * Creates a partition update that entirely deletes a given partition.
+1:      *
+1:      * @param metadata the metadata for the created update.
+0:      * @param key the partition key for the partition that the created update should delete.
+1:      * @param timestamp the timestamp for the deletion.
+1:      * @param nowInSec the current time in seconds to use as local deletion time for the partition deletion.
+1:      *
+1:      * @return the newly created partition deletion update.
+1:      */
+0:     public static PartitionUpdate fullPartitionDelete(CFMetaData metadata, DecoratedKey key, long timestamp, int nowInSec)
+1:     {
+0:         return new PartitionUpdate(metadata,
+0:                                    key,
+0:                                    new DeletionInfo(timestamp, nowInSec),
+0:                                    new RowDataBlock(Columns.NONE, 0, true, metadata.isCounter()),
+0:                                    PartitionColumns.NONE,
+0:                                    0);
+1:     }
+1: 
+1:     /**
+1:      * Merges the provided updates, yielding a new update that incorporates all those updates.
+1:      *
+1:      * @param updates the collection of updates to merge. This shouldn't be empty.
+1:      *
+1:      * @return a partition update that include (merge) all the updates from {@code updates}.
+1:      */
+0:     public static PartitionUpdate merge(Collection<PartitionUpdate> updates)
+1:     {
+1:         assert !updates.isEmpty();
+0:         if (updates.size() == 1)
+1:             return Iterables.getOnlyElement(updates);
+1: 
+0:         int totalSize = 0;
+0:         PartitionColumns.Builder builder = PartitionColumns.builder();
+0:         DecoratedKey key = null;
+0:         CFMetaData metadata = null;
+0:         for (PartitionUpdate update : updates)
+1:         {
+0:             totalSize += update.rows;
+0:             builder.addAll(update.columns());
+1: 
+0:             if (key == null)
+0:                 key = update.partitionKey();
+1:             else
+0:                 assert key.equals(update.partitionKey());
+1: 
+0:             if (metadata == null)
+0:                 metadata = update.metadata();
+1:             else
+0:                 assert metadata.cfId.equals(update.metadata().cfId);
+1:         }
+1: 
+0:         // Used when merging row to decide of liveness
+0:         int nowInSec = FBUtilities.nowInSeconds();
+0:         PartitionUpdate newUpdate = new PartitionUpdate(metadata, key, builder.build(), totalSize);
+0:         for (PartitionUpdate update : updates)
+1:         {
+0:             newUpdate.deletionInfo.add(update.deletionInfo);
+0:             if (!update.staticRow().isEmpty())
+1:             {
+0:                 if (newUpdate.staticRow().isEmpty())
+0:                     newUpdate.staticRow = update.staticRow().takeAlias();
+1:                 else
+0:                     Rows.merge(newUpdate.staticRow(), update.staticRow(), newUpdate.columns().statics, newUpdate.staticWriter(), nowInSec, SecondaryIndexManager.nullUpdater);
+1:             }
+0:             for (Row row : update)
+0:                 row.copyTo(newUpdate.writer);
+1:         }
+0:         return newUpdate;
+1:     }
+1: 
+1:     /**
+1:      * The number of "operations" contained in the update.
+1:      * <p>
+1:      * This is used by {@code Memtable} to approximate how much work this update does. In practice, this
+1:      * count how many rows are updated and how many ranges are deleted by the partition update.
+1:      *
+1:      * @return the number of "operations" performed by the update.
+1:      */
+1:     public int operationCount()
+1:     {
+1:         return rowCount()
+1:              + deletionInfo.rangeCount()
+1:              + (deletionInfo.getPartitionDeletion().isLive() ? 0 : 1);
+1:     }
+1: 
+1:     /**
+1:      * The size of the data contained in this update.
+1:      *
+1:      * @return the size of the data contained in this update.
+1:      */
+1:     public int dataSize()
+1:     {
+0:         int clusteringSize = metadata().comparator.size();
+1:         int size = 0;
+1:         for (Row row : this)
+1:         {
+1:             size += row.clustering().dataSize();
+0:             for (Cell cell : row)
+0:                 size += cell.dataSize();
+1:         }
+1:         return size;
+1:     }
+1: 
+1:     /**
+1:      * If a partition update has been read (and is thus unmodifiable), a call to this method
+1:      * makes the update modifiable again.
+1:      * <p>
+1:      * Please note that calling this method won't result in optimal behavior in the sense that
+1:      * even if very little is added to the update after this call, the whole update will be sorted
+1:      * again on read. This should thus be used sparingly (and if it turns that we end up using
+1:      * this often, we should consider optimizing the behavior).
+1:      */
+1:     public synchronized void allowNewUpdates()
+1:     {
+1:         // This is synchronized to make extra sure things work properly even if this is
+1:         // called concurrently with sort() (which should be avoided in the first place, but
+1:         // better safe than sorry).
+0:         isSorted = false;
+1:     }
+1: 
+1:     /**
+0:      * Returns an iterator that iterators over the rows of this update in clustering order.
+1:      * <p>
+1:      * Note that this might trigger a sorting of the update, and as such the update will not
+1:      * be modifiable anymore after this call.
+1:      *
+1:      * @return an iterator over the rows of this update.
+1:      */
+0:     @Override
+1:     public Iterator<Row> iterator()
+1:     {
+0:         maybeSort();
+1:         return super.iterator();
+1:     }
+1: 
+0:     @Override
+0:     protected SliceableUnfilteredRowIterator sliceableUnfilteredIterator(ColumnFilter columns, boolean reversed)
+1:     {
+0:         maybeSort();
+0:         return super.sliceableUnfilteredIterator(columns, reversed);
+1:     }
+1: 
+1:     /**
+1:      * Validates the data contained in this update.
+1:      *
+0:      * @throws MarshalException if some of the data contained in this update is corrupted.
+1:      */
+1:     public void validate()
+1:     {
+1:         for (Row row : this)
+1:         {
+1:             metadata().comparator.validate(row.clustering());
+0:             for (Cell cell : row)
+0:                 cell.validate();
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * The maximum timestamp used in this update.
+1:      *
+1:      * @return the maximum timestamp used in this update.
+1:      */
+1:     public long maxTimestamp()
+1:     {
+1:         return maxTimestamp;
+1:     }
+1: 
+1:     /**
+1:      * For an update on a counter table, returns a list containing a {@code CounterMark} for
+1:      * every counter contained in the update.
+1:      *
+1:      * @return a list with counter marks for every counter in this update.
+1:      */
+1:     public List<CounterMark> collectCounterMarks()
+1:     {
+1:         assert metadata().isCounter();
+1: 
+0:         InternalReusableClustering clustering = new InternalReusableClustering();
+0:         List<CounterMark> l = new ArrayList<>();
+0:         int i = 0;
+1:         for (Row row : this)
+1:         {
+0:             for (Cell cell : row)
+0:                 if (cell.isCounterCell())
+0:                     l.add(new CounterMark(clustering, i, cell.column(), cell.path()));
+0:             i++;
+1:         }
+0:         return l;
+1:     }
+1: 
+1:     /**
+0:      * Returns a row writer for the static row of this partition update.
+1:      *
+0:      * @return a row writer for the static row of this partition update. A partition
+0:      * update contains only one static row so only one row should be written through
+0:      * this writer (but if multiple rows are added, the latest written one wins).
+1:      */
+0:     public Row.Writer staticWriter()
+1:     {
+0:         return createStaticWriter();
+1:     }
+1: 
+1:     /**
+0:      * Returns a row writer to add (non-static) rows to this partition update.
+1:      *
+0:      * @return a row writer to add (non-static) rows to this partition update.
+0:      * Multiple rows can be successively added this way and the rows added do not have
+0:      * to be in clustering order. Further, the same row can be added multiple time.
+1:      *
+1:      */
+0:     public Row.Writer writer()
+1:     {
+0:         if (isSorted)
+0:             throw new IllegalStateException("An update should not written again once it has been read");
+1: 
+0:         return writer;
+1:     }
+1: 
+1:     /**
+0:      * Returns a range tombstone marker writer to add range tombstones to this
+0:      * partition update.
+1:      * <p>
+0:      * Note that if more convenient, range tombstones can also be added using
+0:      * {@link addRangeTombstone}.
+1:      *
+0:      * @param isReverseOrder whether the range tombstone marker will be provided to the returned writer
+0:      * in clustering order or in reverse clustering order.
+0:      * @return a range tombstone marker writer to add range tombstones to this update.
+1:      */
+0:     public RangeTombstoneMarker.Writer markerWriter(boolean isReverseOrder)
+1:     {
+0:         return new RangeTombstoneCollector(isReverseOrder);
+1:     }
+1: 
+1:     /**
+0:      * The number of rows contained in this update.
+1:      *
+0:      * @return the number of rows contained in this update.
+1:      */
+0:     public int size()
+1:     {
+0:         return rows;
+1:     }
+1: 
+0:     private void maybeSort()
+1:     {
+0:         if (isSorted)
+1:             return;
+1: 
+0:         sort();
+1:     }
+1: 
+0:     private synchronized void sort()
+1:     {
+0:         if (isSorted)
+1:             return;
+1: 
+0:         if (rows <= 1)
+1:         {
+0:             isSorted = true;
+1:             return;
+1:         }
+1: 
+0:         // Sort the rows - will still potentially contain duplicate (non-reconciled) rows
+0:         Sorting.sort(this);
+1: 
+0:         // Now find duplicates and merge them together
+0:         int previous = 0; // The last element that was set
+0:         int nowInSec = FBUtilities.nowInSeconds();
+0:         for (int current = 1; current < rows; current++)
+1:         {
+0:             // There is really only 2 possible comparison: < 0 or == 0 since we've sorted already
+0:             int cmp = compare(previous, current);
+0:             if (cmp == 0)
+1:             {
+0:                 // current and previous are the same row. Merge current into previous
+0:                 // (and so previous + 1 will be "free").
+0:                 data.merge(current, previous, nowInSec);
+1:             }
+1:             else
+1:             {
+0:                 // data[current] != [previous], so move current just after previous if needs be
+0:                 ++previous;
+0:                 if (previous != current)
+0:                     data.move(current, previous);
+1:             }
+1:         }
+1: 
+0:         // previous is on the last value to keep
+0:         rows = previous + 1;
+1: 
+0:         isSorted = true;
+1:     }
+1: 
+1:     /**
+0:      * This method is note meant to be used externally: it is only public so this
+0:      * update conform to the {@link Sorting.Sortable} interface.
+1:      */
+0:     public int compare(int i, int j)
+1:     {
+0:         return metadata.comparator.compare(p1.setTo(i), p2.setTo(j));
+1:     }
+1: 
+0:     protected class StaticWriter extends StaticRow.Builder
+1:     {
+0:         protected StaticWriter()
+1:         {
+0:             super(columns.statics, false, metadata().isCounter());
+1:         }
+1: 
+0:         @Override
+0:         public void endOfRow()
+1:         {
+0:             super.endOfRow();
+0:             if (staticRow == null)
+1:             {
+0:                 staticRow = build();
+1:             }
+1:             else
+1:             {
+0:                 StaticRow.Builder builder = StaticRow.builder(columns.statics, true, metadata().isCounter());
+0:                 Rows.merge(staticRow, build(), columns.statics, builder, FBUtilities.nowInSeconds());
+0:                 staticRow = builder.build();
+1:             }
+1:         }
+1:     }
+1: 
+0:     protected class RegularWriter extends Writer
+1:     {
+0:         // For complex column, the writer assumptions is that for a given row, cells of different
+0:         // complex columns are not intermingled (they also should be in cellPath order). We however
+0:         // don't yet guarantee that this will be the case for updates (both UpdateStatement and
+0:         // RowUpdateBuilder can potentially break that assumption; we could change those classes but
+0:         // that's non trivial, at least for UpdateStatement).
+0:         // To deal with that problem, we record which complex columns have been updated (for the current
+0:         // row) and if we detect a violation of our assumption, we switch the row we're writing
+0:         // into (which is ok because everything will be sorted and merged in maybeSort()).
+0:         private final Set<ColumnDefinition> updatedComplex = new HashSet();
+0:         private ColumnDefinition lastUpdatedComplex;
+0:         private CellPath lastUpdatedComplexPath;
+1: 
+0:         public RegularWriter()
+1:         {
+0:             super(false);
+1:         }
+1: 
+0:         @Override
+0:         public void writeCell(ColumnDefinition column, boolean isCounter, ByteBuffer value, LivenessInfo info, CellPath path)
+1:         {
+0:             if (column.isComplex())
+1:             {
+0:                 if (updatedComplex.contains(column)
+0:                     && (!column.equals(lastUpdatedComplex) || (column.cellPathComparator().compare(path, lastUpdatedComplexPath)) <= 0))
+1:                 {
+0:                     // We've updated that complex already, but we've either updated another complex or it's not in order: as this
+0:                     // break the writer assumption, switch rows.
+0:                     endOfRow();
+1: 
+0:                     // Copy the clustering values from the previous row
+0:                     int clusteringSize = metadata.clusteringColumns().size();
+0:                     int base = (row - 1) * clusteringSize;
+0:                     for (int i = 0; i < clusteringSize; i++)
+0:                         writer.writeClusteringValue(clusterings[base + i]);
+1: 
+0:                     updatedComplex.clear();
+1:                 }
+1: 
+0:                 lastUpdatedComplex = column;
+0:                 lastUpdatedComplexPath = path;
+0:                 updatedComplex.add(column);
+1:             }
+0:             super.writeCell(column, isCounter, value, info, path);
+1:         }
+1: 
+0:         @Override
+0:         public void endOfRow()
+1:         {
+0:             super.endOfRow();
+0:             clear();
+1:         }
+1: 
+0:         @Override
+0:         public Writer reset()
+1:         {
+0:             super.reset();
+0:             clear();
+0:             return this;
+1:         }
+1: 
+0:         private void clear()
+1:         {
+0:             updatedComplex.clear();
+0:             lastUpdatedComplex = null;
+0:             lastUpdatedComplexPath = null;
+1:         }
+1:     }
+1: 
+1:     public static class PartitionUpdateSerializer
+1:     {
+1:         public void serialize(PartitionUpdate update, DataOutputPlus out, int version) throws IOException
+1:         {
+1:             if (version < MessagingService.VERSION_30)
+1:             {
+0:                 // TODO
+0:                 throw new UnsupportedOperationException();
+1: 
+0:                 // if (cf == null)
+0:                 // {
+0:                 //     out.writeBoolean(false);
+0:                 //     return;
+0:                 // }
+1: 
+0:                 // out.writeBoolean(true);
+0:                 // serializeCfId(cf.id(), out, version);
+0:                 // cf.getComparator().deletionInfoSerializer().serialize(cf.deletionInfo(), out, version);
+0:                 // ColumnSerializer columnSerializer = cf.getComparator().columnSerializer();
+0:                 // int count = cf.getColumnCount();
+0:                 // out.writeInt(count);
+0:                 // int written = 0;
+0:                 // for (Cell cell : cf)
+0:                 // {
+0:                 //     columnSerializer.serialize(cell, out);
+0:                 //     written++;
+0:                 // }
+0:                 // assert count == written: "Table had " + count + " columns, but " + written + " written";
+1:             }
+1: 
+0:             try (UnfilteredRowIterator iter = update.sliceableUnfilteredIterator())
+1:             {
+1:                 assert !iter.isReverseOrder();
+0:                 UnfilteredRowIteratorSerializer.serializer.serialize(iter, out, version, update.rows);
+1:             }
+1:         }
+1: 
+0:         public PartitionUpdate deserialize(DataInput in, int version, SerializationHelper.Flag flag, DecoratedKey key) throws IOException
+1:         {
+1:             if (version < MessagingService.VERSION_30)
+1:             {
+1:                 assert key != null;
+1: 
+0:                 // This is only used in mutation, and mutation have never allowed "null" column families
+0:                 boolean present = in.readBoolean();
+0:                 assert present;
+1: 
+0:                 CFMetaData metadata = CFMetaData.serializer.deserialize(in, version);
+0:                 LegacyLayout.LegacyDeletionInfo info = LegacyLayout.LegacyDeletionInfo.serializer.deserialize(metadata, in, version);
+0:                 int size = in.readInt();
+0:                 Iterator<LegacyLayout.LegacyCell> cells = LegacyLayout.deserializeCells(metadata, in, flag, size);
+0:                 SerializationHelper helper = new SerializationHelper(version, flag);
+0:                 try (UnfilteredRowIterator iterator = LegacyLayout.onWireCellstoUnfilteredRowIterator(metadata, key, info, cells, false, helper))
+1:                 {
+0:                     return UnfilteredRowIterators.toUpdate(iterator);
+1:                 }
+1:             }
+1: 
+1:             assert key == null; // key is only there for the old format
+1: 
+0:             UnfilteredRowIteratorSerializer.Header h = UnfilteredRowIteratorSerializer.serializer.deserializeHeader(in, version, flag);
+0:             if (h.isEmpty)
+0:                 return emptyUpdate(h.metadata, h.key);
+1: 
+0:             assert !h.isReversed;
+0:             assert h.rowEstimate >= 0;
+0:             PartitionUpdate upd = new PartitionUpdate(h.metadata,
+0:                                                       h.key,
+0:                                                       new DeletionInfo(h.partitionDeletion),
+0:                                                       new RowDataBlock(h.sHeader.columns().regulars, h.rowEstimate, false, h.metadata.isCounter()),
+0:                                                       h.sHeader.columns(),
+0:                                                       h.rowEstimate);
+1: 
+0:             upd.staticRow = h.staticRow;
+1: 
+0:             RangeTombstoneMarker.Writer markerWriter = upd.markerWriter(false);
+0:             UnfilteredRowIteratorSerializer.serializer.deserialize(in, new SerializationHelper(version, flag), h.sHeader, upd.writer(), markerWriter);
+1: 
+0:             // Mark sorted after we're read it all since that's what we use in the writer() method to detect bad uses
+0:             upd.isSorted = true;
+1: 
+0:             return upd;
+1:         }
+1: 
+0:         public long serializedSize(PartitionUpdate update, int version, TypeSizes sizes)
+1:         {
+1:             if (version < MessagingService.VERSION_30)
+1:             {
+0:                 // TODO
+0:                 throw new UnsupportedOperationException("Version is " + version);
+0:                 //if (cf == null)
+0:                 //{
+0:                 //    return typeSizes.sizeof(false);
+0:                 //}
+0:                 //else
+0:                 //{
+0:                 //    return typeSizes.sizeof(true)  /* nullness bool */
+0:                 //        + cfIdSerializedSize(cf.id(), typeSizes, version)  /* id */
+0:                 //        + contentSerializedSize(cf, typeSizes, version);
+0:                 //}
+1:             }
+1: 
+0:             try (UnfilteredRowIterator iter = update.sliceableUnfilteredIterator())
+1:             {
+0:                 return UnfilteredRowIteratorSerializer.serializer.serializedSize(iter, version, update.rows, sizes);
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * A counter mark is basically a pointer to a counter update inside this partition update. That pointer allows
+1:      * us to update the counter value based on the pre-existing value read during the read-before-write that counters
+1:      * do. See {@link CounterMutation} to understand how this is used.
+1:      */
+0:     public class CounterMark
+1:     {
+0:         private final InternalReusableClustering clustering;
+0:         private final int row;
+1:         private final ColumnDefinition column;
+1:         private final CellPath path;
+1: 
+0:         private CounterMark(InternalReusableClustering clustering, int row, ColumnDefinition column, CellPath path)
+1:         {
+0:             this.clustering = clustering;
+1:             this.row = row;
+1:             this.column = column;
+1:             this.path = path;
+1:         }
+1: 
+1:         public Clustering clustering()
+1:         {
+0:             return clustering.setTo(row);
+1:         }
+1: 
+1:         public ColumnDefinition column()
+1:         {
+1:             return column;
+1:         }
+1: 
+1:         public CellPath path()
+1:         {
+1:             return path;
+1:         }
+1: 
+1:         public ByteBuffer value()
+1:         {
+0:             return data.getValue(row, column, path);
+1:         }
+1: 
+1:         public void setValue(ByteBuffer value)
+1:         {
+0:             data.setValue(row, column, path, value);
+1:         }
+1:     }
+1: }
+author:Josh McKenzie
+-------------------------------------------------------------------------------
+commit:2683806
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Creates a new simple partition update builder.
+1:      *
+1:      * @param metadata the metadata for the table this is a partition of.
+1:      * @param partitionKeyValues the values for partition key columns identifying this partition. The values for each
+1:      * partition key column can be passed either directly as {@code ByteBuffer} or using a "native" value (int for
+1:      * Int32Type, string for UTF8Type, ...). It is also allowed to pass a single {@code DecoratedKey} value directly.
+1:      * @return a newly created builder.
+1:      */
+1:     public static SimpleBuilder simpleBuilder(CFMetaData metadata, Object... partitionKeyValues)
+0:     {
+1:         return new SimpleBuilders.PartitionUpdateBuilder(metadata, partitionKeyValues);
+0:     }
+0: 
+1:     /**
+1:      * Interface for building partition updates geared towards human.
+1:      * <p>
+1:      * This should generally not be used when performance matters too much, but provides a more convenient interface to
+1:      * build an update than using the class constructor when performance is not of the utmost importance.
+1:      */
+1:     public interface SimpleBuilder
+0:     {
+1:         /**
+1:          * The metadata of the table this is a builder on.
+1:          */
+1:         public CFMetaData metadata();
+0: 
+1:         /**
+1:          * Sets the timestamp to use for the following additions to this builder or any derived (row) builder.
+1:          *
+1:          * @param timestamp the timestamp to use for following additions. If that timestamp hasn't been set, the current
+1:          * time in microseconds will be used.
+1:          * @return this builder.
+1:          */
+1:         public SimpleBuilder timestamp(long timestamp);
+0: 
+1:         /**
+1:          * Sets the ttl to use for the following additions to this builder or any derived (row) builder.
+1:          *
+1:          * @param ttl the ttl to use for following additions. If that ttl hasn't been set, no ttl will be used.
+1:          * @return this builder.
+1:          */
+1:         public SimpleBuilder ttl(int ttl);
+0: 
+1:         /**
+1:          * Sets the current time to use for the following additions to this builder or any derived (row) builder.
+1:          *
+1:          * @param nowInSec the current time to use for following additions. If the current time hasn't been set, the current
+1:          * time in seconds will be used.
+1:          * @return this builder.
+1:          */
+1:         public SimpleBuilder nowInSec(int nowInSec);
+0: 
+1:         /**
+1:          * Adds the row identifier by the provided clustering and return a builder for that row.
+1:          *
+1:          * @param clusteringValues the value for the clustering columns of the row to add to this build. There may be no
+1:          * values if either the table has no clustering column, or if you want to edit the static row. Note that as a
+1:          * shortcut it is also allowed to pass a {@code Clustering} object directly, in which case that should be the
+1:          * only argument.
+1:          * @return a builder for the row identified by {@code clusteringValues}.
+1:          */
+1:         public Row.SimpleBuilder row(Object... clusteringValues);
+0: 
+1:         /**
+1:          * Deletes the partition identified by this builder (using a partition level deletion).
+1:          *
+1:          * @return this builder.
+1:          */
+1:         public SimpleBuilder delete();
+0: 
+1:         /**
+1:          * Adds a new range tombstone to this update, returning a builder for that range.
+1:          *
+1:          * @return the range tombstone builder for the newly added range.
+1:          */
+1:         public RangeTombstoneBuilder addRangeTombstone();
+0: 
+1:         /**
+1:          * Build the update represented by this builder.
+1:          *
+1:          * @return the built update.
+1:          */
+1:         public PartitionUpdate build();
+0: 
+1:         /**
+1:          * As shortcut for {@code new Mutation(build())}.
+1:          *
+1:          * @return the built update, wrapped in a {@code Mutation}.
+1:          */
+1:         public Mutation buildAsMutation();
+0: 
+1:         /**
+1:          * Interface to build range tombstone.
+1:          *
+1:          * By default, if no other methods are called, the represented range is inclusive of both start and end and
+1:          * includes everything (its start is {@code BOTTOM} and it's end is {@code TOP}).
+1:          */
+1:         public interface RangeTombstoneBuilder
+0:         {
+1:             /**
+1:              * Sets the start for the built range using the provided values.
+1:              *
+1:              * @param values the value for the start of the range. They act like the {@code clusteringValues} argument
+0:              * of the {@link PartitionUpdate.SimpleBuilder#row()} method, except that it doesn't have to be a full
+1:              * clustering, it can only be a prefix.
+1:              * @return this builder.
+1:              */
+1:             public RangeTombstoneBuilder start(Object... values);
+0: 
+1:             /**
+1:              * Sets the end for the built range using the provided values.
+1:              *
+1:              * @param values the value for the end of the range. They act like the {@code clusteringValues} argument
+0:              * of the {@link PartitionUpdate.SimpleBuilder#row()} method, except that it doesn't have to be a full
+1:              * clustering, it can only be a prefix.
+1:              * @return this builder.
+1:              */
+1:             public RangeTombstoneBuilder end(Object... values);
+0: 
+1:             /**
+1:              * Sets the start of this range as inclusive.
+1:              * <p>
+1:              * This is the default and don't need to be called, but can for explicitness.
+1:              *
+1:              * @return this builder.
+1:              */
+1:             public RangeTombstoneBuilder inclStart();
+0: 
+1:             /**
+1:              * Sets the start of this range as exclusive.
+1:              *
+1:              * @return this builder.
+1:              */
+1:             public RangeTombstoneBuilder exclStart();
+0: 
+1:             /**
+1:              * Sets the end of this range as inclusive.
+1:              * <p>
+1:              * This is the default and don't need to be called, but can for explicitness.
+1:              *
+1:              * @return this builder.
+1:              */
+1:             public RangeTombstoneBuilder inclEnd();
+0: 
+1:             /**
+1:              * Sets the end of this range as exclusive.
+1:              *
+1:              * @return this builder.
+1:              */
+1:             public RangeTombstoneBuilder exclEnd();
+0:         }
+0:     }
+0: 
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:063e917
+/////////////////////////////////////////////////////////////////////////
+1:             return out.asNewBuffer();
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:4fb559b
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:             try (UnfilteredRowIterator iter = update.unfilteredIterator())
+/////////////////////////////////////////////////////////////////////////
+1:             try (UnfilteredRowIterator iter = update.unfilteredIterator())
+commit:c3bc856
+/////////////////////////////////////////////////////////////////////////
+1:         super(metadata, key);
+1:         this.holder = new Holder(columns, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+1:         super(metadata, key);
+/////////////////////////////////////////////////////////////////////////
+1:         Holder holder = new Holder(PartitionColumns.NONE, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+1:         return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
+/////////////////////////////////////////////////////////////////////////
+1:         Holder holder = new Holder(PartitionColumns.NONE, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+1:         return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
+/////////////////////////////////////////////////////////////////////////
+1:             Holder holder = new Holder(new PartitionColumns(Columns.from(row.columns()), Columns.NONE), BTree.empty(), deletionInfo, row, EncodingStats.NO_STATS);
+1:             return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
+1:             Holder holder = new Holder(new PartitionColumns(Columns.NONE, Columns.from(row.columns())), BTree.singleton(row), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+1:             return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
+/////////////////////////////////////////////////////////////////////////
+1:         return new PartitionUpdate(iterator.metadata(), iterator.partitionKey(), holder, deletionInfo, false);
+1:         return new PartitionUpdate(iterator.metadata(), iterator.partitionKey(), holder, deletionInfo, false);
+/////////////////////////////////////////////////////////////////////////
+1:         this.holder = new Holder(holder.columns, tree, deletionInfo, staticRow, newStats);
+/////////////////////////////////////////////////////////////////////////
+0:     @Override
+1:     public PartitionColumns columns()
+0:     {
+1:         // The superclass implementation calls holder(), but that triggers a build of the PartitionUpdate. But since
+1:         // the columns are passed to the ctor, we know the holder always has the proper columns even if it doesn't have
+1:         // the built rows yet, so just bypass the holder() method.
+1:         return holder.columns;
+0:     }
+0: 
+/////////////////////////////////////////////////////////////////////////
+1:             holder = new Holder(holder.columns, holder.tree, holder.deletionInfo, staticRow, holder.stats);
+/////////////////////////////////////////////////////////////////////////
+1:         this.holder = new Holder(holder.columns, merged, holder.deletionInfo, holder.staticRow, newStats);
+/////////////////////////////////////////////////////////////////////////
+1:                                        new Holder(header.sHeader.columns(), rows.build(), deletionInfo, header.staticRow, header.sHeader.stats()),
+commit:aa57626
+/////////////////////////////////////////////////////////////////////////
+0:             return new PartitionUpdate(metadata, key, new PartitionColumns(Columns.from(row.columns()), Columns.NONE), holder, deletionInfo, false);
+0:             return new PartitionUpdate(metadata, key, new PartitionColumns(Columns.NONE, Columns.from(row.columns())), holder, deletionInfo, false);
+/////////////////////////////////////////////////////////////////////////
+1:             // this assert is expensive, and possibly of limited value; we should consider removing it
+1:             // or introducing a new class of assertions for test purposes
+/////////////////////////////////////////////////////////////////////////
+1:             // this assert is expensive, and possibly of limited value; we should consider removing it
+1:             // or introducing a new class of assertions for test purposes
+commit:0d74c3e
+/////////////////////////////////////////////////////////////////////////
+1:             assert columns().statics.containsAll(row.columns()) : columns().statics + " is not superset of " + row.columns();
+/////////////////////////////////////////////////////////////////////////
+1:             assert columns().regulars.containsAll(row.columns()) : columns().regulars + " is not superset of " + row.columns();
+commit:e51f83b
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.btree.BTree;
+1: import org.apache.cassandra.utils.btree.UpdateFunction;
+/////////////////////////////////////////////////////////////////////////
+1: public class PartitionUpdate extends AbstractBTreePartition
+/////////////////////////////////////////////////////////////////////////
+1:     private Holder holder;
+1:     private BTree.Builder<Row> rowBuilder;
+1:     private MutableDeletionInfo deletionInfo;
+1:                             int initialRowCapacity,
+0:         super(metadata, key, columns);
+0:         this.holder = new Holder(BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+1:         this.canHaveShadowedData = canHaveShadowedData;
+1:         rowBuilder = builder(initialRowCapacity);
+0:     }
+0: 
+1:     private PartitionUpdate(CFMetaData metadata,
+0:                             DecoratedKey key,
+0:                             PartitionColumns columns,
+1:                             Holder holder,
+1:                             MutableDeletionInfo deletionInfo,
+1:                             boolean canHaveShadowedData)
+0:     {
+0:         super(metadata, key, columns);
+1:         this.holder = holder;
+1:         this.deletionInfo = deletionInfo;
+1:         this.isBuilt = true;
+/////////////////////////////////////////////////////////////////////////
+1:         this(metadata, key, columns, MutableDeletionInfo.live(), initialRowCapacity, true);
+/////////////////////////////////////////////////////////////////////////
+1:         MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
+0:         Holder holder = new Holder(BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+0:         return new PartitionUpdate(metadata, key, PartitionColumns.NONE, holder, deletionInfo, false);
+/////////////////////////////////////////////////////////////////////////
+1:         MutableDeletionInfo deletionInfo = new MutableDeletionInfo(timestamp, nowInSec);
+0:         Holder holder = new Holder(BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+0:         return new PartitionUpdate(metadata, key, PartitionColumns.NONE, holder, deletionInfo, false);
+/////////////////////////////////////////////////////////////////////////
+1:         MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
+1:         if (row.isStatic())
+0:         {
+0:             Holder holder = new Holder(BTree.empty(), deletionInfo, row, EncodingStats.NO_STATS);
+0:             return new PartitionUpdate(metadata, key, new PartitionColumns(row.columns(), Columns.NONE), holder, deletionInfo, false);
+0:         }
+0:         else
+0:         {
+0:             Holder holder = new Holder(BTree.singleton(row), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+0:             return new PartitionUpdate(metadata, key, new PartitionColumns(Columns.NONE, row.columns()), holder, deletionInfo, false);
+0:         }
+/////////////////////////////////////////////////////////////////////////
+1:         Holder holder = build(iterator, 16);
+1:         MutableDeletionInfo deletionInfo = (MutableDeletionInfo) holder.deletionInfo;
+0:         return new PartitionUpdate(iterator.metadata(), iterator.partitionKey(), iterator.columns(), holder, deletionInfo, false);
+1:         MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
+1:         Holder holder = build(iterator, deletionInfo, true, 16);
+0:         return new PartitionUpdate(iterator.metadata(), iterator.partitionKey(), iterator.columns(), holder, deletionInfo, false);
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     public static PartitionUpdate merge(List<PartitionUpdate> updates)
+/////////////////////////////////////////////////////////////////////////
+1:         int nowInSecs = FBUtilities.nowInSeconds();
+1:         List<UnfilteredRowIterator> asIterators = Lists.transform(updates, AbstractBTreePartition::unfilteredIterator);
+0:         return fromIterator(UnfilteredRowIterators.merge(asIterators, nowInSecs));
+/////////////////////////////////////////////////////////////////////////
+1:         Holder holder = holder();
+1:         Object[] tree = BTree.<Row>transformAndFilter(holder.tree, (x) -> x.updateAllTimestamp(newTimestamp));
+1:         Row staticRow = holder.staticRow.updateAllTimestamp(newTimestamp);
+1:         EncodingStats newStats = EncodingStats.Collector.collect(staticRow, BTree.<Row>iterator(tree), deletionInfo);
+0:         this.holder = new Holder(tree, deletionInfo, staticRow, newStats);
+/////////////////////////////////////////////////////////////////////////
+0:         return rowCount()
+/////////////////////////////////////////////////////////////////////////
+1:     protected Holder holder()
+1:         return holder;
+1:         return holder().stats;
+/////////////////////////////////////////////////////////////////////////
+1:         if (rowBuilder == null)
+1:             rowBuilder = builder(16);
+0:     }
+0: 
+1:     private BTree.Builder<Row> builder(int initialCapacity)
+0:     {
+1:         return BTree.<Row>builder(metadata.comparator, initialCapacity)
+1:                     .setQuickResolver((a, b) ->
+1:                                       Rows.merge(a, b, createdAtInSec));
+/////////////////////////////////////////////////////////////////////////
+0:         for (Row row : this)
+/////////////////////////////////////////////////////////////////////////
+1:             Row staticRow = holder.staticRow.isEmpty()
+1:                       : Rows.merge(holder.staticRow, row, createdAtInSec);
+0:             holder = new Holder(holder.tree, holder.deletionInfo, staticRow, holder.stats);
+1:             rowBuilder.add(row);
+/////////////////////////////////////////////////////////////////////////
+1:         Holder holder = this.holder;
+1:         Object[] cur = holder.tree;
+1:         Object[] add = rowBuilder.build();
+1:         Object[] merged = BTree.<Row>merge(cur, add, metadata.comparator,
+1:                                            UpdateFunction.Simple.of((a, b) -> Rows.merge(a, b, createdAtInSec)));
+1:         assert deletionInfo == holder.deletionInfo;
+1:         EncodingStats newStats = EncodingStats.Collector.collect(holder.staticRow, BTree.<Row>iterator(merged), deletionInfo);
+0:         this.holder = new Holder(merged, holder.deletionInfo, holder.staticRow, newStats);
+1:         rowBuilder = null;
+/////////////////////////////////////////////////////////////////////////
+1:                     UnfilteredRowIteratorSerializer.serializer.serialize(iter, null, out, version, update.rowCount());
+/////////////////////////////////////////////////////////////////////////
+1:             BTree.Builder<Row> rows = BTree.builder(metadata.comparator, header.rowEstimate);
+1:             rows.auto(false);
+/////////////////////////////////////////////////////////////////////////
+1:             MutableDeletionInfo deletionInfo = deletionBuilder.build();
+0:                                        new Holder(rows.build(), deletionInfo, header.staticRow, header.sHeader.stats()),
+1:                                        deletionInfo,
+/////////////////////////////////////////////////////////////////////////
+1:                      + UnfilteredRowIteratorSerializer.serializer.serializedSize(iter, null, version, update.rowCount());
+/////////////////////////////////////////////////////////////////////////
+1:             assert row instanceof BTreeRow;
+1:             ((BTreeRow)row).setValue(column, path, value);
+commit:fe388d4
+/////////////////////////////////////////////////////////////////////////
+0:                     UnfilteredRowIteratorSerializer.serializer.serialize(iter, null, out, version, update.rows.size());
+/////////////////////////////////////////////////////////////////////////
+1:             UnfilteredRowIteratorSerializer.Header header = UnfilteredRowIteratorSerializer.serializer.deserializeHeader(metadata, null, in, version, flag);
+/////////////////////////////////////////////////////////////////////////
+0:                      + UnfilteredRowIteratorSerializer.serializer.serializedSize(iter, null, version, update.rows.size());
+commit:639d4b2
+/////////////////////////////////////////////////////////////////////////
+0:             assert row instanceof BTreeBackedRow;
+0:             ((BTreeBackedRow)row).setValue(column, path, value);
+commit:4cea221
+/////////////////////////////////////////////////////////////////////////
+commit:5250d7f
+/////////////////////////////////////////////////////////////////////////
+0:     public int rowCount()
+0:     {
+0:         maybeSort();
+0:         return super.rowCount();
+0:     }
+0: 
+author:Tyler Hobbs
+-------------------------------------------------------------------------------
+commit:270e986
+/////////////////////////////////////////////////////////////////////////
+0:     @Override
+1:     public String toString()
+0:     {
+1:         if (isBuilt)
+1:             return super.toString();
+0: 
+1:         // We intentionally override AbstractBTreePartition#toString() to avoid iterating over the rows in the
+1:         // partition, which can result in build() being triggered and lead to errors if the PartitionUpdate is later
+1:         // modified.
+0: 
+1:         StringBuilder sb = new StringBuilder();
+1:         sb.append(String.format("[%s.%s] key=%s columns=%s",
+1:                                 metadata.ksName,
+1:                                 metadata.cfName,
+1:                                 metadata.getKeyValidator().getString(partitionKey().getKey()),
+1:                                 columns()));
+0: 
+1:         sb.append("\n    deletionInfo=").append(deletionInfo);
+1:         sb.append(" (not built)");
+1:         return sb.toString();
+0:     }
+0: 
+commit:8c64cef
+/////////////////////////////////////////////////////////////////////////
+1: import com.google.common.collect.Lists;
+0: 
+0: import org.apache.cassandra.db.context.CounterContext;
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.utils.ByteBufferUtil;
+0: import org.apache.cassandra.utils.Pair;
+/////////////////////////////////////////////////////////////////////////
+0:     public SliceableUnfilteredRowIterator sliceableUnfilteredIterator(ColumnFilter columns, boolean reversed)
+/////////////////////////////////////////////////////////////////////////
+1:      * @throws org.apache.cassandra.serializers.MarshalException if some of the data contained in this update is corrupted.
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:                 if (version < MessagingService.VERSION_30)
+0:                 {
+0:                     LegacyLayout.serializeAsLegacyPartition(iter, out, version);
+0:                 }
+0:                 else
+0:                 {
+0:                     CFMetaData.serializer.serialize(update.metadata(), out, version);
+0:                     UnfilteredRowIteratorSerializer.serializer.serialize(iter, out, version, update.rows.size());
+0:                 }
+/////////////////////////////////////////////////////////////////////////
+1:                 return deserializePre30(in, version, flag, key);
+/////////////////////////////////////////////////////////////////////////
+1:                 return deserializePre30(in, version, flag, key.getKey());
+/////////////////////////////////////////////////////////////////////////
+1:         private static PartitionUpdate deserializePre30(DataInputPlus in, int version, SerializationHelper.Flag flag, ByteBuffer key) throws IOException
+1:             try (UnfilteredRowIterator iterator = LegacyLayout.deserializeLegacyPartition(in, version, flag, key))
+1:                 assert iterator != null; // This is only used in mutation, and mutation have never allowed "null" column families
+0:                 if (version < MessagingService.VERSION_30)
+0:                     return LegacyLayout.serializedSizeAsLegacyPartition(iter, version);
+0: 
+author:Benjamin Lerer
+-------------------------------------------------------------------------------
+commit:3615da5
+/////////////////////////////////////////////////////////////////////////
+1:              + (staticRow().isEmpty() ? 0 : 1)
+author:Sam Tunnicliffe
+-------------------------------------------------------------------------------
+commit:0626be8
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.ArrayList;
+1: import java.util.Iterator;
+1: import java.util.List;
+1: import org.apache.cassandra.io.util.*;
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:0a08525
+/////////////////////////////////////////////////////////////////////////
+0:     public PartitionUpdate(CFMetaData metadata,
+1:                            ByteBuffer key,
+0:                            PartitionColumns columns,
+0:                            int initialRowCapacity)
+0:     {
+0:         this(metadata,
+1:              metadata.decorateKey(key),
+0:              columns,
+0:              initialRowCapacity);
+0:     }
+0: 
+/////////////////////////////////////////////////////////////////////////
+1:      * @param key the partition key for the partition to update.
+/////////////////////////////////////////////////////////////////////////
+1:      * Creates an immutable partition update that contains a single row update.
+0:      *
+0:      * @param metadata the metadata for the created update.
+1:      * @param key the partition key for the partition to update.
+1:      * @param row the row for the update.
+0:      *
+1:      * @return the newly created partition update containing only {@code row}.
+0:      */
+1:     public static PartitionUpdate singleRowUpdate(CFMetaData metadata, ByteBuffer key, Row row)
+0:     {
+1:         return singleRowUpdate(metadata, metadata.decorateKey(key), row);
+0:     }
+0: 
+0:     /**
+/////////////////////////////////////////////////////////////////////////
+0:      * Creates a partition update that entirely deletes a given partition.
+0:      *
+0:      * @param metadata the metadata for the created update.
+0:      * @param key the partition key for the partition that the created update should delete.
+0:      * @param timestamp the timestamp for the deletion.
+0:      * @param nowInSec the current time in seconds to use as local deletion time for the partition deletion.
+0:      *
+0:      * @return the newly created partition deletion update.
+0:      */
+1:     public static PartitionUpdate fullPartitionDelete(CFMetaData metadata, ByteBuffer key, long timestamp, int nowInSec)
+0:     {
+1:         return fullPartitionDelete(metadata, metadata.decorateKey(key), timestamp, nowInSec);
+0:     }
+0: 
+0:     /**
+/////////////////////////////////////////////////////////////////////////
+1:         public PartitionUpdate deserialize(DataInputPlus in, int version, SerializationHelper.Flag flag, ByteBuffer key) throws IOException
+1:             if (version >= MessagingService.VERSION_30)
+0:             {
+0:                 assert key == null; // key is only there for the old format
+1:                 return deserialize30(in, version, flag);
+0:             }
+0:             else
+0:                 CFMetaData metadata = deserializeMetadata(in, version);
+0:                 DecoratedKey dk = metadata.decorateKey(key);
+0:                 return deserializePre30(in, version, flag, metadata, dk);
+0:         }
+1:         // Used to share same decorated key between updates.
+1:         public PartitionUpdate deserialize(DataInputPlus in, int version, SerializationHelper.Flag flag, DecoratedKey key) throws IOException
+0:         {
+1:             if (version >= MessagingService.VERSION_30)
+0:             {
+1:                 return deserialize30(in, version, flag);
+0:             }
+0:             else
+0:             {
+1:                 assert key != null;
+0:                 CFMetaData metadata = deserializeMetadata(in, version);
+0:                 return deserializePre30(in, version, flag, metadata, key);
+0:             }
+0:         }
+1:         private static PartitionUpdate deserialize30(DataInputPlus in, int version, SerializationHelper.Flag flag) throws IOException
+0:         {
+/////////////////////////////////////////////////////////////////////////
+0:         private static CFMetaData deserializeMetadata(DataInputPlus in, int version) throws IOException
+0:         {
+0:             // This is only used in mutation, and mutation have never allowed "null" column families
+0:             boolean present = in.readBoolean();
+0:             assert present;
+0: 
+0:             CFMetaData metadata = CFMetaData.serializer.deserialize(in, version);
+0:             return metadata;
+0:         }
+0: 
+0:         private static PartitionUpdate deserializePre30(DataInputPlus in, int version, SerializationHelper.Flag flag, CFMetaData metadata, DecoratedKey dk) throws IOException
+0:         {
+0:             LegacyLayout.LegacyDeletionInfo info = LegacyLayout.LegacyDeletionInfo.serializer.deserialize(metadata, in, version);
+0:             int size = in.readInt();
+0:             Iterator<LegacyLayout.LegacyCell> cells = LegacyLayout.deserializeCells(metadata, in, flag, size);
+0:             SerializationHelper helper = new SerializationHelper(metadata, version, flag);
+0:             try (UnfilteredRowIterator iterator = LegacyLayout.onWireCellstoUnfilteredRowIterator(metadata, dk, info, cells, false, helper))
+0:             {
+0:                 return PartitionUpdate.fromIterator(iterator);
+0:             }
+0:         }
+0: 
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:a22ce89
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:      * @param key the partition key for the partition that the created update should delete.
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:             if (version < MessagingService.VERSION_30)
+0:                 // This is only used in mutation, and mutation have never allowed "null" column families
+0:                 boolean present = in.readBoolean();
+0:                 assert present;
+0: 
+0:                 CFMetaData metadata = CFMetaData.serializer.deserialize(in, version);
+0:                 LegacyLayout.LegacyDeletionInfo info = LegacyLayout.LegacyDeletionInfo.serializer.deserialize(metadata, in, version);
+0:                 int size = in.readInt();
+0:                 Iterator<LegacyLayout.LegacyCell> cells = LegacyLayout.deserializeCells(metadata, in, flag, size);
+0:                 SerializationHelper helper = new SerializationHelper(metadata, version, flag);
+0:                 try (UnfilteredRowIterator iterator = LegacyLayout.onWireCellstoUnfilteredRowIterator(metadata, key, info, cells, false, helper))
+0:                 {
+0:                     return PartitionUpdate.fromIterator(iterator);
+0:                 }
+0:             }
+0: 
+0:             assert key == null; // key is only there for the old format
+0: 
+/////////////////////////////////////////////////////////////////////////
+author:Branimir Lambov
+-------------------------------------------------------------------------------
+commit:69f77cb
+/////////////////////////////////////////////////////////////////////////
+0:     public PartitionUpdate(CFMetaData metadata,
+0:                            ByteBuffer key,
+0:                            PartitionColumns columns,
+0:                            int initialRowCapacity)
+0:     {
+0:         this(metadata,
+0:              metadata.decorateKey(key),
+0:              columns,
+0:              initialRowCapacity);
+0:     }
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:      * @param key the partition key for the partition to update.
+/////////////////////////////////////////////////////////////////////////
+0:      * Creates an immutable partition update that contains a single row update.
+0:      *
+0:      * @param metadata the metadata for the created update.
+0:      * @param key the partition key for the partition to update.
+0:      * @param row the row for the update.
+0:      *
+0:      * @return the newly created partition update containing only {@code row}.
+0:      */
+0:     public static PartitionUpdate singleRowUpdate(CFMetaData metadata, ByteBuffer key, Row row)
+0:     {
+0:         return singleRowUpdate(metadata, metadata.decorateKey(key), row);
+0:     }
+0: 
+0:     /**
+/////////////////////////////////////////////////////////////////////////
+0:      * Creates a partition update that entirely deletes a given partition.
+0:      *
+0:      * @param metadata the metadata for the created update.
+0:      * @param key the partition key for the partition that the created update should delete.
+0:      * @param timestamp the timestamp for the deletion.
+0:      * @param nowInSec the current time in seconds to use as local deletion time for the partition deletion.
+0:      *
+0:      * @return the newly created partition deletion update.
+0:      */
+0:     public static PartitionUpdate fullPartitionDelete(CFMetaData metadata, ByteBuffer key, long timestamp, int nowInSec)
+0:     {
+0:         return fullPartitionDelete(metadata, metadata.decorateKey(key), timestamp, nowInSec);
+0:     }
+0: 
+0:     /**
+/////////////////////////////////////////////////////////////////////////
+0:         public PartitionUpdate deserialize(DataInputPlus in, int version, SerializationHelper.Flag flag, ByteBuffer key) throws IOException
+0:             if (version >= MessagingService.VERSION_30)
+0:             {
+0:                 assert key == null; // key is only there for the old format
+0:                 return deserialize30(in, version, flag);
+0:             }
+0:             else
+0:                 CFMetaData metadata = deserializeMetadata(in, version);
+0:                 DecoratedKey dk = metadata.decorateKey(key);
+0:                 return deserializePre30(in, version, flag, metadata, dk);
+0:         }
+0:         // Used to share same decorated key between updates.
+0:         public PartitionUpdate deserialize(DataInputPlus in, int version, SerializationHelper.Flag flag, DecoratedKey key) throws IOException
+0:         {
+0:             if (version >= MessagingService.VERSION_30)
+0:             {
+0:                 return deserialize30(in, version, flag);
+0:             }
+0:             else
+0:             {
+0:                 assert key != null;
+0:                 CFMetaData metadata = deserializeMetadata(in, version);
+0:                 return deserializePre30(in, version, flag, metadata, key);
+0:             }
+0:         }
+0:         private static PartitionUpdate deserialize30(DataInputPlus in, int version, SerializationHelper.Flag flag) throws IOException
+0:         {
+/////////////////////////////////////////////////////////////////////////
+0:         private static CFMetaData deserializeMetadata(DataInputPlus in, int version) throws IOException
+0:         {
+0:             // This is only used in mutation, and mutation have never allowed "null" column families
+0:             boolean present = in.readBoolean();
+0:             assert present;
+0: 
+0:             CFMetaData metadata = CFMetaData.serializer.deserialize(in, version);
+0:             return metadata;
+0:         }
+0: 
+0:         private static PartitionUpdate deserializePre30(DataInputPlus in, int version, SerializationHelper.Flag flag, CFMetaData metadata, DecoratedKey dk) throws IOException
+0:         {
+0:             LegacyLayout.LegacyDeletionInfo info = LegacyLayout.LegacyDeletionInfo.serializer.deserialize(metadata, in, version);
+0:             int size = in.readInt();
+0:             Iterator<LegacyLayout.LegacyCell> cells = LegacyLayout.deserializeCells(metadata, in, flag, size);
+0:             SerializationHelper helper = new SerializationHelper(metadata, version, flag);
+0:             try (UnfilteredRowIterator iterator = LegacyLayout.onWireCellstoUnfilteredRowIterator(metadata, dk, info, cells, false, helper))
+0:             {
+0:                 return PartitionUpdate.fromIterator(iterator);
+0:             }
+0:         }
+0: 
+author:Ariel Weisberg
+-------------------------------------------------------------------------------
+commit:c4c9eae
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.util.DataInputBuffer;
+/////////////////////////////////////////////////////////////////////////
+1:             return serializer.deserialize(new DataInputBuffer(bytes, true),
+commit:03f72ac
+/////////////////////////////////////////////////////////////////////////
+0: 
+0: import org.apache.cassandra.io.util.DataInputPlus;
+0: import org.apache.cassandra.io.util.NIODataInputStream;
+/////////////////////////////////////////////////////////////////////////
+0:             return serializer.deserialize(new NIODataInputStream(bytes, true),
+/////////////////////////////////////////////////////////////////////////
+0:         public PartitionUpdate deserialize(DataInputPlus in, int version, SerializationHelper.Flag flag, DecoratedKey key) throws IOException
+/////////////////////////////////////////////////////////////////////////
+1:         public long serializedSize(PartitionUpdate update, int version)
+/////////////////////////////////////////////////////////////////////////
+0:                 //    return TypeSizes.sizeof(false);
+0:                 //    return TypeSizes.sizeof(true)  /* nullness bool */
+/////////////////////////////////////////////////////////////////////////
+0:                 return UnfilteredRowIteratorSerializer.serializer.serializedSize(iter, version, update.rows);
+============================================================================

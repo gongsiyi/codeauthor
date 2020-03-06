@@ -1,0 +1,1370 @@
+1:72790dc: /*
+1:72790dc:  * Licensed to the Apache Software Foundation (ASF) under one
+1:72790dc:  * or more contributor license agreements.  See the NOTICE file
+1:72790dc:  * distributed with this work for additional information
+1:72790dc:  * regarding copyright ownership.  The ASF licenses this file
+1:72790dc:  * to you under the Apache License, Version 2.0 (the
+1:72790dc:  * "License"); you may not use this file except in compliance
+1:72790dc:  * with the License.  You may obtain a copy of the License at
+1:72790dc:  *
+1:72790dc:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:72790dc:  *
+1:72790dc:  * Unless required by applicable law or agreed to in writing, software
+1:72790dc:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:72790dc:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:72790dc:  * See the License for the specific language governing permissions and
+1:72790dc:  * limitations under the License.
+1:72790dc:  */
+1:72790dc: package org.apache.cassandra.index.sasi.disk;
+12:72790dc: 
+1:72790dc: import java.io.IOException;
+1:72790dc: import java.util.*;
+1:7d857b4: import java.util.stream.*;
+1:72790dc: 
+1:72790dc: import com.google.common.annotations.VisibleForTesting;
+1:72790dc: import com.google.common.collect.Iterators;
+1:72790dc: import org.apache.commons.lang3.builder.HashCodeBuilder;
+1:72790dc: 
+1:7d857b4: import com.carrotsearch.hppc.cursors.LongObjectCursor;
+1:7d857b4: import org.apache.cassandra.index.sasi.*;
+1:7d857b4: import org.apache.cassandra.index.sasi.disk.Descriptor.*;
+1:7d857b4: import org.apache.cassandra.index.sasi.utils.AbstractIterator;
+1:7d857b4: import org.apache.cassandra.index.sasi.utils.*;
+1:7d857b4: import org.apache.cassandra.utils.*;
+1:7d857b4: 
+1:7d857b4: import static org.apache.cassandra.index.sasi.disk.Descriptor.Version.*;
+1:7d857b4: import static org.apache.cassandra.index.sasi.disk.TokenTreeBuilder.*;
+1:72790dc: 
+1:72790dc: // Note: all of the seek-able offsets contained in TokenTree should be sizeof(long)
+1:72790dc: // even if currently only lower int portion of them if used, because that makes
+1:72790dc: // it possible to switch to mmap implementation which supports long positions
+1:72790dc: // without any on-disk format changes and/or re-indexing if one day we'll have a need to.
+1:72790dc: public class TokenTree
+4:72790dc: {
+1:72790dc:     private final Descriptor descriptor;
+1:72790dc:     private final MappedBuffer file;
+1:72790dc:     private final long startPos;
+1:72790dc:     private final long treeMinToken;
+1:72790dc:     private final long treeMaxToken;
+1:72790dc:     private final long tokenCount;
+1:72790dc: 
+1:72790dc:     @VisibleForTesting
+1:72790dc:     protected TokenTree(MappedBuffer tokenTree)
+1:72790dc:     {
+1:72790dc:         this(Descriptor.CURRENT, tokenTree);
+5:72790dc:     }
+1:72790dc: 
+1:72790dc:     public TokenTree(Descriptor d, MappedBuffer tokenTree)
+1:72790dc:     {
+1:72790dc:         descriptor = d;
+1:72790dc:         file = tokenTree;
+1:72790dc:         startPos = file.position();
+1:72790dc: 
+1:72790dc:         file.position(startPos + TokenTreeBuilder.SHARED_HEADER_BYTES);
+1:72790dc: 
+1:7d857b4:         validateMagic();
+1:72790dc: 
+1:72790dc:         tokenCount = file.getLong();
+1:72790dc:         treeMinToken = file.getLong();
+1:72790dc:         treeMaxToken = file.getLong();
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     public long getCount()
+1:72790dc:     {
+1:72790dc:         return tokenCount;
+1:72790dc:     }
+1:72790dc: 
+1:7d857b4:     public RangeIterator<Long, Token> iterator(KeyFetcher keyFetcher)
+1:72790dc:     {
+1:72790dc:         return new TokenTreeIterator(file.duplicate(), keyFetcher);
+1:72790dc:     }
+1:72790dc: 
+1:7d857b4:     public OnDiskToken get(final long searchToken, KeyFetcher keyFetcher)
+1:72790dc:     {
+1:72790dc:         seekToLeaf(searchToken, file);
+1:72790dc:         long leafStart = file.position();
+1:72790dc:         short leafSize = file.getShort(leafStart + 1); // skip the info byte
+1:72790dc: 
+1:72790dc:         file.position(leafStart + TokenTreeBuilder.BLOCK_HEADER_BYTES); // skip to tokens
+1:72790dc:         short tokenIndex = searchLeaf(searchToken, leafSize);
+1:72790dc: 
+1:72790dc:         file.position(leafStart + TokenTreeBuilder.BLOCK_HEADER_BYTES);
+1:72790dc: 
+1:7d857b4:         OnDiskToken token = getTokenAt(file, tokenIndex, leafSize, keyFetcher);
+1:7d857b4: 
+1:72790dc:         return token.get().equals(searchToken) ? token : null;
+1:72790dc:     }
+1:72790dc: 
+1:7d857b4:     private void validateMagic()
+1:72790dc:     {
+1:7d857b4:         if (descriptor.version == aa)
+1:7d857b4:             return;
+1:7d857b4: 
+1:7d857b4:         short magic = file.getShort();
+1:7d857b4:         if (descriptor.version == Version.ab && magic == TokenTreeBuilder.AB_MAGIC)
+1:7d857b4:             return;
+1:7d857b4: 
+1:7d857b4:         if (descriptor.version == Version.ac && magic == TokenTreeBuilder.AC_MAGIC)
+1:7d857b4:             return;
+1:7d857b4: 
+1:7d857b4:         throw new IllegalArgumentException("invalid token tree. Written magic: '" + ByteBufferUtil.bytesToHex(ByteBufferUtil.bytes(magic)) + "'");
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     // finds leaf that *could* contain token
+1:72790dc:     private void seekToLeaf(long token, MappedBuffer file)
+1:72790dc:     {
+1:72790dc:         // this loop always seeks forward except for the first iteration
+1:72790dc:         // where it may seek back to the root
+1:72790dc:         long blockStart = startPos;
+1:72790dc:         while (true)
+1:72790dc:         {
+1:72790dc:             file.position(blockStart);
+1:72790dc: 
+1:72790dc:             byte info = file.get();
+1:72790dc:             boolean isLeaf = (info & 1) == 1;
+1:72790dc: 
+1:72790dc:             if (isLeaf)
+1:72790dc:             {
+1:72790dc:                 file.position(blockStart);
+1:72790dc:                 break;
+1:72790dc:             }
+1:72790dc: 
+1:72790dc:             short tokenCount = file.getShort();
+1:72790dc: 
+1:72790dc:             long minToken = file.getLong();
+1:72790dc:             long maxToken = file.getLong();
+1:72790dc: 
+1:7d857b4:             long seekBase = blockStart + BLOCK_HEADER_BYTES;
+1:72790dc:             if (minToken > token)
+1:72790dc:             {
+1:72790dc:                 // seek to beginning of child offsets to locate first child
+1:7d857b4:                 file.position(seekBase + tokenCount * TOKEN_BYTES);
+1:72790dc:             }
+1:72790dc:             else if (maxToken < token)
+1:72790dc:             {
+1:72790dc:                 // seek to end of child offsets to locate last child
+1:7d857b4:                 file.position(seekBase + (2 * tokenCount) * TOKEN_BYTES);
+1:72790dc:             }
+1:72790dc:             else
+1:72790dc:             {
+1:72790dc:                 // skip to end of block header/start of interior block tokens
+1:72790dc:                 file.position(seekBase);
+1:72790dc: 
+1:72790dc:                 short offsetIndex = searchBlock(token, tokenCount, file);
+1:72790dc: 
+1:72790dc:                 // file pointer is now at beginning of offsets
+1:72790dc:                 if (offsetIndex == tokenCount)
+1:7d857b4:                     file.position(file.position() + (offsetIndex * TOKEN_BYTES));
+1:72790dc:                 else
+1:7d857b4:                     file.position(file.position() + ((tokenCount - offsetIndex - 1) + offsetIndex) * TOKEN_BYTES);
+1:72790dc:             }
+1:7d857b4:             blockStart = (startPos + (int) file.getLong());
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private short searchBlock(long searchToken, short tokenCount, MappedBuffer file)
+1:72790dc:     {
+1:72790dc:         short offsetIndex = 0;
+1:72790dc:         for (int i = 0; i < tokenCount; i++)
+1:72790dc:         {
+1:7d857b4:             if (searchToken < file.getLong())
+1:72790dc:                 break;
+1:72790dc: 
+1:72790dc:             offsetIndex++;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         return offsetIndex;
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private short searchLeaf(long searchToken, short tokenCount)
+1:72790dc:     {
+1:72790dc:         long base = file.position();
+1:72790dc: 
+1:72790dc:         int start = 0;
+1:72790dc:         int end = tokenCount;
+1:72790dc:         int middle = 0;
+1:72790dc: 
+1:72790dc:         while (start <= end)
+1:72790dc:         {
+1:72790dc:             middle = start + ((end - start) >> 1);
+1:7d857b4:             long token = file.getLong(base + middle * LEAF_ENTRY_BYTES + (descriptor.version.compareTo(Version.ac) < 0 ? LEGACY_TOKEN_OFFSET_BYTES : TOKEN_OFFSET_BYTES));
+1:72790dc:             if (token == searchToken)
+1:72790dc:                 break;
+1:72790dc: 
+1:72790dc:             if (token < searchToken)
+1:72790dc:                 start = middle + 1;
+1:72790dc:             else
+1:72790dc:                 end = middle - 1;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         return (short) middle;
+1:72790dc:     }
+1:72790dc: 
+1:7d857b4:     private class TokenTreeIterator extends RangeIterator<Long, Token>
+1:72790dc:     {
+1:7d857b4:         private final KeyFetcher keyFetcher;
+1:72790dc:         private final MappedBuffer file;
+1:72790dc: 
+1:72790dc:         private long currentLeafStart;
+1:72790dc:         private int currentTokenIndex;
+1:72790dc: 
+1:72790dc:         private long leafMinToken;
+1:72790dc:         private long leafMaxToken;
+1:72790dc:         private short leafSize;
+1:72790dc: 
+1:72790dc:         protected boolean firstIteration = true;
+1:72790dc:         private boolean lastLeaf;
+1:72790dc: 
+1:7d857b4:         TokenTreeIterator(MappedBuffer file, KeyFetcher keyFetcher)
+1:72790dc:         {
+1:72790dc:             super(treeMinToken, treeMaxToken, tokenCount);
+1:72790dc: 
+1:72790dc:             this.file = file;
+1:72790dc:             this.keyFetcher = keyFetcher;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         protected Token computeNext()
+1:72790dc:         {
+1:72790dc:             maybeFirstIteration();
+1:72790dc: 
+1:72790dc:             if (currentTokenIndex >= leafSize && lastLeaf)
+1:72790dc:                 return endOfData();
+1:72790dc: 
+1:72790dc:             if (currentTokenIndex < leafSize) // tokens remaining in this leaf
+1:72790dc:             {
+1:72790dc:                 return getTokenAt(currentTokenIndex++);
+1:72790dc:             }
+1:72790dc:             else // no more tokens remaining in this leaf
+1:72790dc:             {
+1:72790dc:                 assert !lastLeaf;
+1:72790dc: 
+1:72790dc:                 seekToNextLeaf();
+1:72790dc:                 setupBlock();
+1:72790dc:                 return computeNext();
+1:72790dc:             }
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         protected void performSkipTo(Long nextToken)
+1:72790dc:         {
+1:72790dc:             maybeFirstIteration();
+1:72790dc: 
+1:72790dc:             if (nextToken <= leafMaxToken) // next is in this leaf block
+1:72790dc:             {
+1:72790dc:                 searchLeaf(nextToken);
+1:72790dc:             }
+1:72790dc:             else // next is in a leaf block that needs to be found
+1:72790dc:             {
+1:72790dc:                 seekToLeaf(nextToken, file);
+1:72790dc:                 setupBlock();
+1:72790dc:                 findNearest(nextToken);
+1:72790dc:             }
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         private void setupBlock()
+1:72790dc:         {
+1:72790dc:             currentLeafStart = file.position();
+1:72790dc:             currentTokenIndex = 0;
+1:72790dc: 
+1:72790dc:             lastLeaf = (file.get() & (1 << TokenTreeBuilder.LAST_LEAF_SHIFT)) > 0;
+1:72790dc:             leafSize = file.getShort();
+1:72790dc: 
+1:72790dc:             leafMinToken = file.getLong();
+1:72790dc:             leafMaxToken = file.getLong();
+1:72790dc: 
+1:72790dc:             // seek to end of leaf header/start of data
+1:72790dc:             file.position(currentLeafStart + TokenTreeBuilder.BLOCK_HEADER_BYTES);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         private void findNearest(Long next)
+1:72790dc:         {
+1:72790dc:             if (next > leafMaxToken && !lastLeaf)
+1:72790dc:             {
+1:72790dc:                 seekToNextLeaf();
+1:72790dc:                 setupBlock();
+1:72790dc:                 findNearest(next);
+1:72790dc:             }
+1:72790dc:             else if (next > leafMinToken)
+1:72790dc:                 searchLeaf(next);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         private void searchLeaf(long next)
+1:72790dc:         {
+1:72790dc:             for (int i = currentTokenIndex; i < leafSize; i++)
+1:72790dc:             {
+1:72790dc:                 if (compareTokenAt(currentTokenIndex, next) >= 0)
+1:72790dc:                     break;
+1:72790dc: 
+1:72790dc:                 currentTokenIndex++;
+1:72790dc:             }
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         private int compareTokenAt(int idx, long toToken)
+1:72790dc:         {
+1:72790dc:             return Long.compare(file.getLong(getTokenPosition(idx)), toToken);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         private Token getTokenAt(int idx)
+1:72790dc:         {
+1:7d857b4:             return TokenTree.this.getTokenAt(file, idx, leafSize, keyFetcher);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         private long getTokenPosition(int idx)
+1:72790dc:         {
+1:7d857b4:             // skip entry header to get position pointing directly at the entry's token
+1:7d857b4:             return TokenTree.this.getEntryPosition(idx, file, descriptor) + (descriptor.version.compareTo(Version.ac) < 0 ? LEGACY_TOKEN_OFFSET_BYTES : TOKEN_OFFSET_BYTES);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         private void seekToNextLeaf()
+1:72790dc:         {
+1:72790dc:             file.position(currentLeafStart + TokenTreeBuilder.BLOCK_BYTES);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void close() throws IOException
+1:72790dc:         {
+1:72790dc:             // nothing to do here
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         private void maybeFirstIteration()
+1:72790dc:         {
+1:72790dc:             // seek to the first token only when requested for the first time,
+1:72790dc:             // highly predictable branch and saves us a lot by not traversing the tree
+1:72790dc:             // on creation time because it's not at all required.
+1:72790dc:             if (!firstIteration)
+1:72790dc:                 return;
+1:72790dc: 
+1:72790dc:             seekToLeaf(treeMinToken, file);
+1:72790dc:             setupBlock();
+1:72790dc:             firstIteration = false;
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:7d857b4:     public class OnDiskToken extends Token
+1:72790dc:     {
+1:72790dc:         private final Set<TokenInfo> info = new HashSet<>(2);
+1:7d857b4:         private final Set<RowKey> loadedKeys = new TreeSet<>(RowKey.COMPARATOR);
+1:72790dc: 
+1:7d857b4:         private OnDiskToken(MappedBuffer buffer, long position, short leafSize, KeyFetcher keyFetcher)
+1:72790dc:         {
+1:7d857b4:             super(buffer.getLong(position + (descriptor.version.compareTo(Version.ac) < 0 ? LEGACY_TOKEN_OFFSET_BYTES : TOKEN_OFFSET_BYTES)));
+1:7d857b4:             info.add(new TokenInfo(buffer, position, leafSize, keyFetcher, descriptor));
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void merge(CombinedValue<Long> other)
+1:72790dc:         {
+1:72790dc:             if (!(other instanceof Token))
+1:72790dc:                 return;
+1:72790dc: 
+1:72790dc:             Token o = (Token) other;
+1:72790dc:             if (token != o.token)
+1:72790dc:                 throw new IllegalArgumentException(String.format("%s != %s", token, o.token));
+1:72790dc: 
+1:72790dc:             if (o instanceof OnDiskToken)
+1:72790dc:             {
+1:72790dc:                 info.addAll(((OnDiskToken) other).info);
+1:72790dc:             }
+1:72790dc:             else
+1:72790dc:             {
+1:72790dc:                 Iterators.addAll(loadedKeys, o.iterator());
+1:72790dc:             }
+1:72790dc:         }
+1:72790dc: 
+1:7d857b4:         public Iterator<RowKey> iterator()
+1:72790dc:         {
+1:7d857b4:             List<Iterator<RowKey>> keys = new ArrayList<>(info.size());
+1:72790dc: 
+1:72790dc:             for (TokenInfo i : info)
+1:72790dc:                 keys.add(i.iterator());
+1:72790dc: 
+1:72790dc:             if (!loadedKeys.isEmpty())
+1:72790dc:                 keys.add(loadedKeys.iterator());
+1:72790dc: 
+1:7d857b4:             return MergeIterator.get(keys, RowKey.COMPARATOR, new MergeIterator.Reducer<RowKey, RowKey>()
+1:72790dc:             {
+1:7d857b4:                 RowKey reduced = null;
+1:72790dc: 
+1:72790dc:                 public boolean trivialReduceIsTrivial()
+1:72790dc:                 {
+2:72790dc:                     return true;
+1:72790dc:                 }
+1:72790dc: 
+1:7d857b4:                 public void reduce(int idx, RowKey current)
+1:72790dc:                 {
+1:72790dc:                     reduced = current;
+1:72790dc:                 }
+1:72790dc: 
+1:7d857b4:                 protected RowKey getReduced()
+1:72790dc:                 {
+1:72790dc:                     return reduced;
+1:72790dc:                 }
+1:72790dc:             });
+1:72790dc:         }
+1:72790dc: 
+1:7d857b4:         public KeyOffsets getOffsets()
+1:72790dc:         {
+1:7d857b4:             KeyOffsets offsets = new KeyOffsets();
+1:72790dc:             for (TokenInfo i : info)
+1:72790dc:             {
+1:7d857b4:                 for (LongObjectCursor<long[]> offset : i.fetchOffsets())
+1:7d857b4:                     offsets.put(offset.key, offset.value);
+1:72790dc:             }
+1:72790dc: 
+2:72790dc:             return offsets;
+1:7d857b4:         }
+1:72790dc:     }
+1:72790dc: 
+1:7d857b4:     private OnDiskToken getTokenAt(MappedBuffer buffer, int idx, short leafSize, KeyFetcher keyFetcher)
+1:7d857b4:     {
+1:7d857b4:         return new OnDiskToken(buffer, getEntryPosition(idx, buffer, descriptor), leafSize, keyFetcher);
+1:7d857b4:     }
+1:72790dc: 
+1:7d857b4:     private long getEntryPosition(int idx, MappedBuffer file, Descriptor descriptor)
+1:7d857b4:     {
+1:7d857b4:         if (descriptor.version.compareTo(Version.ac) < 0)
+1:7d857b4:             return file.position() + (idx * LEGACY_LEAF_ENTRY_BYTES);
+1:7d857b4: 
+1:7d857b4:         // skip n entries, to the entry with the given index
+1:7d857b4:         return file.position() + (idx * LEAF_ENTRY_BYTES);
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private static class TokenInfo
+1:72790dc:     {
+1:72790dc:         private final MappedBuffer buffer;
+1:7d857b4:         private final KeyFetcher keyFetcher;
+1:7d857b4:         private final Descriptor descriptor;
+1:72790dc:         private final long position;
+1:72790dc:         private final short leafSize;
+1:72790dc: 
+1:7d857b4:         public TokenInfo(MappedBuffer buffer, long position, short leafSize, KeyFetcher keyFetcher, Descriptor descriptor)
+1:72790dc:         {
+1:72790dc:             this.keyFetcher = keyFetcher;
+1:72790dc:             this.buffer = buffer;
+1:72790dc:             this.position = position;
+1:72790dc:             this.leafSize = leafSize;
+1:7d857b4:             this.descriptor = descriptor;
+1:72790dc:         }
+1:72790dc: 
+1:7d857b4:         public Iterator<RowKey> iterator()
+1:72790dc:         {
+1:72790dc:             return new KeyIterator(keyFetcher, fetchOffsets());
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public int hashCode()
+1:72790dc:         {
+1:72790dc:             return new HashCodeBuilder().append(keyFetcher).append(position).append(leafSize).build();
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public boolean equals(Object other)
+1:72790dc:         {
+1:72790dc:             if (!(other instanceof TokenInfo))
+2:72790dc:                 return false;
+1:72790dc: 
+1:72790dc:             TokenInfo o = (TokenInfo) other;
+1:72790dc:             return keyFetcher == o.keyFetcher && position == o.position;
+1:7d857b4: 
+1:72790dc:         }
+1:72790dc: 
+1:7d857b4:         /**
+1:7d857b4:          * Legacy leaf storage format (used for reading data formats before AC):
+1:7d857b4:          *
+1:7d857b4:          *    [(short) leaf type][(short) offset extra bytes][(long) token][(int) offsetData]
+1:7d857b4:          *
+1:7d857b4:          * Many pairs can be encoded into long+int.
+1:7d857b4:          *
+1:7d857b4:          * Simple entry: offset fits into (int)
+1:7d857b4:          *
+1:7d857b4:          *    [(short) leaf type][(short) offset extra bytes][(long) token][(int) offsetData]
+1:7d857b4:          *
+1:7d857b4:          * FactoredOffset: a single offset, offset fits into (long)+(int) bits:
+1:7d857b4:          *
+1:7d857b4:          *    [(short) leaf type][(short) 16 bytes of remained offset][(long) token][(int) top 32 bits of offset]
+1:7d857b4:          *
+1:7d857b4:          * PackedCollisionEntry: packs the two offset entries into int and a short (if both of them fit into
+1:7d857b4:          * (long) and one of them fits into (int))
+1:7d857b4:          *
+1:7d857b4:          *    [(short) leaf type][(short) 16 the offset that'd fit into short][(long) token][(int) 32 bits of offset that'd fit into int]
+1:7d857b4:          *
+1:7d857b4:          * Otherwise, the rest gets packed into limited-size overflow collision entry
+1:7d857b4:          *
+1:7d857b4:          *    [(short) leaf type][(short) count][(long) token][(int) start index]
+1:7d857b4:          */
+1:7d857b4:         private KeyOffsets fetchOffsetsLegacy()
+1:72790dc:         {
+1:72790dc:             short info = buffer.getShort(position);
+1:020dd2d:             // offset extra is unsigned short (right-most 16 bits of 48 bits allowed for an offset)
+1:7d857b4:             int offsetExtra = buffer.getShort(position + Short.BYTES) & 0xFFFF;
+1:020dd2d:             // is the it left-most (32-bit) base of the actual offset in the index file
+1:7d857b4:             int offsetData = buffer.getInt(position + (2 * Short.BYTES) + Long.BYTES);
+1:72790dc: 
+1:72790dc:             EntryType type = EntryType.of(info & TokenTreeBuilder.ENTRY_TYPE_MASK);
+1:72790dc: 
+1:7d857b4:             KeyOffsets rowOffsets = new KeyOffsets();
+1:72790dc:             switch (type)
+1:72790dc:             {
+1:72790dc:                 case SIMPLE:
+1:7d857b4:                     rowOffsets.put(offsetData, KeyOffsets.NO_OFFSET);
+1:7d857b4:                     break;
+1:72790dc:                 case OVERFLOW:
+1:7d857b4:                     long offsetPos = (buffer.position() + (2 * (leafSize * Long.BYTES)) + (offsetData * Long.BYTES));
+1:72790dc: 
+1:020dd2d:                     for (int i = 0; i < offsetExtra; i++)
+1:7d857b4:                     {
+1:7d857b4:                         long offset = buffer.getLong(offsetPos + (i * Long.BYTES));;
+1:7d857b4:                         rowOffsets.put(offset, KeyOffsets.NO_OFFSET);
+1:7d857b4:                     }
+1:7d857b4:                     break;
+1:72790dc:                 case FACTORED:
+1:7d857b4:                     long offset = (((long) offsetData) << Short.SIZE) + offsetExtra;
+1:7d857b4:                     rowOffsets.put(offset, KeyOffsets.NO_OFFSET);
+1:7d857b4:                     break;
+1:72790dc:                 case PACKED:
+1:7d857b4:                     rowOffsets.put(offsetExtra, KeyOffsets.NO_OFFSET);
+1:7d857b4:                     rowOffsets.put(offsetData, KeyOffsets.NO_OFFSET);
+2:72790dc:                 default:
+1:72790dc:                     throw new IllegalStateException("Unknown entry type: " + type);
+1:72790dc:             }
+1:7d857b4:             return rowOffsets;
+1:7d857b4:         }
+1:7d857b4: 
+1:7d857b4:         private KeyOffsets fetchOffsets()
+1:7d857b4:         {
+1:7d857b4:             if (descriptor.version.compareTo(Version.ac) < 0)
+1:7d857b4:                 return fetchOffsetsLegacy();
+1:7d857b4: 
+1:7d857b4:             short info = buffer.getShort(position);
+1:7d857b4:             EntryType type = EntryType.of(info & TokenTreeBuilder.ENTRY_TYPE_MASK);
+1:7d857b4: 
+1:7d857b4:             KeyOffsets rowOffsets = new KeyOffsets();
+1:7d857b4:             long baseOffset = position + LEAF_ENTRY_TYPE_BYTES + TOKEN_BYTES;
+1:7d857b4:             switch (type)
+1:7d857b4:             {
+1:7d857b4:                 case SIMPLE:
+1:7d857b4:                     long partitionOffset = buffer.getLong(baseOffset);
+1:7d857b4:                     long rowOffset = buffer.getLong(baseOffset + LEAF_PARTITON_OFFSET_BYTES);
+1:7d857b4: 
+1:7d857b4:                     rowOffsets.put(partitionOffset, rowOffset);
+1:7d857b4:                     break;
+1:7d857b4:                 case PACKED:
+1:7d857b4:                     long partitionOffset1 = buffer.getInt(baseOffset);
+1:7d857b4:                     long rowOffset1 = buffer.getInt(baseOffset + LEAF_PARTITON_OFFSET_PACKED_BYTES);
+1:7d857b4: 
+1:7d857b4:                     long partitionOffset2 = buffer.getInt(baseOffset + LEAF_PARTITON_OFFSET_PACKED_BYTES + LEAF_ROW_OFFSET_PACKED_BYTES);
+1:7d857b4:                     long rowOffset2 = buffer.getInt(baseOffset + 2 * LEAF_PARTITON_OFFSET_PACKED_BYTES + LEAF_ROW_OFFSET_PACKED_BYTES);
+1:7d857b4: 
+1:7d857b4:                     rowOffsets.put(partitionOffset1, rowOffset1);
+1:7d857b4:                     rowOffsets.put(partitionOffset2, rowOffset2);
+1:7d857b4:                     break;
+1:7d857b4:                 case OVERFLOW:
+1:7d857b4:                     long collisionOffset = buffer.getLong(baseOffset);
+1:7d857b4:                     long count = buffer.getLong(baseOffset + LEAF_PARTITON_OFFSET_BYTES);
+1:7d857b4: 
+1:7d857b4:                     // Skip leaves and collision offsets that do not belong to current token
+1:7d857b4:                     long offsetPos = buffer.position() + leafSize *  LEAF_ENTRY_BYTES + collisionOffset * COLLISION_ENTRY_BYTES;
+1:7d857b4: 
+1:7d857b4:                     for (int i = 0; i < count; i++)
+1:7d857b4:                     {
+1:7d857b4:                         long currentPartitionOffset = buffer.getLong(offsetPos + i * COLLISION_ENTRY_BYTES);
+1:7d857b4:                         long currentRowOffset = buffer.getLong(offsetPos + i * COLLISION_ENTRY_BYTES + LEAF_PARTITON_OFFSET_BYTES);
+1:7d857b4: 
+1:7d857b4:                         rowOffsets.put(currentPartitionOffset, currentRowOffset);
+1:7d857b4:                     }
+1:7d857b4:                     break;
+1:7d857b4:                 default:
+1:7d857b4:                     throw new IllegalStateException("Unknown entry type: " + type);
+1:7d857b4:             }
+1:7d857b4: 
+1:7d857b4: 
+1:7d857b4:             return rowOffsets;
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:7d857b4:     private static class KeyIterator extends AbstractIterator<RowKey>
+1:72790dc:     {
+1:7d857b4:         private final KeyFetcher keyFetcher;
+1:7d857b4:         private final Iterator<LongObjectCursor<long[]>> offsets;
+1:7d857b4:         private long currentPatitionKey;
+1:7d857b4:         private PrimitiveIterator.OfLong currentCursor = null;
+1:72790dc: 
+1:7d857b4:         public KeyIterator(KeyFetcher keyFetcher, KeyOffsets offsets)
+1:72790dc:         {
+1:72790dc:             this.keyFetcher = keyFetcher;
+1:7d857b4:             this.offsets = offsets.iterator();
+1:72790dc:         }
+1:72790dc: 
+1:7d857b4:         public RowKey computeNext()
+1:72790dc:         {
+1:7d857b4:             if (currentCursor != null && currentCursor.hasNext())
+1:7d857b4:             {
+1:7d857b4:                 return keyFetcher.getRowKey(currentPatitionKey, currentCursor.nextLong());
+1:7d857b4:             }
+1:7d857b4:             else if (offsets.hasNext())
+1:7d857b4:             {
+1:7d857b4:                 LongObjectCursor<long[]> cursor = offsets.next();
+1:7d857b4:                 currentPatitionKey = cursor.key;
+1:7d857b4:                 currentCursor = LongStream.of(cursor.value).iterator();
+1:7d857b4: 
+1:7d857b4:                 return keyFetcher.getRowKey(currentPatitionKey, currentCursor.nextLong());
+1:7d857b4:             }
+1:7d857b4:             else
+1:7d857b4:             {
+1:7d857b4:                 return endOfData();
+1:7d857b4:             }
+1:7d857b4:         }
+1:72790dc:     }
+1:72790dc: }
+============================================================================
+author:Alex Petrov
+-------------------------------------------------------------------------------
+commit:7d857b4
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.stream.*;
+1: import com.carrotsearch.hppc.cursors.LongObjectCursor;
+1: import org.apache.cassandra.index.sasi.*;
+1: import org.apache.cassandra.index.sasi.disk.Descriptor.*;
+1: import org.apache.cassandra.index.sasi.utils.AbstractIterator;
+1: import org.apache.cassandra.index.sasi.utils.*;
+1: import org.apache.cassandra.utils.*;
+1: 
+1: import static org.apache.cassandra.index.sasi.disk.Descriptor.Version.*;
+1: import static org.apache.cassandra.index.sasi.disk.TokenTreeBuilder.*;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         validateMagic();
+/////////////////////////////////////////////////////////////////////////
+1:     public RangeIterator<Long, Token> iterator(KeyFetcher keyFetcher)
+1:     public OnDiskToken get(final long searchToken, KeyFetcher keyFetcher)
+/////////////////////////////////////////////////////////////////////////
+1:         OnDiskToken token = getTokenAt(file, tokenIndex, leafSize, keyFetcher);
+1: 
+1:     private void validateMagic()
+1:         if (descriptor.version == aa)
+1:             return;
+1: 
+1:         short magic = file.getShort();
+1:         if (descriptor.version == Version.ab && magic == TokenTreeBuilder.AB_MAGIC)
+1:             return;
+1: 
+1:         if (descriptor.version == Version.ac && magic == TokenTreeBuilder.AC_MAGIC)
+1:             return;
+1: 
+1:         throw new IllegalArgumentException("invalid token tree. Written magic: '" + ByteBufferUtil.bytesToHex(ByteBufferUtil.bytes(magic)) + "'");
+/////////////////////////////////////////////////////////////////////////
+1:             long seekBase = blockStart + BLOCK_HEADER_BYTES;
+1:                 file.position(seekBase + tokenCount * TOKEN_BYTES);
+1:                 file.position(seekBase + (2 * tokenCount) * TOKEN_BYTES);
+/////////////////////////////////////////////////////////////////////////
+1:                     file.position(file.position() + (offsetIndex * TOKEN_BYTES));
+1:                     file.position(file.position() + ((tokenCount - offsetIndex - 1) + offsetIndex) * TOKEN_BYTES);
+1:             blockStart = (startPos + (int) file.getLong());
+/////////////////////////////////////////////////////////////////////////
+1:             if (searchToken < file.getLong())
+/////////////////////////////////////////////////////////////////////////
+1:             long token = file.getLong(base + middle * LEAF_ENTRY_BYTES + (descriptor.version.compareTo(Version.ac) < 0 ? LEGACY_TOKEN_OFFSET_BYTES : TOKEN_OFFSET_BYTES));
+/////////////////////////////////////////////////////////////////////////
+1:     private class TokenTreeIterator extends RangeIterator<Long, Token>
+1:         private final KeyFetcher keyFetcher;
+/////////////////////////////////////////////////////////////////////////
+1:         TokenTreeIterator(MappedBuffer file, KeyFetcher keyFetcher)
+/////////////////////////////////////////////////////////////////////////
+1:             return TokenTree.this.getTokenAt(file, idx, leafSize, keyFetcher);
+1:             // skip entry header to get position pointing directly at the entry's token
+1:             return TokenTree.this.getEntryPosition(idx, file, descriptor) + (descriptor.version.compareTo(Version.ac) < 0 ? LEGACY_TOKEN_OFFSET_BYTES : TOKEN_OFFSET_BYTES);
+/////////////////////////////////////////////////////////////////////////
+1:     public class OnDiskToken extends Token
+1:         private final Set<RowKey> loadedKeys = new TreeSet<>(RowKey.COMPARATOR);
+1:         private OnDiskToken(MappedBuffer buffer, long position, short leafSize, KeyFetcher keyFetcher)
+1:             super(buffer.getLong(position + (descriptor.version.compareTo(Version.ac) < 0 ? LEGACY_TOKEN_OFFSET_BYTES : TOKEN_OFFSET_BYTES)));
+1:             info.add(new TokenInfo(buffer, position, leafSize, keyFetcher, descriptor));
+/////////////////////////////////////////////////////////////////////////
+1:         public Iterator<RowKey> iterator()
+1:             List<Iterator<RowKey>> keys = new ArrayList<>(info.size());
+/////////////////////////////////////////////////////////////////////////
+1:             return MergeIterator.get(keys, RowKey.COMPARATOR, new MergeIterator.Reducer<RowKey, RowKey>()
+1:                 RowKey reduced = null;
+1:                 public void reduce(int idx, RowKey current)
+1:                 protected RowKey getReduced()
+1:         public KeyOffsets getOffsets()
+1:             KeyOffsets offsets = new KeyOffsets();
+1:                 for (LongObjectCursor<long[]> offset : i.fetchOffsets())
+1:                     offsets.put(offset.key, offset.value);
+1:     }
+1:     private OnDiskToken getTokenAt(MappedBuffer buffer, int idx, short leafSize, KeyFetcher keyFetcher)
+1:     {
+1:         return new OnDiskToken(buffer, getEntryPosition(idx, buffer, descriptor), leafSize, keyFetcher);
+1:     }
+1:     private long getEntryPosition(int idx, MappedBuffer file, Descriptor descriptor)
+1:     {
+1:         if (descriptor.version.compareTo(Version.ac) < 0)
+1:             return file.position() + (idx * LEGACY_LEAF_ENTRY_BYTES);
+1: 
+1:         // skip n entries, to the entry with the given index
+1:         return file.position() + (idx * LEAF_ENTRY_BYTES);
+1:         private final KeyFetcher keyFetcher;
+1:         private final Descriptor descriptor;
+1:         public TokenInfo(MappedBuffer buffer, long position, short leafSize, KeyFetcher keyFetcher, Descriptor descriptor)
+1:             this.descriptor = descriptor;
+1:         public Iterator<RowKey> iterator()
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         /**
+1:          * Legacy leaf storage format (used for reading data formats before AC):
+1:          *
+1:          *    [(short) leaf type][(short) offset extra bytes][(long) token][(int) offsetData]
+1:          *
+1:          * Many pairs can be encoded into long+int.
+1:          *
+1:          * Simple entry: offset fits into (int)
+1:          *
+1:          *    [(short) leaf type][(short) offset extra bytes][(long) token][(int) offsetData]
+1:          *
+1:          * FactoredOffset: a single offset, offset fits into (long)+(int) bits:
+1:          *
+1:          *    [(short) leaf type][(short) 16 bytes of remained offset][(long) token][(int) top 32 bits of offset]
+1:          *
+1:          * PackedCollisionEntry: packs the two offset entries into int and a short (if both of them fit into
+1:          * (long) and one of them fits into (int))
+1:          *
+1:          *    [(short) leaf type][(short) 16 the offset that'd fit into short][(long) token][(int) 32 bits of offset that'd fit into int]
+1:          *
+1:          * Otherwise, the rest gets packed into limited-size overflow collision entry
+1:          *
+1:          *    [(short) leaf type][(short) count][(long) token][(int) start index]
+1:          */
+1:         private KeyOffsets fetchOffsetsLegacy()
+1:             int offsetExtra = buffer.getShort(position + Short.BYTES) & 0xFFFF;
+1:             int offsetData = buffer.getInt(position + (2 * Short.BYTES) + Long.BYTES);
+1:             KeyOffsets rowOffsets = new KeyOffsets();
+1:                     rowOffsets.put(offsetData, KeyOffsets.NO_OFFSET);
+1:                     break;
+1:                     long offsetPos = (buffer.position() + (2 * (leafSize * Long.BYTES)) + (offsetData * Long.BYTES));
+1:                     {
+1:                         long offset = buffer.getLong(offsetPos + (i * Long.BYTES));;
+1:                         rowOffsets.put(offset, KeyOffsets.NO_OFFSET);
+1:                     }
+1:                     break;
+1:                     long offset = (((long) offsetData) << Short.SIZE) + offsetExtra;
+1:                     rowOffsets.put(offset, KeyOffsets.NO_OFFSET);
+1:                     break;
+1:                     rowOffsets.put(offsetExtra, KeyOffsets.NO_OFFSET);
+1:                     rowOffsets.put(offsetData, KeyOffsets.NO_OFFSET);
+1:             return rowOffsets;
+1:         }
+1: 
+1:         private KeyOffsets fetchOffsets()
+1:         {
+1:             if (descriptor.version.compareTo(Version.ac) < 0)
+1:                 return fetchOffsetsLegacy();
+1: 
+1:             short info = buffer.getShort(position);
+1:             EntryType type = EntryType.of(info & TokenTreeBuilder.ENTRY_TYPE_MASK);
+1: 
+1:             KeyOffsets rowOffsets = new KeyOffsets();
+1:             long baseOffset = position + LEAF_ENTRY_TYPE_BYTES + TOKEN_BYTES;
+1:             switch (type)
+1:             {
+1:                 case SIMPLE:
+1:                     long partitionOffset = buffer.getLong(baseOffset);
+1:                     long rowOffset = buffer.getLong(baseOffset + LEAF_PARTITON_OFFSET_BYTES);
+1: 
+1:                     rowOffsets.put(partitionOffset, rowOffset);
+1:                     break;
+1:                 case PACKED:
+1:                     long partitionOffset1 = buffer.getInt(baseOffset);
+1:                     long rowOffset1 = buffer.getInt(baseOffset + LEAF_PARTITON_OFFSET_PACKED_BYTES);
+1: 
+1:                     long partitionOffset2 = buffer.getInt(baseOffset + LEAF_PARTITON_OFFSET_PACKED_BYTES + LEAF_ROW_OFFSET_PACKED_BYTES);
+1:                     long rowOffset2 = buffer.getInt(baseOffset + 2 * LEAF_PARTITON_OFFSET_PACKED_BYTES + LEAF_ROW_OFFSET_PACKED_BYTES);
+1: 
+1:                     rowOffsets.put(partitionOffset1, rowOffset1);
+1:                     rowOffsets.put(partitionOffset2, rowOffset2);
+1:                     break;
+1:                 case OVERFLOW:
+1:                     long collisionOffset = buffer.getLong(baseOffset);
+1:                     long count = buffer.getLong(baseOffset + LEAF_PARTITON_OFFSET_BYTES);
+1: 
+1:                     // Skip leaves and collision offsets that do not belong to current token
+1:                     long offsetPos = buffer.position() + leafSize *  LEAF_ENTRY_BYTES + collisionOffset * COLLISION_ENTRY_BYTES;
+1: 
+1:                     for (int i = 0; i < count; i++)
+1:                     {
+1:                         long currentPartitionOffset = buffer.getLong(offsetPos + i * COLLISION_ENTRY_BYTES);
+1:                         long currentRowOffset = buffer.getLong(offsetPos + i * COLLISION_ENTRY_BYTES + LEAF_PARTITON_OFFSET_BYTES);
+1: 
+1:                         rowOffsets.put(currentPartitionOffset, currentRowOffset);
+1:                     }
+1:                     break;
+1:                 default:
+1:                     throw new IllegalStateException("Unknown entry type: " + type);
+1:             }
+1: 
+1: 
+1:             return rowOffsets;
+1:     private static class KeyIterator extends AbstractIterator<RowKey>
+1:         private final KeyFetcher keyFetcher;
+1:         private final Iterator<LongObjectCursor<long[]>> offsets;
+1:         private long currentPatitionKey;
+1:         private PrimitiveIterator.OfLong currentCursor = null;
+1:         public KeyIterator(KeyFetcher keyFetcher, KeyOffsets offsets)
+1:             this.offsets = offsets.iterator();
+1:         public RowKey computeNext()
+1:             if (currentCursor != null && currentCursor.hasNext())
+1:             {
+1:                 return keyFetcher.getRowKey(currentPatitionKey, currentCursor.nextLong());
+1:             }
+1:             else if (offsets.hasNext())
+1:             {
+1:                 LongObjectCursor<long[]> cursor = offsets.next();
+1:                 currentPatitionKey = cursor.key;
+1:                 currentCursor = LongStream.of(cursor.value).iterator();
+1: 
+1:                 return keyFetcher.getRowKey(currentPatitionKey, currentCursor.nextLong());
+1:             }
+1:             else
+1:             {
+1:                 return endOfData();
+1:             }
+1: }
+author:Jordan West
+-------------------------------------------------------------------------------
+commit:020dd2d
+/////////////////////////////////////////////////////////////////////////
+1:             // offset extra is unsigned short (right-most 16 bits of 48 bits allowed for an offset)
+0:             int offsetExtra = buffer.getShort(position + SHORT_BYTES) & 0xFFFF;
+1:             // is the it left-most (32-bit) base of the actual offset in the index file
+0:             int offsetData = buffer.getInt(position + (2 * SHORT_BYTES) + LONG_BYTES);
+0:                     return new long[] { offsetData };
+0:                     long[] offsets = new long[offsetExtra]; // offsetShort contains count of tokens
+0:                     long offsetPos = (buffer.position() + (2 * (leafSize * LONG_BYTES)) + (offsetData * LONG_BYTES));
+1:                     for (int i = 0; i < offsetExtra; i++)
+0:                     return new long[] { (((long) offsetData) << Short.SIZE) + offsetExtra };
+0:                     return new long[] { offsetExtra, offsetData };
+commit:5c4d5c7
+/////////////////////////////////////////////////////////////////////////
+0: import com.carrotsearch.hppc.LongOpenHashSet;
+0: import com.carrotsearch.hppc.LongSet;
+/////////////////////////////////////////////////////////////////////////
+0:         public LongSet getOffsets()
+0:             LongSet offsets = new LongOpenHashSet(4);
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:72790dc
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.index.sasi.disk;
+1: 
+1: import java.io.IOException;
+1: import java.util.*;
+1: 
+0: import org.apache.cassandra.db.DecoratedKey;
+0: import org.apache.cassandra.index.sasi.utils.AbstractIterator;
+0: import org.apache.cassandra.index.sasi.utils.CombinedValue;
+0: import org.apache.cassandra.index.sasi.utils.MappedBuffer;
+0: import org.apache.cassandra.index.sasi.utils.RangeIterator;
+0: import org.apache.cassandra.utils.MergeIterator;
+1: 
+1: import com.google.common.annotations.VisibleForTesting;
+0: import com.google.common.base.Function;
+1: import com.google.common.collect.Iterators;
+1: import org.apache.commons.lang3.builder.HashCodeBuilder;
+1: 
+0: import static org.apache.cassandra.index.sasi.disk.TokenTreeBuilder.EntryType;
+1: 
+1: // Note: all of the seek-able offsets contained in TokenTree should be sizeof(long)
+1: // even if currently only lower int portion of them if used, because that makes
+1: // it possible to switch to mmap implementation which supports long positions
+1: // without any on-disk format changes and/or re-indexing if one day we'll have a need to.
+1: public class TokenTree
+1: {
+0:     private static final int LONG_BYTES = Long.SIZE / 8;
+0:     private static final int SHORT_BYTES = Short.SIZE / 8;
+1: 
+1:     private final Descriptor descriptor;
+1:     private final MappedBuffer file;
+1:     private final long startPos;
+1:     private final long treeMinToken;
+1:     private final long treeMaxToken;
+1:     private final long tokenCount;
+1: 
+1:     @VisibleForTesting
+1:     protected TokenTree(MappedBuffer tokenTree)
+1:     {
+1:         this(Descriptor.CURRENT, tokenTree);
+1:     }
+1: 
+1:     public TokenTree(Descriptor d, MappedBuffer tokenTree)
+1:     {
+1:         descriptor = d;
+1:         file = tokenTree;
+1:         startPos = file.position();
+1: 
+1:         file.position(startPos + TokenTreeBuilder.SHARED_HEADER_BYTES);
+1: 
+0:         if (!validateMagic())
+0:             throw new IllegalArgumentException("invalid token tree");
+1: 
+1:         tokenCount = file.getLong();
+1:         treeMinToken = file.getLong();
+1:         treeMaxToken = file.getLong();
+1:     }
+1: 
+1:     public long getCount()
+1:     {
+1:         return tokenCount;
+1:     }
+1: 
+0:     public RangeIterator<Long, Token> iterator(Function<Long, DecoratedKey> keyFetcher)
+1:     {
+1:         return new TokenTreeIterator(file.duplicate(), keyFetcher);
+1:     }
+1: 
+0:     public OnDiskToken get(final long searchToken, Function<Long, DecoratedKey> keyFetcher)
+1:     {
+1:         seekToLeaf(searchToken, file);
+1:         long leafStart = file.position();
+1:         short leafSize = file.getShort(leafStart + 1); // skip the info byte
+1: 
+1:         file.position(leafStart + TokenTreeBuilder.BLOCK_HEADER_BYTES); // skip to tokens
+1:         short tokenIndex = searchLeaf(searchToken, leafSize);
+1: 
+1:         file.position(leafStart + TokenTreeBuilder.BLOCK_HEADER_BYTES);
+1: 
+0:         OnDiskToken token = OnDiskToken.getTokenAt(file, tokenIndex, leafSize, keyFetcher);
+1:         return token.get().equals(searchToken) ? token : null;
+1:     }
+1: 
+0:     private boolean validateMagic()
+1:     {
+0:         switch (descriptor.version.toString())
+1:         {
+0:             case Descriptor.VERSION_AA:
+1:                 return true;
+0:             case Descriptor.VERSION_AB:
+0:                 return TokenTreeBuilder.AB_MAGIC == file.getShort();
+1:             default:
+1:                 return false;
+1:         }
+1:     }
+1: 
+1:     // finds leaf that *could* contain token
+1:     private void seekToLeaf(long token, MappedBuffer file)
+1:     {
+1:         // this loop always seeks forward except for the first iteration
+1:         // where it may seek back to the root
+1:         long blockStart = startPos;
+1:         while (true)
+1:         {
+1:             file.position(blockStart);
+1: 
+1:             byte info = file.get();
+1:             boolean isLeaf = (info & 1) == 1;
+1: 
+1:             if (isLeaf)
+1:             {
+1:                 file.position(blockStart);
+1:                 break;
+1:             }
+1: 
+1:             short tokenCount = file.getShort();
+1: 
+1:             long minToken = file.getLong();
+1:             long maxToken = file.getLong();
+1: 
+0:             long seekBase = blockStart + TokenTreeBuilder.BLOCK_HEADER_BYTES;
+1:             if (minToken > token)
+1:             {
+1:                 // seek to beginning of child offsets to locate first child
+0:                 file.position(seekBase + tokenCount * LONG_BYTES);
+0:                 blockStart = (startPos + (int) file.getLong());
+1:             }
+1:             else if (maxToken < token)
+1:             {
+1:                 // seek to end of child offsets to locate last child
+0:                 file.position(seekBase + (2 * tokenCount) * LONG_BYTES);
+0:                 blockStart = (startPos + (int) file.getLong());
+1:             }
+1:             else
+1:             {
+1:                 // skip to end of block header/start of interior block tokens
+1:                 file.position(seekBase);
+1: 
+1:                 short offsetIndex = searchBlock(token, tokenCount, file);
+1: 
+1:                 // file pointer is now at beginning of offsets
+1:                 if (offsetIndex == tokenCount)
+0:                     file.position(file.position() + (offsetIndex * LONG_BYTES));
+1:                 else
+0:                     file.position(file.position() + ((tokenCount - offsetIndex - 1) + offsetIndex) * LONG_BYTES);
+1: 
+0:                 blockStart = (startPos + (int) file.getLong());
+1:             }
+1:         }
+1:     }
+1: 
+1:     private short searchBlock(long searchToken, short tokenCount, MappedBuffer file)
+1:     {
+1:         short offsetIndex = 0;
+1:         for (int i = 0; i < tokenCount; i++)
+1:         {
+0:             long readToken = file.getLong();
+0:             if (searchToken < readToken)
+1:                 break;
+1: 
+1:             offsetIndex++;
+1:         }
+1: 
+1:         return offsetIndex;
+1:     }
+1: 
+1:     private short searchLeaf(long searchToken, short tokenCount)
+1:     {
+1:         long base = file.position();
+1: 
+1:         int start = 0;
+1:         int end = tokenCount;
+1:         int middle = 0;
+1: 
+1:         while (start <= end)
+1:         {
+1:             middle = start + ((end - start) >> 1);
+1: 
+0:             // each entry is 16 bytes wide, token is in bytes 4-11
+0:             long token = file.getLong(base + (middle * (2 * LONG_BYTES) + 4));
+1: 
+1:             if (token == searchToken)
+1:                 break;
+1: 
+1:             if (token < searchToken)
+1:                 start = middle + 1;
+1:             else
+1:                 end = middle - 1;
+1:         }
+1: 
+1:         return (short) middle;
+1:     }
+1: 
+0:     public class TokenTreeIterator extends RangeIterator<Long, Token>
+1:     {
+0:         private final Function<Long, DecoratedKey> keyFetcher;
+1:         private final MappedBuffer file;
+1: 
+1:         private long currentLeafStart;
+1:         private int currentTokenIndex;
+1: 
+1:         private long leafMinToken;
+1:         private long leafMaxToken;
+1:         private short leafSize;
+1: 
+1:         protected boolean firstIteration = true;
+1:         private boolean lastLeaf;
+1: 
+0:         TokenTreeIterator(MappedBuffer file, Function<Long, DecoratedKey> keyFetcher)
+1:         {
+1:             super(treeMinToken, treeMaxToken, tokenCount);
+1: 
+1:             this.file = file;
+1:             this.keyFetcher = keyFetcher;
+1:         }
+1: 
+1:         protected Token computeNext()
+1:         {
+1:             maybeFirstIteration();
+1: 
+1:             if (currentTokenIndex >= leafSize && lastLeaf)
+1:                 return endOfData();
+1: 
+1:             if (currentTokenIndex < leafSize) // tokens remaining in this leaf
+1:             {
+1:                 return getTokenAt(currentTokenIndex++);
+1:             }
+1:             else // no more tokens remaining in this leaf
+1:             {
+1:                 assert !lastLeaf;
+1: 
+1:                 seekToNextLeaf();
+1:                 setupBlock();
+1:                 return computeNext();
+1:             }
+1:         }
+1: 
+1:         protected void performSkipTo(Long nextToken)
+1:         {
+1:             maybeFirstIteration();
+1: 
+1:             if (nextToken <= leafMaxToken) // next is in this leaf block
+1:             {
+1:                 searchLeaf(nextToken);
+1:             }
+1:             else // next is in a leaf block that needs to be found
+1:             {
+1:                 seekToLeaf(nextToken, file);
+1:                 setupBlock();
+1:                 findNearest(nextToken);
+1:             }
+1:         }
+1: 
+1:         private void setupBlock()
+1:         {
+1:             currentLeafStart = file.position();
+1:             currentTokenIndex = 0;
+1: 
+1:             lastLeaf = (file.get() & (1 << TokenTreeBuilder.LAST_LEAF_SHIFT)) > 0;
+1:             leafSize = file.getShort();
+1: 
+1:             leafMinToken = file.getLong();
+1:             leafMaxToken = file.getLong();
+1: 
+1:             // seek to end of leaf header/start of data
+1:             file.position(currentLeafStart + TokenTreeBuilder.BLOCK_HEADER_BYTES);
+1:         }
+1: 
+1:         private void findNearest(Long next)
+1:         {
+1:             if (next > leafMaxToken && !lastLeaf)
+1:             {
+1:                 seekToNextLeaf();
+1:                 setupBlock();
+1:                 findNearest(next);
+1:             }
+1:             else if (next > leafMinToken)
+1:                 searchLeaf(next);
+1:         }
+1: 
+1:         private void searchLeaf(long next)
+1:         {
+1:             for (int i = currentTokenIndex; i < leafSize; i++)
+1:             {
+1:                 if (compareTokenAt(currentTokenIndex, next) >= 0)
+1:                     break;
+1: 
+1:                 currentTokenIndex++;
+1:             }
+1:         }
+1: 
+1:         private int compareTokenAt(int idx, long toToken)
+1:         {
+1:             return Long.compare(file.getLong(getTokenPosition(idx)), toToken);
+1:         }
+1: 
+1:         private Token getTokenAt(int idx)
+1:         {
+0:             return OnDiskToken.getTokenAt(file, idx, leafSize, keyFetcher);
+1:         }
+1: 
+1:         private long getTokenPosition(int idx)
+1:         {
+0:             // skip 4 byte entry header to get position pointing directly at the entry's token
+0:             return OnDiskToken.getEntryPosition(idx, file) + (2 * SHORT_BYTES);
+1:         }
+1: 
+1:         private void seekToNextLeaf()
+1:         {
+1:             file.position(currentLeafStart + TokenTreeBuilder.BLOCK_BYTES);
+1:         }
+1: 
+1:         public void close() throws IOException
+1:         {
+1:             // nothing to do here
+1:         }
+1: 
+1:         private void maybeFirstIteration()
+1:         {
+1:             // seek to the first token only when requested for the first time,
+1:             // highly predictable branch and saves us a lot by not traversing the tree
+1:             // on creation time because it's not at all required.
+1:             if (!firstIteration)
+1:                 return;
+1: 
+1:             seekToLeaf(treeMinToken, file);
+1:             setupBlock();
+1:             firstIteration = false;
+1:         }
+1:     }
+1: 
+0:     public static class OnDiskToken extends Token
+1:     {
+1:         private final Set<TokenInfo> info = new HashSet<>(2);
+0:         private final Set<DecoratedKey> loadedKeys = new TreeSet<>(DecoratedKey.comparator);
+1: 
+0:         public OnDiskToken(MappedBuffer buffer, long position, short leafSize, Function<Long, DecoratedKey> keyFetcher)
+1:         {
+0:             super(buffer.getLong(position + (2 * SHORT_BYTES)));
+0:             info.add(new TokenInfo(buffer, position, leafSize, keyFetcher));
+1:         }
+1: 
+1:         public void merge(CombinedValue<Long> other)
+1:         {
+1:             if (!(other instanceof Token))
+1:                 return;
+1: 
+1:             Token o = (Token) other;
+1:             if (token != o.token)
+1:                 throw new IllegalArgumentException(String.format("%s != %s", token, o.token));
+1: 
+1:             if (o instanceof OnDiskToken)
+1:             {
+1:                 info.addAll(((OnDiskToken) other).info);
+1:             }
+1:             else
+1:             {
+1:                 Iterators.addAll(loadedKeys, o.iterator());
+1:             }
+1:         }
+1: 
+0:         public Iterator<DecoratedKey> iterator()
+1:         {
+0:             List<Iterator<DecoratedKey>> keys = new ArrayList<>(info.size());
+1: 
+1:             for (TokenInfo i : info)
+1:                 keys.add(i.iterator());
+1: 
+1:             if (!loadedKeys.isEmpty())
+1:                 keys.add(loadedKeys.iterator());
+1: 
+0:             return MergeIterator.get(keys, DecoratedKey.comparator, new MergeIterator.Reducer<DecoratedKey, DecoratedKey>()
+1:             {
+0:                 DecoratedKey reduced = null;
+1: 
+1:                 public boolean trivialReduceIsTrivial()
+1:                 {
+1:                     return true;
+1:                 }
+1: 
+0:                 public void reduce(int idx, DecoratedKey current)
+1:                 {
+1:                     reduced = current;
+1:                 }
+1: 
+0:                 protected DecoratedKey getReduced()
+1:                 {
+1:                     return reduced;
+1:                 }
+1:             });
+1:         }
+1: 
+0:         public Set<Long> getOffsets()
+1:         {
+0:             Set<Long> offsets = new HashSet<>();
+1:             for (TokenInfo i : info)
+1:             {
+0:                 for (long offset : i.fetchOffsets())
+0:                     offsets.add(offset);
+1:             }
+1: 
+1:             return offsets;
+1:         }
+1: 
+0:         public static OnDiskToken getTokenAt(MappedBuffer buffer, int idx, short leafSize, Function<Long, DecoratedKey> keyFetcher)
+1:         {
+0:             return new OnDiskToken(buffer, getEntryPosition(idx, buffer), leafSize, keyFetcher);
+1:         }
+1: 
+0:         private static long getEntryPosition(int idx, MappedBuffer file)
+1:         {
+0:             // info (4 bytes) + token (8 bytes) + offset (4 bytes) = 16 bytes
+0:             return file.position() + (idx * (2 * LONG_BYTES));
+1:         }
+1:     }
+1: 
+1:     private static class TokenInfo
+1:     {
+1:         private final MappedBuffer buffer;
+0:         private final Function<Long, DecoratedKey> keyFetcher;
+1: 
+1:         private final long position;
+1:         private final short leafSize;
+1: 
+0:         public TokenInfo(MappedBuffer buffer, long position, short leafSize, Function<Long, DecoratedKey> keyFetcher)
+1:         {
+1:             this.keyFetcher = keyFetcher;
+1:             this.buffer = buffer;
+1:             this.position = position;
+1:             this.leafSize = leafSize;
+1:         }
+1: 
+0:         public Iterator<DecoratedKey> iterator()
+1:         {
+1:             return new KeyIterator(keyFetcher, fetchOffsets());
+1:         }
+1: 
+1:         public int hashCode()
+1:         {
+1:             return new HashCodeBuilder().append(keyFetcher).append(position).append(leafSize).build();
+1:         }
+1: 
+1:         public boolean equals(Object other)
+1:         {
+1:             if (!(other instanceof TokenInfo))
+1:                 return false;
+1: 
+1:             TokenInfo o = (TokenInfo) other;
+1:             return keyFetcher == o.keyFetcher && position == o.position;
+1:         }
+1: 
+0:         private long[] fetchOffsets()
+1:         {
+1:             short info = buffer.getShort(position);
+0:             short offsetShort = buffer.getShort(position + SHORT_BYTES);
+0:             int offsetInt = buffer.getInt(position + (2 * SHORT_BYTES) + LONG_BYTES);
+1: 
+1:             EntryType type = EntryType.of(info & TokenTreeBuilder.ENTRY_TYPE_MASK);
+1: 
+1:             switch (type)
+1:             {
+1:                 case SIMPLE:
+0:                     return new long[] { offsetInt };
+1: 
+1:                 case OVERFLOW:
+0:                     long[] offsets = new long[offsetShort]; // offsetShort contains count of tokens
+0:                     long offsetPos = (buffer.position() + (2 * (leafSize * LONG_BYTES)) + (offsetInt * LONG_BYTES));
+1: 
+0:                     for (int i = 0; i < offsetShort; i++)
+0:                         offsets[i] = buffer.getLong(offsetPos + (i * LONG_BYTES));
+1: 
+1:                     return offsets;
+1: 
+1:                 case FACTORED:
+0:                     return new long[] { (((long) offsetInt) << Short.SIZE) + offsetShort };
+1: 
+1:                 case PACKED:
+0:                     return new long[] { offsetShort, offsetInt };
+1: 
+1:                 default:
+1:                     throw new IllegalStateException("Unknown entry type: " + type);
+1:             }
+1:         }
+1:     }
+1: 
+0:     private static class KeyIterator extends AbstractIterator<DecoratedKey>
+1:     {
+0:         private final Function<Long, DecoratedKey> keyFetcher;
+0:         private final long[] offsets;
+0:         private int index = 0;
+1: 
+0:         public KeyIterator(Function<Long, DecoratedKey> keyFetcher, long[] offsets)
+1:         {
+1:             this.keyFetcher = keyFetcher;
+0:             this.offsets = offsets;
+1:         }
+1: 
+0:         public DecoratedKey computeNext()
+1:         {
+0:             return index < offsets.length ? keyFetcher.apply(offsets[index++]) : endOfData();
+1:         }
+1:     }
+1: }
+============================================================================

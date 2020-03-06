@@ -1,0 +1,1706 @@
+1:07cf56f: /*
+1:066ef58:  * Licensed to the Apache Software Foundation (ASF) under one
+1:066ef58:  * or more contributor license agreements.  See the NOTICE file
+1:066ef58:  * distributed with this work for additional information
+1:066ef58:  * regarding copyright ownership.  The ASF licenses this file
+1:066ef58:  * to you under the Apache License, Version 2.0 (the
+1:066ef58:  * "License"); you may not use this file except in compliance
+1:066ef58:  * with the License.  You may obtain a copy of the License at
+1:066ef58:  *
+1:066ef58:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:066ef58:  *
+1:066ef58:  * Unless required by applicable law or agreed to in writing, software
+1:066ef58:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:066ef58:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:066ef58:  * See the License for the specific language governing permissions and
+1:066ef58:  * limitations under the License.
+2:0251a8f:  */
+1:066ef58: package org.apache.cassandra.service;
+1:dc9992a: 
+1:2c6f56d: import java.net.InetAddress;
+1:5577ff6: import java.util.Collections;
+1:dc9992a: import java.util.List;
+1:39df31a: import java.util.Map;
+1:39df31a: import java.util.concurrent.ConcurrentHashMap;
+1:066ef58: import java.util.concurrent.TimeUnit;
+1:7aa3364: import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+1:dc9992a: 
+1:bffd9ea: import org.apache.commons.lang3.StringUtils;
+1:ef25537: import org.slf4j.Logger;
+1:ef25537: import org.slf4j.LoggerFactory;
+1:dc9992a: 
+1:dc9992a: import org.apache.cassandra.concurrent.Stage;
+1:dc9992a: import org.apache.cassandra.concurrent.StageManager;
+1:066ef58: import org.apache.cassandra.config.DatabaseDescriptor;
+1:a991b64: import org.apache.cassandra.db.*;
+1:a991b64: import org.apache.cassandra.db.partitions.PartitionIterator;
+1:39df31a: import org.apache.cassandra.exceptions.RequestFailureReason;
+1:c6525da: import org.apache.cassandra.exceptions.ReadFailureException;
+1:3a2faf9: import org.apache.cassandra.exceptions.ReadTimeoutException;
+1:3a2faf9: import org.apache.cassandra.exceptions.UnavailableException;
+1:4c0be33: import org.apache.cassandra.metrics.ReadRepairMetrics;
+1:c6525da: import org.apache.cassandra.net.IAsyncCallbackWithFailure;
+1:5d46a01: import org.apache.cassandra.net.MessageIn;
+1:5a6f0b8: import org.apache.cassandra.net.MessageOut;
+1:066ef58: import org.apache.cassandra.net.MessagingService;
+1:3a2faf9: import org.apache.cassandra.db.ConsistencyLevel;
+1:353d4a0: import org.apache.cassandra.tracing.TraceState;
+1:353d4a0: import org.apache.cassandra.tracing.Tracing;
+1:8a7ab59: import org.apache.cassandra.utils.FBUtilities;
+1:5420b7a: import org.apache.cassandra.utils.concurrent.SimpleCondition;
+1:dc9992a: 
+1:a991b64: public class ReadCallback implements IAsyncCallbackWithFailure<ReadResponse>
+1:3d787b7: {
+1:dcb6112:     protected static final Logger logger = LoggerFactory.getLogger( ReadCallback.class );
+1:b16d8c9: 
+1:a991b64:     public final ResponseResolver resolver;
+1:5267112:     private final SimpleCondition condition = new SimpleCondition();
+1:aa83c94:     private final long queryStartNanoTime;
+1:20c419b:     final int blockfor;
+1:fffecb8:     final List<InetAddress> endpoints;
+1:a991b64:     private final ReadCommand command;
+1:5267112:     private final ConsistencyLevel consistencyLevel;
+1:7aa3364:     private static final AtomicIntegerFieldUpdater<ReadCallback> recievedUpdater
+1:7aa3364:             = AtomicIntegerFieldUpdater.newUpdater(ReadCallback.class, "received");
+1:7aa3364:     private volatile int received = 0;
+1:c6525da:     private static final AtomicIntegerFieldUpdater<ReadCallback> failuresUpdater
+1:c6525da:             = AtomicIntegerFieldUpdater.newUpdater(ReadCallback.class, "failures");
+1:c6525da:     private volatile int failures = 0;
+1:39df31a:     private final Map<InetAddress, RequestFailureReason> failureReasonByEndpoint;
+1:c6525da: 
+1:0e96e58:     private final Keyspace keyspace; // TODO push this into ConsistencyLevel?
+1:fffecb8: 
+1:c2cf5c4:     /**
+1:5a45534:      * Constructor when response count has to be calculated and blocked for.
+1:c2cf5c4:      */
+1:aa83c94:     public ReadCallback(ResponseResolver resolver, ConsistencyLevel consistencyLevel, ReadCommand command, List<InetAddress> filteredEndpoints, long queryStartNanoTime)
+1:dc9992a:     {
+1:a991b64:         this(resolver,
+1:a991b64:              consistencyLevel,
+1:a991b64:              consistencyLevel.blockFor(Keyspace.open(command.metadata().ksName)),
+1:a991b64:              command,
+1:a991b64:              Keyspace.open(command.metadata().ksName),
+1:aa83c94:              filteredEndpoints,
+1:aa83c94:              queryStartNanoTime);
+1:dc9992a:     }
+1:c6525da: 
+1:aa83c94:     public ReadCallback(ResponseResolver resolver, ConsistencyLevel consistencyLevel, int blockfor, ReadCommand command, Keyspace keyspace, List<InetAddress> endpoints, long queryStartNanoTime)
+1:b73178d:     {
+1:3d787b7:         this.command = command;
+1:0e96e58:         this.keyspace = keyspace;
+1:3d787b7:         this.blockfor = blockfor;
+1:3d787b7:         this.consistencyLevel = consistencyLevel;
+1:3d787b7:         this.resolver = resolver;
+1:aa83c94:         this.queryStartNanoTime = queryStartNanoTime;
+1:3d787b7:         this.endpoints = endpoints;
+1:39df31a:         this.failureReasonByEndpoint = new ConcurrentHashMap<>();
+1:4347982:         // we don't support read repair (or rapid read protection) for range scans yet (CASSANDRA-6897)
+1:a991b64:         assert !(command instanceof PartitionRangeReadCommand) || blockfor >= endpoints.size();
+1:a991b64: 
+1:a991b64:         if (logger.isTraceEnabled())
+1:2dc2bb8:             logger.trace("Blockfor is {}; setting up requests to {}", blockfor, StringUtils.join(this.endpoints, ","));
+1:3d787b7:     }
+1:3d787b7: 
+1:1d2c122:     public boolean await(long timePastStart, TimeUnit unit)
+1:3d787b7:     {
+1:aa83c94:         long time = unit.toNanos(timePastStart) - (System.nanoTime() - queryStartNanoTime);
+3:066ef58:         try
+1:c6525da:         {
+1:1d2c122:             return condition.await(time, TimeUnit.NANOSECONDS);
+1:3d787b7:         }
+1:e547733:         catch (InterruptedException ex)
+1:2d2105d:         {
+1:e547733:             throw new AssertionError(ex);
+1:c6525da:         }
+4:dc9992a:     }
+1:3d787b7: 
+1:a991b64:     public void awaitResults() throws ReadFailureException, ReadTimeoutException
+1:dc9992a:     {
+1:a991b64:         boolean signaled = await(command.getTimeout(), TimeUnit.MILLISECONDS);
+1:a991b64:         boolean failed = blockfor + failures > endpoints.size();
+1:a991b64:         if (signaled && !failed)
+1:a991b64:             return;
+1:a991b64: 
+1:a991b64:         if (Tracing.isTracing())
+1:dc9992a:         {
+1:a991b64:             String gotData = received > 0 ? (resolver.isDataPresent() ? " (including data)" : " (only digests)") : "";
+1:a991b64:             Tracing.trace("{}; received {} of {} responses{}", new Object[]{ (failed ? "Failed" : "Timed out"), received, blockfor, gotData });
+1:a991b64:         }
+1:a991b64:         else if (logger.isDebugEnabled())
+1:a991b64:         {
+1:a991b64:             String gotData = received > 0 ? (resolver.isDataPresent() ? " (including data)" : " (only digests)") : "";
+1:a991b64:             logger.debug("{}; received {} of {} responses{}", new Object[]{ (failed ? "Failed" : "Timed out"), received, blockfor, gotData });
+1:dc9992a:         }
+1:c6525da: 
+1:a991b64:         // Same as for writes, see AbstractWriteResponseHandler
+1:a991b64:         throw failed
+1:39df31a:             ? new ReadFailureException(consistencyLevel, received, blockfor, resolver.isDataPresent(), failureReasonByEndpoint)
+1:a991b64:             : new ReadTimeoutException(consistencyLevel, received, blockfor, resolver.isDataPresent());
+1:b73178d:     }
+1:c6525da: 
+1:a991b64:     public PartitionIterator get() throws ReadFailureException, ReadTimeoutException, DigestMismatchException
+1:a991b64:     {
+1:a991b64:         awaitResults();
+1:a991b64: 
+1:a991b64:         PartitionIterator result = blockfor == 1 ? resolver.getData() : resolver.resolve();
+1:4a849ef:         if (logger.isTraceEnabled())
+1:aa83c94:             logger.trace("Read: {} ms.", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - queryStartNanoTime));
+1:a991b64:         return result;
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public int blockFor()
+1:a991b64:     {
+1:a991b64:         return blockfor;
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public void response(MessageIn<ReadResponse> message)
+1:dc9992a:     {
+1:c2cf5c4:         resolver.preprocess(message);
+1:c6525da:         int n = waitingFor(message.from)
+1:7aa3364:               ? recievedUpdater.incrementAndGet(this)
+1:7aa3364:               : received;
+2:0251a8f:         if (n >= blockfor && resolver.isDataPresent())
+1:0251a8f:         {
+1:3ec4ff5:             condition.signalAll();
+1:e682c03:             // kick off a background digest comparison if this is a result that (may have) arrived after
+1:e682c03:             // the original resolve that get() kicks off as soon as the condition is signaled
+1:e682c03:             if (blockfor < endpoints.size() && n == endpoints.size())
+1:353d4a0:             {
+1:353d4a0:                 TraceState traceState = Tracing.instance.get();
+1:353d4a0:                 if (traceState != null)
+1:353d4a0:                     traceState.trace("Initiating read-repair");
+1:aa83c94:                 StageManager.getStage(Stage.READ_REPAIR).execute(new AsyncRepairRunner(traceState, queryStartNanoTime));
+1:353d4a0:             }
+1:0251a8f:         }
+1:dc9992a:     }
+1:2d2105d: 
+1:ab849a7:     /**
+1:c2cf5c4:      * @return true if the message counts towards the blockfor threshold
+1:ab849a7:      */
+1:c6525da:     private boolean waitingFor(InetAddress from)
+1:c2cf5c4:     {
+1:5c0c84b:         return consistencyLevel.isDatacenterLocal()
+1:c6525da:              ? DatabaseDescriptor.getLocalDataCenter().equals(DatabaseDescriptor.getEndpointSnitch().getDatacenter(from))
+1:5267112:              : true;
+1:c2cf5c4:     }
+1:c2cf5c4: 
+1:39a38e6:     /**
+1:39a38e6:      * @return the current number of received responses
+1:39a38e6:      */
+1:39a38e6:     public int getReceivedCount()
+1:39a38e6:     {
+1:7aa3364:         return received;
+1:39a38e6:     }
+1:39a38e6: 
+1:a991b64:     public void response(ReadResponse result)
+1:0251a8f:     {
+1:a991b64:         MessageIn<ReadResponse> message = MessageIn.create(FBUtilities.getBroadcastAddress(),
+1:a991b64:                                                            result,
+1:a991b64:                                                            Collections.<String, byte[]>emptyMap(),
+1:a991b64:                                                            MessagingService.Verb.INTERNAL_RESPONSE,
+1:9d9a1a1:                                                            MessagingService.current_version);
+1:5577ff6:         response(message);
+1:dc9992a:     }
+1:0251a8f: 
+1:dc9992a:     public void assureSufficientLiveNodes() throws UnavailableException
+1:dbcfe67:     {
+1:0e96e58:         consistencyLevel.assureSufficientLiveNodes(keyspace, endpoints);
+1:dbcfe67:     }
+1:dc9992a: 
+1:dc9992a:     public boolean isLatencyForSnitch()
+1:dc9992a:     {
+1:c2cf5c4:         return true;
+1:0251a8f:     }
+1:0251a8f: 
+1:6a03b11:     private class AsyncRepairRunner implements Runnable
+1:dc9992a:     {
+1:353d4a0:         private final TraceState traceState;
+1:aa83c94:         private final long queryStartNanoTime;
+1:353d4a0: 
+1:aa83c94:         public AsyncRepairRunner(TraceState traceState, long queryStartNanoTime)
+1:353d4a0:         {
+1:353d4a0:             this.traceState = traceState;
+1:aa83c94:             this.queryStartNanoTime = queryStartNanoTime;
+1:353d4a0:         }
+1:353d4a0: 
+1:6a03b11:         public void run()
+1:dc9992a:         {
+1:a991b64:             // If the resolver is a DigestResolver, we need to do a full data read if there is a mismatch.
+1:3d787b7:             // Otherwise, resolve will send the repairs directly if needs be (and in that case we should never
+1:3d787b7:             // get a digest mismatch)
+1:dc9992a:             try
+1:dc9992a:             {
+1:dc9992a:                 resolver.resolve();
+1:dc9992a:             }
+1:dc9992a:             catch (DigestMismatchException e)
+5:dc9992a:             {
+1:a991b64:                 assert resolver instanceof DigestResolver;
+1:3d787b7: 
+1:353d4a0:                 if (traceState != null)
+1:353d4a0:                     traceState.trace("Digest mismatch: {}", e.toString());
+1:a991b64:                 if (logger.isDebugEnabled())
+1:dc9992a:                     logger.debug("Digest mismatch:", e);
+1:2dc2bb8: 
+1:4c0be33:                 ReadRepairMetrics.repairedBackground.mark();
+1:2dc2bb8: 
+1:aa83c94:                 final DataResolver repairResolver = new DataResolver(keyspace, command, consistencyLevel, endpoints.size(), queryStartNanoTime);
+1:b60bc58:                 AsyncRepairCallback repairHandler = new AsyncRepairCallback(repairResolver, endpoints.size());
+1:1d2c122: 
+1:dc9992a:                 for (InetAddress endpoint : endpoints)
+1:8c64cef:                 {
+1:8c64cef:                     MessageOut<ReadCommand> message = command.createMessage(MessagingService.instance().getVersion(endpoint));
+1:5a6f0b8:                     MessagingService.instance().sendRR(message, endpoint, repairHandler);
+1:8c64cef:                 }
+1:2d2105d:             }
+1:dc9992a:         }
+1:dc9992a:     }
+1:2d2105d: 
+1:c6525da:     @Override
+1:39df31a:     public void onFailure(InetAddress from, RequestFailureReason failureReason)
+1:c6525da:     {
+1:c6525da:         int n = waitingFor(from)
+1:c6525da:               ? failuresUpdater.incrementAndGet(this)
+1:c6525da:               : failures;
+1:c6525da: 
+1:39df31a:         failureReasonByEndpoint.put(from, failureReason);
+1:39df31a: 
+1:c6525da:         if (blockfor + n > endpoints.size())
+1:c6525da:             condition.signalAll();
+1:c6525da:     }
+1:dc9992a: }
+============================================================================
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:9d9a1a1
+/////////////////////////////////////////////////////////////////////////
+1:                                                            MessagingService.current_version);
+commit:a991b64
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.*;
+1: import org.apache.cassandra.db.partitions.PartitionIterator;
+/////////////////////////////////////////////////////////////////////////
+1: public class ReadCallback implements IAsyncCallbackWithFailure<ReadResponse>
+1:     public final ResponseResolver resolver;
+0:     private final long start;
+1:     private final ReadCommand command;
+/////////////////////////////////////////////////////////////////////////
+0:     public ReadCallback(ResponseResolver resolver, ConsistencyLevel consistencyLevel, ReadCommand command, List<InetAddress> filteredEndpoints)
+1:         this(resolver,
+1:              consistencyLevel,
+1:              consistencyLevel.blockFor(Keyspace.open(command.metadata().ksName)),
+1:              command,
+1:              Keyspace.open(command.metadata().ksName),
+0:              filteredEndpoints);
+0:     public ReadCallback(ResponseResolver resolver, ConsistencyLevel consistencyLevel, int blockfor, ReadCommand command, Keyspace keyspace, List<InetAddress> endpoints)
+/////////////////////////////////////////////////////////////////////////
+1:         assert !(command instanceof PartitionRangeReadCommand) || blockfor >= endpoints.size();
+1: 
+1:         if (logger.isTraceEnabled())
+0:             logger.trace(String.format("Blockfor is %s; setting up requests to %s", blockfor, StringUtils.join(this.endpoints, ",")));
+/////////////////////////////////////////////////////////////////////////
+1:     public void awaitResults() throws ReadFailureException, ReadTimeoutException
+1:         boolean signaled = await(command.getTimeout(), TimeUnit.MILLISECONDS);
+1:         boolean failed = blockfor + failures > endpoints.size();
+1:         if (signaled && !failed)
+1:             return;
+1: 
+1:         if (Tracing.isTracing())
+1:             String gotData = received > 0 ? (resolver.isDataPresent() ? " (including data)" : " (only digests)") : "";
+1:             Tracing.trace("{}; received {} of {} responses{}", new Object[]{ (failed ? "Failed" : "Timed out"), received, blockfor, gotData });
+1:         }
+1:         else if (logger.isDebugEnabled())
+1:         {
+1:             String gotData = received > 0 ? (resolver.isDataPresent() ? " (including data)" : " (only digests)") : "";
+1:             logger.debug("{}; received {} of {} responses{}", new Object[]{ (failed ? "Failed" : "Timed out"), received, blockfor, gotData });
+1:         // Same as for writes, see AbstractWriteResponseHandler
+1:         throw failed
+0:             ? new ReadFailureException(consistencyLevel, received, failures, blockfor, resolver.isDataPresent())
+1:             : new ReadTimeoutException(consistencyLevel, received, blockfor, resolver.isDataPresent());
+1:     public PartitionIterator get() throws ReadFailureException, ReadTimeoutException, DigestMismatchException
+1:     {
+1:         awaitResults();
+1: 
+1:         PartitionIterator result = blockfor == 1 ? resolver.getData() : resolver.resolve();
+1:         if (logger.isDebugEnabled())
+0:             logger.debug("Read: {} ms.", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
+1:         return result;
+1:     }
+1: 
+1:     public int blockFor()
+1:     {
+1:         return blockfor;
+1:     }
+1: 
+1:     public void response(MessageIn<ReadResponse> message)
+/////////////////////////////////////////////////////////////////////////
+1:     public void response(ReadResponse result)
+1:         MessageIn<ReadResponse> message = MessageIn.create(FBUtilities.getBroadcastAddress(),
+1:                                                            result,
+1:                                                            Collections.<String, byte[]>emptyMap(),
+1:                                                            MessagingService.Verb.INTERNAL_RESPONSE,
+0:                                                            MessagingService.current_version);
+/////////////////////////////////////////////////////////////////////////
+1:             // If the resolver is a DigestResolver, we need to do a full data read if there is a mismatch.
+/////////////////////////////////////////////////////////////////////////
+1:                 assert resolver instanceof DigestResolver;
+/////////////////////////////////////////////////////////////////////////
+0:                 final DataResolver repairResolver = new DataResolver(keyspace, command, consistencyLevel, endpoints.size());
+0:                 MessageOut<ReadCommand> message = command.createMessage();
+commit:1727ea7
+commit:b73178d
+/////////////////////////////////////////////////////////////////////////
+1:         {
+0:             // Same as for writes, see AbstractWriteResponseHandler
+0:             int acks = received.get();
+0:             if (resolver.isDataPresent() && acks >= blockfor)
+0:                 acks = blockfor - 1;
+0:             throw new ReadTimeoutException(consistencyLevel, acks, blockfor, resolver.isDataPresent());
+1:         }
+commit:5267112
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.Table;
+/////////////////////////////////////////////////////////////////////////
+1:     private final SimpleCondition condition = new SimpleCondition();
+0:     private final int blockfor;
+0:     private final IReadCommand command;
+1:     private final ConsistencyLevel consistencyLevel;
+0:     private final AtomicInteger received = new AtomicInteger(0);
+0:     private final Table table; // TODO push this into ConsistencyLevel?
+0:     public ReadCallback(IResponseResolver<TMessage, TResolved> resolver, ConsistencyLevel consistencyLevel, IReadCommand command, List<InetAddress> filteredEndpoints)
+0:         this(resolver, consistencyLevel, consistencyLevel.blockFor(Table.open(command.getKeyspace())), command, Table.open(command.getKeyspace()), filteredEndpoints);
+0:     private ReadCallback(IResponseResolver<TMessage, TResolved> resolver, ConsistencyLevel consistencyLevel, int blockfor, IReadCommand command, Table table, List<InetAddress> endpoints)
+0:         this.table = table;
+/////////////////////////////////////////////////////////////////////////
+0:         return new ReadCallback(newResolver, consistencyLevel, blockfor, command, table, endpoints);
+/////////////////////////////////////////////////////////////////////////
+0:     private boolean waitingFor(MessageIn message)
+0:         return consistencyLevel == ConsistencyLevel.LOCAL_QUORUM
+0:              ? DatabaseDescriptor.getLocalDataCenter().equals(DatabaseDescriptor.getEndpointSnitch().getDatacenter(message.from))
+1:              : true;
+/////////////////////////////////////////////////////////////////////////
+0:         consistencyLevel.assureSufficientLiveNodes(table, endpoints);
+commit:3d787b7
+/////////////////////////////////////////////////////////////////////////
+0:     protected final IReadCommand command;
+/////////////////////////////////////////////////////////////////////////
+0:         this.endpoints = filterEndpoints(endpoints);
+0:     protected ReadCallback(IResponseResolver<TMessage, TResolved> resolver, ConsistencyLevel consistencyLevel, int blockfor, IReadCommand command, List<InetAddress> endpoints)
+1:     {
+1:         this.command = command;
+1:         this.blockfor = blockfor;
+1:         this.consistencyLevel = consistencyLevel;
+1:         this.resolver = resolver;
+0:         this.startTime = System.currentTimeMillis();
+1:         this.endpoints = endpoints;
+1:     }
+1: 
+0:     public ReadCallback<TMessage, TResolved> withNewResolver(IResponseResolver<TMessage, TResolved> newResolver)
+1:     {
+0:         return new ReadCallback(newResolver, consistencyLevel, blockfor, command, endpoints);
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:             // If the resolver is a RowDigestResolver, we need to do a full data read if there is a mismatch.
+1:             // Otherwise, resolve will send the repairs directly if needs be (and in that case we should never
+1:             // get a digest mismatch)
+0:                 assert resolver instanceof RowDigestResolver;
+1: 
+0:                 final RowDataResolver repairResolver = new RowDataResolver(readCommand.table, readCommand.key, readCommand.filter());
+commit:353309f
+/////////////////////////////////////////////////////////////////////////
+0:                 final RowRepairResolver repairResolver = new RowRepairResolver(readCommand.table, readCommand.key, readCommand.filter());
+commit:3a2faf9
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.Set;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.exceptions.ReadTimeoutException;
+1: import org.apache.cassandra.exceptions.UnavailableException;
+1: import org.apache.cassandra.db.ConsistencyLevel;
+/////////////////////////////////////////////////////////////////////////
+0:     protected final ConsistencyLevel consistencyLevel;
+/////////////////////////////////////////////////////////////////////////
+0:         this.blockfor = consistencyLevel.blockFor(command.getKeyspace());
+0:         this.consistencyLevel = consistencyLevel;
+/////////////////////////////////////////////////////////////////////////
+0:     public TResolved get() throws ReadTimeoutException, DigestMismatchException, IOException
+/////////////////////////////////////////////////////////////////////////
+0:             throw new ReadTimeoutException(consistencyLevel, received.get(), blockfor, resolver.isDataPresent());
+/////////////////////////////////////////////////////////////////////////
+0:             throw new UnavailableException(consistencyLevel, blockfor, endpoints.size());
+commit:07cf56f
+/////////////////////////////////////////////////////////////////////////
+1: /*
+/////////////////////////////////////////////////////////////////////////
+commit:8a7ab59
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.FBUtilities;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:             return cfmd.getReadRepairChance() > FBUtilities.threadLocalRandom().nextDouble();
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:2dc2bb8
+/////////////////////////////////////////////////////////////////////////
+1:             logger.trace("Blockfor is {}; setting up requests to {}", blockfor, StringUtils.join(this.endpoints, ","));
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: 
+commit:b30cdd9
+/////////////////////////////////////////////////////////////////////////
+commit:4b4a8dd
+commit:5f60fcc
+/////////////////////////////////////////////////////////////////////////
+commit:95f94a4
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+author:Geoffrey Yu
+-------------------------------------------------------------------------------
+commit:39df31a
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.Map;
+1: import java.util.concurrent.ConcurrentHashMap;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.exceptions.RequestFailureReason;
+/////////////////////////////////////////////////////////////////////////
+1:     private final Map<InetAddress, RequestFailureReason> failureReasonByEndpoint;
+/////////////////////////////////////////////////////////////////////////
+1:         this.failureReasonByEndpoint = new ConcurrentHashMap<>();
+/////////////////////////////////////////////////////////////////////////
+1:             ? new ReadFailureException(consistencyLevel, received, blockfor, resolver.isDataPresent(), failureReasonByEndpoint)
+/////////////////////////////////////////////////////////////////////////
+1:     public void onFailure(InetAddress from, RequestFailureReason failureReason)
+1:         failureReasonByEndpoint.put(from, failureReason);
+1: 
+commit:aa83c94
+/////////////////////////////////////////////////////////////////////////
+1:     private final long queryStartNanoTime;
+/////////////////////////////////////////////////////////////////////////
+1:     public ReadCallback(ResponseResolver resolver, ConsistencyLevel consistencyLevel, ReadCommand command, List<InetAddress> filteredEndpoints, long queryStartNanoTime)
+1:              filteredEndpoints,
+1:              queryStartNanoTime);
+1:     public ReadCallback(ResponseResolver resolver, ConsistencyLevel consistencyLevel, int blockfor, ReadCommand command, Keyspace keyspace, List<InetAddress> endpoints, long queryStartNanoTime)
+1:         this.queryStartNanoTime = queryStartNanoTime;
+/////////////////////////////////////////////////////////////////////////
+1:         long time = unit.toNanos(timePastStart) - (System.nanoTime() - queryStartNanoTime);
+/////////////////////////////////////////////////////////////////////////
+1:             logger.trace("Read: {} ms.", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - queryStartNanoTime));
+/////////////////////////////////////////////////////////////////////////
+1:                 StageManager.getStage(Stage.READ_REPAIR).execute(new AsyncRepairRunner(traceState, queryStartNanoTime));
+/////////////////////////////////////////////////////////////////////////
+1:         private final long queryStartNanoTime;
+1:         public AsyncRepairRunner(TraceState traceState, long queryStartNanoTime)
+1:             this.queryStartNanoTime = queryStartNanoTime;
+/////////////////////////////////////////////////////////////////////////
+1:                 final DataResolver repairResolver = new DataResolver(keyspace, command, consistencyLevel, endpoints.size(), queryStartNanoTime);
+author:Stefania Alborghetti
+-------------------------------------------------------------------------------
+commit:557bbbc
+/////////////////////////////////////////////////////////////////////////
+0:                                                            MessagingService.current_version,
+0:                                                            MessageIn.createTimestamp());
+commit:b16d8c9
+/////////////////////////////////////////////////////////////////////////
+1: 
+author:blerer
+-------------------------------------------------------------------------------
+commit:aa60cde
+commit:af0cd32
+author:Paulo Motta
+-------------------------------------------------------------------------------
+commit:4a849ef
+/////////////////////////////////////////////////////////////////////////
+1:             if (logger.isTraceEnabled())
+0:                 logger.trace("Read timeout: {}", ex.toString());
+/////////////////////////////////////////////////////////////////////////
+0:             if (logger.isTraceEnabled())
+0:                 logger.trace("Read failure: {}", ex.toString());
+/////////////////////////////////////////////////////////////////////////
+0:                 if (logger.isTraceEnabled())
+0:                     logger.trace("Digest mismatch:", e);
+author:Tyler Hobbs
+-------------------------------------------------------------------------------
+commit:8c64cef
+/////////////////////////////////////////////////////////////////////////
+1:                 {
+1:                     MessageOut<ReadCommand> message = command.createMessage(MessagingService.instance().getVersion(endpoint));
+1:                 }
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:14d7a63
+commit:8a56868
+commit:353d4a0
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.tracing.TraceState;
+1: import org.apache.cassandra.tracing.Tracing;
+/////////////////////////////////////////////////////////////////////////
+0:             Tracing.trace("Read timeout: {}", ex.toString());
+/////////////////////////////////////////////////////////////////////////
+1:             {
+1:                 TraceState traceState = Tracing.instance.get();
+1:                 if (traceState != null)
+1:                     traceState.trace("Initiating read-repair");
+0:                 StageManager.getStage(Stage.READ_REPAIR).execute(new AsyncRepairRunner(traceState));
+1:             }
+/////////////////////////////////////////////////////////////////////////
+1:         private final TraceState traceState;
+1: 
+0:         public AsyncRepairRunner(TraceState traceState)
+1:         {
+1:             this.traceState = traceState;
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 if (traceState != null)
+1:                     traceState.trace("Digest mismatch: {}", e.toString());
+author:Christian Spriegel
+-------------------------------------------------------------------------------
+commit:c6525da
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.exceptions.ReadFailureException;
+0: import org.apache.cassandra.exceptions.RequestExecutionException;
+1: import org.apache.cassandra.net.IAsyncCallbackWithFailure;
+/////////////////////////////////////////////////////////////////////////
+0: public class ReadCallback<TMessage, TResolved> implements IAsyncCallbackWithFailure<TMessage>
+/////////////////////////////////////////////////////////////////////////
+1:     private static final AtomicIntegerFieldUpdater<ReadCallback> failuresUpdater
+1:             = AtomicIntegerFieldUpdater.newUpdater(ReadCallback.class, "failures");
+1:     private volatile int failures = 0;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:     public TResolved get() throws ReadFailureException, ReadTimeoutException, DigestMismatchException
+/////////////////////////////////////////////////////////////////////////
+0:         if (blockfor + failures > endpoints.size())
+1:         {
+0:             ReadFailureException ex = new ReadFailureException(consistencyLevel, received, failures, blockfor, resolver.isDataPresent());
+1: 
+0:             if (logger.isDebugEnabled())
+0:                 logger.debug("Read failure: {}", ex.toString());
+0:             throw ex;
+1:         }
+1: 
+1:         int n = waitingFor(message.from)
+/////////////////////////////////////////////////////////////////////////
+1:     private boolean waitingFor(InetAddress from)
+1:              ? DatabaseDescriptor.getLocalDataCenter().equals(DatabaseDescriptor.getEndpointSnitch().getDatacenter(from))
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     @Override
+0:     public void onFailure(InetAddress from)
+1:     {
+1:         int n = waitingFor(from)
+1:               ? failuresUpdater.incrementAndGet(this)
+1:               : failures;
+1: 
+1:         if (blockfor + n > endpoints.size())
+1:             condition.signalAll();
+1:     }
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:b867050
+/////////////////////////////////////////////////////////////////////////
+0:                 final RowDataResolver repairResolver = new RowDataResolver(readCommand.ksName, readCommand.key, readCommand.filter(), readCommand.timestamp, endpoints.size());
+author:belliottsmith
+-------------------------------------------------------------------------------
+commit:5420b7a
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.concurrent.SimpleCondition;
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:fdae99d
+commit:4347982
+/////////////////////////////////////////////////////////////////////////
+1:         // we don't support read repair (or rapid read protection) for range scans yet (CASSANDRA-6897)
+0:         assert !(resolver instanceof RangeSliceResponseResolver) || blockfor >= endpoints.size();
+commit:e682c03
+/////////////////////////////////////////////////////////////////////////
+1:             // kick off a background digest comparison if this is a result that (may have) arrived after
+1:             // the original resolve that get() kicks off as soon as the condition is signaled
+1:             if (blockfor < endpoints.size() && n == endpoints.size())
+0:                 StageManager.getStage(Stage.READ_REPAIR).execute(new AsyncRepairRunner());
+/////////////////////////////////////////////////////////////////////////
+commit:20c419b
+/////////////////////////////////////////////////////////////////////////
+1:     final int blockfor;
+commit:b320cd9
+commit:39a38e6
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * @return the current number of received responses
+1:      */
+1:     public int getReceivedCount()
+1:     {
+0:         return received.get();
+1:     }
+1: 
+commit:3ec4ff5
+/////////////////////////////////////////////////////////////////////////
+1:             condition.signalAll();
+commit:1d2c122
+/////////////////////////////////////////////////////////////////////////
+0:     final long start;
+/////////////////////////////////////////////////////////////////////////
+0:         this.start = System.nanoTime();
+/////////////////////////////////////////////////////////////////////////
+1:     public boolean await(long timePastStart, TimeUnit unit)
+0:         long time = unit.toNanos(timePastStart) - (System.nanoTime() - start);
+1:             return condition.await(time, TimeUnit.NANOSECONDS);
+/////////////////////////////////////////////////////////////////////////
+0:         if (!await(command.getTimeout(), TimeUnit.MICROSECONDS))
+1: 
+commit:3d4c2f9
+/////////////////////////////////////////////////////////////////////////
+0:         return new ReadCallback<TMessage, TResolved>(newResolver, consistencyLevel, blockfor, command, table, endpoints);
+commit:b60bc58
+/////////////////////////////////////////////////////////////////////////
+1:                 AsyncRepairCallback repairHandler = new AsyncRepairCallback(repairResolver, endpoints.size());
+commit:36b40be
+/////////////////////////////////////////////////////////////////////////
+0:         if (logger.isTraceEnabled())
+0:             logger.trace(String.format("Blockfor is %s; setting up requests to %s", blockfor, StringUtils.join(this.endpoints, ",")));
+commit:5577ff6
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.Collections;
+/////////////////////////////////////////////////////////////////////////
+0:     public void response(TMessage result)
+0:         MessageIn<TMessage> message = MessageIn.create(FBUtilities.getBroadcastAddress(),
+0:                                                        result,
+0:                                                        Collections.<String, byte[]>emptyMap(),
+0:                                                        MessagingService.Verb.INTERNAL_RESPONSE,
+0:                                                        MessagingService.current_version);
+1:         response(message);
+commit:e6610e4
+/////////////////////////////////////////////////////////////////////////
+0:         long timeout = command.getTimeout() - (System.currentTimeMillis() - startTime);
+commit:a06be23
+/////////////////////////////////////////////////////////////////////////
+0: public class ReadCallback<TMessage, TResolved> implements IAsyncCallback<TMessage>
+0:     public final IResponseResolver<TMessage, TResolved> resolver;
+/////////////////////////////////////////////////////////////////////////
+0:     public ReadCallback(IResponseResolver<TMessage, TResolved> resolver, ConsistencyLevel consistencyLevel, IReadCommand command, List<InetAddress> endpoints)
+/////////////////////////////////////////////////////////////////////////
+0:     public TResolved get() throws TimeoutException, DigestMismatchException, IOException
+/////////////////////////////////////////////////////////////////////////
+0:                 sb.append(message.from).append(", ");
+0:     public void response(MessageIn<TMessage> message)
+commit:5d46a01
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.net.MessageIn;
+/////////////////////////////////////////////////////////////////////////
+0:             for (MessageIn message : resolver.getMessages())
+/////////////////////////////////////////////////////////////////////////
+0:     public void response(MessageIn message)
+/////////////////////////////////////////////////////////////////////////
+0:     protected boolean waitingFor(MessageIn message)
+commit:5a6f0b8
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.net.MessageOut;
+/////////////////////////////////////////////////////////////////////////
+0:                 MessageOut<ReadCommand> message = ((ReadCommand) command).createMessage();
+1:                     MessagingService.instance().sendRR(message, endpoint, repairHandler);
+commit:95ca3a2
+commit:ab849a7
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         sortForConsistencyLevel(endpoints);
+0:                        : endpoints.subList(0, Math.min(endpoints.size(), blockfor));
+1:     /**
+0:      * Endpoints is already restricted to live replicas, sorted by snitch preference.  This is a hook for
+0:      * DatacenterReadCallback to move local-DC replicas to the front of the list.  We need this both
+0:      * when doing read repair (because the first replica gets the data read) and otherwise (because
+0:      * only the first 1..blockfor replicas will get digest reads).
+1:      */
+0:     protected void sortForConsistencyLevel(List<InetAddress> endpoints)
+0:         // no-op except in DRC
+commit:e301063
+/////////////////////////////////////////////////////////////////////////
+commit:42ebfb1
+commit:2d2105d
+/////////////////////////////////////////////////////////////////////////
+0:                        : preferredEndpoints(endpoints);
+1: 
+0:     protected List<InetAddress> preferredEndpoints(List<InetAddress> endpoints)
+1:     {
+0:         return endpoints.subList(0, Math.min(endpoints.size(), blockfor)); // min so as to not throw exception until assureSufficient is called
+1:     }
+1: 
+commit:dbcfe67
+/////////////////////////////////////////////////////////////////////////
+1:         {
+0:             logger.debug("Live nodes {} do not satisfy ConsistencyLevel ({} required)",
+0:                          StringUtils.join(endpoints, ", "), blockfor);
+1:         }
+commit:c2cf5c4
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         resolver.preprocess(message);
+0:         int n = waitingFor(message)
+/////////////////////////////////////////////////////////////////////////
+1:      * @return true if the message counts towards the blockfor threshold
+0:      * TODO turn the Message into a response so we don't need two versions of this method
+1:      */
+0:     protected boolean waitingFor(Message message)
+1:     {
+1:         return true;
+1:     }
+1: 
+1:     /**
+0:     protected boolean waitingFor(ReadResponse response)
+/////////////////////////////////////////////////////////////////////////
+0:         int n = waitingFor(result)
+commit:50b490e
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.utils.FBUtilities;
+/////////////////////////////////////////////////////////////////////////
+0:         ReadResponse result = resolver.preprocess(message);
+0:         int n = waitingFor(result, message.getFrom())
+0:         if (logger.isDebugEnabled())
+0:             logger.debug("{} response; {} qualifying responses seen.  Data is {}present",
+0:                          new Object[] { result.isDigestQuery() ? "digest" : "data", n, resolver.isDataPresent() ? "" : "not " });
+/////////////////////////////////////////////////////////////////////////
+0:     protected boolean waitingFor(ReadResponse response, InetAddress from)
+/////////////////////////////////////////////////////////////////////////
+0:         if (logger.isDebugEnabled())
+0:             logger.debug("Preprocessed {} response", result.isDigestQuery() ? "digest" : "data");
+0:         int n = waitingFor(result, FBUtilities.getLocalAddress())
+commit:b111610
+commit:0251a8f
+/////////////////////////////////////////////////////////////////////////
+0:         int n = waitingFor(message)
+0:               ? received.incrementAndGet()
+0:               : received.get();
+1:         if (n >= blockfor && resolver.isDataPresent())
+0:     /**
+0:      * @return true if the message counts towards the blockfor threshold
+0:      * TODO turn the Message into a response so we don't need two versions of this method
+1:      */
+0:     protected boolean waitingFor(Message message)
+1:     {
+0:         return true;
+1:     }
+1: 
+0:     /**
+0:      * @return true if the response counts towards the blockfor threshold
+1:      */
+0:     protected boolean waitingFor(ReadResponse response)
+1:     {
+0:         return true;
+1:     }
+1: 
+0:         int n = waitingFor(result)
+0:               ? received.incrementAndGet()
+0:               : received.get();
+1:         if (n >= blockfor && resolver.isDataPresent())
+commit:5e6539a
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.concurrent.atomic.AtomicInteger;
+/////////////////////////////////////////////////////////////////////////
+0:     protected final AtomicInteger received = new AtomicInteger(0);
+/////////////////////////////////////////////////////////////////////////
+0:             throw new TimeoutException("Operation timed out - received only " + received.get() + " responses from " + sb.toString() + " .");
+/////////////////////////////////////////////////////////////////////////
+0:         if (received.incrementAndGet() >= blockfor && resolver.isDataPresent())
+/////////////////////////////////////////////////////////////////////////
+0:         if (received.incrementAndGet() >= blockfor && resolver.isDataPresent())
+/////////////////////////////////////////////////////////////////////////
+0:         if (blockfor < endpoints.size() && received.get() == endpoints.size())
+commit:fffecb8
+/////////////////////////////////////////////////////////////////////////
+0:     /** the list of endpoints that StorageProxy should send requests to */
+1:     final List<InetAddress> endpoints;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         assert resolver.getMessageCount() <= endpoints.size() : "Got " + resolver.getMessageCount() + " replies but requests were only sent to " + endpoints.size() + " endpoints";
+commit:da936f5
+commit:0d6db4a
+/////////////////////////////////////////////////////////////////////////
+0:             case TWO:
+0:                 return 2;
+0:             case THREE:
+0:                 return 3;
+commit:489cafe
+commit:dc9992a
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.List;
+0: import java.util.Random;
+0: import org.apache.commons.lang.StringUtils;
+1: import org.apache.cassandra.concurrent.Stage;
+1: import org.apache.cassandra.concurrent.StageManager;
+0: import org.apache.cassandra.config.CFMetaData;
+0: import org.apache.cassandra.db.ReadCommand;
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.utils.WrappedRunnable;
+0:     private static final ThreadLocal<Random> random = new ThreadLocal<Random>()
+1:     {
+0:         @Override
+0:         protected Random initialValue()
+1:         {
+0:             return new Random();
+1:         }
+0:     };
+1: 
+0:     final List<InetAddress> endpoints;
+0:     private final IReadCommand command;
+1: 
+0:     public ReadCallback(IResponseResolver<T> resolver, ConsistencyLevel consistencyLevel, IReadCommand command, List<InetAddress> endpoints)
+0:         this.command = command;
+0:         this.blockfor = determineBlockFor(consistencyLevel, command.getKeyspace());
+0:         boolean repair = randomlyReadRepair();
+0:         this.endpoints = repair || resolver instanceof RowRepairResolver
+0:                        ? endpoints
+0:                        : endpoints.subList(0, Math.min(endpoints.size(), blockfor)); // min so as to not throw exception until assureSufficient is called
+0:         if (logger.isDebugEnabled())
+0:             logger.debug(String.format("Blockfor/repair is %s/%s; setting up requests to %s",
+0:                                        blockfor, repair, StringUtils.join(this.endpoints, ",")));
+0:     private boolean randomlyReadRepair()
+1:     {
+0:         if (resolver instanceof RowDigestResolver)
+1:         {
+0:             assert command instanceof ReadCommand : command;
+0:             String table = ((RowDigestResolver) resolver).table;
+0:             String columnFamily = ((ReadCommand) command).getColumnFamilyName();
+0:             CFMetaData cfmd = DatabaseDescriptor.getTableMetaData(table).get(columnFamily);
+0:             return cfmd.getReadRepairChance() > random.get().nextDouble();
+1:         }
+0:         // we don't read repair on range scans
+0:         return false;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         assert resolver.getMessageCount() <= endpoints.size();
+1:         {
+0:             maybeResolveForRepair();
+1:         }
+0:         ((RowDigestResolver) resolver).injectPreProcessed(result);
+0:         assert resolver.getMessageCount() <= endpoints.size();
+1:         {
+0:             maybeResolveForRepair();
+1:         }
+1: 
+0:     /**
+0:      * Check digests in the background on the Repair stage if we've received replies
+0:      * too all the requests we sent.
+0:      */
+0:     protected void maybeResolveForRepair()
+1:     {
+0:         if (blockfor < endpoints.size() && resolver.getMessageCount() == endpoints.size())
+1:         {
+0:             assert resolver.isDataPresent();
+0:             StageManager.getStage(Stage.READ_REPAIR).execute(new AsyncRepairRunner());
+1:         }
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     public void assureSufficientLiveNodes() throws UnavailableException
+0: 
+1:     public boolean isLatencyForSnitch()
+1:     {
+0:         return true;
+1:     }
+0: 
+0:     private class AsyncRepairRunner extends WrappedRunnable
+1:     {
+0:         protected void runMayThrow() throws IOException
+1:         {
+1:             try
+1:             {
+1:                 resolver.resolve();
+1:             }
+1:             catch (DigestMismatchException e)
+1:             {
+0:                 if (logger.isDebugEnabled())
+1:                     logger.debug("Digest mismatch:", e);
+0: 
+0:                 ReadCommand readCommand = (ReadCommand) command;
+0:                 final RowRepairResolver repairResolver = new RowRepairResolver(readCommand.table, readCommand.key);
+0:                 IAsyncCallback repairHandler = new AsyncRepairCallback(repairResolver, endpoints.size());
+0: 
+0:                 Message messageRepair = readCommand.makeReadMessage();
+1:                 for (InetAddress endpoint : endpoints)
+0:                     MessagingService.instance().sendRR(messageRepair, endpoint, repairHandler);
+1:             }
+1:         }
+1:     }
+commit:4826e8c
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.ReadResponse;
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:     public void response(ReadResponse result)
+0:     {
+0:         ((ReadResponseResolver) resolver).injectPreProcessed(result);
+0:         if (resolver.getMessageCount() < blockfor)
+0:             return;
+0:         if (resolver.isDataPresent())
+0:             condition.signal();
+0:     }
+commit:e134e51
+/////////////////////////////////////////////////////////////////////////
+commit:a043125
+/////////////////////////////////////////////////////////////////////////
+0:         MessagingService ms = MessagingService.instance();
+0:             ms.removeRegisteredCallback(response.getMessageId());
+commit:dcb6112
+/////////////////////////////////////////////////////////////////////////
+0: public class ReadCallback<T> implements IAsyncCallback
+1:     protected static final Logger logger = LoggerFactory.getLogger( ReadCallback.class );
+/////////////////////////////////////////////////////////////////////////
+0:     public ReadCallback(IResponseResolver<T> resolver, ConsistencyLevel consistencyLevel, String table)
+0:         logger.debug("ReadCallback blocking for {} responses", blockfor);
+commit:e547733
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:     public final IResponseResolver<T> resolver;
+/////////////////////////////////////////////////////////////////////////
+0:         long timeout = DatabaseDescriptor.getRpcTimeout() - (System.currentTimeMillis() - startTime);
+0:         boolean success;
+0:             success = condition.await(timeout, TimeUnit.MILLISECONDS);
+1:         catch (InterruptedException ex)
+1:             throw new AssertionError(ex);
+0:         if (!success)
+0:         {
+0:             StringBuilder sb = new StringBuilder("");
+0:             for (Message message : resolver.getMessages())
+0:                 sb.append(message.getFrom()).append(", ");
+0:             throw new TimeoutException("Operation timed out - received only " + resolver.getMessageCount() + " responses from " + sb.toString() + " .");
+0:         }
+0: 
+0:         return blockfor == 1 ? resolver.getData() : resolver.resolve();
+0:     }
+0: 
+0:     public void close()
+0:     {
+0:         for (Message response : resolver.getMessages())
+0:         {
+0:             MessagingService.removeRegisteredCallback(response.getMessageId());
+0:         }
+commit:ef25537
+/////////////////////////////////////////////////////////////////////////
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+0: 
+/////////////////////////////////////////////////////////////////////////
+commit:2c6f56d
+/////////////////////////////////////////////////////////////////////////
+0: import java.io.IOException;
+1: import java.net.InetAddress;
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.thrift.UnavailableException;
+/////////////////////////////////////////////////////////////////////////
+0:     protected final IResponseResolver<T> resolver;
+0:     protected final int blockfor;
+0:     public QuorumResponseHandler(IResponseResolver<T> resolver, ConsistencyLevel consistencyLevel, String table)
+0:         this.resolver = resolver;
+0: 
+0:         logger.debug("QuorumResponseHandler blocking for {} responses", blockfor);
+/////////////////////////////////////////////////////////////////////////
+0:                 for (Message message : resolver.getMessages())
+0:                 throw new TimeoutException("Operation timed out - received only " + resolver.getMessageCount() + " responses from " + sb.toString() + " .");
+0:             for (Message response : resolver.getMessages())
+0:         return resolver.resolve();
+0:         resolver.preprocess(message);
+0:         if (resolver.getMessageCount() < blockfor)
+0:         if (resolver.isDataPresent())
+/////////////////////////////////////////////////////////////////////////
+0:                 throw new UnsupportedOperationException("invalid consistency level: " + consistencyLevel);
+0: 
+0:     public void assureSufficientLiveNodes(Collection<InetAddress> endpoints) throws UnavailableException
+0:     {
+0:         if (endpoints.size() < blockfor)
+0:             throw new UnavailableException();
+0:     }
+commit:2f5f0c2
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.Table;
+/////////////////////////////////////////////////////////////////////////
+0:                 return (Table.open(table).getReplicationStrategy().getReplicationFactor() / 2) + 1;
+0:                 return Table.open(table).getReplicationStrategy().getReplicationFactor();
+commit:b732d4a
+/////////////////////////////////////////////////////////////////////////
+0:         responseResolver.preprocess(message);
+commit:dc33a2d
+/////////////////////////////////////////////////////////////////////////
+0:                 return (DatabaseDescriptor.getReplicationFactor(table) / 2) + 1;
+commit:5a45534
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.thrift.ConsistencyLevel;
+/////////////////////////////////////////////////////////////////////////
+0:     protected final Collection<Message> responses = new LinkedBlockingQueue<Message>();;
+0:     protected IResponseResolver<T> responseResolver;
+0:     protected int blockfor;
+0:     
+0:     /**
+1:      * Constructor when response count has to be calculated and blocked for.
+0:      */
+0:     public QuorumResponseHandler(IResponseResolver<T> responseResolver, ConsistencyLevel consistencyLevel, String table)
+0:         this.blockfor = determineBlockFor(consistencyLevel, table);
+0:         this.startTime = System.currentTimeMillis();
+/////////////////////////////////////////////////////////////////////////
+0:         if (responses.size() < blockfor) {
+0:             return;
+0:         }
+0:     
+0:     public int determineBlockFor(ConsistencyLevel consistencyLevel, String table)
+0:     {
+0:         switch (consistencyLevel)
+0:         {
+0:             case ONE:
+0:             case ANY:
+0:                 return 1;
+0:             case QUORUM:
+0:                 return (DatabaseDescriptor.getQuorum(table)/ 2) + 1;
+0:             case ALL:
+0:                 return DatabaseDescriptor.getReplicationFactor(table);
+0:             default:
+0:                 throw new UnsupportedOperationException("invalid consistency level: " + table.toString());
+0:         }
+0:     }
+commit:d55ed91
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.Iterator;
+0: import java.util.List;
+0: import java.util.ArrayList;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     protected final Collection<Message> responses;
+0:     private IResponseResolver<T> responseResolver;
+0: 
+0:     public QuorumResponseHandler(int responseCount, IResponseResolver<T> responseResolver)
+0:         responses = new LinkedBlockingQueue<Message>();
+0:         startTime = System.currentTimeMillis();
+/////////////////////////////////////////////////////////////////////////
+commit:ef1895b
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.thrift.ConsistencyLevel;
+/////////////////////////////////////////////////////////////////////////
+0:     protected final Collection<Message> responses = new LinkedBlockingQueue<Message>();;
+0:     protected IResponseResolver<T> responseResolver;
+0:     protected int blockfor;
+0:     
+0:     /**
+0:      * Constructor when response count has to be calculated and blocked for.
+0:      */
+0:     public QuorumResponseHandler(IResponseResolver<T> responseResolver, ConsistencyLevel consistencyLevel, String table)
+0:         this.blockfor = determineBlockFor(consistencyLevel, table);
+0:         this.startTime = System.currentTimeMillis();
+/////////////////////////////////////////////////////////////////////////
+0:         if (responses.size() < blockfor) {
+0:             return;
+0:         }
+0:     
+0:     public int determineBlockFor(ConsistencyLevel consistencyLevel, String table)
+0:     {
+0:         switch (consistencyLevel)
+0:         {
+0:             case ONE:
+0:             case ANY:
+0:                 return 1;
+0:             case QUORUM:
+0:                 return (DatabaseDescriptor.getQuorum(table)/ 2) + 1;
+0:             case ALL:
+0:                 return DatabaseDescriptor.getReplicationFactor(table);
+0:             default:
+0:                 throw new UnsupportedOperationException("invalid consistency level: " + table.toString());
+0:         }
+0:     }
+commit:6d96f53
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         if (responseResolver.isDataPresent(responses))
+commit:b7a1c44
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     protected static final Logger logger = Logger.getLogger( QuorumResponseHandler.class );
+0:     protected final SimpleCondition condition = new SimpleCondition();
+0:     private final int responseCount;
+0:     protected final List<Message> responses;
+0:     private IResponseResolver<T> responseResolver;
+0:     private final long startTime;
+0:         this.responseCount = responseCount;
+0:         responses = new ArrayList<Message>(responseCount);
+0:         this.responseResolver =  responseResolver;
+0:         startTime = System.currentTimeMillis();
+0:             long timeout = System.currentTimeMillis() - startTime + DatabaseDescriptor.getRpcTimeout();
+0:                 success = condition.await(timeout, TimeUnit.MILLISECONDS);
+/////////////////////////////////////////////////////////////////////////
+0:                 for (Message message : responses)
+0:                 throw new TimeoutException("Operation timed out - received only " + responses.size() + " responses from " + sb.toString() + " .");
+0:             for (Message response : responses)
+0:         return responseResolver.resolve(responses);
+0:         if (condition.isSignaled())
+0:         responses.add(message);
+0:         if (responses.size() >= responseCount && responseResolver.isDataPresent(responses))
+0:             condition.signal();
+commit:e488d26
+/////////////////////////////////////////////////////////////////////////
+0:     public QuorumResponseHandler(int responseCount, IResponseResolver<T> responseResolver)
+commit:f170a9d
+/////////////////////////////////////////////////////////////////////////
+0:         assert 1 <= responseCount && responseCount <= DatabaseDescriptor.getReplicationFactor()
+0:             : "invalid response count " + responseCount;
+0: 
+commit:d2c2365
+/////////////////////////////////////////////////////////////////////////
+0:     protected static Logger logger_ = Logger.getLogger( QuorumResponseHandler.class );
+0:     protected SimpleCondition condition_ = new SimpleCondition();
+0:     protected List<Message> responses_ = new ArrayList<Message>();
+commit:bdb7bda
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.utils.SimpleCondition;
+0: 
+0:     private SimpleCondition condition_ = new SimpleCondition();
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:             long timeout = System.currentTimeMillis() - startTime_ + DatabaseDescriptor.getRpcTimeout();
+0:             boolean success;
+0:                 success = condition_.await(timeout, TimeUnit.MILLISECONDS);
+0:             if (!success)
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         if (condition_.isSignaled())
+0:             return;
+0: 
+0:         responses_.add(message);
+0:         if (responses_.size() >= responseCount_ && responseResolver_.isDataPresent(responses_))
+0:             condition_.signal();
+commit:1782c88
+/////////////////////////////////////////////////////////////////////////
+commit:f48c5b6
+/////////////////////////////////////////////////////////////////////////
+0: import java.io.IOException;
+/////////////////////////////////////////////////////////////////////////
+0:     public T get() throws TimeoutException, DigestMismatchException, IOException
+0:         lock_.lock();
+0:         {
+0:             boolean bVal = true;
+0:                 if (!done_.get())
+0:                     if (timeout > 0)
+0:                     {
+0:                     }
+0:                     {
+0:                     }
+0:             catch (InterruptedException ex)
+0:                 throw new AssertionError(ex);
+0: 
+0:             if (!bVal && !done_.get())
+0:                 for (Message message : responses_)
+0:                     sb.append(message.getFrom());
+0:                 }
+0:                 throw new TimeoutException("Operation timed out - received only " + responses_.size() + " responses from " + sb.toString() + " .");
+0:             for (Message response : responses_)
+0:                 MessagingService.removeRegisteredCallback(response.getMessageId());
+0:         return responseResolver_.resolve(responses_);
+0:         {
+0:             if (!done_.get())
+0:                 responses_.add(message);
+0:                 if (responses_.size() >= responseCount_ && responseResolver_.isDataPresent(responses_))
+0:                 {
+0:                     done_.set(true);
+0:                     condition_.signal();
+0:                 }
+commit:6690c51
+/////////////////////////////////////////////////////////////////////////
+0:     private long startTime_;
+/////////////////////////////////////////////////////////////////////////
+0:         startTime_ = System.currentTimeMillis();
+/////////////////////////////////////////////////////////////////////////
+0:                 {
+0:                     long timeout = System.currentTimeMillis() - startTime_ + DatabaseDescriptor.getRpcTimeout();
+0:                     if(timeout > 0)
+0:                         bVal = condition_.await(timeout, TimeUnit.MILLISECONDS);
+0:                     else
+0:                         bVal = false;
+commit:d7e4924
+/////////////////////////////////////////////////////////////////////////
+commit:066ef58
+/////////////////////////////////////////////////////////////////////////
+0: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+0:  */
+0: 
+1: package org.apache.cassandra.service;
+0: 
+0: import java.util.List;
+0: import java.util.ArrayList;
+0: import java.util.concurrent.atomic.AtomicBoolean;
+0: import java.util.concurrent.locks.*;
+1: import java.util.concurrent.TimeUnit;
+0: import java.util.concurrent.TimeoutException;
+0: 
+1: import org.apache.cassandra.config.DatabaseDescriptor;
+0: import org.apache.cassandra.net.IAsyncCallback;
+0: import org.apache.cassandra.net.Message;
+1: import org.apache.cassandra.net.MessagingService;
+0: import org.apache.cassandra.utils.LogUtil;
+0: import org.apache.log4j.Logger;
+0: 
+0: /**
+0:  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+0:  */
+0: 
+0: public class QuorumResponseHandler<T> implements IAsyncCallback
+0: {
+0:     private static Logger logger_ = Logger.getLogger( QuorumResponseHandler.class );
+0:     private Lock lock_ = new ReentrantLock();
+0:     private Condition condition_;
+0:     private int responseCount_;
+0:     private List<Message> responses_ = new ArrayList<Message>();
+0:     private IResponseResolver<T> responseResolver_;
+0:     private AtomicBoolean done_ = new AtomicBoolean(false);
+0: 
+0:     public QuorumResponseHandler(int responseCount, IResponseResolver<T> responseResolver) throws InvalidRequestException
+0:     {
+0:         if (responseCount > DatabaseDescriptor.getReplicationFactor())
+0:             throw new InvalidRequestException("Cannot block for more than the replication factor of " + DatabaseDescriptor.getReplicationFactor());
+0:         if (responseCount < 1)
+0:             throw new InvalidRequestException("Cannot block for less than one replica");
+0:         condition_ = lock_.newCondition();
+0:         responseCount_ = responseCount;
+0:         responseResolver_ =  responseResolver;
+0:     }
+0:     
+0:     public T get() throws TimeoutException, DigestMismatchException
+0:     {
+0:     	lock_.lock();
+1:         try
+0:         {            
+0:             boolean bVal = true;            
+1:             try
+0:             {
+0:             	if ( !done_.get() )
+0:                 {            		
+0:             		bVal = condition_.await(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
+0:                 }
+0:             }
+0:             catch ( InterruptedException ex )
+0:             {
+0:                 if (logger_.isDebugEnabled())
+0:                   logger_.debug( LogUtil.throwableToString(ex) );
+0:             }
+0:             
+0:             if ( !bVal && !done_.get() )
+0:             {
+0:                 StringBuilder sb = new StringBuilder("");
+0:                 for ( Message message : responses_ )
+0:                 {
+0:                     sb.append(message.getFrom());                    
+0:                 }                
+0:                 throw new TimeoutException("Operation timed out - received only " +  responses_.size() + " responses from " + sb.toString() + " .");
+0:             }
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:             for(Message response : responses_)
+0:             {
+0:             	MessagingService.removeRegisteredCallback( response.getMessageId() );
+0:             }
+0:         }
+0: 
+0:     	return responseResolver_.resolve( responses_);
+0:     }
+0:     
+0:     public void response(Message message)
+0:     {
+0:         lock_.lock();
+1:         try
+0:         {            
+0:             if ( !done_.get() )
+0:             {
+0:             	responses_.add( message );
+0:             	if ( responses_.size() >= responseCount_ && responseResolver_.isDataPresent(responses_))
+0:             	{
+0:             		done_.set(true);
+0:             		condition_.signal();            	
+0:             	}
+0:             }
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:         }
+0:     }
+0:     
+0:     public void attachContext(Object o)
+0:     {
+0:         throw new UnsupportedOperationException("This operation is not supported in this version of the callback handler");
+0:     }
+0: }
+commit:0077af4
+/////////////////////////////////////////////////////////////////////////
+0:                 if (logger_.isDebugEnabled())
+0:                   logger_.debug( LogUtil.throwableToString(ex) );
+commit:0ae07f2
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:     public QuorumResponseHandler(int responseCount, IResponseResolver<T> responseResolver) throws InvalidRequestException
+0:     {
+0:         if (responseCount > DatabaseDescriptor.getReplicationFactor())
+0:             throw new InvalidRequestException("Cannot block for more than the replication factor of " + DatabaseDescriptor.getReplicationFactor());
+0:         if (responseCount < 1)
+0:             throw new InvalidRequestException("Cannot block for less than one replica");
+/////////////////////////////////////////////////////////////////////////
+0:         {            
+0:             	if ( responses_.size() >= responseCount_ && responseResolver_.isDataPresent(responses_))
+commit:735008d
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+commit:71739ef
+commit:2ee9f9e
+/////////////////////////////////////////////////////////////////////////
+0: 
+commit:8f56a96
+/////////////////////////////////////////////////////////////////////////
+0: 
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:a1ecb12
+commit:09ab439
+/////////////////////////////////////////////////////////////////////////
+0:             maybeResolveForRepair(n);
+/////////////////////////////////////////////////////////////////////////
+0:      * to all the requests we sent.
+0:     protected void maybeResolveForRepair(int n)
+0:         if (blockfor < endpoints.size() && n == endpoints.size())
+commit:01370bb
+/////////////////////////////////////////////////////////////////////////
+0:     public ReadCallback(IResponseResolver<TMessage, TResolved> resolver, ConsistencyLevel consistencyLevel, int blockfor, IReadCommand command, Keyspace keyspace, List<InetAddress> endpoints)
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         resolver.preprocess(message);
+0:         int n = waitingFor(message)
+commit:bffd9ea
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.commons.lang3.StringUtils;
+commit:0e96e58
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.Keyspace;
+/////////////////////////////////////////////////////////////////////////
+1:     private final Keyspace keyspace; // TODO push this into ConsistencyLevel?
+0:         this(resolver, consistencyLevel, consistencyLevel.blockFor(Keyspace.open(command.getKeyspace())), command, Keyspace.open(command.getKeyspace()), filteredEndpoints);
+0:     private ReadCallback(IResponseResolver<TMessage, TResolved> resolver, ConsistencyLevel consistencyLevel, int blockfor, IReadCommand command, Keyspace keyspace, List<InetAddress> endpoints)
+1:         this.keyspace = keyspace;
+/////////////////////////////////////////////////////////////////////////
+0:         return new ReadCallback<TMessage, TResolved>(newResolver, consistencyLevel, blockfor, command, keyspace, endpoints);
+/////////////////////////////////////////////////////////////////////////
+1:         consistencyLevel.assureSufficientLiveNodes(keyspace, endpoints);
+/////////////////////////////////////////////////////////////////////////
+0:                 final RowDataResolver repairResolver = new RowDataResolver(readCommand.ksName, readCommand.key, readCommand.filter(), readCommand.timestamp);
+commit:1f7628c
+/////////////////////////////////////////////////////////////////////////
+0:                 final RowDataResolver repairResolver = new RowDataResolver(readCommand.table, readCommand.key, readCommand.filter(), readCommand.timestamp);
+commit:b2ba251
+/////////////////////////////////////////////////////////////////////////
+0:         if (!await(command.getTimeout(), TimeUnit.MILLISECONDS))
+commit:2739248
+commit:6a03b11
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     public TResolved get() throws ReadTimeoutException, DigestMismatchException
+/////////////////////////////////////////////////////////////////////////
+1:     private class AsyncRepairRunner implements Runnable
+1:         public void run()
+author:Marcus Eriksson
+-------------------------------------------------------------------------------
+commit:7aa3364
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+/////////////////////////////////////////////////////////////////////////
+1:     private static final AtomicIntegerFieldUpdater<ReadCallback> recievedUpdater
+1:             = AtomicIntegerFieldUpdater.newUpdater(ReadCallback.class, "received");
+1:     private volatile int received = 0;
+/////////////////////////////////////////////////////////////////////////
+0:             int acks = received;
+0:             ReadTimeoutException ex = new ReadTimeoutException(consistencyLevel, received, blockfor, resolver.isDataPresent());
+/////////////////////////////////////////////////////////////////////////
+1:               ? recievedUpdater.incrementAndGet(this)
+1:               : received;
+/////////////////////////////////////////////////////////////////////////
+1:         return received;
+/////////////////////////////////////////////////////////////////////////
+0:         if (blockfor < endpoints.size() && received == endpoints.size())
+author:Jason Brown
+-------------------------------------------------------------------------------
+commit:5c0c84b
+/////////////////////////////////////////////////////////////////////////
+1:         return consistencyLevel.isDatacenterLocal()
+commit:c9528f9
+/////////////////////////////////////////////////////////////////////////
+0:         return consistencyLevel.isDatacenterLocal()
+author:Brandon Williams
+-------------------------------------------------------------------------------
+commit:4c0be33
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.metrics.ReadRepairMetrics;
+/////////////////////////////////////////////////////////////////////////
+0:                 
+1:                 ReadRepairMetrics.repairedBackground.mark();
+0:                 
+commit:a5c0484
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0: 
+commit:6193fef
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.metrics.ReadRepairMetrics;
+/////////////////////////////////////////////////////////////////////////
+0:                 
+0:                 ReadRepairMetrics.repairedBackground.mark();
+0:                 
+commit:e301c38
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.metrics.ReadRepairMetrics;
+/////////////////////////////////////////////////////////////////////////
+0:                 
+0:                 ReadRepairMetrics.repairedBackground.mark();
+0:                 
+author:Vijay Parthasarathy
+-------------------------------------------------------------------------------
+commit:c25a6a1
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     final long startTime;
+/////////////////////////////////////////////////////////////////////////
+0:     public boolean await(long interimTimeout)
+0:         long timeout = interimTimeout - (System.currentTimeMillis() - startTime);
+0:             return condition.await(timeout, TimeUnit.MILLISECONDS);
+0:     }
+0:     public TResolved get() throws ReadTimeoutException, DigestMismatchException, IOException
+0:     {
+0:         long timeout = command.getTimeout() - (System.currentTimeMillis() - startTime);
+0:         if (!await(timeout))
+0:         {
+0:             ReadTimeoutException ex = new ReadTimeoutException(consistencyLevel, received.get(), blockfor, resolver.isDataPresent());
+0:             if (logger.isDebugEnabled())
+0:                 logger.debug("Read timeout: {}", ex.toString());
+0:             throw ex;
+0:         }
+0:         boolean hasAdded = resolver.preprocess(message);
+0:         int n = (waitingFor(message) && hasAdded)
+commit:4e6a4c0
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.locator.IEndpointSnitch;
+/////////////////////////////////////////////////////////////////////////
+0: import com.google.common.collect.Lists;
+0: 
+0:     protected static final IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
+0:     protected static final String localdc = snitch.getDatacenter(FBUtilities.getBroadcastAddress());
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:         this.endpoints = resolver instanceof RowRepairResolver ? endpoints : filterEndpoints(endpoints);
+0:             logger.debug(String.format("Blockfor is %s; setting up requests to %s", blockfor, StringUtils.join(this.endpoints, ",")));
+/////////////////////////////////////////////////////////////////////////
+0:     private List<InetAddress> filterEndpoints(List<InetAddress> ep)
+/////////////////////////////////////////////////////////////////////////
+0:             double chance = FBUtilities.threadLocalRandom().nextDouble();
+0: 
+0:             // if global repair then just return all the ep's
+0:             if (cfmd.getReadRepairChance() > chance)
+0:                 return ep;
+0: 
+0:             // if local repair then just return localDC ep's
+0:             if (cfmd.getDcLocalReadRepair() > chance)
+0:             {
+0:                 List<InetAddress> local = Lists.newArrayList();
+0:                 List<InetAddress> other = Lists.newArrayList();
+0:                 for (InetAddress add : ep)
+0:                 {
+0:                     if (snitch.getDatacenter(add).equals(localdc))
+0:                         local.add(add);
+0:                     else
+0:                         other.add(add);
+0:                 }
+0:                 // check if blockfor more than we have localep's
+0:                 if (local.size() < blockfor)
+0:                     local.addAll(other.subList(0, Math.min(blockfor - local.size(), other.size())));
+0:                 return local;
+0:             }
+0:         return ep.subList(0, Math.min(ep.size(), blockfor));
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:7b532bc
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.config.Schema;
+/////////////////////////////////////////////////////////////////////////
+0:             CFMetaData cfmd = Schema.instance.getTableMetaData(table).get(columnFamily);
+author:Chris Goffinet
+-------------------------------------------------------------------------------
+commit:afe2420
+/////////////////////////////////////////////////////////////////////////
+0:             long timeout = DatabaseDescriptor.getRpcTimeout() - (System.currentTimeMillis() - startTime);
+author:Gary Dusbabek
+-------------------------------------------------------------------------------
+commit:0095f0c
+/////////////////////////////////////////////////////////////////////////
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+0:     protected static final Logger logger = LoggerFactory.getLogger( QuorumResponseHandler.class );
+commit:443d534
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.Collection;
+0: import java.util.Iterator;
+0: import java.util.concurrent.LinkedBlockingQueue;
+/////////////////////////////////////////////////////////////////////////
+0:     protected final Collection<Message> responses;
+0:         responses = new LinkedBlockingQueue<Message>();
+0:         this.responseResolver = responseResolver;
+/////////////////////////////////////////////////////////////////////////
+author:Avinash Lakshman
+-------------------------------------------------------------------------------
+commit:1cc4294
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.WriteResponseMessage;
+0: import org.apache.cassandra.utils.*;
+/////////////////////////////////////////////////////////////////////////
+0:     
+0:     public void attachContext(Object o)
+0:     {
+0:         throw new UnsupportedOperationException("This operation is not supported in this version of the callback handler");
+0:     }
+author:Prashant Malik
+-------------------------------------------------------------------------------
+commit:1f91e99
+/////////////////////////////////////////////////////////////////////////
+0: /**
+0:  * Licensed to the Apache Software Foundation (ASF) under one
+0:  * or more contributor license agreements.  See the NOTICE file
+0:  * distributed with this work for additional information
+0:  * regarding copyright ownership.  The ASF licenses this file
+0:  * to you under the Apache License, Version 2.0 (the
+0:  * "License"); you may not use this file except in compliance
+0:  * with the License.  You may obtain a copy of the License at
+0:  *
+0:  *     http://www.apache.org/licenses/LICENSE-2.0
+0:  *
+0:  * Unless required by applicable law or agreed to in writing, software
+0:  * distributed under the License is distributed on an "AS IS" BASIS,
+0:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+0:  * See the License for the specific language governing permissions and
+0:  * limitations under the License.
+0:  */
+0: 
+0: package org.apache.cassandra.service;
+0: 
+0: import java.util.List;
+0: import java.util.ArrayList;
+0: import java.util.concurrent.atomic.AtomicBoolean;
+0: import java.util.concurrent.locks.*;
+0: import java.util.concurrent.TimeUnit;
+0: import java.util.concurrent.TimeoutException;
+0: 
+0: import org.apache.cassandra.config.DatabaseDescriptor;
+0: import org.apache.cassandra.db.WriteResponseMessage;
+0: import org.apache.cassandra.net.IAsyncCallback;
+0: import org.apache.cassandra.net.Message;
+0: import org.apache.cassandra.net.MessagingService;
+0: import org.apache.cassandra.utils.LogUtil;
+0: import org.apache.log4j.Logger;
+0: import org.apache.cassandra.utils.*;
+0: /**
+0:  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+0:  */
+0: 
+0: public class QuorumResponseHandler<T> implements IAsyncCallback
+0: {
+0:     private static Logger logger_ = Logger.getLogger( QuorumResponseHandler.class );
+0:     private Lock lock_ = new ReentrantLock();
+0:     private Condition condition_;
+0:     private int responseCount_;
+0:     private List<Message> responses_ = new ArrayList<Message>();
+0:     private IResponseResolver<T> responseResolver_;
+0:     private AtomicBoolean done_ = new AtomicBoolean(false);
+0:     
+0:     public QuorumResponseHandler(int responseCount, IResponseResolver<T> responseResolver)
+0:     {        
+0:         condition_ = lock_.newCondition();
+0:         responseCount_ = responseCount;
+0:         responseResolver_ =  responseResolver;
+0:     }
+0:     
+0:     public void  setResponseCount(int responseCount)
+0:     {
+0:         responseCount_ = responseCount;
+0:     }
+0:     
+0:     public T get() throws TimeoutException, DigestMismatchException
+0:     {
+0:         long startTime = System.currentTimeMillis();
+0:     	lock_.lock();
+0:         try
+0:         {            
+0:             boolean bVal = true;            
+0:             try
+0:             {
+0:             	if ( !done_.get() )
+0:                 {            		
+0:             		bVal = condition_.await(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
+0:                 }
+0:             }
+0:             catch ( InterruptedException ex )
+0:             {
+0:                 logger_.debug( LogUtil.throwableToString(ex) );
+0:             }
+0:             
+0:             if ( !bVal && !done_.get() )
+0:             {
+0:                 StringBuilder sb = new StringBuilder("");
+0:                 for ( Message message : responses_ )
+0:                 {
+0:                     sb.append(message.getFrom());                    
+0:                 }                
+0:                 throw new TimeoutException("Operation timed out - received only " +  responses_.size() + " responses from " + sb.toString() + " .");
+0:             }
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:             for(Message response : responses_)
+0:             {
+0:             	MessagingService.removeRegisteredCallback( response.getMessageId() );
+0:             }
+0:         }
+0:         logger_.info("QuorumResponseHandler: " + (System.currentTimeMillis() - startTime)
+0:                 + " ms.");
+0: 
+0:     	return responseResolver_.resolve( responses_);
+0:     }
+0:     
+0:     public void response(Message message)
+0:     {
+0:         lock_.lock();
+0:         try
+0:         {
+0:         	int majority = (responseCount_ >> 1) + 1;            
+0:             if ( !done_.get() )
+0:             {
+0:             	responses_.add( message );
+0:             	if ( responses_.size() >= majority && responseResolver_.isDataPresent(responses_))
+0:             	{
+0:             		done_.set(true);
+0:             		condition_.signal();            	
+0:             	}
+0:             }
+0:         }
+0:         finally
+0:         {
+0:             lock_.unlock();
+0:         }
+0:     }
+0: }
+============================================================================

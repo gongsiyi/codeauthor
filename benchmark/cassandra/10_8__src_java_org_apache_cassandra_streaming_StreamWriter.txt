@@ -1,0 +1,435 @@
+1:5151169: /*
+1:5151169:  * Licensed to the Apache Software Foundation (ASF) under one
+1:5151169:  * or more contributor license agreements.  See the NOTICE file
+1:5151169:  * distributed with this work for additional information
+1:5151169:  * regarding copyright ownership.  The ASF licenses this file
+1:5151169:  * to you under the Apache License, Version 2.0 (the
+1:5151169:  * "License"); you may not use this file except in compliance
+1:5151169:  * with the License.  You may obtain a copy of the License at
+1:5151169:  *
+1:5151169:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:5151169:  *
+1:5151169:  * Unless required by applicable law or agreed to in writing, software
+1:5151169:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:5151169:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:5151169:  * See the License for the specific language governing permissions and
+1:5151169:  * limitations under the License.
+1:5151169:  */
+1:5151169: package org.apache.cassandra.streaming;
+1:5151169: 
+1:5151169: import java.io.File;
+1:5151169: import java.io.IOException;
+1:5151169: import java.io.OutputStream;
+1:5151169: import java.util.Collection;
+1:5151169: 
+1:582bdba: import org.slf4j.Logger;
+1:582bdba: import org.slf4j.LoggerFactory;
+1:582bdba: 
+1:5151169: import com.ning.compress.lzf.LZFOutputStream;
+1:5151169: 
+1:5151169: import org.apache.cassandra.io.sstable.Component;
+1:0368e97: import org.apache.cassandra.io.sstable.format.SSTableReader;
+1:5151169: import org.apache.cassandra.io.util.DataIntegrityMetadata;
+1:5151169: import org.apache.cassandra.io.util.DataIntegrityMetadata.ChecksumValidator;
+1:16499ca: import org.apache.cassandra.io.util.DataOutputStreamPlus;
+1:5151169: import org.apache.cassandra.io.util.RandomAccessReader;
+1:4112a7f: import org.apache.cassandra.streaming.StreamManager.StreamRateLimiter;
+1:db68ac9: import org.apache.cassandra.utils.FBUtilities;
+1:5151169: import org.apache.cassandra.utils.Pair;
+1:5151169: 
+1:5151169: /**
+1:5151169:  * StreamWriter writes given section of the SSTable to given channel.
+1:5151169:  */
+1:5151169: public class StreamWriter
+2:5151169: {
+1:5151169:     private static final int DEFAULT_CHUNK_SIZE = 64 * 1024;
+1:5151169: 
+1:582bdba:     private static final Logger logger = LoggerFactory.getLogger(StreamWriter.class);
+1:5151169: 
+1:5151169:     protected final SSTableReader sstable;
+1:5151169:     protected final Collection<Pair<Long, Long>> sections;
+1:4112a7f:     protected final StreamRateLimiter limiter;
+1:5151169:     protected final StreamSession session;
+1:5151169: 
+1:5151169:     private OutputStream compressedOutput;
+1:5151169: 
+1:5151169:     // allocate buffer to use for transfers only once
+1:5151169:     private byte[] transferBuffer;
+1:5151169: 
+1:5151169:     public StreamWriter(SSTableReader sstable, Collection<Pair<Long, Long>> sections, StreamSession session)
+1:5151169:     {
+1:5151169:         this.session = session;
+1:5151169:         this.sstable = sstable;
+1:5151169:         this.sections = sections;
+1:4112a7f:         this.limiter =  StreamManager.getRateLimiter(session.peer);
+2:5151169:     }
+1:5151169: 
+1:5151169:     /**
+1:5151169:      * Stream file of specified sections to given channel.
+1:5151169:      *
+1:5151169:      * StreamWriter uses LZF compression on wire to decrease size to transfer.
+1:5151169:      *
+1:16499ca:      * @param output where this writes data to
+1:5151169:      * @throws IOException on any I/O error
+1:5151169:      */
+1:16499ca:     public void write(DataOutputStreamPlus output) throws IOException
+1:5151169:     {
+1:5151169:         long totalSize = totalSize();
+1:582bdba:         logger.debug("[Stream #{}] Start streaming file {} to {}, repairedAt = {}, totalSize = {}", session.planId(),
+1:582bdba:                      sstable.getFilename(), session.peer, sstable.getSSTableMetadata().repairedAt, totalSize);
+1:5151169: 
+1:7aafe05:         try(RandomAccessReader file = sstable.openDataReader();
+1:7aafe05:             ChecksumValidator validator = new File(sstable.descriptor.filenameFor(Component.CRC)).exists()
+1:7aafe05:                                           ? DataIntegrityMetadata.checksumValidator(sstable.descriptor)
+1:7aafe05:                                           : null;)
+1:5151169:         {
+1:5151169:             transferBuffer = validator == null ? new byte[DEFAULT_CHUNK_SIZE] : new byte[validator.chunkSize];
+1:5151169: 
+1:5151169:             // setting up data compression stream
+1:7aafe05:             compressedOutput = new LZFOutputStream(output);
+1:5151169:             long progress = 0L;
+1:5151169: 
+1:5151169:             // stream each of the required sections of the file
+1:5151169:             for (Pair<Long, Long> section : sections)
+1:5151169:             {
+1:5151169:                 long start = validator == null ? section.left : validator.chunkStart(section.left);
+1:3db38d7:                 int readOffset = (int) (section.left - start);
+1:5151169:                 // seek to the beginning of the section
+1:5151169:                 file.seek(start);
+1:5151169:                 if (validator != null)
+1:5151169:                     validator.seek(start);
+1:5151169: 
+1:5151169:                 // length of the section to read
+1:5151169:                 long length = section.right - start;
+1:5151169:                 // tracks write progress
+1:3db38d7:                 long bytesRead = 0;
+1:3db38d7:                 while (bytesRead < length)
+1:5151169:                 {
+1:3db38d7:                     long lastBytesRead = write(file, validator, readOffset, length, bytesRead);
+1:3db38d7:                     bytesRead += lastBytesRead;
+1:3db38d7:                     progress += (lastBytesRead - readOffset);
+1:e2c6341:                     session.progress(sstable.descriptor.filenameFor(Component.DATA), ProgressInfo.Direction.OUT, progress, totalSize);
+1:3db38d7:                     readOffset = 0;
+1:5151169:                 }
+1:5151169: 
+1:16499ca:                 // make sure that current section is sent
+1:5151169:                 compressedOutput.flush();
+1:5151169:             }
+1:582bdba:             logger.debug("[Stream #{}] Finished streaming file {} to {}, bytesTransferred = {}, totalSize = {}",
+1:db68ac9:                          session.planId(), sstable.getFilename(), session.peer, FBUtilities.prettyPrintMemory(progress), FBUtilities.prettyPrintMemory(totalSize));
+1:5151169:         }
+1:5151169:     }
+1:5151169: 
+1:5151169:     protected long totalSize()
+1:5151169:     {
+1:5151169:         long size = 0;
+1:5151169:         for (Pair<Long, Long> section : sections)
+1:5151169:             size += section.right - section.left;
+1:5151169:         return size;
+1:5151169:     }
+1:5151169: 
+1:5151169:     /**
+1:5151169:      * Sequentially read bytes from the file and write them to the output stream
+1:5151169:      *
+1:5151169:      * @param reader The file reader to read from
+1:5151169:      * @param validator validator to verify data integrity
+1:5151169:      * @param start number of bytes to skip transfer, but include for validation.
+1:3db38d7:      * @param length The full length that should be read from {@code reader}
+1:3db38d7:      * @param bytesTransferred Number of bytes already read out of {@code length}
+1:5151169:      *
+1:3db38d7:      * @return Number of bytes read
+1:5151169:      *
+1:5151169:      * @throws java.io.IOException on any I/O error
+1:5151169:      */
+1:5151169:     protected long write(RandomAccessReader reader, ChecksumValidator validator, int start, long length, long bytesTransferred) throws IOException
+1:5151169:     {
+1:5151169:         int toTransfer = (int) Math.min(transferBuffer.length, length - bytesTransferred);
+1:5151169:         int minReadable = (int) Math.min(transferBuffer.length, reader.length() - reader.getFilePointer());
+1:5151169: 
+1:5151169:         reader.readFully(transferBuffer, 0, minReadable);
+1:5151169:         if (validator != null)
+1:5151169:             validator.validate(transferBuffer, 0, minReadable);
+1:5151169: 
+1:3db38d7:         limiter.acquire(toTransfer - start);
+1:5151169:         compressedOutput.write(transferBuffer, start, (toTransfer - start));
+1:5151169: 
+1:5151169:         return toTransfer;
+1:5151169:     }
+1:5151169: }
+============================================================================
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:087264f
+/////////////////////////////////////////////////////////////////////////
+author:Giampaolo Trapasso
+-------------------------------------------------------------------------------
+commit:db68ac9
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.FBUtilities;
+/////////////////////////////////////////////////////////////////////////
+1:                          session.planId(), sstable.getFilename(), session.peer, FBUtilities.prettyPrintMemory(progress), FBUtilities.prettyPrintMemory(totalSize));
+author:Yuki Morishita
+-------------------------------------------------------------------------------
+commit:a7feb80
+commit:3db38d7
+/////////////////////////////////////////////////////////////////////////
+1:                 int readOffset = (int) (section.left - start);
+/////////////////////////////////////////////////////////////////////////
+1:                 long bytesRead = 0;
+1:                 while (bytesRead < length)
+1:                     long lastBytesRead = write(file, validator, readOffset, length, bytesRead);
+1:                     bytesRead += lastBytesRead;
+1:                     progress += (lastBytesRead - readOffset);
+1:                     readOffset = 0;
+/////////////////////////////////////////////////////////////////////////
+1:      * @param length The full length that should be read from {@code reader}
+1:      * @param bytesTransferred Number of bytes already read out of {@code length}
+1:      * @return Number of bytes read
+/////////////////////////////////////////////////////////////////////////
+1:         limiter.acquire(toTransfer - start);
+commit:afc4e2e
+commit:04fd84c
+/////////////////////////////////////////////////////////////////////////
+commit:5151169
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.streaming;
+1: 
+1: import java.io.File;
+1: import java.io.IOException;
+1: import java.io.OutputStream;
+0: import java.nio.channels.Channels;
+0: import java.nio.channels.WritableByteChannel;
+1: import java.util.Collection;
+1: 
+0: import com.google.common.util.concurrent.RateLimiter;
+1: import com.ning.compress.lzf.LZFOutputStream;
+1: 
+1: import org.apache.cassandra.io.sstable.Component;
+0: import org.apache.cassandra.io.sstable.SSTableReader;
+1: import org.apache.cassandra.io.util.DataIntegrityMetadata;
+1: import org.apache.cassandra.io.util.DataIntegrityMetadata.ChecksumValidator;
+0: import org.apache.cassandra.io.util.FileUtils;
+1: import org.apache.cassandra.io.util.RandomAccessReader;
+1: import org.apache.cassandra.utils.Pair;
+1: 
+1: /**
+1:  * StreamWriter writes given section of the SSTable to given channel.
+1:  */
+1: public class StreamWriter
+1: {
+1:     private static final int DEFAULT_CHUNK_SIZE = 64 * 1024;
+1: 
+1:     protected final SSTableReader sstable;
+1:     protected final Collection<Pair<Long, Long>> sections;
+0:     protected final RateLimiter limiter = StreamManager.getRateLimiter();
+1:     protected final StreamSession session;
+1: 
+1:     private OutputStream compressedOutput;
+1: 
+1:     // allocate buffer to use for transfers only once
+1:     private byte[] transferBuffer;
+1: 
+1:     public StreamWriter(SSTableReader sstable, Collection<Pair<Long, Long>> sections, StreamSession session)
+1:     {
+1:         this.session = session;
+1:         this.sstable = sstable;
+1:         this.sections = sections;
+1:     }
+1: 
+1:     /**
+1:      * Stream file of specified sections to given channel.
+1:      *
+1:      * StreamWriter uses LZF compression on wire to decrease size to transfer.
+1:      *
+0:      * @param channel where this writes data to
+1:      * @throws IOException on any I/O error
+1:      */
+0:     public void write(WritableByteChannel channel) throws IOException
+1:     {
+1:         long totalSize = totalSize();
+0:         RandomAccessReader file = sstable.openDataReader();
+0:         ChecksumValidator validator = null;
+0:         if (new File(sstable.descriptor.filenameFor(Component.CRC)).exists())
+0:             validator = DataIntegrityMetadata.checksumValidator(sstable.descriptor);
+1: 
+1:         transferBuffer = validator == null ? new byte[DEFAULT_CHUNK_SIZE] : new byte[validator.chunkSize];
+1: 
+1:         // setting up data compression stream
+0:         compressedOutput = new LZFOutputStream(Channels.newOutputStream(channel));
+1:         long progress = 0L;
+1: 
+0:         try
+1:         {
+1:             // stream each of the required sections of the file
+1:             for (Pair<Long, Long> section : sections)
+1:             {
+1:                 long start = validator == null ? section.left : validator.chunkStart(section.left);
+0:                 int skipBytes = (int) (section.left - start);
+1:                 // seek to the beginning of the section
+1:                 file.seek(start);
+1:                 if (validator != null)
+1:                     validator.seek(start);
+1: 
+1:                 // length of the section to read
+1:                 long length = section.right - start;
+1:                 // tracks write progress
+0:                 long bytesTransferred = 0;
+0:                 while (bytesTransferred < length)
+1:                 {
+0:                     long lastWrite = write(file, validator, skipBytes, length, bytesTransferred);
+0:                     bytesTransferred += lastWrite;
+0:                     progress += lastWrite;
+0:                     session.progress(sstable.descriptor, ProgressInfo.Direction.OUT, progress, totalSize);
+0:                     skipBytes = 0;
+1:                 }
+1: 
+0:                 // make sure that current section is send
+1:                 compressedOutput.flush();
+1:             }
+1:         }
+0:         finally
+1:         {
+0:             // no matter what happens close file
+0:             FileUtils.closeQuietly(file);
+1:         }
+1: 
+0:         // release reference only when completed successfully
+0:         sstable.releaseReference();
+1:     }
+1: 
+1:     protected long totalSize()
+1:     {
+1:         long size = 0;
+1:         for (Pair<Long, Long> section : sections)
+1:             size += section.right - section.left;
+1:         return size;
+1:     }
+1: 
+1:     /**
+1:      * Sequentially read bytes from the file and write them to the output stream
+1:      *
+1:      * @param reader The file reader to read from
+1:      * @param validator validator to verify data integrity
+1:      * @param start number of bytes to skip transfer, but include for validation.
+0:      * @param length The full length that should be transferred
+0:      * @param bytesTransferred Number of bytes remaining to transfer
+1:      *
+0:      * @return Number of bytes transferred
+1:      *
+1:      * @throws java.io.IOException on any I/O error
+1:      */
+1:     protected long write(RandomAccessReader reader, ChecksumValidator validator, int start, long length, long bytesTransferred) throws IOException
+1:     {
+1:         int toTransfer = (int) Math.min(transferBuffer.length, length - bytesTransferred);
+1:         int minReadable = (int) Math.min(transferBuffer.length, reader.length() - reader.getFilePointer());
+1: 
+1:         reader.readFully(transferBuffer, 0, minReadable);
+1:         if (validator != null)
+1:             validator.validate(transferBuffer, 0, minReadable);
+1: 
+0:         limiter.acquire(toTransfer);
+1:         compressedOutput.write(transferBuffer, start, (toTransfer - start));
+1: 
+1:         return toTransfer;
+1:     }
+1: }
+author:Paulo Motta
+-------------------------------------------------------------------------------
+commit:582bdba
+/////////////////////////////////////////////////////////////////////////
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     private static final Logger logger = LoggerFactory.getLogger(StreamWriter.class);
+0: 
+/////////////////////////////////////////////////////////////////////////
+1:         logger.debug("[Stream #{}] Start streaming file {} to {}, repairedAt = {}, totalSize = {}", session.planId(),
+1:                      sstable.getFilename(), session.peer, sstable.getSSTableMetadata().repairedAt, totalSize);
+/////////////////////////////////////////////////////////////////////////
+1:             logger.debug("[Stream #{}] Finished streaming file {} to {}, bytesTransferred = {}, totalSize = {}",
+0:                          session.planId(), sstable.getFilename(), session.peer, progress, totalSize);
+author:Marcus Eriksson
+-------------------------------------------------------------------------------
+commit:e2c6341
+/////////////////////////////////////////////////////////////////////////
+1:                     session.progress(sstable.descriptor.filenameFor(Component.DATA), ProgressInfo.Direction.OUT, progress, totalSize);
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:7aafe05
+/////////////////////////////////////////////////////////////////////////
+1:         try(RandomAccessReader file = sstable.openDataReader();
+1:             ChecksumValidator validator = new File(sstable.descriptor.filenameFor(Component.CRC)).exists()
+1:                                           ? DataIntegrityMetadata.checksumValidator(sstable.descriptor)
+1:                                           : null;)
+0:             transferBuffer = validator == null ? new byte[DEFAULT_CHUNK_SIZE] : new byte[validator.chunkSize];
+0: 
+0:             // setting up data compression stream
+1:             compressedOutput = new LZFOutputStream(output);
+0:             long progress = 0L;
+0: 
+/////////////////////////////////////////////////////////////////////////
+author:Ariel Weisberg
+-------------------------------------------------------------------------------
+commit:16499ca
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.io.util.DataOutputStreamPlus;
+/////////////////////////////////////////////////////////////////////////
+1:      * @param output where this writes data to
+1:     public void write(DataOutputStreamPlus output) throws IOException
+/////////////////////////////////////////////////////////////////////////
+0:         compressedOutput = new LZFOutputStream(output);
+/////////////////////////////////////////////////////////////////////////
+1:                 // make sure that current section is sent
+author:Jake Luciani
+-------------------------------------------------------------------------------
+commit:0368e97
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.io.sstable.format.SSTableReader;
+author:vparthasarathy
+-------------------------------------------------------------------------------
+commit:4112a7f
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.streaming.StreamManager.StreamRateLimiter;
+/////////////////////////////////////////////////////////////////////////
+1:     protected final StreamRateLimiter limiter;
+/////////////////////////////////////////////////////////////////////////
+1:         this.limiter =  StreamManager.getRateLimiter(session.peer);
+commit:94bda1f
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.streaming.StreamManager.StreamRateLimiter;
+/////////////////////////////////////////////////////////////////////////
+0:     protected final StreamRateLimiter limiter;
+/////////////////////////////////////////////////////////////////////////
+0:         this.limiter =  StreamManager.getRateLimiter(session.peer);
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:4c22b16
+commit:da2d971
+/////////////////////////////////////////////////////////////////////////
+0:         ChecksumValidator validator = new File(sstable.descriptor.filenameFor(Component.CRC)).exists()
+0:                                     ? DataIntegrityMetadata.checksumValidator(sstable.descriptor)
+0:                                     : null;
+/////////////////////////////////////////////////////////////////////////
+0:             FileUtils.closeQuietly(validator);
+============================================================================

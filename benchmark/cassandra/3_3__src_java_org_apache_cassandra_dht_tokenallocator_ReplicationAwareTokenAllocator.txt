@@ -1,0 +1,1404 @@
+1:9a3fa88: /*
+1:9a3fa88:  * Licensed to the Apache Software Foundation (ASF) under one
+1:9a3fa88:  * or more contributor license agreements.  See the NOTICE file
+1:9a3fa88:  * distributed with this work for additional information
+1:9a3fa88:  * regarding copyright ownership.  The ASF licenses this file
+1:9a3fa88:  * to you under the Apache License, Version 2.0 (the
+1:9a3fa88:  * "License"); you may not use this file except in compliance
+1:9a3fa88:  * with the License.  You may obtain a copy of the License at
+2:9a3fa88:  *
+1:9a3fa88:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:9a3fa88:  *
+1:9a3fa88:  * Unless required by applicable law or agreed to in writing, software
+1:9a3fa88:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:9a3fa88:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:9a3fa88:  * See the License for the specific language governing permissions and
+1:9a3fa88:  * limitations under the License.
+16:9a3fa88:  */
+1:9a3fa88: package org.apache.cassandra.dht.tokenallocator;
+29:9a3fa88: 
+1:9a3fa88: import java.util.*;
+1:9a3fa88: 
+1:9a3fa88: import com.google.common.collect.HashMultimap;
+1:9a3fa88: import com.google.common.collect.ImmutableList;
+1:9a3fa88: import com.google.common.collect.Maps;
+1:9a3fa88: import com.google.common.collect.Multimap;
+1:9a3fa88: 
+1:9a3fa88: import org.apache.cassandra.dht.IPartitioner;
+1:9a3fa88: import org.apache.cassandra.dht.Token;
+1:9a3fa88: 
+16:9a3fa88: /**
+1:9a3fa88:  * A Replication Aware allocator for tokens, that attempts to ensure an even distribution of ownership across
+1:9a3fa88:  * the known cluster for the provided replication strategy.
+1:9a3fa88:  *
+1:9a3fa88:  * A unit is shorthand for a "unit of ownership" which translates roughly to a node, or a disk on the node,
+1:9a3fa88:  * a CPU on the node, or some other relevant unit of ownership. These units should be the lowest rung over which
+1:9a3fa88:  * ownership needs to be evenly distributed. At the moment only nodes as a whole are treated as units, but that
+1:9a3fa88:  * will change with the introduction of token ranges per disk.
+1:9a3fa88:  */
+1:e2a0d75: class ReplicationAwareTokenAllocator<Unit> extends TokenAllocatorBase<Unit>
+28:9a3fa88: {
+1:9a3fa88:     final Multimap<Unit, Token> unitToTokens;
+1:9a3fa88:     final int replicas;
+1:9a3fa88: 
+1:9a3fa88:     ReplicationAwareTokenAllocator(NavigableMap<Token, Unit> sortedTokens, ReplicationStrategy<Unit> strategy, IPartitioner partitioner)
+1:9a3fa88:     {
+1:e2a0d75:         super(sortedTokens, strategy, partitioner);
+1:9a3fa88:         unitToTokens = HashMultimap.create();
+1:9a3fa88:         for (Map.Entry<Token, Unit> en : sortedTokens.entrySet())
+1:9a3fa88:             unitToTokens.put(en.getValue(), en.getKey());
+1:9a3fa88:         this.replicas = strategy.replicas();
+1:e2a0d75:     }
+1:e2a0d75: 
+1:e2a0d75:     public int getReplicas()
+1:e2a0d75:     {
+1:e2a0d75:         return replicas;
+28:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     public Collection<Token> addUnit(Unit newUnit, int numTokens)
+1:9a3fa88:     {
+1:9a3fa88:         assert !unitToTokens.containsKey(newUnit);
+1:9a3fa88: 
+1:9a3fa88:         if (unitCount() < replicas)
+1:9a3fa88:             // Allocation does not matter; everything replicates everywhere.
+1:9a3fa88:             return generateRandomTokens(newUnit, numTokens);
+1:9a3fa88:         if (numTokens > sortedTokens.size())
+1:9a3fa88:             // Some of the heuristics below can't deal with this case. Use random for now, later allocations can fix any problems this may cause.
+1:9a3fa88:             return generateRandomTokens(newUnit, numTokens);
+1:9a3fa88: 
+1:9a3fa88:         // ============= construct our initial token ring state =============
+1:9a3fa88: 
+1:9a3fa88:         double optTokenOwnership = optimalTokenOwnership(numTokens);
+1:9a3fa88:         Map<Object, GroupInfo> groups = Maps.newHashMap();
+1:9a3fa88:         Map<Unit, UnitInfo<Unit>> unitInfos = createUnitInfos(groups);
+1:9a3fa88:         if (groups.size() < replicas)
+1:9a3fa88:         {
+1:9a3fa88:             // We need at least replicas groups to do allocation correctly. If there aren't enough, 
+1:9a3fa88:             // use random allocation.
+1:9a3fa88:             // This part of the code should only be reached via the RATATest. StrategyAdapter should disallow
+1:9a3fa88:             // token allocation in this case as the algorithm is not able to cover the behavior of NetworkTopologyStrategy.
+1:9a3fa88:             return generateRandomTokens(newUnit, numTokens);
+1:9a3fa88:         }
+1:9a3fa88: 
+1:9a3fa88:         // initialise our new unit's state (with an idealised ownership)
+1:9a3fa88:         // strategy must already know about this unit
+1:9a3fa88:         UnitInfo<Unit> newUnitInfo = new UnitInfo<>(newUnit, numTokens * optTokenOwnership, groups, strategy);
+1:9a3fa88: 
+1:9a3fa88:         // build the current token ring state
+1:9a3fa88:         TokenInfo<Unit> tokens = createTokenInfos(unitInfos, newUnitInfo.group);
+1:9a3fa88:         newUnitInfo.tokenCount = numTokens;
+1:9a3fa88: 
+1:9a3fa88:         // ============= construct and rank our candidate token allocations =============
+1:9a3fa88: 
+1:9a3fa88:         // walk the token ring, constructing the set of candidates in ring order
+1:9a3fa88:         // as the midpoints between all existing tokens
+1:9a3fa88:         CandidateInfo<Unit> candidates = createCandidates(tokens, newUnitInfo, optTokenOwnership);
+1:9a3fa88: 
+1:9a3fa88:         // Evaluate the expected improvements from all candidates and form a priority queue.
+1:9a3fa88:         PriorityQueue<Weighted<CandidateInfo<Unit>>> improvements = new PriorityQueue<>(sortedTokens.size());
+1:9a3fa88:         CandidateInfo<Unit> candidate = candidates;
+1:9a3fa88:         do
+1:9a3fa88:         {
+1:9a3fa88:             double impr = evaluateImprovement(candidate, optTokenOwnership, 1.0 / numTokens);
+1:9a3fa88:             improvements.add(new Weighted<>(impr, candidate));
+1:9a3fa88:             candidate = candidate.next;
+1:9a3fa88:         } while (candidate != candidates);
+1:9a3fa88: 
+1:9a3fa88:         // ============= iteratively take the best candidate, and re-rank =============
+1:9a3fa88: 
+1:9a3fa88:         CandidateInfo<Unit> bestToken = improvements.remove().value;
+1:9a3fa88:         for (int vn = 1; ; ++vn)
+1:9a3fa88:         {
+1:9a3fa88:             candidates = bestToken.removeFrom(candidates);
+1:9a3fa88:             confirmCandidate(bestToken);
+1:9a3fa88: 
+1:9a3fa88:             if (vn == numTokens)
+1:9a3fa88:                 break;
+1:9a3fa88: 
+1:9a3fa88:             while (true)
+1:9a3fa88:             {
+1:9a3fa88:                 // Get the next candidate in the queue. Its improvement may have changed (esp. if multiple tokens
+1:9a3fa88:                 // were good suggestions because they could improve the same problem)-- evaluate it again to check
+1:9a3fa88:                 // if it is still a good candidate.
+1:9a3fa88:                 bestToken = improvements.remove().value;
+1:9a3fa88:                 double impr = evaluateImprovement(bestToken, optTokenOwnership, (vn + 1.0) / numTokens);
+1:9a3fa88:                 Weighted<CandidateInfo<Unit>> next = improvements.peek();
+1:9a3fa88: 
+1:9a3fa88:                 // If it is better than the next in the queue, it is good enough. This is a heuristic that doesn't
+1:9a3fa88:                 // get the best results, but works well enough and on average cuts search time by a factor of O(vnodes).
+1:9a3fa88:                 if (next == null || impr >= next.weight)
+1:9a3fa88:                     break;
+1:9a3fa88:                 improvements.add(new Weighted<>(impr, bestToken));
+1:9a3fa88:             }
+1:9a3fa88:         }
+1:9a3fa88: 
+1:9a3fa88:         return ImmutableList.copyOf(unitToTokens.get(newUnit));
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     private Collection<Token> generateRandomTokens(Unit newUnit, int numTokens)
+1:9a3fa88:     {
+1:9a3fa88:         Set<Token> tokens = new HashSet<>(numTokens);
+1:9a3fa88:         while (tokens.size() < numTokens)
+1:9a3fa88:         {
+1:9a3fa88:             Token token = partitioner.getRandomToken();
+1:9a3fa88:             if (!sortedTokens.containsKey(token))
+1:9a3fa88:             {
+1:9a3fa88:                 tokens.add(token);
+1:9a3fa88:                 sortedTokens.put(token, newUnit);
+1:9a3fa88:                 unitToTokens.put(newUnit, token);
+1:9a3fa88:             }
+1:9a3fa88:         }
+1:9a3fa88:         return tokens;
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     /**
+1:9a3fa88:      * Construct the token ring as a CircularList of TokenInfo,
+1:9a3fa88:      * and populate the ownership of the UnitInfo's provided
+1:9a3fa88:      */
+1:9a3fa88:     private TokenInfo<Unit> createTokenInfos(Map<Unit, UnitInfo<Unit>> units, GroupInfo newUnitGroup)
+1:9a3fa88:     {
+1:9a3fa88:         // build the circular list
+1:9a3fa88:         TokenInfo<Unit> prev = null;
+1:9a3fa88:         TokenInfo<Unit> first = null;
+1:9a3fa88:         for (Map.Entry<Token, Unit> en : sortedTokens.entrySet())
+1:9a3fa88:         {
+1:9a3fa88:             Token t = en.getKey();
+1:9a3fa88:             UnitInfo<Unit> ni = units.get(en.getValue());
+1:9a3fa88:             TokenInfo<Unit> ti = new TokenInfo<>(t, ni);
+1:9a3fa88:             first = ti.insertAfter(first, prev);
+1:9a3fa88:             prev = ti;
+1:9a3fa88:         }
+1:9a3fa88: 
+1:9a3fa88:         TokenInfo<Unit> curr = first;
+1:9a3fa88:         do
+1:9a3fa88:         {
+1:9a3fa88:             populateTokenInfoAndAdjustUnit(curr, newUnitGroup);
+1:9a3fa88:             curr = curr.next;
+1:9a3fa88:         } while (curr != first);
+1:9a3fa88: 
+1:9a3fa88:         return first;
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     private CandidateInfo<Unit> createCandidates(TokenInfo<Unit> tokens, UnitInfo<Unit> newUnitInfo, double initialTokenOwnership)
+1:9a3fa88:     {
+1:9a3fa88:         TokenInfo<Unit> curr = tokens;
+1:9a3fa88:         CandidateInfo<Unit> first = null;
+1:9a3fa88:         CandidateInfo<Unit> prev = null;
+1:9a3fa88:         do
+1:9a3fa88:         {
+1:9a3fa88:             CandidateInfo<Unit> candidate = new CandidateInfo<Unit>(partitioner.midpoint(curr.prev.token, curr.token), curr, newUnitInfo);
+1:9a3fa88:             first = candidate.insertAfter(first, prev);
+1:9a3fa88: 
+1:9a3fa88:             candidate.replicatedOwnership = initialTokenOwnership;
+1:9a3fa88:             populateCandidate(candidate);
+1:9a3fa88: 
+1:9a3fa88:             prev = candidate;
+1:9a3fa88:             curr = curr.next;
+1:9a3fa88:         } while (curr != tokens);
+1:9a3fa88:         prev.next = first;
+1:9a3fa88:         return first;
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     private void populateCandidate(CandidateInfo<Unit> candidate)
+1:9a3fa88:     {
+1:9a3fa88:         // Only finding replication start would do.
+1:9a3fa88:         populateTokenInfo(candidate, candidate.owningUnit.group);
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     /**
+1:9a3fa88:      * Incorporates the selected candidate into the ring, adjusting ownership information and calculated token
+1:9a3fa88:      * information.
+1:9a3fa88:      */
+1:9a3fa88:     private void confirmCandidate(CandidateInfo<Unit> candidate)
+1:9a3fa88:     {
+1:9a3fa88:         // This process is less efficient than it could be (loops through each vnode's replication span instead
+1:9a3fa88:         // of recalculating replicationStart, replicationThreshold from existing data + new token data in an O(1)
+1:9a3fa88:         // case analysis similar to evaluateImprovement). This is fine as the method does not dominate processing
+1:9a3fa88:         // time.
+1:9a3fa88: 
+1:9a3fa88:         // Put the accepted candidate in the token list.
+1:9a3fa88:         UnitInfo<Unit> newUnit = candidate.owningUnit;
+1:9a3fa88:         Token newToken = candidate.token;
+1:9a3fa88:         sortedTokens.put(newToken, newUnit.unit);
+1:9a3fa88:         unitToTokens.put(newUnit.unit, newToken);
+1:9a3fa88: 
+1:9a3fa88:         TokenInfo<Unit> prev = candidate.prevInRing();
+1:9a3fa88:         TokenInfo<Unit> newTokenInfo = new TokenInfo<>(newToken, newUnit);
+1:9a3fa88:         newTokenInfo.replicatedOwnership = candidate.replicatedOwnership;
+1:9a3fa88:         newTokenInfo.insertAfter(prev, prev);   // List is not empty so this won't need to change head of list.
+1:9a3fa88: 
+1:9a3fa88:         // Update data for candidate.
+1:9a3fa88:         populateTokenInfoAndAdjustUnit(newTokenInfo, newUnit.group);
+1:9a3fa88: 
+1:9a3fa88:         ReplicationVisitor replicationVisitor = new ReplicationVisitor();
+1:9a3fa88:         assert newTokenInfo.next == candidate.split;
+1:9a3fa88:         for (TokenInfo<Unit> curr = newTokenInfo.next; !replicationVisitor.visitedAll(); curr = curr.next)
+1:9a3fa88:         {
+1:9a3fa88:             // update the candidate between curr and next
+1:9a3fa88:             candidate = candidate.next;
+1:9a3fa88:             populateCandidate(candidate);
+1:9a3fa88: 
+1:9a3fa88:             if (!replicationVisitor.add(curr.owningUnit.group))
+1:9a3fa88:                 continue;    // If we've already seen this group, the token cannot be affected.
+1:9a3fa88: 
+1:9a3fa88:             populateTokenInfoAndAdjustUnit(curr, newUnit.group);
+1:9a3fa88:         }
+1:9a3fa88: 
+1:9a3fa88:         replicationVisitor.clean();
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     /**
+1:9a3fa88:      * Calculates the {@code replicationStart} of a token, as well as {@code replicationThreshold} which is chosen in a way
+1:9a3fa88:      * that permits {@code findUpdatedReplicationStart} to quickly identify changes in ownership.
+1:9a3fa88:      */
+1:9a3fa88:     private Token populateTokenInfo(BaseTokenInfo<Unit, ?> token, GroupInfo newUnitGroup)
+1:9a3fa88:     {
+1:9a3fa88:         GroupInfo tokenGroup = token.owningUnit.group;
+1:9a3fa88:         PopulateVisitor visitor = new PopulateVisitor();
+1:9a3fa88: 
+1:9a3fa88:         // Replication start = the end of a token from the RF'th different group seen before the token.
+2:9a3fa88:         Token replicationStart;
+1:9a3fa88:         // The end of a token from the RF-1'th different group seen before the token.
+1:9a3fa88:         Token replicationThreshold = token.token;
+1:9a3fa88:         GroupInfo currGroup;
+1:9a3fa88:         for (TokenInfo<Unit> curr = token.prevInRing(); ; curr = curr.prev)
+1:9a3fa88:         {
+1:9a3fa88:             replicationStart = curr.token;
+1:9a3fa88:             currGroup = curr.owningUnit.group;
+1:9a3fa88:             if (!visitor.add(currGroup))
+1:9a3fa88:                 continue; // Group is already seen.
+1:9a3fa88:             if (visitor.visitedAll())
+1:9a3fa88:                 break;
+1:9a3fa88: 
+1:9a3fa88:             replicationThreshold = replicationStart;
+1:9a3fa88:             // Another instance of the same group precedes us in the replication range of the ring,
+1:9a3fa88:             // so this is where our replication range begins
+1:9a3fa88:             if (currGroup == tokenGroup)
+1:9a3fa88:                 break;
+1:9a3fa88:         }
+1:9a3fa88:         if (newUnitGroup == tokenGroup)
+1:9a3fa88:             // new token is always a boundary (as long as it's closer than replicationStart)
+1:9a3fa88:             replicationThreshold = token.token;
+1:9a3fa88:         else if (newUnitGroup != currGroup && visitor.seen(newUnitGroup))
+1:9a3fa88:             // already has new group in replication span before last seen. cannot be affected
+1:9a3fa88:             replicationThreshold = replicationStart;
+1:9a3fa88:         visitor.clean();
+1:9a3fa88: 
+1:9a3fa88:         token.replicationThreshold = replicationThreshold;
+1:9a3fa88:         token.replicationStart = replicationStart;
+1:9a3fa88:         return replicationStart;
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     private void populateTokenInfoAndAdjustUnit(TokenInfo<Unit> populate, GroupInfo newUnitGroup)
+1:9a3fa88:     {
+1:9a3fa88:         Token replicationStart = populateTokenInfo(populate, newUnitGroup);
+1:9a3fa88:         double newOwnership = replicationStart.size(populate.token);
+1:9a3fa88:         double oldOwnership = populate.replicatedOwnership;
+1:9a3fa88:         populate.replicatedOwnership = newOwnership;
+1:9a3fa88:         populate.owningUnit.ownership += newOwnership - oldOwnership;
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     /**
+1:9a3fa88:      * Evaluates the improvement in variance for both units and individual tokens when candidate is inserted into the
+1:9a3fa88:      * ring.
+1:9a3fa88:      */
+1:9a3fa88:     private double evaluateImprovement(CandidateInfo<Unit> candidate, double optTokenOwnership, double newUnitMult)
+1:9a3fa88:     {
+1:9a3fa88:         double tokenChange = 0;
+1:9a3fa88: 
+1:9a3fa88:         UnitInfo<Unit> candidateUnit = candidate.owningUnit;
+1:9a3fa88:         Token candidateEnd = candidate.token;
+1:9a3fa88: 
+1:9a3fa88:         // Form a chain of units affected by the insertion to be able to qualify change of unit ownership.
+1:9a3fa88:         // A unit may be affected more than once.
+1:9a3fa88:         UnitAdjustmentTracker<Unit> unitTracker = new UnitAdjustmentTracker<>(candidateUnit);
+1:9a3fa88: 
+1:9a3fa88:         // Reflect change in ownership of the splitting token (candidate).
+1:9a3fa88:         tokenChange += applyOwnershipAdjustment(candidate, candidateUnit, candidate.replicationStart, candidateEnd, optTokenOwnership, unitTracker);
+1:9a3fa88: 
+1:9a3fa88:         // Loop through all vnodes that replicate candidate or split and update their ownership.
+1:9a3fa88:         ReplicationVisitor replicationVisitor = new ReplicationVisitor();
+1:9a3fa88:         for (TokenInfo<Unit> curr = candidate.split; !replicationVisitor.visitedAll(); curr = curr.next)
+1:9a3fa88:         {
+1:9a3fa88:             UnitInfo<Unit> currUnit = curr.owningUnit;
+1:9a3fa88: 
+1:9a3fa88:             if (!replicationVisitor.add(currUnit.group))
+1:9a3fa88:                 continue;    // If this group is already seen, the token cannot be affected.
+1:9a3fa88: 
+1:9a3fa88:             Token replicationEnd = curr.token;
+1:9a3fa88:             Token replicationStart = findUpdatedReplicationStart(curr, candidate);
+1:9a3fa88:             tokenChange += applyOwnershipAdjustment(curr, currUnit, replicationStart, replicationEnd, optTokenOwnership, unitTracker);
+1:9a3fa88:         }
+1:9a3fa88:         replicationVisitor.clean();
+1:9a3fa88: 
+1:9a3fa88:         double nodeChange = unitTracker.calculateUnitChange(newUnitMult, optTokenOwnership);
+1:9a3fa88:         return -(tokenChange + nodeChange);
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     /**
+1:9a3fa88:      * Returns the start of the replication span for the token {@code curr} when {@code candidate} is inserted into the
+1:9a3fa88:      * ring.
+1:9a3fa88:      */
+1:9a3fa88:     private Token findUpdatedReplicationStart(TokenInfo<Unit> curr, CandidateInfo<Unit> candidate)
+1:9a3fa88:     {
+1:9a3fa88:         return furtherStartToken(curr.replicationThreshold, candidate.token, curr.token);
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     /**
+1:9a3fa88:      * Applies the ownership adjustment for the given element, updating tracked unit ownership and returning the change
+1:9a3fa88:      * of variance.
+1:9a3fa88:      */
+1:9a3fa88:     private double applyOwnershipAdjustment(BaseTokenInfo<Unit, ?> curr, UnitInfo<Unit> currUnit,
+1:9a3fa88:             Token replicationStart, Token replicationEnd,
+1:9a3fa88:             double optTokenOwnership, UnitAdjustmentTracker<Unit> unitTracker)
+1:9a3fa88:     {
+1:9a3fa88:         double oldOwnership = curr.replicatedOwnership;
+1:9a3fa88:         double newOwnership = replicationStart.size(replicationEnd);
+1:9a3fa88:         double tokenCount = currUnit.tokenCount;
+1:9a3fa88:         assert tokenCount > 0;
+1:9a3fa88:         unitTracker.add(currUnit, newOwnership - oldOwnership);
+1:9a3fa88:         return (sq(newOwnership - optTokenOwnership) - sq(oldOwnership - optTokenOwnership)) / sq(tokenCount);
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     /**
+1:9a3fa88:      * Tracker for unit ownership changes. The changes are tracked by a chain of UnitInfos where the adjustedOwnership
+1:9a3fa88:      * field is being updated as we see changes in token ownership.
+1:9a3fa88:      *
+1:9a3fa88:      * The chain ends with an element that points to itself; this element must be specified as argument to the
+1:9a3fa88:      * constructor as well as be the first unit with which 'add' is called; when calculating the variance change
+1:9a3fa88:      * a separate multiplier is applied to it (used to permit more freedom in choosing the first tokens of a unit).
+1:9a3fa88:      */
+1:9a3fa88:     private static class UnitAdjustmentTracker<Unit>
+1:9a3fa88:     {
+1:9a3fa88:         UnitInfo<Unit> unitsChain;
+1:9a3fa88: 
+1:9a3fa88:         UnitAdjustmentTracker(UnitInfo<Unit> newUnit)
+1:9a3fa88:         {
+1:9a3fa88:             unitsChain = newUnit;
+1:9a3fa88:         }
+1:9a3fa88: 
+1:9a3fa88:         void add(UnitInfo<Unit> currUnit, double diff)
+1:9a3fa88:         {
+1:9a3fa88:             if (currUnit.prevUsed == null)
+1:9a3fa88:             {
+1:9a3fa88:                 assert unitsChain.prevUsed != null || currUnit == unitsChain;
+1:9a3fa88: 
+1:9a3fa88:                 currUnit.adjustedOwnership = currUnit.ownership + diff;
+1:9a3fa88:                 currUnit.prevUsed = unitsChain;
+1:9a3fa88:                 unitsChain = currUnit;
+1:9a3fa88:             }
+1:9a3fa88:             else
+1:9a3fa88:             {
+1:9a3fa88:                 currUnit.adjustedOwnership += diff;
+1:9a3fa88:             }
+1:9a3fa88:         }
+1:9a3fa88: 
+1:9a3fa88:         double calculateUnitChange(double newUnitMult, double optTokenOwnership)
+1:9a3fa88:         {
+1:9a3fa88:             double unitChange = 0;
+1:9a3fa88:             UnitInfo<Unit> unitsChain = this.unitsChain;
+1:9a3fa88:             // Now loop through the units chain and add the unit-level changes. Also clear the groups' seen marks.
+1:9a3fa88:             while (true)
+1:9a3fa88:             {
+1:9a3fa88:                 double newOwnership = unitsChain.adjustedOwnership;
+1:9a3fa88:                 double oldOwnership = unitsChain.ownership;
+1:9a3fa88:                 double tokenCount = unitsChain.tokenCount;
+1:9a3fa88:                 double diff = (sq(newOwnership / tokenCount - optTokenOwnership) - sq(oldOwnership / tokenCount - optTokenOwnership));
+1:9a3fa88:                 UnitInfo<Unit> prev = unitsChain.prevUsed;
+1:9a3fa88:                 unitsChain.prevUsed = null;
+1:9a3fa88:                 if (unitsChain != prev)
+1:9a3fa88:                     unitChange += diff;
+1:9a3fa88:                 else
+1:9a3fa88:                 {
+1:9a3fa88:                     unitChange += diff * newUnitMult;
+1:9a3fa88:                     break;
+1:9a3fa88:                 }
+1:9a3fa88:                 unitsChain = prev;
+1:9a3fa88:             }
+1:9a3fa88:             this.unitsChain = unitsChain;
+1:9a3fa88:             return unitChange;
+1:9a3fa88:         }
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88: 
+1:9a3fa88:     /**
+1:9a3fa88:      * Helper class for marking/unmarking visited a chain of groups
+1:9a3fa88:      */
+1:9a3fa88:     private abstract class GroupVisitor
+1:9a3fa88:     {
+1:9a3fa88:         GroupInfo groupChain = GroupInfo.TERMINATOR;
+1:9a3fa88:         int seen = 0;
+1:9a3fa88: 
+1:9a3fa88:         abstract GroupInfo prevSeen(GroupInfo group);
+1:9a3fa88:         abstract void setPrevSeen(GroupInfo group, GroupInfo prevSeen);
+1:9a3fa88: 
+1:9a3fa88:         // true iff this is the first time we've visited this group
+1:9a3fa88:         boolean add(GroupInfo group)
+1:9a3fa88:         {
+1:9a3fa88:             if (prevSeen(group) != null)
+1:9a3fa88:                 return false;
+1:9a3fa88:             ++seen;
+1:9a3fa88:             setPrevSeen(group, groupChain);
+1:9a3fa88:             groupChain = group;
+1:9a3fa88:             return true;
+1:9a3fa88:         }
+1:9a3fa88: 
+1:9a3fa88:         boolean visitedAll()
+1:9a3fa88:         {
+1:9a3fa88:             return seen >= replicas;
+1:9a3fa88:         }
+1:9a3fa88: 
+1:9a3fa88:         boolean seen(GroupInfo group)
+1:9a3fa88:         {
+1:9a3fa88:             return prevSeen(group) != null;
+1:9a3fa88:         }
+1:9a3fa88: 
+1:9a3fa88:         // Clean group seen markers.
+1:9a3fa88:         void clean()
+1:9a3fa88:         {
+1:9a3fa88:             GroupInfo groupChain = this.groupChain;
+1:9a3fa88:             while (groupChain != GroupInfo.TERMINATOR)
+1:9a3fa88:             {
+1:9a3fa88:                 GroupInfo prev = prevSeen(groupChain);
+1:9a3fa88:                 setPrevSeen(groupChain, null);
+1:9a3fa88:                 groupChain = prev;
+1:9a3fa88:             }
+1:9a3fa88:             this.groupChain = GroupInfo.TERMINATOR;
+1:9a3fa88:         }
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     private class ReplicationVisitor extends GroupVisitor
+1:9a3fa88:     {
+1:9a3fa88:         GroupInfo prevSeen(GroupInfo group)
+1:9a3fa88:         {
+1:9a3fa88:             return group.prevSeen;
+1:9a3fa88:         }
+1:9a3fa88: 
+1:9a3fa88:         void setPrevSeen(GroupInfo group, GroupInfo prevSeen)
+1:9a3fa88:         {
+1:9a3fa88:             group.prevSeen = prevSeen;
+1:9a3fa88:         }
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     private class PopulateVisitor extends GroupVisitor
+1:9a3fa88:     {
+1:9a3fa88:         GroupInfo prevSeen(GroupInfo group)
+1:9a3fa88:         {
+1:9a3fa88:             return group.prevPopulate;
+1:9a3fa88:         }
+1:9a3fa88: 
+1:9a3fa88:         void setPrevSeen(GroupInfo group, GroupInfo prevSeen)
+1:9a3fa88:         {
+1:9a3fa88:             group.prevPopulate = prevSeen;
+1:9a3fa88:         }
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     private double optimalTokenOwnership(int tokensToAdd)
+1:9a3fa88:     {
+1:9a3fa88:         return 1.0 * replicas / (sortedTokens.size() + tokensToAdd);
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     /**
+1:9a3fa88:      * Selects from {@code t1}, {@code t2} the token that forms a bigger range with {@code towards} as the upper bound,
+1:9a3fa88:      * taking into account wrapping.
+1:9a3fa88:      * Unlike Token.size(), equality is taken to mean "same as" rather than covering the whole range.
+1:9a3fa88:      */
+1:9a3fa88:     private static Token furtherStartToken(Token t1, Token t2, Token towards)
+1:9a3fa88:     {
+1:9a3fa88:         if (t1.equals(towards))
+1:9a3fa88:             return t2;
+1:9a3fa88:         if (t2.equals(towards))
+1:9a3fa88:             return t1;
+1:9a3fa88: 
+1:9a3fa88:         return t1.size(towards) > t2.size(towards) ? t1 : t2;
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     private static double sq(double d)
+1:9a3fa88:     {
+1:9a3fa88:         return d * d;
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88: 
+1:9a3fa88:     /**
+1:9a3fa88:      * For testing, remove the given unit preserving correct state of the allocator.
+1:9a3fa88:      */
+1:9a3fa88:     void removeUnit(Unit n)
+1:9a3fa88:     {
+1:9a3fa88:         Collection<Token> tokens = unitToTokens.removeAll(n);
+1:9a3fa88:         sortedTokens.keySet().removeAll(tokens);
+1:9a3fa88:     }
+1:9a3fa88: 
+1:e2a0d75:     public int unitCount()
+1:9a3fa88:     {
+1:9a3fa88:         return unitToTokens.asMap().size();
+1:9a3fa88:     }
+1:9a3fa88: 
+5:9a3fa88:     public String toString()
+1:9a3fa88:     {
+1:9a3fa88:         return getClass().getSimpleName();
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     /**
+1:9a3fa88:      * TokenInfo about candidate new tokens/vnodes.
+1:9a3fa88:      */
+1:9a3fa88:     private static class CandidateInfo<Unit> extends BaseTokenInfo<Unit, CandidateInfo<Unit>>
+1:9a3fa88:     {
+1:9a3fa88:         // directly preceding token in the current token ring
+1:9a3fa88:         final TokenInfo<Unit> split;
+1:9a3fa88: 
+1:9a3fa88:         public CandidateInfo(Token token, TokenInfo<Unit> split, UnitInfo<Unit> owningUnit)
+1:9a3fa88:         {
+2:9a3fa88:             super(token, owningUnit);
+1:9a3fa88:             this.split = split;
+1:9a3fa88:         }
+1:9a3fa88: 
+3:9a3fa88:         TokenInfo<Unit> prevInRing()
+1:9a3fa88:         {
+1:9a3fa88:             return split.prev;
+1:9a3fa88:         }
+1:9a3fa88:     }
+1:9a3fa88: 
+1:9a3fa88:     static void dumpTokens(String lead, BaseTokenInfo<?, ?> tokens)
+1:9a3fa88:     {
+1:9a3fa88:         BaseTokenInfo<?, ?> token = tokens;
+1:9a3fa88:         do
+1:9a3fa88:         {
+1:d019136:             System.out.format("%s%s: rs %s rt %s size %.2e%n", lead, token, token.replicationStart, token.replicationThreshold, token.replicatedOwnership);
+1:9a3fa88:             token = token.next;
+1:9a3fa88:         } while (token != null && token != tokens);
+1:9a3fa88:     }
+1:9a3fa88: }
+1:9a3fa88: 
+============================================================================
+author:Dikang Gu
+-------------------------------------------------------------------------------
+commit:e2a0d75
+/////////////////////////////////////////////////////////////////////////
+1: class ReplicationAwareTokenAllocator<Unit> extends TokenAllocatorBase<Unit>
+1:         super(sortedTokens, strategy, partitioner);
+1:     }
+1: 
+1:     public int getReplicas()
+1:     {
+1:         return replicas;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     public int unitCount()
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:d019136
+/////////////////////////////////////////////////////////////////////////
+1:             System.out.format("%s%s: rs %s rt %s size %.2e%n", lead, token, token.replicationStart, token.replicationThreshold, token.replicatedOwnership);
+author:branimir
+-------------------------------------------------------------------------------
+commit:9a3fa88
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.dht.tokenallocator;
+1: 
+1: import java.util.*;
+1: 
+1: import com.google.common.collect.HashMultimap;
+1: import com.google.common.collect.ImmutableList;
+1: import com.google.common.collect.Maps;
+1: import com.google.common.collect.Multimap;
+1: 
+1: import org.apache.cassandra.dht.IPartitioner;
+1: import org.apache.cassandra.dht.Token;
+1: 
+1: /**
+1:  * A Replication Aware allocator for tokens, that attempts to ensure an even distribution of ownership across
+1:  * the known cluster for the provided replication strategy.
+1:  *
+1:  * A unit is shorthand for a "unit of ownership" which translates roughly to a node, or a disk on the node,
+1:  * a CPU on the node, or some other relevant unit of ownership. These units should be the lowest rung over which
+1:  * ownership needs to be evenly distributed. At the moment only nodes as a whole are treated as units, but that
+1:  * will change with the introduction of token ranges per disk.
+1:  */
+0: class ReplicationAwareTokenAllocator<Unit> implements TokenAllocator<Unit>
+1: {
+0:     final NavigableMap<Token, Unit> sortedTokens;
+1:     final Multimap<Unit, Token> unitToTokens;
+0:     final ReplicationStrategy<Unit> strategy;
+0:     final IPartitioner partitioner;
+1:     final int replicas;
+1: 
+1:     ReplicationAwareTokenAllocator(NavigableMap<Token, Unit> sortedTokens, ReplicationStrategy<Unit> strategy, IPartitioner partitioner)
+1:     {
+0:         this.sortedTokens = sortedTokens;
+1:         unitToTokens = HashMultimap.create();
+1:         for (Map.Entry<Token, Unit> en : sortedTokens.entrySet())
+1:             unitToTokens.put(en.getValue(), en.getKey());
+0:         this.strategy = strategy;
+1:         this.replicas = strategy.replicas();
+0:         this.partitioner = partitioner;
+1:     }
+1: 
+1:     public Collection<Token> addUnit(Unit newUnit, int numTokens)
+1:     {
+1:         assert !unitToTokens.containsKey(newUnit);
+1: 
+1:         if (unitCount() < replicas)
+1:             // Allocation does not matter; everything replicates everywhere.
+1:             return generateRandomTokens(newUnit, numTokens);
+1:         if (numTokens > sortedTokens.size())
+1:             // Some of the heuristics below can't deal with this case. Use random for now, later allocations can fix any problems this may cause.
+1:             return generateRandomTokens(newUnit, numTokens);
+1: 
+1:         // ============= construct our initial token ring state =============
+1: 
+1:         double optTokenOwnership = optimalTokenOwnership(numTokens);
+1:         Map<Object, GroupInfo> groups = Maps.newHashMap();
+1:         Map<Unit, UnitInfo<Unit>> unitInfos = createUnitInfos(groups);
+1:         if (groups.size() < replicas)
+1:         {
+1:             // We need at least replicas groups to do allocation correctly. If there aren't enough, 
+1:             // use random allocation.
+1:             // This part of the code should only be reached via the RATATest. StrategyAdapter should disallow
+1:             // token allocation in this case as the algorithm is not able to cover the behavior of NetworkTopologyStrategy.
+1:             return generateRandomTokens(newUnit, numTokens);
+1:         }
+1: 
+1:         // initialise our new unit's state (with an idealised ownership)
+1:         // strategy must already know about this unit
+1:         UnitInfo<Unit> newUnitInfo = new UnitInfo<>(newUnit, numTokens * optTokenOwnership, groups, strategy);
+1: 
+1:         // build the current token ring state
+1:         TokenInfo<Unit> tokens = createTokenInfos(unitInfos, newUnitInfo.group);
+1:         newUnitInfo.tokenCount = numTokens;
+1: 
+1:         // ============= construct and rank our candidate token allocations =============
+1: 
+1:         // walk the token ring, constructing the set of candidates in ring order
+1:         // as the midpoints between all existing tokens
+1:         CandidateInfo<Unit> candidates = createCandidates(tokens, newUnitInfo, optTokenOwnership);
+1: 
+1:         // Evaluate the expected improvements from all candidates and form a priority queue.
+1:         PriorityQueue<Weighted<CandidateInfo<Unit>>> improvements = new PriorityQueue<>(sortedTokens.size());
+1:         CandidateInfo<Unit> candidate = candidates;
+1:         do
+1:         {
+1:             double impr = evaluateImprovement(candidate, optTokenOwnership, 1.0 / numTokens);
+1:             improvements.add(new Weighted<>(impr, candidate));
+1:             candidate = candidate.next;
+1:         } while (candidate != candidates);
+1: 
+1:         // ============= iteratively take the best candidate, and re-rank =============
+1: 
+1:         CandidateInfo<Unit> bestToken = improvements.remove().value;
+1:         for (int vn = 1; ; ++vn)
+1:         {
+1:             candidates = bestToken.removeFrom(candidates);
+1:             confirmCandidate(bestToken);
+1: 
+1:             if (vn == numTokens)
+1:                 break;
+1: 
+1:             while (true)
+1:             {
+1:                 // Get the next candidate in the queue. Its improvement may have changed (esp. if multiple tokens
+1:                 // were good suggestions because they could improve the same problem)-- evaluate it again to check
+1:                 // if it is still a good candidate.
+1:                 bestToken = improvements.remove().value;
+1:                 double impr = evaluateImprovement(bestToken, optTokenOwnership, (vn + 1.0) / numTokens);
+1:                 Weighted<CandidateInfo<Unit>> next = improvements.peek();
+1: 
+1:                 // If it is better than the next in the queue, it is good enough. This is a heuristic that doesn't
+1:                 // get the best results, but works well enough and on average cuts search time by a factor of O(vnodes).
+1:                 if (next == null || impr >= next.weight)
+1:                     break;
+1:                 improvements.add(new Weighted<>(impr, bestToken));
+1:             }
+1:         }
+1: 
+1:         return ImmutableList.copyOf(unitToTokens.get(newUnit));
+1:     }
+1: 
+1:     private Collection<Token> generateRandomTokens(Unit newUnit, int numTokens)
+1:     {
+1:         Set<Token> tokens = new HashSet<>(numTokens);
+1:         while (tokens.size() < numTokens)
+1:         {
+1:             Token token = partitioner.getRandomToken();
+1:             if (!sortedTokens.containsKey(token))
+1:             {
+1:                 tokens.add(token);
+1:                 sortedTokens.put(token, newUnit);
+1:                 unitToTokens.put(newUnit, token);
+1:             }
+1:         }
+1:         return tokens;
+1:     }
+1: 
+0:     private Map<Unit, UnitInfo<Unit>> createUnitInfos(Map<Object, GroupInfo> groups)
+1:     {
+0:         Map<Unit, UnitInfo<Unit>> map = Maps.newHashMap();
+0:         for (Unit n : sortedTokens.values())
+1:         {
+0:             UnitInfo<Unit> ni = map.get(n);
+0:             if (ni == null)
+0:                 map.put(n, ni = new UnitInfo<>(n, 0, groups, strategy));
+0:             ni.tokenCount++;
+1:         }
+0:         return map;
+1:     }
+1: 
+1:     /**
+1:      * Construct the token ring as a CircularList of TokenInfo,
+1:      * and populate the ownership of the UnitInfo's provided
+1:      */
+1:     private TokenInfo<Unit> createTokenInfos(Map<Unit, UnitInfo<Unit>> units, GroupInfo newUnitGroup)
+1:     {
+1:         // build the circular list
+1:         TokenInfo<Unit> prev = null;
+1:         TokenInfo<Unit> first = null;
+1:         for (Map.Entry<Token, Unit> en : sortedTokens.entrySet())
+1:         {
+1:             Token t = en.getKey();
+1:             UnitInfo<Unit> ni = units.get(en.getValue());
+1:             TokenInfo<Unit> ti = new TokenInfo<>(t, ni);
+1:             first = ti.insertAfter(first, prev);
+1:             prev = ti;
+1:         }
+1: 
+1:         TokenInfo<Unit> curr = first;
+1:         do
+1:         {
+1:             populateTokenInfoAndAdjustUnit(curr, newUnitGroup);
+1:             curr = curr.next;
+1:         } while (curr != first);
+1: 
+1:         return first;
+1:     }
+1: 
+1:     private CandidateInfo<Unit> createCandidates(TokenInfo<Unit> tokens, UnitInfo<Unit> newUnitInfo, double initialTokenOwnership)
+1:     {
+1:         TokenInfo<Unit> curr = tokens;
+1:         CandidateInfo<Unit> first = null;
+1:         CandidateInfo<Unit> prev = null;
+1:         do
+1:         {
+1:             CandidateInfo<Unit> candidate = new CandidateInfo<Unit>(partitioner.midpoint(curr.prev.token, curr.token), curr, newUnitInfo);
+1:             first = candidate.insertAfter(first, prev);
+1: 
+1:             candidate.replicatedOwnership = initialTokenOwnership;
+1:             populateCandidate(candidate);
+1: 
+1:             prev = candidate;
+1:             curr = curr.next;
+1:         } while (curr != tokens);
+1:         prev.next = first;
+1:         return first;
+1:     }
+1: 
+1:     private void populateCandidate(CandidateInfo<Unit> candidate)
+1:     {
+1:         // Only finding replication start would do.
+1:         populateTokenInfo(candidate, candidate.owningUnit.group);
+1:     }
+1: 
+1:     /**
+1:      * Incorporates the selected candidate into the ring, adjusting ownership information and calculated token
+1:      * information.
+1:      */
+1:     private void confirmCandidate(CandidateInfo<Unit> candidate)
+1:     {
+1:         // This process is less efficient than it could be (loops through each vnode's replication span instead
+1:         // of recalculating replicationStart, replicationThreshold from existing data + new token data in an O(1)
+1:         // case analysis similar to evaluateImprovement). This is fine as the method does not dominate processing
+1:         // time.
+1: 
+1:         // Put the accepted candidate in the token list.
+1:         UnitInfo<Unit> newUnit = candidate.owningUnit;
+1:         Token newToken = candidate.token;
+1:         sortedTokens.put(newToken, newUnit.unit);
+1:         unitToTokens.put(newUnit.unit, newToken);
+1: 
+1:         TokenInfo<Unit> prev = candidate.prevInRing();
+1:         TokenInfo<Unit> newTokenInfo = new TokenInfo<>(newToken, newUnit);
+1:         newTokenInfo.replicatedOwnership = candidate.replicatedOwnership;
+1:         newTokenInfo.insertAfter(prev, prev);   // List is not empty so this won't need to change head of list.
+1: 
+1:         // Update data for candidate.
+1:         populateTokenInfoAndAdjustUnit(newTokenInfo, newUnit.group);
+1: 
+1:         ReplicationVisitor replicationVisitor = new ReplicationVisitor();
+1:         assert newTokenInfo.next == candidate.split;
+1:         for (TokenInfo<Unit> curr = newTokenInfo.next; !replicationVisitor.visitedAll(); curr = curr.next)
+1:         {
+1:             // update the candidate between curr and next
+1:             candidate = candidate.next;
+1:             populateCandidate(candidate);
+1: 
+1:             if (!replicationVisitor.add(curr.owningUnit.group))
+1:                 continue;    // If we've already seen this group, the token cannot be affected.
+1: 
+1:             populateTokenInfoAndAdjustUnit(curr, newUnit.group);
+1:         }
+1: 
+1:         replicationVisitor.clean();
+1:     }
+1: 
+1:     /**
+1:      * Calculates the {@code replicationStart} of a token, as well as {@code replicationThreshold} which is chosen in a way
+1:      * that permits {@code findUpdatedReplicationStart} to quickly identify changes in ownership.
+1:      */
+1:     private Token populateTokenInfo(BaseTokenInfo<Unit, ?> token, GroupInfo newUnitGroup)
+1:     {
+1:         GroupInfo tokenGroup = token.owningUnit.group;
+1:         PopulateVisitor visitor = new PopulateVisitor();
+1: 
+1:         // Replication start = the end of a token from the RF'th different group seen before the token.
+1:         Token replicationStart;
+1:         // The end of a token from the RF-1'th different group seen before the token.
+1:         Token replicationThreshold = token.token;
+1:         GroupInfo currGroup;
+1:         for (TokenInfo<Unit> curr = token.prevInRing(); ; curr = curr.prev)
+1:         {
+1:             replicationStart = curr.token;
+1:             currGroup = curr.owningUnit.group;
+1:             if (!visitor.add(currGroup))
+1:                 continue; // Group is already seen.
+1:             if (visitor.visitedAll())
+1:                 break;
+1: 
+1:             replicationThreshold = replicationStart;
+1:             // Another instance of the same group precedes us in the replication range of the ring,
+1:             // so this is where our replication range begins
+1:             if (currGroup == tokenGroup)
+1:                 break;
+1:         }
+1:         if (newUnitGroup == tokenGroup)
+1:             // new token is always a boundary (as long as it's closer than replicationStart)
+1:             replicationThreshold = token.token;
+1:         else if (newUnitGroup != currGroup && visitor.seen(newUnitGroup))
+1:             // already has new group in replication span before last seen. cannot be affected
+1:             replicationThreshold = replicationStart;
+1:         visitor.clean();
+1: 
+1:         token.replicationThreshold = replicationThreshold;
+1:         token.replicationStart = replicationStart;
+1:         return replicationStart;
+1:     }
+1: 
+1:     private void populateTokenInfoAndAdjustUnit(TokenInfo<Unit> populate, GroupInfo newUnitGroup)
+1:     {
+1:         Token replicationStart = populateTokenInfo(populate, newUnitGroup);
+1:         double newOwnership = replicationStart.size(populate.token);
+1:         double oldOwnership = populate.replicatedOwnership;
+1:         populate.replicatedOwnership = newOwnership;
+1:         populate.owningUnit.ownership += newOwnership - oldOwnership;
+1:     }
+1: 
+1:     /**
+1:      * Evaluates the improvement in variance for both units and individual tokens when candidate is inserted into the
+1:      * ring.
+1:      */
+1:     private double evaluateImprovement(CandidateInfo<Unit> candidate, double optTokenOwnership, double newUnitMult)
+1:     {
+1:         double tokenChange = 0;
+1: 
+1:         UnitInfo<Unit> candidateUnit = candidate.owningUnit;
+1:         Token candidateEnd = candidate.token;
+1: 
+1:         // Form a chain of units affected by the insertion to be able to qualify change of unit ownership.
+1:         // A unit may be affected more than once.
+1:         UnitAdjustmentTracker<Unit> unitTracker = new UnitAdjustmentTracker<>(candidateUnit);
+1: 
+1:         // Reflect change in ownership of the splitting token (candidate).
+1:         tokenChange += applyOwnershipAdjustment(candidate, candidateUnit, candidate.replicationStart, candidateEnd, optTokenOwnership, unitTracker);
+1: 
+1:         // Loop through all vnodes that replicate candidate or split and update their ownership.
+1:         ReplicationVisitor replicationVisitor = new ReplicationVisitor();
+1:         for (TokenInfo<Unit> curr = candidate.split; !replicationVisitor.visitedAll(); curr = curr.next)
+1:         {
+1:             UnitInfo<Unit> currUnit = curr.owningUnit;
+1: 
+1:             if (!replicationVisitor.add(currUnit.group))
+1:                 continue;    // If this group is already seen, the token cannot be affected.
+1: 
+1:             Token replicationEnd = curr.token;
+1:             Token replicationStart = findUpdatedReplicationStart(curr, candidate);
+1:             tokenChange += applyOwnershipAdjustment(curr, currUnit, replicationStart, replicationEnd, optTokenOwnership, unitTracker);
+1:         }
+1:         replicationVisitor.clean();
+1: 
+1:         double nodeChange = unitTracker.calculateUnitChange(newUnitMult, optTokenOwnership);
+1:         return -(tokenChange + nodeChange);
+1:     }
+1: 
+1:     /**
+1:      * Returns the start of the replication span for the token {@code curr} when {@code candidate} is inserted into the
+1:      * ring.
+1:      */
+1:     private Token findUpdatedReplicationStart(TokenInfo<Unit> curr, CandidateInfo<Unit> candidate)
+1:     {
+1:         return furtherStartToken(curr.replicationThreshold, candidate.token, curr.token);
+1:     }
+1: 
+1:     /**
+1:      * Applies the ownership adjustment for the given element, updating tracked unit ownership and returning the change
+1:      * of variance.
+1:      */
+1:     private double applyOwnershipAdjustment(BaseTokenInfo<Unit, ?> curr, UnitInfo<Unit> currUnit,
+1:             Token replicationStart, Token replicationEnd,
+1:             double optTokenOwnership, UnitAdjustmentTracker<Unit> unitTracker)
+1:     {
+1:         double oldOwnership = curr.replicatedOwnership;
+1:         double newOwnership = replicationStart.size(replicationEnd);
+1:         double tokenCount = currUnit.tokenCount;
+1:         assert tokenCount > 0;
+1:         unitTracker.add(currUnit, newOwnership - oldOwnership);
+1:         return (sq(newOwnership - optTokenOwnership) - sq(oldOwnership - optTokenOwnership)) / sq(tokenCount);
+1:     }
+1: 
+1:     /**
+1:      * Tracker for unit ownership changes. The changes are tracked by a chain of UnitInfos where the adjustedOwnership
+1:      * field is being updated as we see changes in token ownership.
+1:      *
+1:      * The chain ends with an element that points to itself; this element must be specified as argument to the
+1:      * constructor as well as be the first unit with which 'add' is called; when calculating the variance change
+1:      * a separate multiplier is applied to it (used to permit more freedom in choosing the first tokens of a unit).
+1:      */
+1:     private static class UnitAdjustmentTracker<Unit>
+1:     {
+1:         UnitInfo<Unit> unitsChain;
+1: 
+1:         UnitAdjustmentTracker(UnitInfo<Unit> newUnit)
+1:         {
+1:             unitsChain = newUnit;
+1:         }
+1: 
+1:         void add(UnitInfo<Unit> currUnit, double diff)
+1:         {
+1:             if (currUnit.prevUsed == null)
+1:             {
+1:                 assert unitsChain.prevUsed != null || currUnit == unitsChain;
+1: 
+1:                 currUnit.adjustedOwnership = currUnit.ownership + diff;
+1:                 currUnit.prevUsed = unitsChain;
+1:                 unitsChain = currUnit;
+1:             }
+1:             else
+1:             {
+1:                 currUnit.adjustedOwnership += diff;
+1:             }
+1:         }
+1: 
+1:         double calculateUnitChange(double newUnitMult, double optTokenOwnership)
+1:         {
+1:             double unitChange = 0;
+1:             UnitInfo<Unit> unitsChain = this.unitsChain;
+1:             // Now loop through the units chain and add the unit-level changes. Also clear the groups' seen marks.
+1:             while (true)
+1:             {
+1:                 double newOwnership = unitsChain.adjustedOwnership;
+1:                 double oldOwnership = unitsChain.ownership;
+1:                 double tokenCount = unitsChain.tokenCount;
+1:                 double diff = (sq(newOwnership / tokenCount - optTokenOwnership) - sq(oldOwnership / tokenCount - optTokenOwnership));
+1:                 UnitInfo<Unit> prev = unitsChain.prevUsed;
+1:                 unitsChain.prevUsed = null;
+1:                 if (unitsChain != prev)
+1:                     unitChange += diff;
+1:                 else
+1:                 {
+1:                     unitChange += diff * newUnitMult;
+1:                     break;
+1:                 }
+1:                 unitsChain = prev;
+1:             }
+1:             this.unitsChain = unitsChain;
+1:             return unitChange;
+1:         }
+1:     }
+1: 
+1: 
+1:     /**
+1:      * Helper class for marking/unmarking visited a chain of groups
+1:      */
+1:     private abstract class GroupVisitor
+1:     {
+1:         GroupInfo groupChain = GroupInfo.TERMINATOR;
+1:         int seen = 0;
+1: 
+1:         abstract GroupInfo prevSeen(GroupInfo group);
+1:         abstract void setPrevSeen(GroupInfo group, GroupInfo prevSeen);
+1: 
+1:         // true iff this is the first time we've visited this group
+1:         boolean add(GroupInfo group)
+1:         {
+1:             if (prevSeen(group) != null)
+1:                 return false;
+1:             ++seen;
+1:             setPrevSeen(group, groupChain);
+1:             groupChain = group;
+1:             return true;
+1:         }
+1: 
+1:         boolean visitedAll()
+1:         {
+1:             return seen >= replicas;
+1:         }
+1: 
+1:         boolean seen(GroupInfo group)
+1:         {
+1:             return prevSeen(group) != null;
+1:         }
+1: 
+1:         // Clean group seen markers.
+1:         void clean()
+1:         {
+1:             GroupInfo groupChain = this.groupChain;
+1:             while (groupChain != GroupInfo.TERMINATOR)
+1:             {
+1:                 GroupInfo prev = prevSeen(groupChain);
+1:                 setPrevSeen(groupChain, null);
+1:                 groupChain = prev;
+1:             }
+1:             this.groupChain = GroupInfo.TERMINATOR;
+1:         }
+1:     }
+1: 
+1:     private class ReplicationVisitor extends GroupVisitor
+1:     {
+1:         GroupInfo prevSeen(GroupInfo group)
+1:         {
+1:             return group.prevSeen;
+1:         }
+1: 
+1:         void setPrevSeen(GroupInfo group, GroupInfo prevSeen)
+1:         {
+1:             group.prevSeen = prevSeen;
+1:         }
+1:     }
+1: 
+1:     private class PopulateVisitor extends GroupVisitor
+1:     {
+1:         GroupInfo prevSeen(GroupInfo group)
+1:         {
+1:             return group.prevPopulate;
+1:         }
+1: 
+1:         void setPrevSeen(GroupInfo group, GroupInfo prevSeen)
+1:         {
+1:             group.prevPopulate = prevSeen;
+1:         }
+1:     }
+1: 
+0:     private Map.Entry<Token, Unit> mapEntryFor(Token t)
+1:     {
+0:         Map.Entry<Token, Unit> en = sortedTokens.floorEntry(t);
+0:         if (en == null)
+0:             en = sortedTokens.lastEntry();
+0:         return en;
+1:     }
+1: 
+0:     Unit unitFor(Token t)
+1:     {
+0:         return mapEntryFor(t).getValue();
+1:     }
+1: 
+1:     private double optimalTokenOwnership(int tokensToAdd)
+1:     {
+1:         return 1.0 * replicas / (sortedTokens.size() + tokensToAdd);
+1:     }
+1: 
+1:     /**
+1:      * Selects from {@code t1}, {@code t2} the token that forms a bigger range with {@code towards} as the upper bound,
+1:      * taking into account wrapping.
+1:      * Unlike Token.size(), equality is taken to mean "same as" rather than covering the whole range.
+1:      */
+1:     private static Token furtherStartToken(Token t1, Token t2, Token towards)
+1:     {
+1:         if (t1.equals(towards))
+1:             return t2;
+1:         if (t2.equals(towards))
+1:             return t1;
+1: 
+1:         return t1.size(towards) > t2.size(towards) ? t1 : t2;
+1:     }
+1: 
+1:     private static double sq(double d)
+1:     {
+1:         return d * d;
+1:     }
+1: 
+1: 
+1:     /**
+1:      * For testing, remove the given unit preserving correct state of the allocator.
+1:      */
+1:     void removeUnit(Unit n)
+1:     {
+1:         Collection<Token> tokens = unitToTokens.removeAll(n);
+1:         sortedTokens.keySet().removeAll(tokens);
+1:     }
+1: 
+0:     int unitCount()
+1:     {
+1:         return unitToTokens.asMap().size();
+1:     }
+1: 
+1:     public String toString()
+1:     {
+1:         return getClass().getSimpleName();
+1:     }
+1: 
+0:     // get or initialise the shared GroupInfo associated with the unit
+0:     private static <Unit> GroupInfo getGroup(Unit unit, Map<Object, GroupInfo> groupMap, ReplicationStrategy<Unit> strategy)
+1:     {
+0:         Object groupClass = strategy.getGroup(unit);
+0:         GroupInfo group = groupMap.get(groupClass);
+0:         if (group == null)
+0:             groupMap.put(groupClass, group = new GroupInfo(groupClass));
+0:         return group;
+1:     }
+1: 
+1:     /**
+0:      * Unique group object that one or more UnitInfo objects link to.
+1:      */
+0:     private static class GroupInfo
+1:     {
+1:         /**
+0:          * Group identifier given by ReplicationStrategy.getGroup(Unit).
+1:          */
+0:         final Object group;
+1: 
+1:         /**
+0:          * Seen marker. When non-null, the group is already seen in replication walks.
+0:          * Also points to previous seen group to enable walking the seen groups and clearing the seen markers.
+1:          */
+0:         GroupInfo prevSeen = null;
+1:         /**
+0:          * Same marker/chain used by populateTokenInfo.
+1:          */
+0:         GroupInfo prevPopulate = null;
+1: 
+1:         /**
+0:          * Value used as terminator for seen chains.
+1:          */
+0:         static GroupInfo TERMINATOR = new GroupInfo(null);
+1: 
+0:         public GroupInfo(Object group)
+1:         {
+0:             this.group = group;
+1:         }
+1: 
+1:         public String toString()
+1:         {
+0:             return group.toString() + (prevSeen != null ? "*" : "");
+1:         }
+1:     }
+1: 
+1:     /**
+0:      * Unit information created and used by ReplicationAwareTokenDistributor. Contained vnodes all point to the same
+0:      * instance.
+1:      */
+0:     static class UnitInfo<Unit>
+1:     {
+0:         final Unit unit;
+0:         final GroupInfo group;
+0:         double ownership;
+0:         int tokenCount;
+1: 
+1:         /**
+0:          * During evaluateImprovement this is used to form a chain of units affected by the candidate insertion.
+1:          */
+0:         UnitInfo<Unit> prevUsed;
+1:         /**
+0:          * During evaluateImprovement this holds the ownership after the candidate insertion.
+1:          */
+0:         double adjustedOwnership;
+1: 
+0:         private UnitInfo(Unit unit, GroupInfo group)
+1:         {
+0:             this.unit = unit;
+0:             this.group = group;
+0:             this.tokenCount = 0;
+1:         }
+1: 
+0:         public UnitInfo(Unit unit, double ownership, Map<Object, GroupInfo> groupMap, ReplicationStrategy<Unit> strategy)
+1:         {
+0:             this(unit, getGroup(unit, groupMap, strategy));
+0:             this.ownership = ownership;
+1:         }
+1: 
+1:         public String toString()
+1:         {
+0:             return String.format("%s%s(%.2e)%s",
+0:                     unit, unit == group.group ? (group.prevSeen != null ? "*" : "") : ":" + group.toString(),
+0:                     ownership, prevUsed != null ? (prevUsed == this ? "#" : "->" + prevUsed.toString()) : "");
+1:         }
+1:     }
+1: 
+0:     private static class CircularList<T extends CircularList<T>>
+1:     {
+0:         T prev;
+0:         T next;
+1: 
+1:         /**
+0:          * Inserts this after unit in the circular list which starts at head. Returns the new head of the list, which
+0:          * only changes if head was null.
+1:          */
+0:         @SuppressWarnings("unchecked")
+0:         T insertAfter(T head, T unit)
+1:         {
+0:             if (head == null)
+1:             {
+0:                 return prev = next = (T) this;
+1:             }
+0:             assert unit != null;
+0:             assert unit.next != null;
+0:             prev = unit;
+0:             next = unit.next;
+0:             prev.next = (T) this;
+0:             next.prev = (T) this;
+0:             return head;
+1:         }
+1: 
+1:         /**
+0:          * Removes this from the list that starts at head. Returns the new head of the list, which only changes if the
+0:          * head was removed.
+1:          */
+0:         T removeFrom(T head)
+1:         {
+0:             next.prev = prev;
+0:             prev.next = next;
+0:             return this == head ? (this == next ? null : next) : head;
+1:         }
+1:     }
+1: 
+0:     private static class BaseTokenInfo<Unit, T extends BaseTokenInfo<Unit, T>> extends CircularList<T>
+1:     {
+0:         final Token token;
+0:         final UnitInfo<Unit> owningUnit;
+1: 
+1:         /**
+0:          * Start of the replication span for the vnode, i.e. the first token of the RF'th group seen before the token.
+0:          * The replicated ownership of the unit is the range between {@code replicationStart} and {@code token}.
+1:          */
+1:         Token replicationStart;
+1:         /**
+0:          * The closest position that the new candidate can take to become the new replication start. If candidate is
+0:          * closer, the start moves to this position. Used to determine replicationStart after insertion of new token.
+1:          *
+0:          * Usually the RF minus one boundary, i.e. the first token of the RF-1'th group seen before the token.
+1:          */
+0:         Token replicationThreshold;
+1:         /**
+0:          * Current replicated ownership. This number is reflected in the owning unit's ownership.
+1:          */
+0:         double replicatedOwnership = 0;
+1: 
+0:         public BaseTokenInfo(Token token, UnitInfo<Unit> owningUnit)
+1:         {
+0:             this.token = token;
+0:             this.owningUnit = owningUnit;
+1:         }
+1: 
+1:         public String toString()
+1:         {
+0:             return String.format("%s(%s)", token, owningUnit);
+1:         }
+1: 
+1:         /**
+0:          * Previous unit in the token ring. For existing tokens this is prev,
+0:          * for candidates it's "split".
+1:          */
+1:         TokenInfo<Unit> prevInRing()
+1:         {
+0:             return null;
+1:         }
+1:     }
+1: 
+1:     /**
+0:      * TokenInfo about existing tokens/vnodes.
+1:      */
+0:     private static class TokenInfo<Unit> extends BaseTokenInfo<Unit, TokenInfo<Unit>>
+1:     {
+0:         public TokenInfo(Token token, UnitInfo<Unit> owningUnit)
+1:         {
+1:             super(token, owningUnit);
+1:         }
+1: 
+1:         TokenInfo<Unit> prevInRing()
+1:         {
+0:             return prev;
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * TokenInfo about candidate new tokens/vnodes.
+1:      */
+1:     private static class CandidateInfo<Unit> extends BaseTokenInfo<Unit, CandidateInfo<Unit>>
+1:     {
+1:         // directly preceding token in the current token ring
+1:         final TokenInfo<Unit> split;
+1: 
+1:         public CandidateInfo(Token token, TokenInfo<Unit> split, UnitInfo<Unit> owningUnit)
+1:         {
+1:             super(token, owningUnit);
+1:             this.split = split;
+1:         }
+1: 
+1:         TokenInfo<Unit> prevInRing()
+1:         {
+1:             return split.prev;
+1:         }
+1:     }
+1: 
+1:     static void dumpTokens(String lead, BaseTokenInfo<?, ?> tokens)
+1:     {
+1:         BaseTokenInfo<?, ?> token = tokens;
+1:         do
+1:         {
+0:             System.out.format("%s%s: rs %s rt %s size %.2e\n", lead, token, token.replicationStart, token.replicationThreshold, token.replicatedOwnership);
+1:             token = token.next;
+1:         } while (token != null && token != tokens);
+1:     }
+1: 
+0:     static class Weighted<T> implements Comparable<Weighted<T>>
+1:     {
+0:         final double weight;
+0:         final T value;
+1: 
+0:         public Weighted(double weight, T value)
+1:         {
+0:             this.weight = weight;
+0:             this.value = value;
+1:         }
+1: 
+0:         @Override
+0:         public int compareTo(Weighted<T> o)
+1:         {
+0:             int cmp = Double.compare(o.weight, this.weight);
+0:             return cmp;
+1:         }
+1: 
+0:         @Override
+1:         public String toString()
+1:         {
+0:             return String.format("%s<%s>", value, weight);
+1:         }
+1:     }
+1: }
+1: 
+============================================================================

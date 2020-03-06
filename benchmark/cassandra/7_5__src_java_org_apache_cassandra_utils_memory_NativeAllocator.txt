@@ -1,0 +1,760 @@
+1:8541cca: /*
+1:8541cca:  * Licensed to the Apache Software Foundation (ASF) under one
+1:8541cca:  * or more contributor license agreements.  See the NOTICE file
+1:8541cca:  * distributed with this work for additional information
+1:8541cca:  * regarding copyright ownership.  The ASF licenses this file
+1:8541cca:  * to you under the Apache License, Version 2.0 (the
+1:8541cca:  * "License"); you may not use this file except in compliance
+1:8541cca:  * with the License.  You may obtain a copy of the License at
+1:8541cca:  *
+1:8541cca:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:8541cca:  *
+1:8541cca:  * Unless required by applicable law or agreed to in writing, software
+1:8541cca:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:8541cca:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:8541cca:  * See the License for the specific language governing permissions and
+1:8541cca:  * limitations under the License.
+2:8541cca:  */
+1:8541cca: package org.apache.cassandra.utils.memory;
+15:8541cca: 
+1:2fdd1d5: import java.util.HashMap;
+1:2fdd1d5: import java.util.Map;
+1:8541cca: import java.util.concurrent.ConcurrentLinkedQueue;
+1:51f7cad: import java.util.concurrent.Semaphore;
+1:8541cca: import java.util.concurrent.atomic.AtomicInteger;
+1:8541cca: import java.util.concurrent.atomic.AtomicReference;
+1:d641053: 
+1:2f41243: import org.apache.cassandra.db.*;
+1:2f41243: import org.apache.cassandra.db.rows.*;
+1:8541cca: import org.apache.cassandra.utils.concurrent.OpOrder;
+1:8541cca: 
+1:ac9844b: /**
+1:ac9844b:  * This NativeAllocator uses global slab allocation strategy
+1:ac9844b:  * with slab size that scales exponentially from 8kb to 1Mb to
+1:ac9844b:  * serve allocation of up to 128kb.
+1:ac9844b:  * <p>
+1:ac9844b:  * </p>
+1:ac9844b:  * The slab allocation reduces heap fragmentation from small
+1:ac9844b:  * long-lived objects.
+1:ac9844b:  *
+1:ac9844b:  */
+1:8541cca: public class NativeAllocator extends MemtableAllocator
+9:8541cca: {
+1:51f7cad:     private final static int MAX_REGION_SIZE = 1 * 1024 * 1024;
+1:8541cca:     private final static int MAX_CLONED_SIZE = 128 * 1024; // bigger than this don't go in the region
+1:51f7cad:     private final static int MIN_REGION_SIZE = 8 * 1024;
+1:51f7cad: 
+1:8541cca:     // globally stash any Regions we allocate but are beaten to using, and use these up before allocating any more
+1:51f7cad:     private static final Map<Integer, RaceAllocated> RACE_ALLOCATED = new HashMap<>();
+1:51f7cad: 
+1:51f7cad:     static
+1:51f7cad:     {
+1:51f7cad:         for(int i = MIN_REGION_SIZE ; i <= MAX_REGION_SIZE; i *= 2)
+1:51f7cad:             RACE_ALLOCATED.put(i, new RaceAllocated());
+1:51f7cad:     }
+1:8541cca: 
+1:8541cca:     private final AtomicReference<Region> currentRegion = new AtomicReference<>();
+1:8541cca:     private final ConcurrentLinkedQueue<Region> regions = new ConcurrentLinkedQueue<>();
+1:2f41243:     private final EnsureOnHeap.CloneToHeap cloneToHeap = new EnsureOnHeap.CloneToHeap();
+1:8541cca: 
+1:8541cca:     protected NativeAllocator(NativePool pool)
+1:8541cca:     {
+1:8541cca:         super(pool.onHeap.newAllocator(), pool.offHeap.newAllocator());
+9:8541cca:     }
+1:8541cca: 
+1:2f41243:     private static class CloningBTreeRowBuilder extends BTreeRow.Builder
+1:2f41243:     {
+1:2f41243:         final OpOrder.Group writeOp;
+1:2f41243:         final NativeAllocator allocator;
+1:2f41243:         private CloningBTreeRowBuilder(OpOrder.Group writeOp, NativeAllocator allocator)
+1:2f41243:         {
+1:2f41243:             super(true);
+1:2f41243:             this.writeOp = writeOp;
+1:2f41243:             this.allocator = allocator;
+1:2f41243:         }
+1:2f41243: 
+1:2f41243:         @Override
+1:2f41243:         public void newRow(Clustering clustering)
+1:2f41243:         {
+1:2f41243:             if (clustering != Clustering.STATIC_CLUSTERING)
+1:2f41243:                 clustering = new NativeClustering(allocator, writeOp, clustering);
+1:2f41243:             super.newRow(clustering);
+1:2f41243:         }
+1:2f41243: 
+1:2f41243:         @Override
+1:2f41243:         public void addCell(Cell cell)
+1:2f41243:         {
+1:2f41243:             super.addCell(new NativeCell(allocator, writeOp, cell));
+1:2f41243:         }
+1:2f41243:     }
+1:2f41243: 
+1:aa57626:     public Row.Builder rowBuilder(OpOrder.Group opGroup)
+1:8541cca:     {
+1:2f41243:         return new CloningBTreeRowBuilder(opGroup, this);
+1:8541cca:     }
+1:8541cca: 
+1:8541cca:     public DecoratedKey clone(DecoratedKey key, OpOrder.Group writeOp)
+1:8541cca:     {
+1:8541cca:         return new NativeDecoratedKey(key.getToken(), this, writeOp, key.getKey());
+1:8541cca:     }
+1:8541cca: 
+5:8541cca:     @Override
+1:8541cca:     public MemtableAllocator.DataReclaimer reclaimer()
+1:8541cca:     {
+1:8541cca:         return NO_OP;
+1:8541cca:     }
+1:8541cca: 
+1:2f41243:     public EnsureOnHeap ensureOnHeap()
+1:2f41243:     {
+1:2f41243:         return cloneToHeap;
+1:2f41243:     }
+1:2f41243: 
+1:8541cca:     public long allocate(int size, OpOrder.Group opGroup)
+1:8541cca:     {
+1:8541cca:         assert size >= 0;
+1:97c54c5:         offHeap().allocate(size, opGroup);
+1:97c54c5:         // satisfy large allocations directly from JVM since they don't cause fragmentation
+1:97c54c5:         // as badly, and fill up our regions quickly
+1:8541cca:         if (size > MAX_CLONED_SIZE)
+1:d06fd78:             return allocateOversize(size);
+1:8541cca: 
+2:8541cca:         while (true)
+1:8541cca:         {
+1:51f7cad:             Region region = currentRegion.get();
+2:8541cca:             long peer;
+1:51f7cad:             if (region != null && (peer = region.allocate(size)) > 0)
+2:8541cca:                 return peer;
+1:8541cca: 
+1:51f7cad:             trySwapRegion(region, size);
+1:8541cca:         }
+1:8541cca:     }
+1:8541cca: 
+1:51f7cad:     private void trySwapRegion(Region current, int minSize)
+1:51f7cad:     {
+1:51f7cad:         // decide how big we want the new region to be:
+1:51f7cad:         //  * if there is no prior region, we set it to min size
+1:51f7cad:         //  * otherwise we double its size; if it's too small to fit the allocation, we round it up to 4-8x its size
+1:51f7cad:         int size;
+1:51f7cad:         if (current == null) size = MIN_REGION_SIZE;
+1:51f7cad:         else size = current.capacity * 2;
+1:51f7cad:         if (minSize > size)
+1:51f7cad:             size = Integer.highestOneBit(minSize) << 3;
+1:51f7cad:         size = Math.min(MAX_REGION_SIZE, size);
+1:51f7cad: 
+1:51f7cad:         // first we try and repurpose a previously allocated region
+1:51f7cad:         RaceAllocated raceAllocated = RACE_ALLOCATED.get(size);
+1:51f7cad:         Region next = raceAllocated.poll();
+1:51f7cad: 
+1:51f7cad:         // if there are none, we allocate one
+1:51f7cad:         if (next == null)
+1:0d2ec11:             next = new Region(MemoryUtil.allocate(size), size);
+1:51f7cad: 
+1:51f7cad:         // we try to swap in the region we've obtained;
+1:51f7cad:         // if we fail to swap the region, we try to stash it for repurposing later; if we're out of stash room, we free it
+1:51f7cad:         if (currentRegion.compareAndSet(current, next))
+1:51f7cad:             regions.add(next);
+1:51f7cad:         else if (!raceAllocated.stash(next))
+1:0d2ec11:             MemoryUtil.free(next.peer);
+1:51f7cad:     }
+1:51f7cad: 
+1:d06fd78:     private long allocateOversize(int size)
+1:51f7cad:     {
+1:51f7cad:         // satisfy large allocations directly from JVM since they don't cause fragmentation
+1:51f7cad:         // as badly, and fill up our regions quickly
+1:0d2ec11:         Region region = new Region(MemoryUtil.allocate(size), size);
+1:51f7cad:         regions.add(region);
+1:51f7cad: 
+1:51f7cad:         long peer;
+1:51f7cad:         if ((peer = region.allocate(size)) == -1)
+1:51f7cad:             throw new AssertionError();
+1:51f7cad: 
+1:51f7cad:         return peer;
+1:51f7cad:     }
+1:51f7cad: 
+1:8541cca:     public void setDiscarded()
+1:8541cca:     {
+1:8541cca:         for (Region region : regions)
+1:0d2ec11:             MemoryUtil.free(region.peer);
+1:2f41243: 
+1:8541cca:         super.setDiscarded();
+1:8541cca:     }
+1:8541cca: 
+1:51f7cad:     // used to ensure we don't keep loads of race allocated regions around indefinitely. keeps the total bound on wasted memory low.
+1:51f7cad:     private static class RaceAllocated
+1:8541cca:     {
+1:51f7cad:         final ConcurrentLinkedQueue<Region> stash = new ConcurrentLinkedQueue<>();
+1:51f7cad:         final Semaphore permits = new Semaphore(8);
+1:51f7cad:         boolean stash(Region region)
+1:8541cca:         {
+1:51f7cad:             if (!permits.tryAcquire())
+1:51f7cad:                 return false;
+1:51f7cad:             stash.add(region);
+1:51f7cad:             return true;
+1:51f7cad:         }
+1:51f7cad:         Region poll()
+1:51f7cad:         {
+1:51f7cad:             Region next = stash.poll();
+1:51f7cad:             if (next != null)
+1:51f7cad:                 permits.release();
+1:51f7cad:             return next;
+1:8541cca:         }
+1:8541cca:     }
+1:8541cca: 
+2:8541cca:     /**
+1:8541cca:      * A region of memory out of which allocations are sliced.
+1:8541cca:      *
+1:8541cca:      * This serves two purposes:
+1:8541cca:      *  - to provide a step between initialization and allocation, so that racing to CAS a
+1:8541cca:      *    new region in is harmless
+1:8541cca:      *  - encapsulates the allocation offset
+1:8541cca:      */
+1:8541cca:     private static class Region
+1:8541cca:     {
+1:8541cca:         /**
+1:8541cca:          * Actual underlying data
+1:8541cca:          */
+1:8541cca:         private final long peer;
+1:8541cca: 
+1:51f7cad:         private final int capacity;
+1:8541cca: 
+1:8541cca:         /**
+1:8541cca:          * Offset for the next allocation, or the sentinel value -1
+1:8541cca:          * which implies that the region is still uninitialized.
+1:8541cca:          */
+1:2f41243:         private final AtomicInteger nextFreeOffset = new AtomicInteger(0);
+1:8541cca: 
+1:8541cca:         /**
+1:8541cca:          * Total number of allocations satisfied from this buffer
+1:8541cca:          */
+1:2f41243:         private final AtomicInteger allocCount = new AtomicInteger();
+1:8541cca: 
+1:8541cca:         /**
+1:8541cca:          * Create an uninitialized region. Note that memory is not allocated yet, so
+1:8541cca:          * this is cheap.
+1:8541cca:          *
+1:8541cca:          * @param peer peer
+1:8541cca:          */
+1:51f7cad:         private Region(long peer, int capacity)
+1:8541cca:         {
+1:8541cca:             this.peer = peer;
+1:8541cca:             this.capacity = capacity;
+1:8541cca:         }
+1:8541cca: 
+1:8541cca:         /**
+1:8541cca:          * Try to allocate <code>size</code> bytes from the region.
+1:8541cca:          *
+1:8541cca:          * @return the successful allocation, or null to indicate not-enough-space
+1:8541cca:          */
+1:8541cca:         long allocate(int size)
+1:8541cca:         {
+1:8541cca:             while (true)
+1:8541cca:             {
+1:8541cca:                 int oldOffset = nextFreeOffset.get();
+1:8541cca: 
+1:8541cca:                 if (oldOffset + size > capacity) // capacity == remaining
+1:8541cca:                     return -1;
+1:8541cca: 
+1:8541cca:                 // Try to atomically claim this region
+1:8541cca:                 if (nextFreeOffset.compareAndSet(oldOffset, oldOffset + size))
+1:8541cca:                 {
+1:8541cca:                     // we got the alloc
+1:8541cca:                     allocCount.incrementAndGet();
+1:8541cca:                     return peer + oldOffset;
+1:8541cca:                 }
+1:8541cca:                 // we raced and lost alloc, try again
+1:8541cca:             }
+1:8541cca:         }
+1:8541cca: 
+1:8541cca:         @Override
+1:8541cca:         public String toString()
+1:8541cca:         {
+1:8541cca:             return "Region@" + System.identityHashCode(this) +
+1:8541cca:                     " allocs=" + allocCount.get() + "waste=" +
+1:8541cca:                     (capacity - nextFreeOffset.get());
+1:8541cca:         }
+1:8541cca:     }
+1:8541cca: 
+1:8541cca: }
+============================================================================
+author:Josh McKenzie
+-------------------------------------------------------------------------------
+commit:a8a3a73
+commit:ecb4ae8
+author:Zhao Yang
+-------------------------------------------------------------------------------
+commit:ac9844b
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * This NativeAllocator uses global slab allocation strategy
+1:  * with slab size that scales exponentially from 8kb to 1Mb to
+1:  * serve allocation of up to 128kb.
+1:  * <p>
+1:  * </p>
+1:  * The slab allocation reduces heap fragmentation from small
+1:  * long-lived objects.
+1:  *
+1:  */
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:2f41243
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.*;
+1: import org.apache.cassandra.db.rows.*;
+/////////////////////////////////////////////////////////////////////////
+1:     private final EnsureOnHeap.CloneToHeap cloneToHeap = new EnsureOnHeap.CloneToHeap();
+1:     private static class CloningBTreeRowBuilder extends BTreeRow.Builder
+1:     {
+1:         final OpOrder.Group writeOp;
+1:         final NativeAllocator allocator;
+1:         private CloningBTreeRowBuilder(OpOrder.Group writeOp, NativeAllocator allocator)
+1:         {
+1:             super(true);
+1:             this.writeOp = writeOp;
+1:             this.allocator = allocator;
+1:         }
+1: 
+1:         @Override
+1:         public void newRow(Clustering clustering)
+1:         {
+1:             if (clustering != Clustering.STATIC_CLUSTERING)
+1:                 clustering = new NativeClustering(allocator, writeOp, clustering);
+1:             super.newRow(clustering);
+1:         }
+1: 
+1:         @Override
+1:         public void addCell(Cell cell)
+1:         {
+1:             super.addCell(new NativeCell(allocator, writeOp, cell));
+1:         }
+1:     }
+1: 
+1:         return new CloningBTreeRowBuilder(opGroup, this);
+/////////////////////////////////////////////////////////////////////////
+1:     public EnsureOnHeap ensureOnHeap()
+1:     {
+1:         return cloneToHeap;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         private final AtomicInteger nextFreeOffset = new AtomicInteger(0);
+1:         private final AtomicInteger allocCount = new AtomicInteger();
+commit:aa57626
+/////////////////////////////////////////////////////////////////////////
+1:     public Row.Builder rowBuilder(OpOrder.Group opGroup)
+commit:0af4ae2
+commit:97c54c5
+/////////////////////////////////////////////////////////////////////////
+1:         offHeap().allocate(size, opGroup);
+1:         // satisfy large allocations directly from JVM since they don't cause fragmentation
+1:         // as badly, and fill up our regions quickly
+/////////////////////////////////////////////////////////////////////////
+commit:2fdd1d5
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.HashMap;
+1: import java.util.Map;
+commit:b5795ef
+commit:51f7cad
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.HashMap;
+0: import java.util.Map;
+1: import java.util.concurrent.Semaphore;
+0: import org.apache.cassandra.config.DatabaseDescriptor;
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.util.IAllocator;
+1:     private final static int MAX_REGION_SIZE = 1 * 1024 * 1024;
+1:     private final static int MIN_REGION_SIZE = 8 * 1024;
+1: 
+0:     private static final IAllocator allocator = DatabaseDescriptor.getoffHeapMemoryAllocator();
+1:     private static final Map<Integer, RaceAllocated> RACE_ALLOCATED = new HashMap<>();
+1: 
+1:     static
+1:     {
+1:         for(int i = MIN_REGION_SIZE ; i <= MAX_REGION_SIZE; i *= 2)
+1:             RACE_ALLOCATED.put(i, new RaceAllocated());
+1:     }
+/////////////////////////////////////////////////////////////////////////
+0:             return allocateOversize(size, opGroup);
+1:             Region region = currentRegion.get();
+1:             if (region != null && (peer = region.allocate(size)) > 0)
+1:             trySwapRegion(region, size);
+1:     private void trySwapRegion(Region current, int minSize)
+1:     {
+1:         // decide how big we want the new region to be:
+1:         //  * if there is no prior region, we set it to min size
+1:         //  * otherwise we double its size; if it's too small to fit the allocation, we round it up to 4-8x its size
+1:         int size;
+1:         if (current == null) size = MIN_REGION_SIZE;
+1:         else size = current.capacity * 2;
+1:         if (minSize > size)
+1:             size = Integer.highestOneBit(minSize) << 3;
+1:         size = Math.min(MAX_REGION_SIZE, size);
+1: 
+1:         // first we try and repurpose a previously allocated region
+1:         RaceAllocated raceAllocated = RACE_ALLOCATED.get(size);
+1:         Region next = raceAllocated.poll();
+1: 
+1:         // if there are none, we allocate one
+1:         if (next == null)
+0:             next = new Region(allocator.allocate(size), size);
+1: 
+1:         // we try to swap in the region we've obtained;
+1:         // if we fail to swap the region, we try to stash it for repurposing later; if we're out of stash room, we free it
+1:         if (currentRegion.compareAndSet(current, next))
+1:             regions.add(next);
+1:         else if (!raceAllocated.stash(next))
+0:             allocator.free(next.peer);
+1:     }
+1: 
+0:     private long allocateOversize(int size, OpOrder.Group opGroup)
+1:     {
+1:         // satisfy large allocations directly from JVM since they don't cause fragmentation
+1:         // as badly, and fill up our regions quickly
+0:         offHeap().allocate(size, opGroup);
+0:         Region region = new Region(allocator.allocate(size), size);
+1:         regions.add(region);
+1: 
+1:         long peer;
+1:         if ((peer = region.allocate(size)) == -1)
+1:             throw new AssertionError();
+1: 
+1:         return peer;
+1:     }
+1: 
+0:             allocator.free(region.peer);
+1:     // used to ensure we don't keep loads of race allocated regions around indefinitely. keeps the total bound on wasted memory low.
+1:     private static class RaceAllocated
+1:         final ConcurrentLinkedQueue<Region> stash = new ConcurrentLinkedQueue<>();
+1:         final Semaphore permits = new Semaphore(8);
+1:         boolean stash(Region region)
+1:             if (!permits.tryAcquire())
+1:                 return false;
+1:             stash.add(region);
+1:             return true;
+1:         }
+1:         Region poll()
+1:         {
+1:             Region next = stash.poll();
+1:             if (next != null)
+1:                 permits.release();
+1:             return next;
+/////////////////////////////////////////////////////////////////////////
+1:         private final int capacity;
+/////////////////////////////////////////////////////////////////////////
+1:         private Region(long peer, int capacity)
+/////////////////////////////////////////////////////////////////////////
+commit:d641053
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.config.DatabaseDescriptor;
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.util.IAllocator;
+/////////////////////////////////////////////////////////////////////////
+0:     private static final IAllocator allocator = DatabaseDescriptor.getoffHeapMemoryAllocator();
+1:     
+/////////////////////////////////////////////////////////////////////////
+0:             Region region = new Region(allocator.allocate(size), size);
+/////////////////////////////////////////////////////////////////////////
+0:             allocator.free(region.peer);
+/////////////////////////////////////////////////////////////////////////
+0:                 region = new Region(allocator.allocate(REGION_SIZE), REGION_SIZE);
+/////////////////////////////////////////////////////////////////////////
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:2457599
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.rows.Row;
+/////////////////////////////////////////////////////////////////////////
+0:     public Row.Builder rowBuilder(CFMetaData metadata, OpOrder.Group opGroup, boolean isStatic)
+commit:a991b64
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.rows.MemtableRowData;
+/////////////////////////////////////////////////////////////////////////
+0:     public MemtableRowData.ReusableRow newReusableRow()
+0:         // TODO
+0:         throw new UnsupportedOperationException();
+0:     public RowAllocator newRowAllocator(CFMetaData cfm, OpOrder.Group writeOp)
+0:         // TODO
+0:         throw new UnsupportedOperationException();
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:d06fd78
+/////////////////////////////////////////////////////////////////////////
+1:             return allocateOversize(size);
+/////////////////////////////////////////////////////////////////////////
+1:     private long allocateOversize(int size)
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:0d2ec11
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:             next = new Region(MemoryUtil.allocate(size), size);
+1:             MemoryUtil.free(next.peer);
+1:         Region region = new Region(MemoryUtil.allocate(size), size);
+/////////////////////////////////////////////////////////////////////////
+1:             MemoryUtil.free(region.peer);
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:8541cca
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.utils.memory;
+1: 
+0: import java.lang.reflect.Field;
+1: 
+1: import java.util.concurrent.ConcurrentLinkedQueue;
+1: import java.util.concurrent.atomic.AtomicInteger;
+0: import java.util.concurrent.atomic.AtomicLong;
+1: import java.util.concurrent.atomic.AtomicReference;
+1: 
+0: import org.apache.cassandra.config.CFMetaData;
+0: import org.apache.cassandra.db.Cell;
+0: import org.apache.cassandra.db.CounterCell;
+0: import org.apache.cassandra.db.DecoratedKey;
+0: import org.apache.cassandra.db.DeletedCell;
+0: import org.apache.cassandra.db.ExpiringCell;
+0: import org.apache.cassandra.db.NativeCell;
+0: import org.apache.cassandra.db.NativeCounterCell;
+0: import org.apache.cassandra.db.NativeDecoratedKey;
+0: import org.apache.cassandra.db.NativeDeletedCell;
+0: import org.apache.cassandra.db.NativeExpiringCell;
+1: import org.apache.cassandra.utils.concurrent.OpOrder;
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+0: import sun.misc.Unsafe;
+1: 
+1: public class NativeAllocator extends MemtableAllocator
+1: {
+0:     private static final Logger logger = LoggerFactory.getLogger(NativeAllocator.class);
+1: 
+0:     private final static int REGION_SIZE = 1024 * 1024;
+1:     private final static int MAX_CLONED_SIZE = 128 * 1024; // bigger than this don't go in the region
+1: 
+1:     // globally stash any Regions we allocate but are beaten to using, and use these up before allocating any more
+0:     private static final ConcurrentLinkedQueue<Region> RACE_ALLOCATED = new ConcurrentLinkedQueue<>();
+1: 
+1:     private final AtomicReference<Region> currentRegion = new AtomicReference<>();
+0:     private final AtomicInteger regionCount = new AtomicInteger(0);
+1:     private final ConcurrentLinkedQueue<Region> regions = new ConcurrentLinkedQueue<>();
+0:     private AtomicLong unslabbed = new AtomicLong(0);
+1: 
+1:     protected NativeAllocator(NativePool pool)
+1:     {
+1:         super(pool.onHeap.newAllocator(), pool.offHeap.newAllocator());
+1:     }
+1: 
+1:     @Override
+0:     public Cell clone(Cell cell, CFMetaData cfm, OpOrder.Group writeOp)
+1:     {
+0:         return new NativeCell(this, writeOp, cell);
+1:     }
+1: 
+1:     @Override
+0:     public CounterCell clone(CounterCell cell, CFMetaData cfm, OpOrder.Group writeOp)
+1:     {
+0:         return new NativeCounterCell(this, writeOp, cell);
+1:     }
+1: 
+1:     @Override
+0:     public DeletedCell clone(DeletedCell cell, CFMetaData cfm, OpOrder.Group writeOp)
+1:     {
+0:         return new NativeDeletedCell(this, writeOp, cell);
+1:     }
+1: 
+1:     @Override
+0:     public ExpiringCell clone(ExpiringCell cell, CFMetaData cfm, OpOrder.Group writeOp)
+1:     {
+0:         return new NativeExpiringCell(this, writeOp, cell);
+1:     }
+1: 
+1:     public DecoratedKey clone(DecoratedKey key, OpOrder.Group writeOp)
+1:     {
+1:         return new NativeDecoratedKey(key.getToken(), this, writeOp, key.getKey());
+1:     }
+1: 
+1:     @Override
+1:     public MemtableAllocator.DataReclaimer reclaimer()
+1:     {
+1:         return NO_OP;
+1:     }
+1: 
+1:     public long allocate(int size, OpOrder.Group opGroup)
+1:     {
+1:         assert size >= 0;
+0:         offHeap().allocate(size, opGroup);
+0:         // satisfy large allocations directly from JVM since they don't cause fragmentation
+0:         // as badly, and fill up our regions quickly
+1:         if (size > MAX_CLONED_SIZE)
+1:         {
+0:             unslabbed.addAndGet(size);
+0:             Region region = new Region(unsafe.allocateMemory(size), size);
+0:             regions.add(region);
+1: 
+1:             long peer;
+0:             if ((peer = region.allocate(size)) == -1)
+0:                 throw new AssertionError();
+1: 
+1:             return peer;
+1:         }
+1: 
+1:         while (true)
+1:         {
+0:             Region region = getRegion();
+1: 
+1:             long peer;
+0:             if ((peer = region.allocate(size)) > 0)
+1:                 return peer;
+1: 
+0:             // not enough space!
+0:             currentRegion.compareAndSet(region, null);
+1:         }
+1:     }
+1: 
+1:     public void setDiscarded()
+1:     {
+1:         for (Region region : regions)
+0:             unsafe.freeMemory(region.peer);
+1:         super.setDiscarded();
+1:     }
+1: 
+1:     /**
+0:      * Get the current region, or, if there is no current region, allocate a new one
+1:      */
+0:     private Region getRegion()
+1:     {
+1:         while (true)
+1:         {
+0:             // Try to get the region
+0:             Region region = currentRegion.get();
+0:             if (region != null)
+0:                 return region;
+1: 
+0:             // No current region, so we want to allocate one. We race
+0:             // against other allocators to CAS in a Region, and if we fail we stash the region for re-use
+0:             region = RACE_ALLOCATED.poll();
+0:             if (region == null)
+0:                 region = new Region(unsafe.allocateMemory(REGION_SIZE), REGION_SIZE);
+0:             if (currentRegion.compareAndSet(null, region))
+1:             {
+0:                 regions.add(region);
+0:                 regionCount.incrementAndGet();
+0:                 logger.trace("{} regions now allocated in {}", regionCount, this);
+0:                 return region;
+1:             }
+1: 
+0:             // someone else won race - that's fine, we'll try to grab theirs
+0:             // in the next iteration of the loop.
+0:             RACE_ALLOCATED.add(region);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * A region of memory out of which allocations are sliced.
+1:      *
+1:      * This serves two purposes:
+1:      *  - to provide a step between initialization and allocation, so that racing to CAS a
+1:      *    new region in is harmless
+1:      *  - encapsulates the allocation offset
+1:      */
+1:     private static class Region
+1:     {
+1:         /**
+1:          * Actual underlying data
+1:          */
+1:         private final long peer;
+1: 
+0:         private final long capacity;
+1: 
+1:         /**
+1:          * Offset for the next allocation, or the sentinel value -1
+1:          * which implies that the region is still uninitialized.
+1:          */
+0:         private AtomicInteger nextFreeOffset = new AtomicInteger(0);
+1: 
+1:         /**
+1:          * Total number of allocations satisfied from this buffer
+1:          */
+0:         private AtomicInteger allocCount = new AtomicInteger();
+1: 
+1:         /**
+1:          * Create an uninitialized region. Note that memory is not allocated yet, so
+1:          * this is cheap.
+1:          *
+1:          * @param peer peer
+1:          */
+0:         private Region(long peer, long capacity)
+1:         {
+1:             this.peer = peer;
+1:             this.capacity = capacity;
+1:         }
+1: 
+1:         /**
+1:          * Try to allocate <code>size</code> bytes from the region.
+1:          *
+1:          * @return the successful allocation, or null to indicate not-enough-space
+1:          */
+1:         long allocate(int size)
+1:         {
+1:             while (true)
+1:             {
+1:                 int oldOffset = nextFreeOffset.get();
+1: 
+1:                 if (oldOffset + size > capacity) // capacity == remaining
+1:                     return -1;
+1: 
+1:                 // Try to atomically claim this region
+1:                 if (nextFreeOffset.compareAndSet(oldOffset, oldOffset + size))
+1:                 {
+1:                     // we got the alloc
+1:                     allocCount.incrementAndGet();
+1:                     return peer + oldOffset;
+1:                 }
+1:                 // we raced and lost alloc, try again
+1:             }
+1:         }
+1: 
+1:         @Override
+1:         public String toString()
+1:         {
+1:             return "Region@" + System.identityHashCode(this) +
+1:                     " allocs=" + allocCount.get() + "waste=" +
+1:                     (capacity - nextFreeOffset.get());
+1:         }
+1:     }
+1: 
+1: 
+0:     static final Unsafe unsafe;
+1: 
+0:     static
+1:     {
+0:         try
+1:         {
+0:             Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+0:             field.setAccessible(true);
+0:             unsafe = (sun.misc.Unsafe) field.get(null);
+1:         }
+0:         catch (Exception e)
+1:         {
+0:             throw new AssertionError(e);
+1:         }
+1:     }
+1: }
+============================================================================

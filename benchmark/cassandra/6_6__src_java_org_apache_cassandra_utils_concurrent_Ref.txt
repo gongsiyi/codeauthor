@@ -1,0 +1,1600 @@
+1:615bf37: /*
+1:615bf37:  *
+1:615bf37:  * Licensed to the Apache Software Foundation (ASF) under one
+1:615bf37:  * or more contributor license agreements.  See the NOTICE file
+1:615bf37:  * distributed with this work for additional information
+1:615bf37:  * regarding copyright ownership.  The ASF licenses this file
+1:615bf37:  * to you under the Apache License, Version 2.0 (the
+1:615bf37:  * "License"); you may not use this file except in compliance
+1:615bf37:  * with the License.  You may obtain a copy of the License at
+1:615bf37:  *
+1:615bf37:  *   http://www.apache.org/licenses/LICENSE-2.0
+1:615bf37:  *
+1:615bf37:  * Unless required by applicable law or agreed to in writing,
+1:615bf37:  * software distributed under the License is distributed on an
+1:615bf37:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+1:615bf37:  * KIND, either express or implied.  See the License for the
+1:615bf37:  * specific language governing permissions and limitations
+1:615bf37:  * under the License.
+1:615bf37:  *
+1:615bf37:  */
+1:c75ee41: package org.apache.cassandra.utils.concurrent;
+3:c75ee41: 
+1:c75ee41: import java.lang.ref.PhantomReference;
+1:15092e6: import java.lang.ref.Reference;
+1:c75ee41: import java.lang.ref.ReferenceQueue;
+1:15092e6: import java.lang.ref.WeakReference;
+1:a7f4134: import java.lang.reflect.Field;
+1:a7f4134: import java.lang.reflect.Modifier;
+1:a7f4134: import java.util.*;
+1:7c5fc40: import java.util.concurrent.*;
+1:61384c5: import java.util.concurrent.atomic.AtomicInteger;
+1:c75ee41: import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+1:c75ee41: 
+1:c75ee41: import org.slf4j.Logger;
+1:c75ee41: import org.slf4j.LoggerFactory;
+1:c75ee41: 
+1:f3668e1: import com.google.common.annotations.VisibleForTesting;
+1:f3668e1: import com.google.common.base.Preconditions;
+1:f3668e1: 
+1:61384c5: import org.apache.cassandra.concurrent.NamedThreadFactory;
+1:a7f4134: import org.apache.cassandra.db.ColumnFamilyStore;
+1:a7f4134: import org.apache.cassandra.db.Keyspace;
+1:a7f4134: import org.apache.cassandra.db.lifecycle.View;
+1:a7f4134: import org.apache.cassandra.io.sstable.format.SSTableReader;
+1:a7f4134: import org.apache.cassandra.io.util.Memory;
+1:a7f4134: import org.apache.cassandra.io.util.SafeMemory;
+1:a7f4134: import org.apache.cassandra.utils.NoSpamLogger;
+1:f3668e1: import org.apache.cassandra.utils.Pair;
+1:f3668e1: import org.cliffc.high_scale_lib.NonBlockingHashMap;
+1:a7f4134: 
+1:a7f4134: import static java.util.Collections.emptyList;
+1:61384c5: 
+1:8704006: import static org.apache.cassandra.utils.Throwables.maybeFail;
+1:8704006: import static org.apache.cassandra.utils.Throwables.merge;
+1:8704006: 
+1:c75ee41: /**
+1:61384c5:  * An object that needs ref counting does the two following:
+1:61384c5:  *   - defines a Tidy object that will cleanup once it's gone,
+1:61384c5:  *     (this must retain no references to the object we're tracking (only its resources and how to clean up))
+1:61384c5:  * Then, one of two options:
+1:61384c5:  * 1) Construct a Ref directly pointing to it, and always use this Ref; or
+1:61384c5:  * 2)
+1:61384c5:  *   - implements RefCounted
+1:61384c5:  *   - encapsulates a Ref, we'll call selfRef, to which it proxies all calls to RefCounted behaviours
+1:61384c5:  *   - users must ensure no references to the selfRef leak, or are retained outside of a method scope.
+1:61384c5:  *     (to ensure the selfRef is collected with the object, so that leaks may be detected and corrected)
+2:61384c5:  *
+1:61384c5:  * This class' functionality is achieved by what may look at first glance like a complex web of references,
+1:61384c5:  * but boils down to:
+1:61384c5:  *
+1:79c5bc3:  * {@code
+1:61384c5:  * Target --> selfRef --> [Ref.State] <--> Ref.GlobalState --> Tidy
+1:61384c5:  *                                             ^
+1:61384c5:  *                                             |
+1:61384c5:  * Ref ----------------------------------------
+1:61384c5:  *                                             |
+1:61384c5:  * Global -------------------------------------
+1:79c5bc3:  * }
+1:61384c5:  * So that, if Target is collected, Impl is collected and, hence, so is selfRef.
+1:61384c5:  *
+1:61384c5:  * Once ref or selfRef are collected, the paired Ref.State's release method is called, which if it had
+1:61384c5:  * not already been called will update Ref.GlobalState and log an error.
+1:61384c5:  *
+1:61384c5:  * Once the Ref.GlobalState has been completely released, the Tidy method is called and it removes the global reference
+1:61384c5:  * to itself so it may also be collected.
+1:c75ee41:  */
+1:7aafe05: public final class Ref<T> implements RefCounted<T>
+4:c75ee41: {
+1:c75ee41:     static final Logger logger = LoggerFactory.getLogger(Ref.class);
+1:f3c0e11:     public static final boolean DEBUG_ENABLED = System.getProperty("cassandra.debugrefcount", "false").equalsIgnoreCase("true");
+1:c75ee41: 
+1:c75ee41:     final State state;
+1:61384c5:     final T referent;
+1:c75ee41: 
+1:61384c5:     public Ref(T referent, Tidy tidy)
+1:c75ee41:     {
+1:61384c5:         this.state = new State(new GlobalState(tidy), this, referenceQueue);
+1:61384c5:         this.referent = referent;
+1:61384c5:     }
+1:61384c5: 
+1:61384c5:     Ref(T referent, GlobalState state)
+1:61384c5:     {
+1:61384c5:         this.state = new State(state, this, referenceQueue);
+1:61384c5:         this.referent = referent;
+1:61384c5:     }
+1:c75ee41: 
+1:c75ee41:     /**
+1:c75ee41:      * Must be called exactly once, when the logical operation for which this Ref was created has terminated.
+1:c75ee41:      * Failure to abide by this contract will result in an error (eventually) being reported, assuming a
+1:c75ee41:      * hard reference to the resource it managed is not leaked.
+1:c75ee41:      */
+1:c75ee41:     public void release()
+1:61384c5:     {
+1:c75ee41:         state.release(false);
+1:61384c5:     }
+1:c75ee41: 
+1:8704006:     public Throwable ensureReleased(Throwable accumulate)
+1:8704006:     {
+1:8704006:         return state.ensureReleased(accumulate);
+1:8704006:     }
+1:8704006: 
+1:61384c5:     public void ensureReleased()
+1:61384c5:     {
+1:8704006:         maybeFail(state.ensureReleased(null));
+1:61384c5:     }
+1:61384c5: 
+1:61384c5:     public void close()
+1:61384c5:     {
+1:8704006:         ensureReleased();
+1:61384c5:     }
+1:61384c5: 
+1:61384c5:     public T get()
+1:61384c5:     {
+1:61384c5:         state.assertNotReleased();
+1:61384c5:         return referent;
+1:61384c5:     }
+1:61384c5: 
+1:61384c5:     public Ref<T> tryRef()
+1:61384c5:     {
+1:61384c5:         return state.globalState.ref() ? new Ref<>(referent, state.globalState) : null;
+1:61384c5:     }
+1:61384c5: 
+1:61384c5:     public Ref<T> ref()
+1:61384c5:     {
+1:61384c5:         Ref<T> ref = tryRef();
+1:61384c5:         // TODO: print the last release as well as the release here
+1:61384c5:         if (ref == null)
+1:61384c5:             state.assertNotReleased();
+1:61384c5:         return ref;
+1:61384c5:     }
+1:61384c5: 
+1:746c458:     public String printDebugInfo()
+1:746c458:     {
+1:746c458:         if (DEBUG_ENABLED)
+1:746c458:         {
+1:746c458:             state.debug.log(state.toString());
+1:746c458:             return "Memory was freed by " + state.debug.deallocateThread;
+1:746c458:         }
+1:746c458:         return "Memory was freed";
+1:746c458:     }
+1:746c458: 
+1:c75ee41:     /**
+1:c75ee41:      * A convenience method for reporting:
+1:c75ee41:      * @return the number of currently extant references globally, including the shared reference
+1:c75ee41:      */
+1:c75ee41:     public int globalCount()
+1:61384c5:     {
+1:c75ee41:         return state.globalState.count();
+4:c75ee41:     }
+1:c75ee41: 
+1:61384c5:     // similar to Ref.GlobalState, but tracks only the management of each unique ref created to the managed object
+1:c75ee41:     // ensures it is only released once, and that it is always released
+1:c75ee41:     static final class State extends PhantomReference<Ref>
+1:61384c5:     {
+1:c75ee41:         final Debug debug = DEBUG_ENABLED ? new Debug() : null;
+1:61384c5:         final GlobalState globalState;
+1:c75ee41:         private volatile int released;
+1:c75ee41: 
+1:c75ee41:         private static final AtomicIntegerFieldUpdater<State> releasedUpdater = AtomicIntegerFieldUpdater.newUpdater(State.class, "released");
+1:c75ee41: 
+1:61384c5:         public State(final GlobalState globalState, Ref reference, ReferenceQueue<? super Ref> q)
+1:c75ee41:         {
+1:c75ee41:             super(reference, q);
+1:c75ee41:             this.globalState = globalState;
+1:c75ee41:             globalState.register(this);
+1:c75ee41:         }
+1:c75ee41: 
+1:61384c5:         void assertNotReleased()
+1:61384c5:         {
+1:61384c5:             if (DEBUG_ENABLED && released == 1)
+1:61384c5:                 debug.log(toString());
+1:61384c5:             assert released == 0;
+1:61384c5:         }
+1:61384c5: 
+1:8704006:         Throwable ensureReleased(Throwable accumulate)
+1:61384c5:         {
+1:61384c5:             if (releasedUpdater.getAndSet(this, 1) == 0)
+1:766d8c0:             {
+1:8704006:                 accumulate = globalState.release(this, accumulate);
+1:766d8c0:                 if (DEBUG_ENABLED)
+1:766d8c0:                     debug.deallocate();
+1:766d8c0:             }
+1:8704006:             return accumulate;
+1:61384c5:         }
+1:61384c5: 
+1:c75ee41:         void release(boolean leak)
+1:c75ee41:         {
+1:c75ee41:             if (!releasedUpdater.compareAndSet(this, 0, 1))
+1:c75ee41:             {
+1:c75ee41:                 if (!leak)
+1:c75ee41:                 {
+1:c75ee41:                     String id = this.toString();
+1:61384c5:                     logger.error("BAD RELEASE: attempted to release a reference ({}) that has already been released", id);
+1:c75ee41:                     if (DEBUG_ENABLED)
+1:c75ee41:                         debug.log(id);
+1:c75ee41:                     throw new IllegalStateException("Attempted to release a reference that has already been released");
+1:c75ee41:                 }
+1:c75ee41:                 return;
+1:c75ee41:             }
+1:8704006:             Throwable fail = globalState.release(this, null);
+1:c75ee41:             if (leak)
+1:c75ee41:             {
+1:c75ee41:                 String id = this.toString();
+1:61384c5:                 logger.error("LEAK DETECTED: a reference ({}) to {} was not released before the reference was garbage collected", id, globalState);
+1:c75ee41:                 if (DEBUG_ENABLED)
+1:c75ee41:                     debug.log(id);
+1:c75ee41:             }
+1:c75ee41:             else if (DEBUG_ENABLED)
+1:c75ee41:             {
+1:c75ee41:                 debug.deallocate();
+1:c75ee41:             }
+1:8704006:             if (fail != null)
+1:8704006:                 logger.error("Error when closing {}", globalState, fail);
+1:c75ee41:         }
+1:c75ee41:     }
+1:c75ee41: 
+1:c75ee41:     static final class Debug
+1:c75ee41:     {
+1:c75ee41:         String allocateThread, deallocateThread;
+1:c75ee41:         StackTraceElement[] allocateTrace, deallocateTrace;
+1:c75ee41:         Debug()
+1:c75ee41:         {
+1:c75ee41:             Thread thread = Thread.currentThread();
+1:c75ee41:             allocateThread = thread.toString();
+1:c75ee41:             allocateTrace = thread.getStackTrace();
+1:c75ee41:         }
+1:c75ee41:         synchronized void deallocate()
+1:c75ee41:         {
+1:c75ee41:             Thread thread = Thread.currentThread();
+1:c75ee41:             deallocateThread = thread.toString();
+1:c75ee41:             deallocateTrace = thread.getStackTrace();
+1:c75ee41:         }
+1:c75ee41:         synchronized void log(String id)
+1:c75ee41:         {
+1:c75ee41:             logger.error("Allocate trace {}:\n{}", id, print(allocateThread, allocateTrace));
+1:c75ee41:             if (deallocateThread != null)
+1:c75ee41:                 logger.error("Deallocate trace {}:\n{}", id, print(deallocateThread, deallocateTrace));
+1:c75ee41:         }
+1:c75ee41:         String print(String thread, StackTraceElement[] trace)
+1:c75ee41:         {
+1:c75ee41:             StringBuilder sb = new StringBuilder();
+1:e4b158f:             sb.append(thread);
+1:c75ee41:             sb.append("\n");
+1:c75ee41:             for (StackTraceElement element : trace)
+1:c75ee41:             {
+1:c75ee41:                 sb.append("\tat ");
+1:c75ee41:                 sb.append(element );
+1:c75ee41:                 sb.append("\n");
+1:c75ee41:             }
+1:c75ee41:             return sb.toString();
+1:c75ee41:         }
+1:c75ee41:     }
+1:c75ee41: 
+1:61384c5:     // the object that manages the actual cleaning up; this does not reference the target object
+1:61384c5:     // so that we can detect when references are lost to the resource itself, and still cleanup afterwards
+1:a7f4134:     // the Tidy object MUST NOT contain any references to the object we are managing
+1:61384c5:     static final class GlobalState
+1:61384c5:     {
+1:61384c5:         // we need to retain a reference to each of the PhantomReference instances
+1:61384c5:         // we are using to track individual refs
+1:7c5fc40:         private final Collection<State> locallyExtant = new ConcurrentLinkedDeque<>();
+1:61384c5:         // the number of live refs
+1:61384c5:         private final AtomicInteger counts = new AtomicInteger();
+1:61384c5:         // the object to call to cleanup when our refs are all finished with
+1:61384c5:         private final Tidy tidy;
+1:61384c5: 
+1:61384c5:         GlobalState(Tidy tidy)
+1:61384c5:         {
+1:61384c5:             this.tidy = tidy;
+1:61384c5:             globallyExtant.add(this);
+1:61384c5:         }
+1:61384c5: 
+1:61384c5:         void register(Ref.State ref)
+1:61384c5:         {
+1:61384c5:             locallyExtant.add(ref);
+1:61384c5:         }
+1:61384c5: 
+1:61384c5:         // increment ref count if not already tidied, and return success/failure
+1:61384c5:         boolean ref()
+1:61384c5:         {
+2:61384c5:             while (true)
+1:61384c5:             {
+1:61384c5:                 int cur = counts.get();
+1:61384c5:                 if (cur < 0)
+1:61384c5:                     return false;
+1:61384c5:                 if (counts.compareAndSet(cur, cur + 1))
+1:61384c5:                     return true;
+1:61384c5:             }
+1:61384c5:         }
+1:61384c5: 
+1:61384c5:         // release a single reference, and cleanup if no more are extant
+1:8704006:         Throwable release(Ref.State ref, Throwable accumulate)
+1:61384c5:         {
+1:61384c5:             locallyExtant.remove(ref);
+1:61384c5:             if (-1 == counts.decrementAndGet())
+1:61384c5:             {
+1:61384c5:                 globallyExtant.remove(this);
+2:61384c5:                 try
+1:61384c5:                 {
+1:17dd4cc:                     if (tidy != null)
+1:61384c5:                         tidy.tidy();
+1:61384c5:                 }
+1:61384c5:                 catch (Throwable t)
+1:61384c5:                 {
+1:8704006:                     accumulate = merge(accumulate, t);
+1:61384c5:                 }
+1:61384c5:             }
+1:8704006:             return accumulate;
+1:61384c5:         }
+1:61384c5: 
+1:61384c5:         int count()
+1:61384c5:         {
+1:61384c5:             return 1 + counts.get();
+1:61384c5:         }
+1:61384c5: 
+1:61384c5:         public String toString()
+1:61384c5:         {
+1:17dd4cc:             if (tidy != null)
+1:61384c5:                 return tidy.getClass() + "@" + System.identityHashCode(tidy) + ":" + tidy.name();
+1:17dd4cc:             return "@" + System.identityHashCode(this);
+1:61384c5:         }
+1:61384c5:     }
+1:61384c5: 
+1:68d2526:     private static final Class<?>[] concurrentIterableClasses = new Class<?>[]
+1:68d2526:     {
+1:f3668e1:         ConcurrentLinkedQueue.class,
+1:f3668e1:         ConcurrentLinkedDeque.class,
+1:f3668e1:         ConcurrentSkipListSet.class,
+1:f3668e1:         CopyOnWriteArrayList.class,
+1:f3668e1:         CopyOnWriteArraySet.class,
+1:f3668e1:         DelayQueue.class,
+1:f3668e1:         NonBlockingHashMap.class,
+1:f3668e1:     };
+1:f3668e1:     static final Set<Class<?>> concurrentIterables = Collections.newSetFromMap(new IdentityHashMap<>());
+1:a7f4134:     private static final Set<GlobalState> globallyExtant = Collections.newSetFromMap(new ConcurrentHashMap<>());
+1:61384c5:     static final ReferenceQueue<Object> referenceQueue = new ReferenceQueue<>();
+1:61384c5:     private static final ExecutorService EXEC = Executors.newFixedThreadPool(1, new NamedThreadFactory("Reference-Reaper"));
+1:f3668e1:     static final ScheduledExecutorService STRONG_LEAK_DETECTOR = !DEBUG_ENABLED ? null : Executors.newScheduledThreadPool(1, new NamedThreadFactory("Strong-Reference-Leak-Detector"));
+1:61384c5:     static
+1:61384c5:     {
+1:a7f4134:         EXEC.execute(new ReferenceReaper());
+1:a7f4134:         if (DEBUG_ENABLED)
+1:61384c5:         {
+1:a7f4134:             STRONG_LEAK_DETECTOR.scheduleAtFixedRate(new Visitor(), 1, 15, TimeUnit.MINUTES);
+1:a7f4134:             STRONG_LEAK_DETECTOR.scheduleAtFixedRate(new StrongLeakDetector(), 2, 15, TimeUnit.MINUTES);
+1:a7f4134:         }
+1:f3668e1:         concurrentIterables.addAll(Arrays.asList(concurrentIterableClasses));
+1:a7f4134:     }
+1:a7f4134: 
+1:a7f4134:     static final class ReferenceReaper implements Runnable
+1:a7f4134:     {
+1:a7f4134:         public void run()
+1:a7f4134:         {
+1:a7f4134:             try
+1:61384c5:             {
+1:a7f4134:                 while (true)
+1:61384c5:                 {
+1:a7f4134:                     Object obj = referenceQueue.remove();
+1:a7f4134:                     if (obj instanceof Ref.State)
+1:61384c5:                     {
+1:a7f4134:                         ((Ref.State) obj).release(true);
+1:a7f4134:                     }
+1:61384c5:                 }
+1:61384c5:             }
+1:a7f4134:             catch (InterruptedException e)
+1:a7f4134:             {
+1:a7f4134:             }
+1:a7f4134:             finally
+1:a7f4134:             {
+1:a7f4134:                 EXEC.execute(this);
+1:a7f4134:             }
+1:a7f4134:         }
+1:a7f4134:     }
+1:a7f4134: 
+1:f3668e1:     static final Deque<InProgressVisit> inProgressVisitPool = new ArrayDeque<InProgressVisit>();
+1:f3668e1: 
+1:f3668e1:     @SuppressWarnings({ "rawtypes", "unchecked" })
+1:f3668e1:     static InProgressVisit newInProgressVisit(Object o, List<Field> fields, Field field, String name)
+1:f3668e1:     {
+1:f3668e1:         Preconditions.checkNotNull(o);
+1:f3668e1:         InProgressVisit ipv = inProgressVisitPool.pollLast();
+1:f3668e1:         if (ipv == null)
+1:f3668e1:             ipv = new InProgressVisit();
+1:f3668e1: 
+1:f3668e1:         ipv.o = o;
+1:f3668e1:         if (o instanceof Object[])
+1:f3668e1:             ipv.collectionIterator = Arrays.asList((Object[])o).iterator();
+1:f3668e1:         else if (o instanceof ConcurrentMap)
+1:f3668e1:         {
+1:f3668e1:             ipv.isMapIterator = true;
+1:f3668e1:             ipv.collectionIterator = ((Map)o).entrySet().iterator();
+1:f3668e1:         }
+1:f3668e1:         else if (concurrentIterables.contains(o.getClass()) | o instanceof BlockingQueue)
+1:f3668e1:             ipv.collectionIterator = ((Iterable)o).iterator();
+1:f3668e1: 
+1:f3668e1:         ipv.fields = fields;
+1:f3668e1:         ipv.field = field;
+1:f3668e1:         ipv.name = name;
+1:f3668e1:         return ipv;
+1:f3668e1:     }
+1:f3668e1: 
+1:f3668e1:     static void returnInProgressVisit(InProgressVisit ipv)
+1:f3668e1:     {
+1:f3668e1:         if (inProgressVisitPool.size() > 1024)
+1:f3668e1:             return;
+1:f3668e1:         ipv.name = null;
+1:f3668e1:         ipv.fields = null;
+1:f3668e1:         ipv.o = null;
+1:f3668e1:         ipv.fieldIndex = 0;
+1:f3668e1:         ipv.field = null;
+1:f3668e1:         ipv.collectionIterator = null;
+1:f3668e1:         ipv.mapEntryValue = null;
+1:f3668e1:         ipv.isMapIterator = false;
+1:f3668e1:         inProgressVisitPool.offer(ipv);
+1:f3668e1:     }
+1:f3668e1: 
+1:f3668e1:     /*
+1:f3668e1:      * Stack state for walking an object graph.
+1:f3668e1:      * Field index is the index of the current field being fetched.
+1:f3668e1:      */
+1:f3668e1:     @SuppressWarnings({ "rawtypes"})
+1:f3668e1:     static class InProgressVisit
+1:f3668e1:     {
+1:f3668e1:         String name;
+1:f3668e1:         List<Field> fields;
+1:f3668e1:         Object o;
+1:f3668e1:         int fieldIndex = 0;
+1:f3668e1:         Field field;
+1:f3668e1: 
+1:f3668e1:         //Need to know if Map.Entry should be returned or traversed as an object
+1:f3668e1:         boolean isMapIterator;
+1:f3668e1:         //If o is a ConcurrentMap, BlockingQueue, or Object[], this is populated with an iterator over the contents
+1:f3668e1:         Iterator<Object> collectionIterator;
+1:f3668e1:         //If o is a ConcurrentMap the entry set contains keys and values. The key is returned as the first child
+1:f3668e1:         //And the associated value is stashed here and returned next
+1:f3668e1:         Object mapEntryValue;
+1:f3668e1: 
+1:f3668e1:         private Field nextField()
+1:f3668e1:         {
+1:f3668e1:             if (fields.isEmpty())
+1:f3668e1:                 return null;
+1:f3668e1: 
+1:f3668e1:             if (fieldIndex >= fields.size())
+1:f3668e1:                 return null;
+1:f3668e1: 
+1:f3668e1:             Field retval = fields.get(fieldIndex);
+1:f3668e1:             fieldIndex++;
+1:f3668e1:             return retval;
+1:f3668e1:         }
+1:f3668e1: 
+1:f3668e1:         Pair<Object, Field> nextChild() throws IllegalAccessException
+1:f3668e1:         {
+1:f3668e1:             //If the last child returned was a key from a map, the value from that entry is stashed
+1:f3668e1:             //so it can be returned next
+1:f3668e1:             if (mapEntryValue != null)
+1:f3668e1:             {
+1:f3668e1:                 Pair<Object, Field> retval = Pair.create(mapEntryValue, field);
+1:f3668e1:                 mapEntryValue = null;
+1:f3668e1:                 return retval;
+1:f3668e1:             }
+1:f3668e1: 
+1:f3668e1:             //If o is a ConcurrentMap, BlockingQueue, or Object[], then an iterator will be stored to return the elements
+1:f3668e1:             if (collectionIterator != null)
+1:f3668e1:             {
+1:f3668e1:                 if (!collectionIterator.hasNext())
+1:f3668e1:                     return null;
+1:f3668e1:                 Object nextItem = null;
+1:f3668e1:                 //Find the next non-null element to traverse since returning null will cause the visitor to stop
+1:f3668e1:                 while (collectionIterator.hasNext() && (nextItem = collectionIterator.next()) == null){}
+1:f3668e1:                 if (nextItem != null)
+1:f3668e1:                 {
+1:15092e6:                     if (isMapIterator & nextItem instanceof Map.Entry)
+1:f3668e1:                     {
+1:f3668e1:                         Map.Entry entry = (Map.Entry)nextItem;
+1:f3668e1:                         mapEntryValue = entry.getValue();
+1:f3668e1:                         return Pair.create(entry.getKey(), field);
+1:f3668e1:                     }
+1:f3668e1:                     return Pair.create(nextItem, field);
+1:f3668e1:                 }
+1:f3668e1:                 else
+1:f3668e1:                 {
+1:f3668e1:                     return null;
+1:f3668e1:                 }
+1:f3668e1:             }
+1:f3668e1: 
+1:f3668e1:             //Basic traversal of an object by its member fields
+1:f3668e1:             //Don't return null values as that indicates no more objects
+1:f3668e1:             while (true)
+1:f3668e1:             {
+1:f3668e1:                 Field nextField = nextField();
+1:f3668e1:                 if (nextField == null)
+1:f3668e1:                     return null;
+1:15092e6: 
+1:15092e6:                 //A weak reference isn't strongly reachable
+1:15092e6:                 //subclasses of WeakReference contain strong references in their fields, so those need to be traversed
+1:15092e6:                 //The weak reference fields are in the common Reference class base so filter those out
+1:15092e6:                 if (o instanceof WeakReference & nextField.getDeclaringClass() == Reference.class)
+1:15092e6:                     continue;
+1:15092e6: 
+1:f3668e1:                 Object nextObject = nextField.get(o);
+1:f3668e1:                 if (nextObject != null)
+1:f3668e1:                     return Pair.create(nextField.get(o), nextField);
+1:f3668e1:             }
+1:f3668e1:         }
+1:f3668e1: 
+1:f3668e1:         @Override
+1:f3668e1:         public String toString()
+1:f3668e1:         {
+1:f3668e1:             return field == null ? name : field.toString() + "-" + o.getClass().getName();
+1:f3668e1:         }
+1:f3668e1:     }
+1:f3668e1: 
+1:a7f4134:     static class Visitor implements Runnable
+1:a7f4134:     {
+1:f3668e1:         final Deque<InProgressVisit> path = new ArrayDeque<>();
+1:a7f4134:         final Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+1:f3668e1:         @VisibleForTesting
+1:f3668e1:         int lastVisitedCount;
+1:f3668e1:         @VisibleForTesting
+1:f3668e1:         long iterations = 0;
+1:a7f4134:         GlobalState visiting;
+1:15092e6:         Set<GlobalState> haveLoops;
+1:a7f4134: 
+1:a7f4134:         public void run()
+1:a7f4134:         {
+1:a7f4134:             try
+1:a7f4134:             {
+1:a7f4134:                 for (GlobalState globalState : globallyExtant)
+1:a7f4134:                 {
+1:a7f4134:                     if (globalState.tidy == null)
+1:a7f4134:                         continue;
+1:a7f4134: 
+1:a7f4134:                     // do a graph exploration of the GlobalState, since it should be shallow; if it references itself, we have a problem
+1:a7f4134:                     path.clear();
+1:a7f4134:                     visited.clear();
+1:f3668e1:                     lastVisitedCount = 0;
+1:f3668e1:                     iterations = 0;
+1:a7f4134:                     visited.add(globalState);
+1:a7f4134:                     visiting = globalState;
+1:f3668e1:                     traverse(globalState.tidy);
+1:a7f4134:                 }
+1:61384c5:             }
+1:a7f4134:             catch (Throwable t)
+1:a7f4134:             {
+1:a7f4134:                 t.printStackTrace();
+1:a7f4134:             }
+1:a7f4134:             finally
+1:a7f4134:             {
+1:f3668e1:                 lastVisitedCount = visited.size();
+1:a7f4134:                 path.clear();
+1:a7f4134:                 visited.clear();
+1:a7f4134:             }
+1:a7f4134:         }
+1:a7f4134: 
+1:f3668e1:         /*
+1:f3668e1:          * Searches for an indirect strong reference between rootObject and visiting.
+1:f3668e1:          */
+1:f3668e1:         void traverse(final RefCounted.Tidy rootObject)
+1:a7f4134:         {
+1:f3668e1:             path.offer(newInProgressVisit(rootObject, getFields(rootObject.getClass()), null, rootObject.name()));
+1:f3668e1: 
+1:f3668e1:             InProgressVisit inProgress = null;
+1:f3668e1:             while (inProgress != null || !path.isEmpty())
+1:a7f4134:             {
+1:f3668e1:                 //If necessary fetch the next object to start tracing
+1:f3668e1:                 if (inProgress == null)
+1:f3668e1:                     inProgress = path.pollLast();
+1:f3668e1: 
+1:a7f4134:                 try
+1:a7f4134:                 {
+1:f3668e1:                     Pair<Object, Field> p = inProgress.nextChild();
+1:f3668e1:                     Object child = null;
+1:f3668e1:                     Field field = null;
+1:f3668e1: 
+1:f3668e1:                     if (p != null)
+1:f3668e1:                     {
+1:f3668e1:                         iterations++;
+1:f3668e1:                         child = p.left;
+1:f3668e1:                         field = p.right;
+1:f3668e1:                     }
+1:f3668e1: 
+1:a7f4134:                     if (child != null && visited.add(child))
+1:a7f4134:                     {
+1:f3668e1:                         path.offer(inProgress);
+1:f3668e1:                         inProgress = newInProgressVisit(child, getFields(child.getClass()), field, null);
+1:f3668e1:                         continue;
+1:a7f4134:                     }
+1:a7f4134:                     else if (visiting == child)
+1:a7f4134:                     {
+1:15092e6:                         if (haveLoops != null)
+1:15092e6:                             haveLoops.add(visiting);
+1:f3668e1:                         NoSpamLogger.log(logger,
+1:f3668e1:                                 NoSpamLogger.Level.ERROR,
+1:f3668e1:                                 rootObject.getClass().getName(),
+1:f3668e1:                                 1,
+1:f3668e1:                                 TimeUnit.SECONDS,
+1:f3668e1:                                 "Strong self-ref loop detected {}",
+1:f3668e1:                                 path);
+1:f3668e1:                     }
+1:f3668e1:                     else if (child == null)
+1:f3668e1:                     {
+1:f3668e1:                         returnInProgressVisit(inProgress);
+1:f3668e1:                         inProgress = null;
+1:f3668e1:                         continue;
+1:a7f4134:                     }
+1:a7f4134:                 }
+1:a7f4134:                 catch (IllegalAccessException e)
+1:a7f4134:                 {
+1:a7f4134:                     NoSpamLogger.log(logger, NoSpamLogger.Level.ERROR, 5, TimeUnit.MINUTES, "Could not fully check for self-referential leaks", e);
+1:a7f4134:                 }
+1:a7f4134:             }
+1:a7f4134:         }
+1:a7f4134:     }
+1:a7f4134: 
+1:a7f4134:     static final Map<Class<?>, List<Field>> fieldMap = new HashMap<>();
+1:a7f4134:     static List<Field> getFields(Class<?> clazz)
+1:a7f4134:     {
+1:a7f4134:         if (clazz == null || clazz == PhantomReference.class || clazz == Class.class || java.lang.reflect.Member.class.isAssignableFrom(clazz))
+1:a7f4134:             return emptyList();
+1:a7f4134:         List<Field> fields = fieldMap.get(clazz);
+1:a7f4134:         if (fields != null)
+1:a7f4134:             return fields;
+1:a7f4134:         fieldMap.put(clazz, fields = new ArrayList<>());
+1:a7f4134:         for (Field field : clazz.getDeclaredFields())
+1:a7f4134:         {
+1:a7f4134:             if (field.getType().isPrimitive() || Modifier.isStatic(field.getModifiers()))
+1:a7f4134:                 continue;
+1:a7f4134:             field.setAccessible(true);
+1:a7f4134:             fields.add(field);
+1:a7f4134:         }
+1:a7f4134:         fields.addAll(getFields(clazz.getSuperclass()));
+1:a7f4134:         return fields;
+1:a7f4134:     }
+1:a7f4134: 
+1:a7f4134:     public static class IdentityCollection
+1:a7f4134:     {
+1:a7f4134:         final Set<Tidy> candidates;
+1:a7f4134:         public IdentityCollection(Set<Tidy> candidates)
+1:a7f4134:         {
+1:a7f4134:             this.candidates = candidates;
+1:a7f4134:         }
+1:a7f4134: 
+1:a7f4134:         public void add(Ref<?> ref)
+1:a7f4134:         {
+1:a7f4134:             candidates.remove(ref.state.globalState.tidy);
+1:a7f4134:         }
+1:a7f4134:         public void add(SelfRefCounted<?> ref)
+1:a7f4134:         {
+1:a7f4134:             add(ref.selfRef());
+1:a7f4134:         }
+1:a7f4134:         public void add(SharedCloseable ref)
+1:a7f4134:         {
+1:a7f4134:             if (ref instanceof SharedCloseableImpl)
+1:a7f4134:                 add((SharedCloseableImpl)ref);
+1:a7f4134:         }
+1:a7f4134:         public void add(SharedCloseableImpl ref)
+1:a7f4134:         {
+1:a7f4134:             add(ref.ref);
+1:a7f4134:         }
+1:a7f4134:         public void add(Memory memory)
+1:a7f4134:         {
+1:a7f4134:             if (memory instanceof SafeMemory)
+1:a7f4134:                 ((SafeMemory) memory).addTo(this);
+1:a7f4134:         }
+1:a7f4134:     }
+1:a7f4134: 
+1:a7f4134:     private static class StrongLeakDetector implements Runnable
+1:a7f4134:     {
+1:a7f4134:         Set<Tidy> candidates = new HashSet<>();
+1:a7f4134: 
+1:a7f4134:         public void run()
+1:a7f4134:         {
+1:a7f4134:             final Set<Tidy> candidates = Collections.newSetFromMap(new IdentityHashMap<>());
+1:a7f4134:             for (GlobalState state : globallyExtant)
+1:a7f4134:                 candidates.add(state.tidy);
+1:a7f4134:             removeExpected(candidates);
+1:a7f4134:             this.candidates.retainAll(candidates);
+1:a7f4134:             if (!this.candidates.isEmpty())
+1:a7f4134:             {
+1:a7f4134:                 List<String> names = new ArrayList<>();
+1:a7f4134:                 for (Tidy tidy : this.candidates)
+1:a7f4134:                     names.add(tidy.name());
+1:a7f4134:                 logger.warn("Strong reference leak candidates detected: {}", names);
+1:a7f4134:             }
+1:a7f4134:             this.candidates = candidates;
+1:a7f4134:         }
+1:a7f4134: 
+1:a7f4134:         private void removeExpected(Set<Tidy> candidates)
+1:a7f4134:         {
+1:a7f4134:             final Ref.IdentityCollection expected = new Ref.IdentityCollection(candidates);
+1:a7f4134:             for (Keyspace ks : Keyspace.all())
+1:a7f4134:             {
+1:a7f4134:                 for (ColumnFamilyStore cfs : ks.getColumnFamilyStores())
+1:a7f4134:                 {
+1:a7f4134:                     View view = cfs.getTracker().getView();
+1:3879bfd:                     for (SSTableReader reader : view.allKnownSSTables())
+1:a7f4134:                         reader.addTo(expected);
+1:a7f4134:                 }
+1:a7f4134:             }
+1:a7f4134:         }
+1:61384c5:     }
+1:61384c5: }
+============================================================================
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:68d2526
+/////////////////////////////////////////////////////////////////////////
+1:     private static final Class<?>[] concurrentIterableClasses = new Class<?>[]
+1:     {
+commit:79c5bc3
+/////////////////////////////////////////////////////////////////////////
+1:  * {@code
+1:  * }
+commit:e4b158f
+/////////////////////////////////////////////////////////////////////////
+1:             sb.append(thread);
+author:Carl Yeksigian
+-------------------------------------------------------------------------------
+commit:05bacc7
+commit:dbefa85
+commit:615bf37
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  *
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *   http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing,
+1:  * software distributed under the License is distributed on an
+1:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+1:  * KIND, either express or implied.  See the License for the
+1:  * specific language governing permissions and limitations
+1:  * under the License.
+1:  *
+1:  */
+author:Ariel Weisberg
+-------------------------------------------------------------------------------
+commit:15092e6
+/////////////////////////////////////////////////////////////////////////
+1: import java.lang.ref.Reference;
+1: import java.lang.ref.WeakReference;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:                     if (isMapIterator & nextItem instanceof Map.Entry)
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:                 //A weak reference isn't strongly reachable
+1:                 //subclasses of WeakReference contain strong references in their fields, so those need to be traversed
+1:                 //The weak reference fields are in the common Reference class base so filter those out
+1:                 if (o instanceof WeakReference & nextField.getDeclaringClass() == Reference.class)
+1:                     continue;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         Set<GlobalState> haveLoops;
+/////////////////////////////////////////////////////////////////////////
+1:                         if (haveLoops != null)
+1:                             haveLoops.add(visiting);
+commit:f3668e1
+/////////////////////////////////////////////////////////////////////////
+1: import com.google.common.annotations.VisibleForTesting;
+1: import com.google.common.base.Preconditions;
+0: import com.google.common.collect.Iterables;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.Pair;
+1: import org.cliffc.high_scale_lib.NonBlockingHashMap;
+/////////////////////////////////////////////////////////////////////////
+0:     private static final Class<?>[] concurrentIterableClasses = new Class<?>[] {
+1:         ConcurrentLinkedQueue.class,
+1:         ConcurrentLinkedDeque.class,
+1:         ConcurrentSkipListSet.class,
+1:         CopyOnWriteArrayList.class,
+1:         CopyOnWriteArraySet.class,
+1:         DelayQueue.class,
+1:         NonBlockingHashMap.class,
+1:     };
+1:     static final Set<Class<?>> concurrentIterables = Collections.newSetFromMap(new IdentityHashMap<>());
+1:     static final ScheduledExecutorService STRONG_LEAK_DETECTOR = !DEBUG_ENABLED ? null : Executors.newScheduledThreadPool(1, new NamedThreadFactory("Strong-Reference-Leak-Detector"));
+/////////////////////////////////////////////////////////////////////////
+1:         concurrentIterables.addAll(Arrays.asList(concurrentIterableClasses));
+/////////////////////////////////////////////////////////////////////////
+1:     static final Deque<InProgressVisit> inProgressVisitPool = new ArrayDeque<InProgressVisit>();
+1: 
+1:     @SuppressWarnings({ "rawtypes", "unchecked" })
+1:     static InProgressVisit newInProgressVisit(Object o, List<Field> fields, Field field, String name)
+1:     {
+1:         Preconditions.checkNotNull(o);
+1:         InProgressVisit ipv = inProgressVisitPool.pollLast();
+1:         if (ipv == null)
+1:             ipv = new InProgressVisit();
+1: 
+1:         ipv.o = o;
+1:         if (o instanceof Object[])
+1:             ipv.collectionIterator = Arrays.asList((Object[])o).iterator();
+1:         else if (o instanceof ConcurrentMap)
+1:         {
+1:             ipv.isMapIterator = true;
+1:             ipv.collectionIterator = ((Map)o).entrySet().iterator();
+1:         }
+1:         else if (concurrentIterables.contains(o.getClass()) | o instanceof BlockingQueue)
+1:             ipv.collectionIterator = ((Iterable)o).iterator();
+1: 
+1:         ipv.fields = fields;
+1:         ipv.field = field;
+1:         ipv.name = name;
+1:         return ipv;
+1:     }
+1: 
+1:     static void returnInProgressVisit(InProgressVisit ipv)
+1:     {
+1:         if (inProgressVisitPool.size() > 1024)
+1:             return;
+1:         ipv.name = null;
+1:         ipv.fields = null;
+1:         ipv.o = null;
+1:         ipv.fieldIndex = 0;
+1:         ipv.field = null;
+1:         ipv.collectionIterator = null;
+1:         ipv.mapEntryValue = null;
+1:         ipv.isMapIterator = false;
+1:         inProgressVisitPool.offer(ipv);
+1:     }
+1: 
+1:     /*
+1:      * Stack state for walking an object graph.
+1:      * Field index is the index of the current field being fetched.
+1:      */
+1:     @SuppressWarnings({ "rawtypes"})
+1:     static class InProgressVisit
+1:     {
+1:         String name;
+1:         List<Field> fields;
+1:         Object o;
+1:         int fieldIndex = 0;
+1:         Field field;
+1: 
+1:         //Need to know if Map.Entry should be returned or traversed as an object
+1:         boolean isMapIterator;
+1:         //If o is a ConcurrentMap, BlockingQueue, or Object[], this is populated with an iterator over the contents
+1:         Iterator<Object> collectionIterator;
+1:         //If o is a ConcurrentMap the entry set contains keys and values. The key is returned as the first child
+1:         //And the associated value is stashed here and returned next
+1:         Object mapEntryValue;
+1: 
+1:         private Field nextField()
+1:         {
+1:             if (fields.isEmpty())
+1:                 return null;
+1: 
+1:             if (fieldIndex >= fields.size())
+1:                 return null;
+1: 
+1:             Field retval = fields.get(fieldIndex);
+1:             fieldIndex++;
+1:             return retval;
+1:         }
+1: 
+1:         Pair<Object, Field> nextChild() throws IllegalAccessException
+1:         {
+1:             //If the last child returned was a key from a map, the value from that entry is stashed
+1:             //so it can be returned next
+1:             if (mapEntryValue != null)
+1:             {
+1:                 Pair<Object, Field> retval = Pair.create(mapEntryValue, field);
+1:                 mapEntryValue = null;
+1:                 return retval;
+1:             }
+1: 
+1:             //If o is a ConcurrentMap, BlockingQueue, or Object[], then an iterator will be stored to return the elements
+1:             if (collectionIterator != null)
+1:             {
+1:                 if (!collectionIterator.hasNext())
+1:                     return null;
+1:                 Object nextItem = null;
+1:                 //Find the next non-null element to traverse since returning null will cause the visitor to stop
+1:                 while (collectionIterator.hasNext() && (nextItem = collectionIterator.next()) == null){}
+1:                 if (nextItem != null)
+1:                 {
+0:                     if (isMapIterator && nextItem instanceof Map.Entry)
+1:                     {
+1:                         Map.Entry entry = (Map.Entry)nextItem;
+1:                         mapEntryValue = entry.getValue();
+1:                         return Pair.create(entry.getKey(), field);
+1:                     }
+1:                     return Pair.create(nextItem, field);
+1:                 }
+1:                 else
+1:                 {
+1:                     return null;
+1:                 }
+1:             }
+1: 
+1:             //Basic traversal of an object by its member fields
+1:             //Don't return null values as that indicates no more objects
+1:             while (true)
+1:             {
+1:                 Field nextField = nextField();
+1:                 if (nextField == null)
+1:                     return null;
+1:                 Object nextObject = nextField.get(o);
+1:                 if (nextObject != null)
+1:                     return Pair.create(nextField.get(o), nextField);
+1:             }
+1:         }
+1: 
+1:         @Override
+1:         public String toString()
+1:         {
+1:             return field == null ? name : field.toString() + "-" + o.getClass().getName();
+1:         }
+1:     }
+1: 
+1:         final Deque<InProgressVisit> path = new ArrayDeque<>();
+1:         @VisibleForTesting
+1:         int lastVisitedCount;
+1:         @VisibleForTesting
+1:         long iterations = 0;
+/////////////////////////////////////////////////////////////////////////
+1:                     lastVisitedCount = 0;
+1:                     iterations = 0;
+1:                     traverse(globalState.tidy);
+/////////////////////////////////////////////////////////////////////////
+1:                 lastVisitedCount = visited.size();
+1:         /*
+1:          * Searches for an indirect strong reference between rootObject and visiting.
+1:          */
+1:         void traverse(final RefCounted.Tidy rootObject)
+1:             path.offer(newInProgressVisit(rootObject, getFields(rootObject.getClass()), null, rootObject.name()));
+1: 
+1:             InProgressVisit inProgress = null;
+1:             while (inProgress != null || !path.isEmpty())
+1:                 //If necessary fetch the next object to start tracing
+1:                 if (inProgress == null)
+1:                     inProgress = path.pollLast();
+1: 
+1:                     Pair<Object, Field> p = inProgress.nextChild();
+1:                     Object child = null;
+1:                     Field field = null;
+1: 
+1:                     if (p != null)
+1:                     {
+1:                         iterations++;
+1:                         child = p.left;
+1:                         field = p.right;
+1:                     }
+1: 
+1:                         path.offer(inProgress);
+1:                         inProgress = newInProgressVisit(child, getFields(child.getClass()), field, null);
+1:                         continue;
+1:                         NoSpamLogger.log(logger,
+1:                                 NoSpamLogger.Level.ERROR,
+1:                                 rootObject.getClass().getName(),
+1:                                 1,
+1:                                 TimeUnit.SECONDS,
+1:                                 "Strong self-ref loop detected {}",
+1:                                 path);
+1:                     }
+1:                     else if (child == null)
+1:                     {
+1:                         returnInProgressVisit(inProgress);
+1:                         inProgress = null;
+1:                         continue;
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:4b4d69f
+/////////////////////////////////////////////////////////////////////////
+0:     private static final ScheduledExecutorService STRONG_LEAK_DETECTOR = !DEBUG_ENABLED ? null : Executors.newScheduledThreadPool(1, new NamedThreadFactory("Strong-Reference-Leak-Detector"));
+commit:3879bfd
+/////////////////////////////////////////////////////////////////////////
+1:                     for (SSTableReader reader : view.allKnownSSTables())
+commit:a7f4134
+/////////////////////////////////////////////////////////////////////////
+1: import java.lang.reflect.Field;
+1: import java.lang.reflect.Modifier;
+1: import java.util.*;
+0: import com.google.common.collect.Iterables;
+1: import org.apache.cassandra.db.ColumnFamilyStore;
+1: import org.apache.cassandra.db.Keyspace;
+1: import org.apache.cassandra.db.lifecycle.View;
+1: import org.apache.cassandra.io.sstable.format.SSTableReader;
+1: import org.apache.cassandra.io.util.Memory;
+1: import org.apache.cassandra.io.util.SafeMemory;
+1: import org.apache.cassandra.utils.NoSpamLogger;
+1: 
+1: import static java.util.Collections.emptyList;
+/////////////////////////////////////////////////////////////////////////
+1:     // the Tidy object MUST NOT contain any references to the object we are managing
+/////////////////////////////////////////////////////////////////////////
+1:     private static final Set<GlobalState> globallyExtant = Collections.newSetFromMap(new ConcurrentHashMap<>());
+0:     private static final ScheduledExecutorService STRONG_LEAK_DETECTOR = !DEBUG_ENABLED ? null : Executors.newScheduledThreadPool(0, new NamedThreadFactory("Strong-Reference-Leak-Detector"));
+1:         EXEC.execute(new ReferenceReaper());
+1:         if (DEBUG_ENABLED)
+1:             STRONG_LEAK_DETECTOR.scheduleAtFixedRate(new Visitor(), 1, 15, TimeUnit.MINUTES);
+1:             STRONG_LEAK_DETECTOR.scheduleAtFixedRate(new StrongLeakDetector(), 2, 15, TimeUnit.MINUTES);
+1:         }
+1:     }
+1: 
+1:     static final class ReferenceReaper implements Runnable
+1:     {
+1:         public void run()
+1:         {
+1:             try
+1:                 while (true)
+1:                     Object obj = referenceQueue.remove();
+1:                     if (obj instanceof Ref.State)
+1:                         ((Ref.State) obj).release(true);
+1:             }
+1:             catch (InterruptedException e)
+1:             {
+1:             }
+1:             finally
+1:             {
+1:                 EXEC.execute(this);
+1:             }
+1:         }
+1:     }
+1: 
+1:     static class Visitor implements Runnable
+1:     {
+0:         final Stack<Field> path = new Stack<>();
+1:         final Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+1:         GlobalState visiting;
+1: 
+1:         public void run()
+1:         {
+1:             try
+1:             {
+1:                 for (GlobalState globalState : globallyExtant)
+1:                     if (globalState.tidy == null)
+1:                         continue;
+1: 
+1:                     // do a graph exploration of the GlobalState, since it should be shallow; if it references itself, we have a problem
+1:                     path.clear();
+1:                     visited.clear();
+1:                     visited.add(globalState);
+1:                     visiting = globalState;
+0:                     visit(globalState.tidy);
+1:             catch (Throwable t)
+1:             {
+1:                 t.printStackTrace();
+1:             }
+1:             finally
+1:             {
+1:                 path.clear();
+1:                 visited.clear();
+1:             }
+1:         }
+1: 
+0:         void visit(final Object object)
+1:         {
+0:             for (Field field : getFields(object.getClass()))
+1:             {
+0:                 path.push(field);
+1:                 try
+1:                 {
+0:                     Object child = field.get(object);
+1:                     if (child != null && visited.add(child))
+1:                     {
+0:                         visit(child);
+1:                     }
+1:                     else if (visiting == child)
+1:                     {
+0:                         logger.error("Strong self-ref loop detected {}", path);
+1:                     }
+1:                 }
+1:                 catch (IllegalAccessException e)
+1:                 {
+1:                     NoSpamLogger.log(logger, NoSpamLogger.Level.ERROR, 5, TimeUnit.MINUTES, "Could not fully check for self-referential leaks", e);
+1:                 }
+0:                 catch (StackOverflowError e)
+1:                 {
+0:                     logger.error("Stackoverflow {}", path);
+1:                 }
+0:                 path.pop();
+1:             }
+1:         }
+1:     }
+1: 
+1:     static final Map<Class<?>, List<Field>> fieldMap = new HashMap<>();
+1:     static List<Field> getFields(Class<?> clazz)
+1:     {
+1:         if (clazz == null || clazz == PhantomReference.class || clazz == Class.class || java.lang.reflect.Member.class.isAssignableFrom(clazz))
+1:             return emptyList();
+1:         List<Field> fields = fieldMap.get(clazz);
+1:         if (fields != null)
+1:             return fields;
+1:         fieldMap.put(clazz, fields = new ArrayList<>());
+1:         for (Field field : clazz.getDeclaredFields())
+1:         {
+1:             if (field.getType().isPrimitive() || Modifier.isStatic(field.getModifiers()))
+1:                 continue;
+1:             field.setAccessible(true);
+1:             fields.add(field);
+1:         }
+1:         fields.addAll(getFields(clazz.getSuperclass()));
+1:         return fields;
+1:     }
+1: 
+1:     public static class IdentityCollection
+1:     {
+1:         final Set<Tidy> candidates;
+1:         public IdentityCollection(Set<Tidy> candidates)
+1:         {
+1:             this.candidates = candidates;
+1:         }
+1: 
+1:         public void add(Ref<?> ref)
+1:         {
+1:             candidates.remove(ref.state.globalState.tidy);
+1:         }
+1:         public void add(SelfRefCounted<?> ref)
+1:         {
+1:             add(ref.selfRef());
+1:         }
+1:         public void add(SharedCloseable ref)
+1:         {
+1:             if (ref instanceof SharedCloseableImpl)
+1:                 add((SharedCloseableImpl)ref);
+1:         }
+1:         public void add(SharedCloseableImpl ref)
+1:         {
+1:             add(ref.ref);
+1:         }
+1:         public void add(Memory memory)
+1:         {
+1:             if (memory instanceof SafeMemory)
+1:                 ((SafeMemory) memory).addTo(this);
+1:         }
+1:     }
+1: 
+1:     private static class StrongLeakDetector implements Runnable
+1:     {
+1:         Set<Tidy> candidates = new HashSet<>();
+1: 
+1:         public void run()
+1:         {
+1:             final Set<Tidy> candidates = Collections.newSetFromMap(new IdentityHashMap<>());
+1:             for (GlobalState state : globallyExtant)
+1:                 candidates.add(state.tidy);
+1:             removeExpected(candidates);
+1:             this.candidates.retainAll(candidates);
+1:             if (!this.candidates.isEmpty())
+1:             {
+1:                 List<String> names = new ArrayList<>();
+1:                 for (Tidy tidy : this.candidates)
+1:                     names.add(tidy.name());
+1:                 logger.warn("Strong reference leak candidates detected: {}", names);
+1:             }
+1:             this.candidates = candidates;
+1:         }
+1: 
+1:         private void removeExpected(Set<Tidy> candidates)
+1:         {
+1:             final Ref.IdentityCollection expected = new Ref.IdentityCollection(candidates);
+1:             for (Keyspace ks : Keyspace.all())
+1:             {
+1:                 for (ColumnFamilyStore cfs : ks.getColumnFamilyStores())
+1:                 {
+1:                     View view = cfs.getTracker().getView();
+0:                     for (SSTableReader reader : Iterables.concat(view.sstables, view.compacting))
+1:                         reader.addTo(expected);
+1:                 }
+1:             }
+1:         }
+commit:075ff50
+commit:6068efb
+commit:7c5fc40
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.Collection;
+1: import java.util.concurrent.*;
+/////////////////////////////////////////////////////////////////////////
+1:         private final Collection<State> locallyExtant = new ConcurrentLinkedDeque<>();
+commit:8704006
+/////////////////////////////////////////////////////////////////////////
+1: import static org.apache.cassandra.utils.Throwables.maybeFail;
+1: import static org.apache.cassandra.utils.Throwables.merge;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     public Throwable ensureReleased(Throwable accumulate)
+1:     {
+1:         return state.ensureReleased(accumulate);
+1:     }
+1: 
+1:         maybeFail(state.ensureReleased(null));
+1:         ensureReleased();
+/////////////////////////////////////////////////////////////////////////
+1:         Throwable ensureReleased(Throwable accumulate)
+1:                 accumulate = globalState.release(this, accumulate);
+1:             return accumulate;
+/////////////////////////////////////////////////////////////////////////
+1:             Throwable fail = globalState.release(this, null);
+/////////////////////////////////////////////////////////////////////////
+1:             if (fail != null)
+1:                 logger.error("Error when closing {}", globalState, fail);
+/////////////////////////////////////////////////////////////////////////
+1:         Throwable release(Ref.State ref, Throwable accumulate)
+/////////////////////////////////////////////////////////////////////////
+1:                     accumulate = merge(accumulate, t);
+1:             return accumulate;
+commit:f3c0e11
+/////////////////////////////////////////////////////////////////////////
+1:     public static final boolean DEBUG_ENABLED = System.getProperty("cassandra.debugrefcount", "false").equalsIgnoreCase("true");
+commit:766d8c0
+/////////////////////////////////////////////////////////////////////////
+1:             {
+1:                 if (DEBUG_ENABLED)
+1:                     debug.deallocate();
+1:             }
+commit:746c458
+/////////////////////////////////////////////////////////////////////////
+1:     public String printDebugInfo()
+1:     {
+1:         if (DEBUG_ENABLED)
+1:         {
+1:             state.debug.log(state.toString());
+1:             return "Memory was freed by " + state.debug.deallocateThread;
+1:         }
+1:         return "Memory was freed";
+1:     }
+1: 
+commit:61384c5
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.Collections;
+0: import java.util.Set;
+0: import java.util.concurrent.ConcurrentHashMap;
+0: import java.util.concurrent.ConcurrentLinkedQueue;
+0: import java.util.concurrent.ExecutorService;
+0: import java.util.concurrent.Executors;
+1: import java.util.concurrent.atomic.AtomicInteger;
+0: import com.google.common.base.Throwables;
+1: import org.apache.cassandra.concurrent.NamedThreadFactory;
+1: 
+1:  * An object that needs ref counting does the two following:
+1:  *   - defines a Tidy object that will cleanup once it's gone,
+1:  *     (this must retain no references to the object we're tracking (only its resources and how to clean up))
+1:  * Then, one of two options:
+1:  * 1) Construct a Ref directly pointing to it, and always use this Ref; or
+1:  * 2)
+1:  *   - implements RefCounted
+1:  *   - encapsulates a Ref, we'll call selfRef, to which it proxies all calls to RefCounted behaviours
+1:  *   - users must ensure no references to the selfRef leak, or are retained outside of a method scope.
+1:  *     (to ensure the selfRef is collected with the object, so that leaks may be detected and corrected)
+1:  *
+1:  * This class' functionality is achieved by what may look at first glance like a complex web of references,
+1:  * but boils down to:
+1:  *
+1:  * Target --> selfRef --> [Ref.State] <--> Ref.GlobalState --> Tidy
+1:  *                                             ^
+1:  *                                             |
+1:  * Ref ----------------------------------------
+1:  *                                             |
+1:  * Global -------------------------------------
+1:  *
+1:  * So that, if Target is collected, Impl is collected and, hence, so is selfRef.
+1:  *
+1:  * Once ref or selfRef are collected, the paired Ref.State's release method is called, which if it had
+1:  * not already been called will update Ref.GlobalState and log an error.
+1:  *
+1:  * Once the Ref.GlobalState has been completely released, the Tidy method is called and it removes the global reference
+1:  * to itself so it may also be collected.
+0: public final class Ref<T> implements RefCounted<T>, AutoCloseable
+1:     final T referent;
+1:     public Ref(T referent, Tidy tidy)
+1:         this.state = new State(new GlobalState(tidy), this, referenceQueue);
+1:         this.referent = referent;
+1:     }
+1: 
+1:     Ref(T referent, GlobalState state)
+1:     {
+1:         this.state = new State(state, this, referenceQueue);
+1:         this.referent = referent;
+/////////////////////////////////////////////////////////////////////////
+1:     public void ensureReleased()
+1:     {
+0:         state.ensureReleased();
+1:     }
+1: 
+1:     public void close()
+1:     {
+0:         state.ensureReleased();
+1:     }
+1: 
+1:     public T get()
+1:     {
+1:         state.assertNotReleased();
+1:         return referent;
+1:     }
+1: 
+1:     public Ref<T> tryRef()
+1:     {
+1:         return state.globalState.ref() ? new Ref<>(referent, state.globalState) : null;
+1:     }
+1: 
+1:     public Ref<T> ref()
+1:     {
+1:         Ref<T> ref = tryRef();
+1:         // TODO: print the last release as well as the release here
+1:         if (ref == null)
+1:             state.assertNotReleased();
+1:         return ref;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     // similar to Ref.GlobalState, but tracks only the management of each unique ref created to the managed object
+1:         final GlobalState globalState;
+1:         public State(final GlobalState globalState, Ref reference, ReferenceQueue<? super Ref> q)
+1:         void assertNotReleased()
+1:         {
+1:             if (DEBUG_ENABLED && released == 1)
+1:                 debug.log(toString());
+1:             assert released == 0;
+1:         }
+1: 
+0:         void ensureReleased()
+1:         {
+1:             if (releasedUpdater.getAndSet(this, 1) == 0)
+0:                 globalState.release(this);
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                     logger.error("BAD RELEASE: attempted to release a reference ({}) that has already been released", id);
+/////////////////////////////////////////////////////////////////////////
+1:                 logger.error("LEAK DETECTED: a reference ({}) to {} was not released before the reference was garbage collected", id, globalState);
+/////////////////////////////////////////////////////////////////////////
+1:     // the object that manages the actual cleaning up; this does not reference the target object
+1:     // so that we can detect when references are lost to the resource itself, and still cleanup afterwards
+0:     // the Tidy object MUST not contain any references to the object we are managing
+1:     static final class GlobalState
+1:     {
+1:         // we need to retain a reference to each of the PhantomReference instances
+1:         // we are using to track individual refs
+0:         private final ConcurrentLinkedQueue<State> locallyExtant = new ConcurrentLinkedQueue<>();
+1:         // the number of live refs
+1:         private final AtomicInteger counts = new AtomicInteger();
+1:         // the object to call to cleanup when our refs are all finished with
+1:         private final Tidy tidy;
+1: 
+1:         GlobalState(Tidy tidy)
+1:         {
+1:             this.tidy = tidy;
+1:             globallyExtant.add(this);
+1:         }
+1: 
+1:         void register(Ref.State ref)
+1:         {
+1:             locallyExtant.add(ref);
+1:         }
+1: 
+1:         // increment ref count if not already tidied, and return success/failure
+1:         boolean ref()
+1:         {
+1:             while (true)
+1:             {
+1:                 int cur = counts.get();
+1:                 if (cur < 0)
+1:                     return false;
+1:                 if (counts.compareAndSet(cur, cur + 1))
+1:                     return true;
+1:             }
+1:         }
+1: 
+1:         // release a single reference, and cleanup if no more are extant
+0:         void release(Ref.State ref)
+1:         {
+1:             locallyExtant.remove(ref);
+1:             if (-1 == counts.decrementAndGet())
+1:             {
+1:                 globallyExtant.remove(this);
+1:                 try
+1:                 {
+1:                     tidy.tidy();
+1:                 }
+1:                 catch (Throwable t)
+1:                 {
+0:                     logger.error("Error when closing {}", this, t);
+0:                     Throwables.propagate(t);
+1:                 }
+1:             }
+1:         }
+1: 
+1:         int count()
+1:         {
+1:             return 1 + counts.get();
+1:         }
+1: 
+1:         public String toString()
+1:         {
+1:             return tidy.getClass() + "@" + System.identityHashCode(tidy) + ":" + tidy.name();
+1:         }
+1:     }
+1: 
+0:     private static final Set<GlobalState> globallyExtant = Collections.newSetFromMap(new ConcurrentHashMap<GlobalState, Boolean>());
+1:     static final ReferenceQueue<Object> referenceQueue = new ReferenceQueue<>();
+1:     private static final ExecutorService EXEC = Executors.newFixedThreadPool(1, new NamedThreadFactory("Reference-Reaper"));
+1:     static
+1:     {
+0:         EXEC.execute(new Runnable()
+1:         {
+0:             public void run()
+1:             {
+1:                 try
+1:                 {
+1:                     while (true)
+1:                     {
+0:                         Object obj = referenceQueue.remove();
+0:                         if (obj instanceof Ref.State)
+1:                         {
+0:                             ((Ref.State) obj).release(true);
+1:                         }
+1:                     }
+1:                 }
+0:                 catch (InterruptedException e)
+1:                 {
+1:                 }
+0:                 finally
+1:                 {
+0:                     EXEC.execute(this);
+1:                 }
+1:             }
+0:         });
+1:     }
+commit:c75ee41
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.cassandra.utils.concurrent;
+1: 
+1: import java.lang.ref.PhantomReference;
+1: import java.lang.ref.ReferenceQueue;
+1: import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+1: 
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: /**
+0:  * A single managed reference to a RefCounted object
+1:  */
+0: public final class Ref
+1: {
+1:     static final Logger logger = LoggerFactory.getLogger(Ref.class);
+0:     static final boolean DEBUG_ENABLED = System.getProperty("cassandra.debugrefcount", "false").equalsIgnoreCase("true");
+1: 
+1:     final State state;
+1: 
+0:     Ref(RefCountedImpl.GlobalState state, boolean isSharedRef)
+1:     {
+0:         this.state = new State(state, this, RefCountedImpl.referenceQueue, isSharedRef);
+1:     }
+1: 
+1:     /**
+1:      * Must be called exactly once, when the logical operation for which this Ref was created has terminated.
+1:      * Failure to abide by this contract will result in an error (eventually) being reported, assuming a
+1:      * hard reference to the resource it managed is not leaked.
+1:      */
+1:     public void release()
+1:     {
+1:         state.release(false);
+1:     }
+1: 
+1:     /**
+1:      * A convenience method for reporting:
+1:      * @return the number of currently extant references globally, including the shared reference
+1:      */
+1:     public int globalCount()
+1:     {
+1:         return state.globalState.count();
+1:     }
+1: 
+0:     // similar to RefCountedState, but tracks only the management of each unique ref created to the managed object
+1:     // ensures it is only released once, and that it is always released
+1:     static final class State extends PhantomReference<Ref>
+1:     {
+1:         final Debug debug = DEBUG_ENABLED ? new Debug() : null;
+0:         final boolean isSharedRef;
+0:         final RefCountedImpl.GlobalState globalState;
+1:         private volatile int released;
+1: 
+1:         private static final AtomicIntegerFieldUpdater<State> releasedUpdater = AtomicIntegerFieldUpdater.newUpdater(State.class, "released");
+1: 
+0:         public State(final RefCountedImpl.GlobalState globalState, Ref reference, ReferenceQueue<? super Ref> q, boolean isSharedRef)
+1:         {
+1:             super(reference, q);
+1:             this.globalState = globalState;
+0:             this.isSharedRef = isSharedRef;
+1:             globalState.register(this);
+1:         }
+1: 
+1:         void release(boolean leak)
+1:         {
+1:             if (!releasedUpdater.compareAndSet(this, 0, 1))
+1:             {
+1:                 if (!leak)
+1:                 {
+1:                     String id = this.toString();
+0:                     logger.error("BAD RELEASE: attempted to release a{} reference ({}) that has already been released", isSharedRef ? " shared" : "", id);
+1:                     if (DEBUG_ENABLED)
+1:                         debug.log(id);
+1:                     throw new IllegalStateException("Attempted to release a reference that has already been released");
+1:                 }
+1:                 return;
+1:             }
+0:             globalState.release(this);
+1:             if (leak)
+1:             {
+1:                 String id = this.toString();
+0:                 if (isSharedRef)
+0:                     logger.error("LEAK DETECTED: the shared reference ({}) to {} was not released before the object was garbage collected", id, globalState);
+0:                 else
+0:                     logger.error("LEAK DETECTED: a reference ({}) to {} was not released before the reference was garbage collected", id, globalState);
+1:                 if (DEBUG_ENABLED)
+1:                     debug.log(id);
+1:             }
+1:             else if (DEBUG_ENABLED)
+1:             {
+1:                 debug.deallocate();
+1:             }
+1:         }
+1:     }
+1: 
+1:     static final class Debug
+1:     {
+1:         String allocateThread, deallocateThread;
+1:         StackTraceElement[] allocateTrace, deallocateTrace;
+1:         Debug()
+1:         {
+1:             Thread thread = Thread.currentThread();
+1:             allocateThread = thread.toString();
+1:             allocateTrace = thread.getStackTrace();
+1:         }
+1:         synchronized void deallocate()
+1:         {
+1:             Thread thread = Thread.currentThread();
+1:             deallocateThread = thread.toString();
+1:             deallocateTrace = thread.getStackTrace();
+1:         }
+1:         synchronized void log(String id)
+1:         {
+1:             logger.error("Allocate trace {}:\n{}", id, print(allocateThread, allocateTrace));
+1:             if (deallocateThread != null)
+1:                 logger.error("Deallocate trace {}:\n{}", id, print(deallocateThread, deallocateTrace));
+1:         }
+1:         String print(String thread, StackTraceElement[] trace)
+1:         {
+1:             StringBuilder sb = new StringBuilder();
+0:             sb.append(thread.toString());
+1:             sb.append("\n");
+1:             for (StackTraceElement element : trace)
+1:             {
+1:                 sb.append("\tat ");
+1:                 sb.append(element );
+1:                 sb.append("\n");
+1:             }
+1:             return sb.toString();
+1:         }
+1:     }
+1: 
+1: }
+1: 
+1: 
+author:stefania
+-------------------------------------------------------------------------------
+commit:17dd4cc
+/////////////////////////////////////////////////////////////////////////
+1:                     if (tidy != null)
+0:                         tidy.tidy();
+/////////////////////////////////////////////////////////////////////////
+1:             if (tidy != null)
+0:                 return tidy.getClass() + "@" + System.identityHashCode(tidy) + ":" + tidy.name();
+1:             return "@" + System.identityHashCode(this);
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:7aafe05
+/////////////////////////////////////////////////////////////////////////
+1: public final class Ref<T> implements RefCounted<T>
+============================================================================

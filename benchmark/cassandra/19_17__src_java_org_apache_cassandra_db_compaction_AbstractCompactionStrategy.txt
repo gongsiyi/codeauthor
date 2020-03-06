@@ -1,0 +1,1707 @@
+1:07cf56f: /*
+1:129d80a:  * Licensed to the Apache Software Foundation (ASF) under one
+1:129d80a:  * or more contributor license agreements.  See the NOTICE file
+1:129d80a:  * distributed with this work for additional information
+1:129d80a:  * regarding copyright ownership.  The ASF licenses this file
+1:129d80a:  * to you under the Apache License, Version 2.0 (the
+1:129d80a:  * "License"); you may not use this file except in compliance
+1:129d80a:  * with the License.  You may obtain a copy of the License at
+1:129d80a:  *
+1:129d80a:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:129d80a:  *
+1:129d80a:  * Unless required by applicable law or agreed to in writing, software
+1:129d80a:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:129d80a:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:129d80a:  * See the License for the specific language governing permissions and
+1:129d80a:  * limitations under the License.
+3:129d80a:  */
+1:129d80a: package org.apache.cassandra.db.compaction;
+1:9483e14: 
+1:9483e14: import java.util.*;
+1:ebefb77: 
+1:0e83100: import com.google.common.base.Throwables;
+1:367c741: import com.google.common.collect.ImmutableMap;
+1:75d5639: import com.google.common.base.Predicate;
+1:75d5639: import com.google.common.collect.Iterables;
+1:ad8cad7: 
+1:9ed2727: import org.apache.cassandra.db.Directories;
+1:9ed2727: import org.apache.cassandra.db.SerializationHeader;
+1:f81a91d: import org.apache.cassandra.index.Index;
+1:9ed2727: import org.apache.cassandra.io.sstable.Descriptor;
+1:9ed2727: import org.apache.cassandra.io.sstable.SSTableMultiWriter;
+1:9ed2727: import org.apache.cassandra.io.sstable.SimpleSSTableMultiWriter;
+1:0368e97: import org.apache.cassandra.io.sstable.format.SSTableReader;
+1:129d80a: import org.slf4j.Logger;
+1:129d80a: import org.slf4j.LoggerFactory;
+9:129d80a: 
+1:129d80a: import org.apache.cassandra.db.ColumnFamilyStore;
+1:65773b1: import org.apache.cassandra.db.Memtable;
+1:e5a76bd: import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+1:46e422a: import org.apache.cassandra.dht.Range;
+1:46e422a: import org.apache.cassandra.dht.Token;
+1:360d1a2: import org.apache.cassandra.exceptions.ConfigurationException;
+1:b74a00b: import org.apache.cassandra.io.sstable.Component;
+1:1fec4a4: import org.apache.cassandra.io.sstable.ISSTableScanner;
+1:9ed2727: import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+1:d40ac78: import org.apache.cassandra.schema.CompactionParams;
+1:f25da97: import org.apache.cassandra.utils.JVMStabilityInspector;
+1:360d1a2: 
+1:9483e14: /**
+1:129d80a:  * Pluggable compaction strategy determines how SSTables get merged.
+1:129d80a:  *
+1:129d80a:  * There are two main goals:
+1:129d80a:  *  - perform background compaction constantly as needed; this typically makes a tradeoff between
+1:129d80a:  *    i/o done by compaction, and merging done at read time.
+1:129d80a:  *  - perform a full (maximum possible) compaction if requested by the user
+1:129d80a:  */
+1:129d80a: public abstract class AbstractCompactionStrategy
+1:ebefb77: {
+1:b74a00b:     private static final Logger logger = LoggerFactory.getLogger(AbstractCompactionStrategy.class);
+1:d72e938: 
+1:0091af9:     protected static final float DEFAULT_TOMBSTONE_THRESHOLD = 0.2f;
+1:b74a00b:     // minimum interval needed to perform tombstone removal compaction in seconds, default 86400 or 1 day.
+1:b74a00b:     protected static final long DEFAULT_TOMBSTONE_COMPACTION_INTERVAL = 86400;
+1:367c741:     protected static final boolean DEFAULT_UNCHECKED_TOMBSTONE_COMPACTION_OPTION = false;
+1:e16d8a7:     protected static final boolean DEFAULT_LOG_ALL_OPTION = false;
+1:367c741: 
+1:171c661:     protected static final String TOMBSTONE_THRESHOLD_OPTION = "tombstone_threshold";
+1:b74a00b:     protected static final String TOMBSTONE_COMPACTION_INTERVAL_OPTION = "tombstone_compaction_interval";
+1:367c741:     // disable range overlap check when deciding if an SSTable is candidate for tombstone compaction (CASSANDRA-6563)
+1:367c741:     protected static final String UNCHECKED_TOMBSTONE_COMPACTION_OPTION = "unchecked_tombstone_compaction";
+1:e16d8a7:     protected static final String LOG_ALL_OPTION = "log_all";
+1:ebefb77:     protected static final String COMPACTION_ENABLED = "enabled";
+1:6f0c12f:     public static final String ONLY_PURGE_REPAIRED_TOMBSTONES = "only_purge_repaired_tombstones";
+1:171c661: 
+1:dce303b:     protected Map<String, String> options;
+1:129d80a: 
+1:129d80a:     protected final ColumnFamilyStore cfs;
+1:360d1a2:     protected float tombstoneThreshold;
+1:b74a00b:     protected long tombstoneCompactionInterval;
+1:367c741:     protected boolean uncheckedTombstoneCompaction;
+1:75e858a:     protected boolean disableTombstoneCompactions = false;
+1:e16d8a7:     protected boolean logAll = true;
+1:129d80a: 
+1:e1fb18a:     private final Directories directories;
+1:e1fb18a: 
+1:d72e938:     /**
+1:d72e938:      * pause/resume/getNextBackgroundTask must synchronize.  This guarantees that after pause completes,
+1:d72e938:      * no new tasks will be generated; or put another way, pause can't run until in-progress tasks are
+1:d72e938:      * done being created.
+1:d72e938:      *
+1:d72e938:      * This allows runWithCompactionsDisabled to be confident that after pausing, once in-progress
+1:d72e938:      * tasks abort, it's safe to proceed with truncate/cleanup/etc.
+1:d72e938:      *
+1:d72e938:      * See CASSANDRA-3430
+1:d72e938:      */
+1:cc708b9:     protected boolean isActive = false;
+1:d72e938: 
+1:129d80a:     protected AbstractCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
+1:cc708b9:     {
+1:f0ee59d:         assert cfs != null;
+1:129d80a:         this.cfs = cfs;
+1:9376fdd:         this.options = ImmutableMap.copyOf(options);
+1:31e060a: 
+1:360d1a2:         /* checks must be repeated here, as user supplied strategies might not call validateOptions directly */
+1:360d1a2: 
+1:360d1a2:         try
+1:d72e938:         {
+1:360d1a2:             validateOptions(options);
+1:360d1a2:             String optionValue = options.get(TOMBSTONE_THRESHOLD_OPTION);
+1:360d1a2:             tombstoneThreshold = optionValue == null ? DEFAULT_TOMBSTONE_THRESHOLD : Float.parseFloat(optionValue);
+1:360d1a2:             optionValue = options.get(TOMBSTONE_COMPACTION_INTERVAL_OPTION);
+1:360d1a2:             tombstoneCompactionInterval = optionValue == null ? DEFAULT_TOMBSTONE_COMPACTION_INTERVAL : Long.parseLong(optionValue);
+1:367c741:             optionValue = options.get(UNCHECKED_TOMBSTONE_COMPACTION_OPTION);
+1:367c741:             uncheckedTombstoneCompaction = optionValue == null ? DEFAULT_UNCHECKED_TOMBSTONE_COMPACTION_OPTION : Boolean.parseBoolean(optionValue);
+1:e16d8a7:             optionValue = options.get(LOG_ALL_OPTION);
+1:e16d8a7:             logAll = optionValue == null ? DEFAULT_LOG_ALL_OPTION : Boolean.parseBoolean(optionValue);
+1:0490abf:             if (!shouldBeEnabled())
+1:0490abf:                 this.disable();
+1:360d1a2:         }
+1:360d1a2:         catch (ConfigurationException e)
+1:360d1a2:         {
+1:360d1a2:             logger.warn("Error setting compaction strategy options ({}), defaults will be used", e.getMessage());
+1:360d1a2:             tombstoneThreshold = DEFAULT_TOMBSTONE_THRESHOLD;
+1:b74a00b:             tombstoneCompactionInterval = DEFAULT_TOMBSTONE_COMPACTION_INTERVAL;
+1:367c741:             uncheckedTombstoneCompaction = DEFAULT_UNCHECKED_TOMBSTONE_COMPACTION_OPTION;
+1:5c752cd:         }
+1:5c752cd: 
+1:47d3b7e:         directories = cfs.getDirectories();
+1:ebefb77:     }
+1:ebefb77: 
+1:9ed2727:     public Directories getDirectories()
+1:5c752cd:     {
+1:e1fb18a:         return directories;
+1:ebefb77:     }
+1:ebefb77: 
+1:46e422a:     /**
+1:d72e938:      * For internal, temporary suspension of background compactions so that we can do exceptional
+1:d72e938:      * things like truncate or major compaction
+1:129d80a:      */
+1:d72e938:     public synchronized void pause()
+1:ebefb77:     {
+1:d72e938:         isActive = false;
+1:9ed2727:     }
+1:eda763b: 
+1:d72e938:     /**
+1:d72e938:      * For internal, temporary suspension of background compactions so that we can do exceptional
+1:d72e938:      * things like truncate or major compaction
+1:d72e938:      */
+1:d72e938:     public synchronized void resume()
+1:9ed2727:     {
+1:d72e938:         isActive = true;
+1:e16d8a7:     }
+1:e1fb18a: 
+1:d72e938:     /**
+1:cc708b9:      * Performs any extra initialization required
+1:cc708b9:      */
+1:cc708b9:     public void startup()
+1:e16d8a7:     {
+1:cc708b9:         isActive = true;
+1:cc708b9:     }
+1:9ed2727: 
+1:cc708b9:     /**
+1:d72e938:      * Releases any resources if this strategy is shutdown (when the CFS is reloaded after a schema change).
+1:d72e938:      */
+1:d72e938:     public void shutdown()
+1:d72e938:     {
+1:d72e938:         isActive = false;
+1:d72e938:     }
+1:e16d8a7: 
+1:f0ee59d:     /**
+1:129d80a:      * @param gcBefore throw away tombstones older than this
+1:686f516:      *
+1:be1b02b:      * @return the next background/minor compaction task to run; null if nothing to do.
+1:686f516:      *
+1:2a3076b:      * Is responsible for marking its sstables as compaction-pending.
+1:f0ee59d:      */
+1:be1b02b:     public abstract AbstractCompactionTask getNextBackgroundTask(final int gcBefore);
+1:cc708b9: 
+1:ed0df5f:     /**
+1:129d80a:      * @param gcBefore throw away tombstones older than this
+1:686f516:      *
+1:be1b02b:      * @return a compaction task that should be run to compact this columnfamilystore
+1:be1b02b:      * as much as possible.  Null if nothing to do.
+1:686f516:      *
+1:686f516:      * Is responsible for marking its sstables as compaction-pending.
+1:ed0df5f:      */
+1:910170c:     public abstract Collection<AbstractCompactionTask> getMaximalTask(final int gcBefore, boolean splitOutput);
+1:d72e938: 
+4:129d80a:     /**
+1:2a3076b:      * @param sstables SSTables to compact. Must be marked as compacting.
+1:129d80a:      * @param gcBefore throw away tombstones older than this
+1:686f516:      *
+1:129d80a:      * @return a compaction task corresponding to the requested sstables.
+1:129d80a:      * Will not be null. (Will throw if user requests an invalid compaction.)
+1:686f516:      *
+1:686f516:      * Is responsible for marking its sstables as compaction-pending.
+1:129d80a:      */
+1:129d80a:     public abstract AbstractCompactionTask getUserDefinedTask(Collection<SSTableReader> sstables, final int gcBefore);
+1:a90b98e: 
+1:e5a76bd:     public AbstractCompactionTask getCompactionTask(LifecycleTransaction txn, final int gcBefore, long maxSSTableBytes)
+1:80b3e6c:     {
+1:605bcdc:         return new CompactionTask(cfs, txn, gcBefore);
+1:80b3e6c:     }
+1:0e28478: 
+1:129d80a:     /**
+1:129d80a:      * @return the number of background tasks estimated to still be needed for this columnfamilystore
+1:84a461a:      */
+1:129d80a:     public abstract int getEstimatedRemainingTasks();
+1:46e422a: 
+1:84a461a:     /**
+1:84a461a:      * @return size in bytes of the largest sstables for this strategy
+1:3ad3e73:      */
+1:ecec863:     public abstract long getMaxSSTableBytes();
+1:3ad3e73: 
+1:ebefb77:     public void enable()
+1:ebefb77:     {
+1:ebefb77:     }
+1:ebefb77: 
+1:ebefb77:     public void disable()
+1:ebefb77:     {
+1:ebefb77:     }
+1:ebefb77: 
+1:3ad3e73:     /**
+1:65773b1:      * @return whether or not MeteredFlusher should be able to trigger memtable flushes for this CF.
+1:65773b1:      */
+1:65773b1:     public boolean isAffectedByMeteredFlusher()
+1:65773b1:     {
+1:65773b1:         return true;
+1:65773b1:     }
+1:65773b1: 
+1:65773b1:     /**
+1:58e524e:      * If not affected by MeteredFlusher (and handling flushing on its own), override to tell MF how much
+1:58e524e:      * space to reserve for this CF, i.e., how much space to subtract from `memtable_total_space_in_mb` when deciding
+1:58e524e:      * if other memtables should be flushed or not.
+1:58e524e:      */
+1:58e524e:     public long getMemtableReservedSize()
+1:58e524e:     {
+1:58e524e:         return 0;
+1:58e524e:     }
+1:58e524e: 
+1:58e524e:     /**
+1:65773b1:      * Handle a flushed memtable.
+1:65773b1:      *
+1:65773b1:      * @param memtable the flushed memtable
+1:9ed2727:      * @param sstables the written sstables. can be null or empty if the memtable was clean.
+1:65773b1:      */
+1:9ed2727:     public void replaceFlushed(Memtable memtable, Collection<SSTableReader> sstables)
+1:65773b1:     {
+1:904cb5d:         cfs.getTracker().replaceFlushed(memtable, sstables);
+1:904cb5d:         if (sstables != null && !sstables.isEmpty())
+1:904cb5d:             CompactionManager.instance.submitBackground(cfs);
+1:65773b1:     }
+1:65773b1: 
+1:65773b1:     /**
+1:9483e14:      * Filters SSTables that are to be blacklisted from the given collection
+1:9483e14:      *
+1:9483e14:      * @param originalCandidates The collection to check for blacklisted SSTables
+1:9483e14:      * @return list of the SSTables with blacklisted ones filtered out
+1:9483e14:      */
+1:75d5639:     public static Iterable<SSTableReader> filterSuspectSSTables(Iterable<SSTableReader> originalCandidates)
+1:9483e14:     {
+1:75d5639:         return Iterables.filter(originalCandidates, new Predicate<SSTableReader>()
+1:9483e14:         {
+1:75d5639:             public boolean apply(SSTableReader sstable)
+1:65773b1:             {
+1:75d5639:                 return !sstable.isMarkedSuspect();
+1:9483e14:             }
+1:75d5639:         });
+1:9483e14:     }
+1:9b48a0b: 
+1:9483e14: 
+1:9b48a0b:     public ScannerList getScanners(Collection<SSTableReader> sstables, Range<Token> range)
+1:9b48a0b:     {
+1:9b48a0b:         return range == null ? getScanners(sstables, (Collection<Range<Token>>)null) : getScanners(sstables, Collections.singleton(range));
+1:9b48a0b:     }
+1:65773b1:     /**
+1:46e422a:      * Returns a list of KeyScanners given sstables and a range on which to scan.
+1:46e422a:      * The default implementation simply grab one SSTableScanner per-sstable, but overriding this method
+1:46e422a:      * allow for a more memory efficient solution if we know the sstable don't overlap (see
+1:46e422a:      * LeveledCompactionStrategy for instance).
+1:65773b1:      */
+1:7aafe05:     @SuppressWarnings("resource")
+1:9b48a0b:     public ScannerList getScanners(Collection<SSTableReader> sstables, Collection<Range<Token>> ranges)
+1:0e83100:     {
+1:1fec4a4:         ArrayList<ISSTableScanner> scanners = new ArrayList<ISSTableScanner>();
+1:0e83100:         try
+1:75d5639:         {
+1:0e83100:             for (SSTableReader sstable : sstables)
+1:f2a3547:                 scanners.add(sstable.getScanner(ranges));
+1:0e83100:         }
+1:0e83100:         catch (Throwable t)
+1:0e83100:         {
+1:0e83100:             try
+1:0e83100:             {
+1:0e83100:                 new ScannerList(scanners).close();
+1:0e83100:             }
+1:0e83100:             catch (Throwable t2)
+1:0e83100:             {
+1:0e83100:                 t.addSuppressed(t2);
+1:0e83100:             }
+1:0e83100:             throw t;
+1:0e83100:         }
+1:0e83100:         return new ScannerList(scanners);
+1:65773b1:     }
+1:9483e14: 
+1:e16f584:     public boolean shouldDefragment()
+1:e16f584:     {
+1:e16f584:         return false;
+1:e16f584:     }
+1:e16f584: 
+1:e16f584:     public String getName()
+1:e16f584:     {
+1:e16f584:         return getClass().getSimpleName();
+1:e16f584:     }
+1:e16f584: 
+1:3527099:     public synchronized void replaceSSTables(Collection<SSTableReader> removed, Collection<SSTableReader> added)
+1:3527099:     {
+1:3527099:         for (SSTableReader remove : removed)
+1:3527099:             removeSSTable(remove);
+1:3527099:         for (SSTableReader add : added)
+1:3527099:             addSSTable(add);
+1:3527099:     }
+1:3527099: 
+1:e16f584:     public abstract void addSSTable(SSTableReader added);
+1:e16f584: 
+1:ed0a07c:     public synchronized void addSSTables(Iterable<SSTableReader> added)
+1:ed0a07c:     {
+1:ed0a07c:         for (SSTableReader sstable : added)
+1:ed0a07c:             addSSTable(sstable);
+1:ed0a07c:     }
+1:ed0a07c: 
+1:e16f584:     public abstract void removeSSTable(SSTableReader sstable);
+1:e16f584: 
+1:0e83100:     public static class ScannerList implements AutoCloseable
+1:0e83100:     {
+1:1fec4a4:         public final List<ISSTableScanner> scanners;
+1:1fec4a4:         public ScannerList(List<ISSTableScanner> scanners)
+1:0e83100:         {
+1:0e83100:             this.scanners = scanners;
+1:0e83100:         }
+1:0e83100: 
+1:10649b1:         public long getTotalBytesScanned()
+1:10649b1:         {
+1:10649b1:             long bytesScanned = 0L;
+1:10649b1:             for (ISSTableScanner scanner : scanners)
+1:10649b1:                 bytesScanned += scanner.getBytesScanned();
+1:10649b1: 
+1:10649b1:             return bytesScanned;
+1:10649b1:         }
+1:10649b1: 
+1:10649b1:         public long getTotalCompressedSize()
+1:10649b1:         {
+1:10649b1:             long compressedSize = 0;
+1:10649b1:             for (ISSTableScanner scanner : scanners)
+1:10649b1:                 compressedSize += scanner.getCompressedLengthInBytes();
+1:10649b1: 
+1:10649b1:             return compressedSize;
+1:10649b1:         }
+1:10649b1: 
+1:10649b1:         public double getCompressionRatio()
+1:10649b1:         {
+1:10649b1:             double compressed = 0.0;
+1:10649b1:             double uncompressed = 0.0;
+1:10649b1: 
+1:10649b1:             for (ISSTableScanner scanner : scanners)
+1:10649b1:             {
+1:10649b1:                 compressed += scanner.getCompressedLengthInBytes();
+1:10649b1:                 uncompressed += scanner.getLengthInBytes();
+1:10649b1:             }
+1:10649b1: 
+1:10649b1:             if (compressed == uncompressed || uncompressed == 0)
+1:10649b1:                 return MetadataCollector.NO_COMPRESSION_RATIO;
+1:10649b1: 
+1:10649b1:             return compressed / uncompressed;
+1:10649b1:         }
+1:10649b1: 
+1:0e83100:         public void close()
+1:0e83100:         {
+1:0e83100:             Throwable t = null;
+1:1fec4a4:             for (ISSTableScanner scanner : scanners)
+1:0e83100:             {
+1:0e83100:                 try
+1:0e83100:                 {
+1:0e83100:                     scanner.close();
+1:0e83100:                 }
+1:0e83100:                 catch (Throwable t2)
+1:0e83100:                 {
+1:f25da97:                     JVMStabilityInspector.inspectThrowable(t2);
+1:0e83100:                     if (t == null)
+1:0e83100:                         t = t2;
+1:0e83100:                     else
+1:0e83100:                         t.addSuppressed(t2);
+1:0e83100:                 }
+1:0e83100:             }
+1:0e83100:             if (t != null)
+1:0e83100:                 throw Throwables.propagate(t);
+1:0e83100:         }
+1:0e83100:     }
+1:0e83100: 
+1:0e83100:     public ScannerList getScanners(Collection<SSTableReader> toCompact)
+1:d72e938:     {
+1:9b48a0b:         return getScanners(toCompact, (Collection<Range<Token>>)null);
+1:75d5639:     }
+1:65773b1: 
+1:129d80a:     /**
+1:b74a00b:      * Check if given sstable is worth dropping tombstones at gcBefore.
+1:b74a00b:      * Check is skipped if tombstone_compaction_interval time does not elapse since sstable creation and returns false.
+1:9483e14:      *
+1:0091af9:      * @param sstable SSTable to check
+1:0091af9:      * @param gcBefore time to drop tombstones
+1:0091af9:      * @return true if given sstable's tombstones are expected to be removed
+1:46e422a:      */
+1:0091af9:     protected boolean worthDroppingTombstones(SSTableReader sstable, int gcBefore)
+1:0e28478:     {
+1:5dc7414:         if (disableTombstoneCompactions || CompactionController.NEVER_PURGE_TOMBSTONES)
+1:75e858a:             return false;
+1:b74a00b:         // since we use estimations to calculate, there is a chance that compaction will not drop tombstones actually.
+1:b74a00b:         // if that happens we will end up in infinite compaction loop, so first we check enough if enough time has
+1:b74a00b:         // elapsed since SSTable created.
+1:b74a00b:         if (System.currentTimeMillis() < sstable.getCreationTimeFor(Component.DATA) + tombstoneCompactionInterval * 1000)
+1:b74a00b:            return false;
+1:46e422a: 
+1:0091af9:         double droppableRatio = sstable.getEstimatedDroppableTombstoneRatio(gcBefore);
+1:0091af9:         if (droppableRatio <= tombstoneThreshold)
+1:0091af9:             return false;
+1:84a461a: 
+1:367c741:         //sstable range overlap check is disabled. See CASSANDRA-6563.
+1:367c741:         if (uncheckedTombstoneCompaction)
+1:367c741:             return true;
+1:367c741: 
+1:5b0566a:         Collection<SSTableReader> overlaps = cfs.getOverlappingLiveSSTables(Collections.singleton(sstable));
+1:0091af9:         if (overlaps.isEmpty())
+1:46e422a:         {
+1:0091af9:             // there is no overlap, tombstones are safely droppable
+1:0091af9:             return true;
+1:d72e938:         }
+1:4937ac7:         else if (CompactionController.getFullyExpiredSSTables(cfs, Collections.singleton(sstable), overlaps, gcBefore).size() > 0)
+1:4937ac7:         {
+1:4937ac7:             return true;
+1:4937ac7:         }
+1:0091af9:         else
+1:46e422a:         {
+1:0091af9:             // what percentage of columns do we expect to compact outside of overlap?
+1:dbd1a72:             if (sstable.getIndexSummarySize() < 2)
+3:31e060a:             {
+1:b74a00b:                 // we have too few samples to estimate correct percentage
+1:b74a00b:                 return false;
+1:d72e938:             }
+1:0091af9:             // first, calculate estimated keys that do not overlap
+1:0091af9:             long keys = sstable.estimatedKeys();
+1:1bd0139:             Set<Range<Token>> ranges = new HashSet<Range<Token>>(overlaps.size());
+1:0091af9:             for (SSTableReader overlap : overlaps)
+1:07893d7:                 ranges.add(new Range<>(overlap.first.getToken(), overlap.last.getToken()));
+1:0091af9:             long remainingKeys = keys - sstable.estimatedKeysForRanges(ranges);
+1:0091af9:             // next, calculate what percentage of columns we have within those keys
+1:b74a00b:             long columns = sstable.getEstimatedColumnCount().mean() * remainingKeys;
+1:0091af9:             double remainingColumnsRatio = ((double) columns) / (sstable.getEstimatedColumnCount().count() * sstable.getEstimatedColumnCount().mean());
+1:f0ee59d: 
+1:0091af9:             // return if we still expect to have droppable tombstones in rest of columns
+1:0091af9:             return remainingColumnsRatio * droppableRatio > tombstoneThreshold;
+1:0e28478:         }
+1:46e422a:     }
+1:360d1a2: 
+1:360d1a2:     public static Map<String, String> validateOptions(Map<String, String> options) throws ConfigurationException
+1:360d1a2:     {
+1:360d1a2:         String threshold = options.get(TOMBSTONE_THRESHOLD_OPTION);
+1:360d1a2:         if (threshold != null)
+1:360d1a2:         {
+1:360d1a2:             try
+1:360d1a2:             {
+1:360d1a2:                 float thresholdValue = Float.parseFloat(threshold);
+1:360d1a2:                 if (thresholdValue < 0)
+1:360d1a2:                 {
+1:cc8d160:                     throw new ConfigurationException(String.format("%s must be greater than 0, but was %f", TOMBSTONE_THRESHOLD_OPTION, thresholdValue));
+1:360d1a2:                 }
+1:360d1a2:             }
+1:360d1a2:             catch (NumberFormatException e)
+1:360d1a2:             {
+1:360d1a2:                 throw new ConfigurationException(String.format("%s is not a parsable int (base10) for %s", threshold, TOMBSTONE_THRESHOLD_OPTION), e);
+1:360d1a2:             }
+1:360d1a2:         }
+1:360d1a2: 
+1:360d1a2:         String interval = options.get(TOMBSTONE_COMPACTION_INTERVAL_OPTION);
+1:360d1a2:         if (interval != null)
+1:360d1a2:         {
+1:360d1a2:             try
+1:360d1a2:             {
+1:360d1a2:                 long tombstoneCompactionInterval = Long.parseLong(interval);
+1:360d1a2:                 if (tombstoneCompactionInterval < 0)
+1:360d1a2:                 {
+1:360d1a2:                     throw new ConfigurationException(String.format("%s must be greater than 0, but was %d", TOMBSTONE_COMPACTION_INTERVAL_OPTION, tombstoneCompactionInterval));
+1:360d1a2:                 }
+1:360d1a2:             }
+1:360d1a2:             catch (NumberFormatException e)
+1:360d1a2:             {
+1:360d1a2:                 throw new ConfigurationException(String.format("%s is not a parsable int (base10) for %s", interval, TOMBSTONE_COMPACTION_INTERVAL_OPTION), e);
+1:360d1a2:             }
+1:360d1a2:         }
+1:360d1a2: 
+1:367c741:         String unchecked = options.get(UNCHECKED_TOMBSTONE_COMPACTION_OPTION);
+1:367c741:         if (unchecked != null)
+1:367c741:         {
+1:367c741:             if (!unchecked.equalsIgnoreCase("true") && !unchecked.equalsIgnoreCase("false"))
+1:e16d8a7:                 throw new ConfigurationException(String.format("'%s' should be either 'true' or 'false', not '%s'", UNCHECKED_TOMBSTONE_COMPACTION_OPTION, unchecked));
+1:367c741:         }
+1:367c741: 
+1:e16d8a7:         String logAll = options.get(LOG_ALL_OPTION);
+1:e16d8a7:         if (logAll != null)
+1:e16d8a7:         {
+1:e16d8a7:             if (!logAll.equalsIgnoreCase("true") && !logAll.equalsIgnoreCase("false"))
+1:e16d8a7:             {
+1:e16d8a7:                 throw new ConfigurationException(String.format("'%s' should either be 'true' or 'false', not %s", LOG_ALL_OPTION, logAll));
+1:e16d8a7:             }
+1:46e422a:         }
+1:ed0df5f: 
+1:ebefb77:         String compactionEnabled = options.get(COMPACTION_ENABLED);
+1:ebefb77:         if (compactionEnabled != null)
+1:ebefb77:         {
+1:ebefb77:             if (!compactionEnabled.equalsIgnoreCase("true") && !compactionEnabled.equalsIgnoreCase("false"))
+1:ebefb77:             {
+1:ebefb77:                 throw new ConfigurationException(String.format("enabled should either be 'true' or 'false', not %s", compactionEnabled));
+1:ebefb77:             }
+1:ebefb77:         }
+1:e16d8a7: 
+1:360d1a2:         Map<String, String> uncheckedOptions = new HashMap<String, String>(options);
+1:360d1a2:         uncheckedOptions.remove(TOMBSTONE_THRESHOLD_OPTION);
+1:360d1a2:         uncheckedOptions.remove(TOMBSTONE_COMPACTION_INTERVAL_OPTION);
+1:367c741:         uncheckedOptions.remove(UNCHECKED_TOMBSTONE_COMPACTION_OPTION);
+1:e16d8a7:         uncheckedOptions.remove(LOG_ALL_OPTION);
+1:ebefb77:         uncheckedOptions.remove(COMPACTION_ENABLED);
+1:6f0c12f:         uncheckedOptions.remove(ONLY_PURGE_REPAIRED_TOMBSTONES);
+1:d40ac78:         uncheckedOptions.remove(CompactionParams.Option.PROVIDE_OVERLAPPING_TOMBSTONES.toString());
+1:360d1a2:         return uncheckedOptions;
+1:360d1a2:     }
+1:0490abf: 
+1:0490abf:     public boolean shouldBeEnabled()
+1:0490abf:     {
+1:0490abf:         String optionValue = options.get(COMPACTION_ENABLED);
+1:0490abf: 
+1:0490abf:         return optionValue == null || Boolean.parseBoolean(optionValue);
+1:0490abf:     }
+1:37f5175: 
+1:37f5175: 
+1:37f5175:     /**
+1:37f5175:      * Method for grouping similar SSTables together, This will be used by
+1:37f5175:      * anti-compaction to determine which SSTables should be anitcompacted
+1:37f5175:      * as a group. If a given compaction strategy creates sstables which
+1:37f5175:      * cannot be merged due to some constraint it must override this method.
+1:37f5175:      */
+1:37f5175:     public Collection<Collection<SSTableReader>> groupSSTablesForAntiCompaction(Collection<SSTableReader> sstablesToGroup)
+1:37f5175:     {
+1:37f5175:         int groupSize = 2;
+1:37f5175:         List<SSTableReader> sortedSSTablesToGroup = new ArrayList<>(sstablesToGroup);
+1:37f5175:         Collections.sort(sortedSSTablesToGroup, SSTableReader.sstableComparator);
+1:37f5175: 
+1:37f5175:         Collection<Collection<SSTableReader>> groupedSSTables = new ArrayList<>();
+1:37f5175:         Collection<SSTableReader> currGroup = new ArrayList<>();
+1:37f5175: 
+1:37f5175:         for (SSTableReader sstable : sortedSSTablesToGroup)
+1:37f5175:         {
+1:37f5175:             currGroup.add(sstable);
+1:37f5175:             if (currGroup.size() == groupSize)
+1:37f5175:             {
+1:37f5175:                 groupedSSTables.add(currGroup);
+1:37f5175:                 currGroup = new ArrayList<>();
+1:37f5175:             }
+1:37f5175:         }
+1:37f5175: 
+1:37f5175:         if (currGroup.size() != 0)
+1:37f5175:             groupedSSTables.add(currGroup);
+1:37f5175:         return groupedSSTables;
+1:9ed2727:     }
+1:9ed2727: 
+1:e16d8a7:     public CompactionLogger.Strategy strategyLogger()
+1:9ed2727:     {
+1:e16d8a7:         return CompactionLogger.Strategy.none;
+1:e16d8a7:     }
+1:e16d8a7: 
+1:f81a91d:     public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor,
+1:f81a91d:                                                        long keyCount,
+1:f81a91d:                                                        long repairedAt,
+1:f81a91d:                                                        MetadataCollector meta,
+1:f81a91d:                                                        SerializationHeader header,
+1:f81a91d:                                                        Collection<Index> indexes,
+1:f81a91d:                                                        LifecycleTransaction txn)
+1:278a5e8:     {
+1:f81a91d:         return SimpleSSTableMultiWriter.create(descriptor, keyCount, repairedAt, cfs.metadata, meta, header, indexes, txn);
+1:37f5175:     }
+1:278a5e8: 
+1:eda763b:     public boolean supportsEarlyOpen()
+1:eda763b:     {
+1:eda763b:         return true;
+1:eda763b:     }
+1:278a5e8: }
+============================================================================
+author:Anthony Grasso
+-------------------------------------------------------------------------------
+commit:f2a3547
+/////////////////////////////////////////////////////////////////////////
+1:                 scanners.add(sstable.getScanner(ranges));
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:10649b1
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:                 scanners.add(sstable.getScanner(ranges, null));
+/////////////////////////////////////////////////////////////////////////
+1:         public long getTotalBytesScanned()
+1:         {
+1:             long bytesScanned = 0L;
+1:             for (ISSTableScanner scanner : scanners)
+1:                 bytesScanned += scanner.getBytesScanned();
+1: 
+1:             return bytesScanned;
+1:         }
+1: 
+1:         public long getTotalCompressedSize()
+1:         {
+1:             long compressedSize = 0;
+1:             for (ISSTableScanner scanner : scanners)
+1:                 compressedSize += scanner.getCompressedLengthInBytes();
+1: 
+1:             return compressedSize;
+1:         }
+1: 
+1:         public double getCompressionRatio()
+1:         {
+1:             double compressed = 0.0;
+1:             double uncompressed = 0.0;
+1: 
+1:             for (ISSTableScanner scanner : scanners)
+1:             {
+1:                 compressed += scanner.getCompressedLengthInBytes();
+1:                 uncompressed += scanner.getLengthInBytes();
+1:             }
+1: 
+1:             if (compressed == uncompressed || uncompressed == 0)
+1:                 return MetadataCollector.NO_COMPRESSION_RATIO;
+1: 
+1:             return compressed / uncompressed;
+1:         }
+1: 
+commit:47d3b7e
+/////////////////////////////////////////////////////////////////////////
+1:         directories = cfs.getDirectories();
+commit:7aafe05
+/////////////////////////////////////////////////////////////////////////
+1:     @SuppressWarnings("resource")
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:624ed78
+commit:7b10217
+commit:c9ac050
+commit:78a3d2b
+commit:a991b64
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.utils.FBUtilities;
+commit:4937ac7
+/////////////////////////////////////////////////////////////////////////
+1:         else if (CompactionController.getFullyExpiredSSTables(cfs, Collections.singleton(sstable), overlaps, gcBefore).size() > 0)
+1:         {
+1:             return true;
+1:         }
+commit:360d1a2
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.exceptions.ConfigurationException;
+0: import com.google.common.collect.Sets;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     protected float tombstoneThreshold;
+/////////////////////////////////////////////////////////////////////////
+1:         /* checks must be repeated here, as user supplied strategies might not call validateOptions directly */
+1: 
+1:         try
+1:             validateOptions(options);
+1:             String optionValue = options.get(TOMBSTONE_THRESHOLD_OPTION);
+1:             tombstoneThreshold = optionValue == null ? DEFAULT_TOMBSTONE_THRESHOLD : Float.parseFloat(optionValue);
+1:             optionValue = options.get(TOMBSTONE_COMPACTION_INTERVAL_OPTION);
+1:             tombstoneCompactionInterval = optionValue == null ? DEFAULT_TOMBSTONE_COMPACTION_INTERVAL : Long.parseLong(optionValue);
+1:         }
+1:         catch (ConfigurationException e)
+1:         {
+1:             logger.warn("Error setting compaction strategy options ({}), defaults will be used", e.getMessage());
+1:             tombstoneThreshold = DEFAULT_TOMBSTONE_THRESHOLD;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     public static Map<String, String> validateOptions(Map<String, String> options) throws ConfigurationException
+1:     {
+1:         String threshold = options.get(TOMBSTONE_THRESHOLD_OPTION);
+1:         if (threshold != null)
+1:         {
+1:             try
+1:             {
+1:                 float thresholdValue = Float.parseFloat(threshold);
+1:                 if (thresholdValue < 0)
+1:                 {
+0:                     throw new ConfigurationException(String.format("%s must be greater than 0, but was %d", TOMBSTONE_THRESHOLD_OPTION, thresholdValue));
+1:                 }
+1:             }
+1:             catch (NumberFormatException e)
+1:             {
+1:                 throw new ConfigurationException(String.format("%s is not a parsable int (base10) for %s", threshold, TOMBSTONE_THRESHOLD_OPTION), e);
+1:             }
+1:         }
+1: 
+1:         String interval = options.get(TOMBSTONE_COMPACTION_INTERVAL_OPTION);
+1:         if (interval != null)
+1:         {
+1:             try
+1:             {
+1:                 long tombstoneCompactionInterval = Long.parseLong(interval);
+1:                 if (tombstoneCompactionInterval < 0)
+1:                 {
+1:                     throw new ConfigurationException(String.format("%s must be greater than 0, but was %d", TOMBSTONE_COMPACTION_INTERVAL_OPTION, tombstoneCompactionInterval));
+1:                 }
+1:             }
+1:             catch (NumberFormatException e)
+1:             {
+1:                 throw new ConfigurationException(String.format("%s is not a parsable int (base10) for %s", interval, TOMBSTONE_COMPACTION_INTERVAL_OPTION), e);
+1:             }
+1:         }
+1: 
+1:         Map<String, String> uncheckedOptions = new HashMap<String, String>(options);
+1:         uncheckedOptions.remove(TOMBSTONE_THRESHOLD_OPTION);
+1:         uncheckedOptions.remove(TOMBSTONE_COMPACTION_INTERVAL_OPTION);
+1:         return uncheckedOptions;
+1:     }
+commit:a15c35b
+/////////////////////////////////////////////////////////////////////////
+commit:37f6a9f
+/////////////////////////////////////////////////////////////////////////
+commit:07cf56f
+/////////////////////////////////////////////////////////////////////////
+1: /*
+/////////////////////////////////////////////////////////////////////////
+commit:5c752cd
+/////////////////////////////////////////////////////////////////////////
+0:     public Map<String, String> getOptions()
+1:     {
+0:         return options;
+1:     }
+1: 
+author:Branimir Lambov
+-------------------------------------------------------------------------------
+commit:904cb5d
+/////////////////////////////////////////////////////////////////////////
+1:         cfs.getTracker().replaceFlushed(memtable, sstables);
+1:         if (sstables != null && !sstables.isEmpty())
+1:             CompactionManager.instance.submitBackground(cfs);
+commit:d40ac78
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.schema.CompactionParams;
+/////////////////////////////////////////////////////////////////////////
+1:         uncheckedOptions.remove(CompactionParams.Option.PROVIDE_OVERLAPPING_TOMBSTONES.toString());
+commit:07893d7
+/////////////////////////////////////////////////////////////////////////
+1:                 ranges.add(new Range<>(overlap.first.getToken(), overlap.last.getToken()));
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:087264f
+/////////////////////////////////////////////////////////////////////////
+commit:1def02f
+/////////////////////////////////////////////////////////////////////////
+commit:1bd0139
+/////////////////////////////////////////////////////////////////////////
+1:             Set<Range<Token>> ranges = new HashSet<Range<Token>>(overlaps.size());
+commit:cc8d160
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:                     throw new ConfigurationException(String.format("%s must be greater than 0, but was %f", TOMBSTONE_THRESHOLD_OPTION, thresholdValue));
+commit:95f94a4
+/////////////////////////////////////////////////////////////////////////
+author:Marcus Eriksson
+-------------------------------------------------------------------------------
+commit:574e8df
+commit:5b0566a
+/////////////////////////////////////////////////////////////////////////
+1:         Collection<SSTableReader> overlaps = cfs.getOverlappingLiveSSTables(Collections.singleton(sstable));
+commit:cd4dd6b
+commit:a3d0556
+commit:63efa07
+commit:5dc7414
+/////////////////////////////////////////////////////////////////////////
+1:         if (disableTombstoneCompactions || CompactionController.NEVER_PURGE_TOMBSTONES)
+commit:baaf746
+commit:0541597
+commit:9b48a0b
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     public ScannerList getScanners(Collection<SSTableReader> sstables, Range<Token> range)
+1:     {
+1:         return range == null ? getScanners(sstables, (Collection<Range<Token>>)null) : getScanners(sstables, Collections.singleton(range));
+1:     }
+/////////////////////////////////////////////////////////////////////////
+1:     public ScannerList getScanners(Collection<SSTableReader> sstables, Collection<Range<Token>> ranges)
+0:                 scanners.add(sstable.getScanner(ranges, limiter));
+/////////////////////////////////////////////////////////////////////////
+1:         return getScanners(toCompact, (Collection<Range<Token>>)null);
+commit:ed0a07c
+/////////////////////////////////////////////////////////////////////////
+1:     public synchronized void addSSTables(Iterable<SSTableReader> added)
+1:     {
+1:         for (SSTableReader sstable : added)
+1:             addSSTable(sstable);
+1:     }
+1: 
+commit:6f0c12f
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     public static final String ONLY_PURGE_REPAIRED_TOMBSTONES = "only_purge_repaired_tombstones";
+/////////////////////////////////////////////////////////////////////////
+1:         uncheckedOptions.remove(ONLY_PURGE_REPAIRED_TOMBSTONES);
+commit:9c3b967
+commit:5aca7d7
+/////////////////////////////////////////////////////////////////////////
+0:     public Map<String, String> options;
+commit:d26187e
+commit:325aeb7
+commit:dce303b
+/////////////////////////////////////////////////////////////////////////
+1:     protected Map<String, String> options;
+commit:4a61ca6
+/////////////////////////////////////////////////////////////////////////
+commit:0656924
+commit:6770281
+commit:75e858a
+/////////////////////////////////////////////////////////////////////////
+1:     protected boolean disableTombstoneCompactions = false;
+/////////////////////////////////////////////////////////////////////////
+0:         if (disableTombstoneCompactions)
+1:             return false;
+commit:910170c
+/////////////////////////////////////////////////////////////////////////
+1:     public abstract Collection<AbstractCompactionTask> getMaximalTask(final int gcBefore, boolean splitOutput);
+commit:21bb6d2
+commit:3527099
+/////////////////////////////////////////////////////////////////////////
+1:     public synchronized void replaceSSTables(Collection<SSTableReader> removed, Collection<SSTableReader> added)
+1:     {
+1:         for (SSTableReader remove : removed)
+1:             removeSSTable(remove);
+1:         for (SSTableReader add : added)
+1:             addSSTable(add);
+1:     }
+1: 
+commit:af44d1a
+commit:e16f584
+/////////////////////////////////////////////////////////////////////////
+1:     public boolean shouldDefragment()
+1:     {
+1:         return false;
+1:     }
+1: 
+1:     public String getName()
+1:     {
+1:         return getClass().getSimpleName();
+1:     }
+1: 
+1:     public abstract void addSSTable(SSTableReader added);
+1: 
+1:     public abstract void removeSSTable(SSTableReader sstable);
+1: 
+commit:86b6ec5
+commit:367c741
+/////////////////////////////////////////////////////////////////////////
+1: import com.google.common.collect.ImmutableMap;
+/////////////////////////////////////////////////////////////////////////
+1:     protected static final boolean DEFAULT_UNCHECKED_TOMBSTONE_COMPACTION_OPTION = false;
+1: 
+1:     // disable range overlap check when deciding if an SSTable is candidate for tombstone compaction (CASSANDRA-6563)
+1:     protected static final String UNCHECKED_TOMBSTONE_COMPACTION_OPTION = "unchecked_tombstone_compaction";
+/////////////////////////////////////////////////////////////////////////
+1:     protected boolean uncheckedTombstoneCompaction;
+/////////////////////////////////////////////////////////////////////////
+1:             optionValue = options.get(UNCHECKED_TOMBSTONE_COMPACTION_OPTION);
+1:             uncheckedTombstoneCompaction = optionValue == null ? DEFAULT_UNCHECKED_TOMBSTONE_COMPACTION_OPTION : Boolean.parseBoolean(optionValue);
+/////////////////////////////////////////////////////////////////////////
+1:             uncheckedTombstoneCompaction = DEFAULT_UNCHECKED_TOMBSTONE_COMPACTION_OPTION;
+/////////////////////////////////////////////////////////////////////////
+1:         //sstable range overlap check is disabled. See CASSANDRA-6563.
+1:         if (uncheckedTombstoneCompaction)
+1:             return true;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         String unchecked = options.get(UNCHECKED_TOMBSTONE_COMPACTION_OPTION);
+1:         if (unchecked != null)
+1:         {
+1:             if (!unchecked.equalsIgnoreCase("true") && !unchecked.equalsIgnoreCase("false"))
+0:                 throw new ConfigurationException(String.format("'%s' should be either 'true' or 'false', not '%s'",UNCHECKED_TOMBSTONE_COMPACTION_OPTION, unchecked));
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         uncheckedOptions.remove(UNCHECKED_TOMBSTONE_COMPACTION_OPTION);
+commit:8602fe8
+commit:9376fdd
+/////////////////////////////////////////////////////////////////////////
+0: import com.google.common.collect.ImmutableMap;
+/////////////////////////////////////////////////////////////////////////
+1:         this.options = ImmutableMap.copyOf(options);
+commit:af80201
+commit:0490abf
+/////////////////////////////////////////////////////////////////////////
+1:             if (!shouldBeEnabled())
+1:                 this.disable();
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     public boolean shouldBeEnabled()
+1:     {
+1:         String optionValue = options.get(COMPACTION_ENABLED);
+1: 
+1:         return optionValue == null || Boolean.parseBoolean(optionValue);
+1:     }
+commit:92b40fd
+commit:80b3e6c
+/////////////////////////////////////////////////////////////////////////
+0:     public AbstractCompactionTask getCompactionTask(Collection<SSTableReader> sstables, final int gcBefore, long maxSSTableBytes)
+1:     {
+0:         return new CompactionTask(cfs, sstables, gcBefore);
+1:     }
+commit:26191ca
+commit:a90b98e
+/////////////////////////////////////////////////////////////////////////
+0:     public abstract AbstractCompactionTask getCompactionTask(Collection<SSTableReader> sstables, final int gcBefore, long maxSSTableBytes);
+1: 
+commit:a7b7214
+/////////////////////////////////////////////////////////////////////////
+0:     public abstract Collection<AbstractCompactionTask> getMaximalTask(final int gcBefore);
+commit:ebefb77
+/////////////////////////////////////////////////////////////////////////
+1:     protected static final String COMPACTION_ENABLED = "enabled";
+/////////////////////////////////////////////////////////////////////////
+0:     protected volatile boolean enabled = true;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:             optionValue = options.get(COMPACTION_ENABLED);
+1: 
+0:             if (optionValue != null)
+1:             {
+0:                 if (optionValue.equalsIgnoreCase("false"))
+0:                     this.enabled = false;
+1:             }
+/////////////////////////////////////////////////////////////////////////
+0:     public boolean isEnabled()
+1:     {
+0:         return this.enabled && this.isActive;
+1:     }
+1: 
+1:     public void enable()
+1:     {
+0:         this.enabled = true;
+1:     }
+1: 
+1:     public void disable()
+1:     {
+0:         this.enabled = false;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         String compactionEnabled = options.get(COMPACTION_ENABLED);
+1:         if (compactionEnabled != null)
+1:         {
+1:             if (!compactionEnabled.equalsIgnoreCase("true") && !compactionEnabled.equalsIgnoreCase("false"))
+1:             {
+1:                 throw new ConfigurationException(String.format("enabled should either be 'true' or 'false', not %s", compactionEnabled));
+1:             }
+1:         }
+1:         uncheckedOptions.remove(COMPACTION_ENABLED);
+author:Blake Eggleston
+-------------------------------------------------------------------------------
+commit:eda763b
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     public boolean supportsEarlyOpen()
+1:     {
+1:         return true;
+1:     }
+commit:e1fb18a
+/////////////////////////////////////////////////////////////////////////
+1:     private final Directories directories;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:         directories = new Directories(cfs.metadata, Directories.dataDirectories);
+1:         return directories;
+commit:9ed2727
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.Directories;
+1: import org.apache.cassandra.db.SerializationHeader;
+1: import org.apache.cassandra.io.sstable.Descriptor;
+1: import org.apache.cassandra.io.sstable.SSTableMultiWriter;
+1: import org.apache.cassandra.io.sstable.SimpleSSTableMultiWriter;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+/////////////////////////////////////////////////////////////////////////
+1:     public Directories getDirectories()
+1:     {
+0:         return cfs.getDirectories();
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:      * @param sstables the written sstables. can be null or empty if the memtable was clean.
+1:     public void replaceFlushed(Memtable memtable, Collection<SSTableReader> sstables)
+0:         cfs.getTracker().replaceFlushed(memtable, sstables);
+0:         if (sstables != null && !sstables.isEmpty())
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:     public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor, long keyCount, long repairedAt, MetadataCollector meta, SerializationHeader header, LifecycleTransaction txn)
+1:     {
+0:         return SimpleSSTableMultiWriter.create(descriptor, keyCount, repairedAt, cfs.metadata, meta, header, txn);
+1:     }
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:849a438
+/////////////////////////////////////////////////////////////////////////
+commit:ad8cad7
+/////////////////////////////////////////////////////////////////////////
+1: 
+0: import org.apache.cassandra.db.lifecycle.SSTableSet;
+0: import org.apache.cassandra.db.lifecycle.View;
+/////////////////////////////////////////////////////////////////////////
+0:         Collection<SSTableReader> overlaps = cfs.getOverlappingSSTables(SSTableSet.CANONICAL, Collections.singleton(sstable));
+commit:e5a76bd
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+/////////////////////////////////////////////////////////////////////////
+1:     public AbstractCompactionTask getCompactionTask(LifecycleTransaction txn, final int gcBefore, long maxSSTableBytes)
+0:         return new CompactionTask(cfs, txn, gcBefore, false);
+/////////////////////////////////////////////////////////////////////////
+0:         cfs.getTracker().replaceFlushed(memtable, sstable);
+commit:9c4a776
+commit:c75ee41
+/////////////////////////////////////////////////////////////////////////
+0:         Collection<SSTableReader> overlaps = cfs.getOverlappingSSTables(Collections.singleton(sstable));
+commit:0956a8a
+commit:0e83100
+/////////////////////////////////////////////////////////////////////////
+1: import com.google.common.base.Throwables;
+/////////////////////////////////////////////////////////////////////////
+0:     public ScannerList getScanners(Collection<SSTableReader> sstables, Range<Token> range)
+1:         try
+1:         {
+1:             for (SSTableReader sstable : sstables)
+0:                 scanners.add(sstable.getScanner(range, limiter));
+1:         }
+1:         catch (Throwable t)
+1:         {
+1:             try
+1:             {
+1:                 new ScannerList(scanners).close();
+1:             }
+1:             catch (Throwable t2)
+1:             {
+1:                 t.addSuppressed(t2);
+1:             }
+1:             throw t;
+1:         }
+1:         return new ScannerList(scanners);
+1:     public static class ScannerList implements AutoCloseable
+1:     {
+0:         public final List<ICompactionScanner> scanners;
+0:         public ScannerList(List<ICompactionScanner> scanners)
+1:         {
+1:             this.scanners = scanners;
+1:         }
+1: 
+1:         public void close()
+1:         {
+1:             Throwable t = null;
+0:             for (ICompactionScanner scanner : scanners)
+1:             {
+1:                 try
+1:                 {
+1:                     scanner.close();
+1:                 }
+1:                 catch (Throwable t2)
+1:                 {
+1:                     if (t == null)
+1:                         t = t2;
+1:                     else
+1:                         t.addSuppressed(t2);
+1:                 }
+1:             }
+1:             if (t != null)
+1:                 throw Throwables.propagate(t);
+1:         }
+1:     }
+1: 
+1:     public ScannerList getScanners(Collection<SSTableReader> toCompact)
+author:Carl Yeksigian
+-------------------------------------------------------------------------------
+commit:e16d8a7
+/////////////////////////////////////////////////////////////////////////
+1:     protected static final boolean DEFAULT_LOG_ALL_OPTION = false;
+1:     protected static final String LOG_ALL_OPTION = "log_all";
+/////////////////////////////////////////////////////////////////////////
+1:     protected boolean logAll = true;
+/////////////////////////////////////////////////////////////////////////
+1:             optionValue = options.get(LOG_ALL_OPTION);
+1:             logAll = optionValue == null ? DEFAULT_LOG_ALL_OPTION : Boolean.parseBoolean(optionValue);
+/////////////////////////////////////////////////////////////////////////
+1:                 throw new ConfigurationException(String.format("'%s' should be either 'true' or 'false', not '%s'", UNCHECKED_TOMBSTONE_COMPACTION_OPTION, unchecked));
+1:         }
+1: 
+1:         String logAll = options.get(LOG_ALL_OPTION);
+1:         if (logAll != null)
+1:         {
+1:             if (!logAll.equalsIgnoreCase("true") && !logAll.equalsIgnoreCase("false"))
+1:             {
+1:                 throw new ConfigurationException(String.format("'%s' should either be 'true' or 'false', not %s", LOG_ALL_OPTION, logAll));
+1:             }
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         uncheckedOptions.remove(LOG_ALL_OPTION);
+/////////////////////////////////////////////////////////////////////////
+1:     public CompactionLogger.Strategy strategyLogger()
+1:     {
+1:         return CompactionLogger.Strategy.none;
+1:     }
+1: 
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:f81a91d
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.index.Index;
+/////////////////////////////////////////////////////////////////////////
+1:     public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor,
+1:                                                        long keyCount,
+1:                                                        long repairedAt,
+1:                                                        MetadataCollector meta,
+1:                                                        SerializationHeader header,
+1:                                                        Collection<Index> indexes,
+1:                                                        LifecycleTransaction txn)
+1:         return SimpleSSTableMultiWriter.create(descriptor, keyCount, repairedAt, cfs.metadata, meta, header, indexes, txn);
+commit:8541cca
+/////////////////////////////////////////////////////////////////////////
+0:                 ranges.add(new Range<Token>(overlap.first.getToken(), overlap.last.getToken(), overlap.partitioner));
+commit:480a1a8
+commit:27ed655
+/////////////////////////////////////////////////////////////////////////
+0:             scanners.add(sstable.getScanner(range));
+commit:be7cbc8
+commit:9483e14
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.*;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     /**
+1:      * Filters SSTables that are to be blacklisted from the given collection
+1:      *
+1:      * @param originalCandidates The collection to check for blacklisted SSTables
+1:      *
+1:      * @return list of the SSTables with blacklisted ones filtered out
+1:      */
+0:     public static List<SSTableReader> filterSuspectSSTables(Collection<SSTableReader> originalCandidates)
+1:     {
+0:         List<SSTableReader> filteredCandidates = new ArrayList<SSTableReader>();
+1: 
+0:         for (SSTableReader candidate : originalCandidates)
+1:         {
+0:             if (!candidate.isMarkedSuspect())
+0:                 filteredCandidates.add(candidate);
+1:         }
+1: 
+0:         return filteredCandidates;
+1:     }
+author:Stefania Alborghetti
+-------------------------------------------------------------------------------
+commit:605bcdc
+/////////////////////////////////////////////////////////////////////////
+1:         return new CompactionTask(cfs, txn, gcBefore);
+author:Joshua McKenzie
+-------------------------------------------------------------------------------
+commit:bee53d7
+commit:1fec4a4
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.io.sstable.ISSTableScanner;
+/////////////////////////////////////////////////////////////////////////
+1:         ArrayList<ISSTableScanner> scanners = new ArrayList<ISSTableScanner>();
+/////////////////////////////////////////////////////////////////////////
+1:         public final List<ISSTableScanner> scanners;
+1:         public ScannerList(List<ISSTableScanner> scanners)
+/////////////////////////////////////////////////////////////////////////
+1:             for (ISSTableScanner scanner : scanners)
+commit:0705e8a
+commit:f25da97
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.JVMStabilityInspector;
+/////////////////////////////////////////////////////////////////////////
+1:                     JVMStabilityInspector.inspectThrowable(t2);
+author:Jake Luciani
+-------------------------------------------------------------------------------
+commit:0368e97
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.io.sstable.format.SSTableReader;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:                 ranges.add(new Range<>(overlap.first.getToken(), overlap.last.getToken(), overlap.partitioner));
+author:Russell Spitzer
+-------------------------------------------------------------------------------
+commit:37f5175
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: 
+1:     /**
+1:      * Method for grouping similar SSTables together, This will be used by
+1:      * anti-compaction to determine which SSTables should be anitcompacted
+1:      * as a group. If a given compaction strategy creates sstables which
+1:      * cannot be merged due to some constraint it must override this method.
+1:      */
+1:     public Collection<Collection<SSTableReader>> groupSSTablesForAntiCompaction(Collection<SSTableReader> sstablesToGroup)
+1:     {
+1:         int groupSize = 2;
+1:         List<SSTableReader> sortedSSTablesToGroup = new ArrayList<>(sstablesToGroup);
+1:         Collections.sort(sortedSSTablesToGroup, SSTableReader.sstableComparator);
+1: 
+1:         Collection<Collection<SSTableReader>> groupedSSTables = new ArrayList<>();
+1:         Collection<SSTableReader> currGroup = new ArrayList<>();
+1: 
+1:         for (SSTableReader sstable : sortedSSTablesToGroup)
+1:         {
+1:             currGroup.add(sstable);
+1:             if (currGroup.size() == groupSize)
+1:             {
+1:                 groupedSSTables.add(currGroup);
+1:                 currGroup = new ArrayList<>();
+1:             }
+1:         }
+1: 
+1:         if (currGroup.size() != 0)
+1:             groupedSSTables.add(currGroup);
+1:         return groupedSSTables;
+1:     }
+author:belliottsmith
+-------------------------------------------------------------------------------
+commit:4e95953
+/////////////////////////////////////////////////////////////////////////
+0:         return new CompactionTask(cfs, sstables, gcBefore, false);
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:48847b5
+commit:58e524e
+/////////////////////////////////////////////////////////////////////////
+1:      * If not affected by MeteredFlusher (and handling flushing on its own), override to tell MF how much
+1:      * space to reserve for this CF, i.e., how much space to subtract from `memtable_total_space_in_mb` when deciding
+1:      * if other memtables should be flushed or not.
+1:      */
+1:     public long getMemtableReservedSize()
+1:     {
+1:         return 0;
+1:     }
+1: 
+1:     /**
+commit:8a62046
+commit:cc708b9
+/////////////////////////////////////////////////////////////////////////
+1:     protected boolean isActive = false;
+/////////////////////////////////////////////////////////////////////////
+1:      * Performs any extra initialization required
+1:      */
+1:     public void startup()
+1:     {
+1:         isActive = true;
+1:     }
+1: 
+1:     /**
+commit:65773b1
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.Memtable;
+/////////////////////////////////////////////////////////////////////////
+1:      * @return whether or not MeteredFlusher should be able to trigger memtable flushes for this CF.
+1:      */
+1:     public boolean isAffectedByMeteredFlusher()
+1:     {
+1:         return true;
+1:     }
+1: 
+1:     /**
+1:      * Handle a flushed memtable.
+1:      *
+1:      * @param memtable the flushed memtable
+0:      * @param sstable the written sstable. can be null if the memtable was clean.
+1:      */
+0:     public void replaceFlushed(Memtable memtable, SSTableReader sstable)
+1:     {
+0:         cfs.getDataTracker().replaceFlushed(memtable, sstable);
+0:         if (sstable != null)
+0:             CompactionManager.instance.submitBackground(cfs);
+1:     }
+1: 
+1:     /**
+0:      * @return a subset of the suggested sstables that are relevant for read requests.
+1:      */
+0:     public List<SSTableReader> filterSSTablesForReads(List<SSTableReader> sstables)
+1:     {
+0:         return sstables;
+1:     }
+1: 
+1:     /**
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:90e585d
+commit:ecec863
+/////////////////////////////////////////////////////////////////////////
+1:     public abstract long getMaxSSTableBytes();
+commit:dbd1a72
+/////////////////////////////////////////////////////////////////////////
+1:             if (sstable.getIndexSummarySize() < 2)
+commit:74f37b5
+/////////////////////////////////////////////////////////////////////////
+0: import com.google.common.util.concurrent.RateLimiter;
+/////////////////////////////////////////////////////////////////////////
+0:         RateLimiter limiter = CompactionManager.instance.getRateLimiter();
+0:             scanners.add(sstable.getScanner(range, limiter));
+commit:2b0797b
+/////////////////////////////////////////////////////////////////////////
+0: import com.google.common.util.concurrent.RateLimiter;
+/////////////////////////////////////////////////////////////////////////
+0:         RateLimiter limiter = CompactionManager.instance.getRateLimiter();
+0:             scanners.add(sstable.getDirectScanner(range, limiter));
+commit:4439b41
+/////////////////////////////////////////////////////////////////////////
+0:             if (sstable.getKeySamples().length < 2)
+commit:9851b73
+/////////////////////////////////////////////////////////////////////////
+0:             if (sstable.getKeySamples().length < 2)
+commit:75d5639
+/////////////////////////////////////////////////////////////////////////
+1: import com.google.common.base.Predicate;
+1: import com.google.common.collect.Iterables;
+/////////////////////////////////////////////////////////////////////////
+1:     public static Iterable<SSTableReader> filterSuspectSSTables(Iterable<SSTableReader> originalCandidates)
+1:         return Iterables.filter(originalCandidates, new Predicate<SSTableReader>()
+1:             public boolean apply(SSTableReader sstable)
+1:             {
+1:                 return !sstable.isMarkedSuspect();
+1:             }
+1:         });
+/////////////////////////////////////////////////////////////////////////
+commit:01bc564
+/////////////////////////////////////////////////////////////////////////
+0:             scanners.add(sstable.getDirectScanner(range));
+commit:d72e938
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * pause/resume/getNextBackgroundTask must synchronize.  This guarantees that after pause completes,
+1:      * no new tasks will be generated; or put another way, pause can't run until in-progress tasks are
+1:      * done being created.
+1:      *
+1:      * This allows runWithCompactionsDisabled to be confident that after pausing, once in-progress
+1:      * tasks abort, it's safe to proceed with truncate/cleanup/etc.
+1:      *
+1:      * See CASSANDRA-3430
+1:      */
+0:     protected boolean isActive = true;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:      * For internal, temporary suspension of background compactions so that we can do exceptional
+1:      * things like truncate or major compaction
+1:     public synchronized void pause()
+1:     {
+1:         isActive = false;
+1:     }
+1: 
+1:     /**
+1:      * For internal, temporary suspension of background compactions so that we can do exceptional
+1:      * things like truncate or major compaction
+1:      */
+1:     public synchronized void resume()
+1:     {
+1:         isActive = true;
+1:     }
+1: 
+1:     /**
+1:      * Releases any resources if this strategy is shutdown (when the CFS is reloaded after a schema change).
+1:      */
+1:     public void shutdown()
+1:     {
+1:         isActive = false;
+1:     }
+commit:4042ef2
+commit:686f516
+/////////////////////////////////////////////////////////////////////////
+1:      *
+1:      *
+1:      *
+1:      *
+1:      * Is responsible for marking its sstables as compaction-pending.
+1:      *
+1:      *
+1:      * Is responsible for marking its sstables as compaction-pending.
+commit:278a5e8
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:     public int getNextLevel(Collection<SSTableReader> sstables, OperationType operationType)
+1:     {
+0:         return 0;
+1:     }
+commit:5bd57cb
+/////////////////////////////////////////////////////////////////////////
+commit:0e28478
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:     public int getNextLevel(Collection<SSTableReader> sstables, OperationType operationType)
+1:     {
+0:         return 0;
+1:     }
+commit:171c661
+/////////////////////////////////////////////////////////////////////////
+1:     protected static final String TOMBSTONE_THRESHOLD_OPTION = "tombstone_threshold";
+1: 
+0:     public final Map<String, String> options;
+0:     protected final float tombstoneThreshold;
+/////////////////////////////////////////////////////////////////////////
+0:         String optionValue = options.get(TOMBSTONE_THRESHOLD_OPTION);
+commit:d7468ea
+/////////////////////////////////////////////////////////////////////////
+0:         tombstoneThreshold = optionValue == null ? DEFAULT_TOMBSTONE_THRESHOLD : Float.parseFloat(optionValue);
+commit:debb15e
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     public List<ICompactionScanner> getScanners(Collection<SSTableReader> sstables, Range<Token> range)
+/////////////////////////////////////////////////////////////////////////
+0:     public List<ICompactionScanner> getScanners(Collection<SSTableReader> toCompact)
+commit:06a7bf3
+commit:46e422a
+/////////////////////////////////////////////////////////////////////////
+0: import java.io.IOException;
+1: import org.apache.cassandra.dht.Range;
+1: import org.apache.cassandra.dht.Token;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     /**
+1:      * Returns a list of KeyScanners given sstables and a range on which to scan.
+1:      * The default implementation simply grab one SSTableScanner per-sstable, but overriding this method
+1:      * allow for a more memory efficient solution if we know the sstable don't overlap (see
+1:      * LeveledCompactionStrategy for instance).
+1:      */
+0:     public List<ICompactionScanner> getScanners(Collection<SSTableReader> sstables, Range<Token> range) throws IOException
+1:     {
+0:         ArrayList<ICompactionScanner> scanners = new ArrayList<ICompactionScanner>();
+0:         for (SSTableReader sstable : sstables)
+0:             scanners.add(sstable.getDirectScanner(range));
+0:         return scanners;
+1:     }
+1: 
+0:     public List<ICompactionScanner> getScanners(Collection<SSTableReader> toCompact) throws IOException
+1:     {
+0:         return getScanners(toCompact, null);
+1:     }
+commit:be1b02b
+/////////////////////////////////////////////////////////////////////////
+1:      * @return the next background/minor compaction task to run; null if nothing to do.
+1:     public abstract AbstractCompactionTask getNextBackgroundTask(final int gcBefore);
+1:      * @return a compaction task that should be run to compact this columnfamilystore
+1:      * as much as possible.  Null if nothing to do.
+0:     public abstract AbstractCompactionTask getMaximalTask(final int gcBefore);
+commit:3ad3e73
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.Set;
+0: import org.apache.cassandra.io.sstable.SSTable;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     /**
+0:      * @return true if checking for whether a key exists, ignoring @param sstablesToIgnore,
+0:      * is going to be expensive
+1:      */
+0:     public abstract boolean isKeyExistenceExpensive(Set<? extends SSTable> sstablesToIgnore);
+commit:84a461a
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     /**
+1:      * @return size in bytes of the largest sstables for this strategy
+1:      */
+0:     public abstract long getMaxSSTableSize();
+commit:d23655b
+/////////////////////////////////////////////////////////////////////////
+0:         StorageService.optionalTasks.schedule(runnable, 5 * 60, TimeUnit.SECONDS);
+commit:31e060a
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.concurrent.TimeUnit;
+0: import org.apache.cassandra.service.StorageService;
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:         // start compactions in five minutes (if no flushes have occurred by then to do so)
+0:         Runnable runnable = new Runnable()
+1:         {
+0:             public void run()
+1:             {
+0:                 if (CompactionManager.instance.getActiveCompactions() == 0)
+1:                 {
+0:                     CompactionManager.instance.submitBackground(AbstractCompactionStrategy.this.cfs);
+0:                 }
+0:             }
+0:         };
+0:         StorageService.tasks.schedule(runnable, 5 * 60, TimeUnit.SECONDS);
+commit:f0ee59d
+/////////////////////////////////////////////////////////////////////////
+1:         assert cfs != null;
+0:      * Releases any resources if this strategy is shutdown (when the CFS is reloaded after a schema change).
+0:      * Default is to do nothing.
+1:      */
+0:     public void shutdown() { }
+1: 
+1:     /**
+commit:f9497f4
+/////////////////////////////////////////////////////////////////////////
+commit:ed0df5f
+/////////////////////////////////////////////////////////////////////////
+0:         assert cfs != null;
+0:      * Releases any resources if this strategy is shutdown (when the CFS is reloaded after a schema change).
+0:      * Default is to do nothing.
+1:      */
+0:     public void shutdown() { }
+1: 
+1:     /**
+commit:129d80a
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: 
+1: package org.apache.cassandra.db.compaction;
+1: 
+0: import java.util.ArrayList;
+0: import java.util.Collection;
+0: import java.util.List;
+0: import java.util.Map;
+1: 
+0: import org.apache.commons.lang.StringUtils;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+0: import org.apache.cassandra.config.CFMetaData;
+0: import org.apache.cassandra.db.Table;
+1: import org.apache.cassandra.db.ColumnFamilyStore;
+0: import org.apache.cassandra.io.sstable.SSTableReader;
+0: import org.apache.cassandra.utils.DefaultInteger;
+0: import org.apache.cassandra.utils.Pair;
+1: 
+1: 
+1: /**
+1:  * Pluggable compaction strategy determines how SSTables get merged.
+1:  *
+1:  * There are two main goals:
+1:  *  - perform background compaction constantly as needed; this typically makes a tradeoff between
+1:  *    i/o done by compaction, and merging done at read time.
+1:  *  - perform a full (maximum possible) compaction if requested by the user
+1:  */
+1: public abstract class AbstractCompactionStrategy
+0: {
+1:     protected final ColumnFamilyStore cfs;
+0:     protected final Map<String, String> options;
+1: 
+1:     protected AbstractCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
+0:     {
+1:         this.cfs = cfs;
+0:         this.options = options;
+0:     }
+1: 
+1:     /**
+0:      * @return a list of compaction tasks that should run in the background to get the sstable
+0:      * count down to desired parameters. Will not be null, but may be empty.
+1:      * @param gcBefore throw away tombstones older than this
+1:      */
+0:     public abstract List<AbstractCompactionTask> getBackgroundTasks(final int gcBefore);
+1: 
+1:     /**
+0:      * @return a list of compaction tasks that should be run to compact this columnfamilystore
+0:      * as much as possible.  Will not be null, but may be empty.
+1:      * @param gcBefore throw away tombstones older than this
+1:      */
+0:     public abstract List<AbstractCompactionTask> getMaximalTasks(final int gcBefore);
+1: 
+1:     /**
+1:      * @return a compaction task corresponding to the requested sstables.
+1:      * Will not be null. (Will throw if user requests an invalid compaction.)
+1:      * @param gcBefore throw away tombstones older than this
+1:      */
+1:     public abstract AbstractCompactionTask getUserDefinedTask(Collection<SSTableReader> sstables, final int gcBefore);
+1: 
+1:     /**
+1:      * @return the number of background tasks estimated to still be needed for this columnfamilystore
+1:      */
+1:     public abstract int getEstimatedRemainingTasks();
+0: }
+author:Vijay Parthasarathy
+-------------------------------------------------------------------------------
+commit:c33ccd9
+/////////////////////////////////////////////////////////////////////////
+0:             if (sstable.getKeySampleSize() < 2)
+author:Yuki Morishita
+-------------------------------------------------------------------------------
+commit:b74a00b
+/////////////////////////////////////////////////////////////////////////
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+0: 
+1: import org.apache.cassandra.io.sstable.Component;
+/////////////////////////////////////////////////////////////////////////
+1:     private static final Logger logger = LoggerFactory.getLogger(AbstractCompactionStrategy.class);
+0: 
+1:     // minimum interval needed to perform tombstone removal compaction in seconds, default 86400 or 1 day.
+1:     protected static final long DEFAULT_TOMBSTONE_COMPACTION_INTERVAL = 86400;
+1:     protected static final String TOMBSTONE_COMPACTION_INTERVAL_OPTION = "tombstone_compaction_interval";
+1:     protected long tombstoneCompactionInterval;
+/////////////////////////////////////////////////////////////////////////
+0:         optionValue = options.get(TOMBSTONE_COMPACTION_INTERVAL_OPTION);
+0:         tombstoneCompactionInterval = optionValue == null ? DEFAULT_TOMBSTONE_COMPACTION_INTERVAL : Long.parseLong(optionValue);
+0:         if (tombstoneCompactionInterval < 0)
+0:         {
+0:             logger.warn("tombstone_compaction_interval should not be negative({}). Using default value of {}.",
+0:                         tombstoneCompactionInterval, DEFAULT_TOMBSTONE_COMPACTION_INTERVAL);
+1:             tombstoneCompactionInterval = DEFAULT_TOMBSTONE_COMPACTION_INTERVAL;
+0:         }
+/////////////////////////////////////////////////////////////////////////
+1:      * Check if given sstable is worth dropping tombstones at gcBefore.
+1:      * Check is skipped if tombstone_compaction_interval time does not elapse since sstable creation and returns false.
+0:      *
+1:         // since we use estimations to calculate, there is a chance that compaction will not drop tombstones actually.
+1:         // if that happens we will end up in infinite compaction loop, so first we check enough if enough time has
+1:         // elapsed since SSTable created.
+1:         if (System.currentTimeMillis() < sstable.getCreationTimeFor(Component.DATA) + tombstoneCompactionInterval * 1000)
+1:            return false;
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:             if (sstable.getKeySamples().size() < 2)
+0:             {
+1:                 // we have too few samples to estimate correct percentage
+1:                 return false;
+0:             }
+/////////////////////////////////////////////////////////////////////////
+1:             long columns = sstable.getEstimatedColumnCount().mean() * remainingKeys;
+commit:2a3076b
+/////////////////////////////////////////////////////////////////////////
+0:      * @return the next background/minor compaction task to run; null if nothing to do.
+1:      * Is responsible for marking its sstables as compaction-pending.
+0:      * @param gcBefore throw away tombstones older than this
+1:      * @param sstables SSTables to compact. Must be marked as compacting.
+0:      * @param gcBefore throw away tombstones older than this
+/////////////////////////////////////////////////////////////////////////
+commit:00e7150
+commit:8eb2fed
+/////////////////////////////////////////////////////////////////////////
+commit:0091af9
+/////////////////////////////////////////////////////////////////////////
+1:     protected static final float DEFAULT_TOMBSTONE_THRESHOLD = 0.2f;
+0:     protected static final String TOMBSTONE_THRESHOLD_KEY = "tombstone_threshold";
+0: 
+0:     protected float tombstoneThreshold;
+0: 
+0:         String optionValue = options.get(TOMBSTONE_THRESHOLD_KEY);
+0:         tombstoneThreshold = (null != optionValue) ? Float.parseFloat(optionValue) : DEFAULT_TOMBSTONE_THRESHOLD;
+0: 
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:     /**
+1:      * @param sstable SSTable to check
+1:      * @param gcBefore time to drop tombstones
+1:      * @return true if given sstable's tombstones are expected to be removed
+0:      */
+1:     protected boolean worthDroppingTombstones(SSTableReader sstable, int gcBefore)
+0:     {
+1:         double droppableRatio = sstable.getEstimatedDroppableTombstoneRatio(gcBefore);
+1:         if (droppableRatio <= tombstoneThreshold)
+1:             return false;
+0: 
+0:         Set<SSTableReader> overlaps = cfs.getOverlappingSSTables(Collections.singleton(sstable));
+1:         if (overlaps.isEmpty())
+0:         {
+1:             // there is no overlap, tombstones are safely droppable
+1:             return true;
+0:         }
+1:         else
+0:         {
+1:             // what percentage of columns do we expect to compact outside of overlap?
+1:             // first, calculate estimated keys that do not overlap
+1:             long keys = sstable.estimatedKeys();
+0:             Set<Range<Token>> ranges = new HashSet<Range<Token>>();
+1:             for (SSTableReader overlap : overlaps)
+0:                 ranges.add(new Range<Token>(overlap.first.token, overlap.last.token, overlap.partitioner));
+1:             long remainingKeys = keys - sstable.estimatedKeysForRanges(ranges);
+1:             // next, calculate what percentage of columns we have within those keys
+0:             double remainingKeysRatio = ((double) remainingKeys) / keys;
+0:             long columns = sstable.getEstimatedColumnCount().percentile(remainingKeysRatio) * remainingKeys;
+1:             double remainingColumnsRatio = ((double) columns) / (sstable.getEstimatedColumnCount().count() * sstable.getEstimatedColumnCount().mean());
+0: 
+1:             // return if we still expect to have droppable tombstones in rest of columns
+1:             return remainingColumnsRatio * droppableRatio > tombstoneThreshold;
+0:         }
+0:     }
+============================================================================

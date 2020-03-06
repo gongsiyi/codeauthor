@@ -1,0 +1,777 @@
+1:eb4fa4a: /*
+1:eb4fa4a:  * Licensed to the Apache Software Foundation (ASF) under one
+1:eb4fa4a:  * or more contributor license agreements.  See the NOTICE file
+1:eb4fa4a:  * distributed with this work for additional information
+1:eb4fa4a:  * regarding copyright ownership.  The ASF licenses this file
+1:eb4fa4a:  * to you under the Apache License, Version 2.0 (the
+1:eb4fa4a:  * "License"); you may not use this file except in compliance
+1:eb4fa4a:  * with the License.  You may obtain a copy of the License at
+1:eb4fa4a:  *
+1:eb4fa4a:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:eb4fa4a:  *
+1:eb4fa4a:  * Unless required by applicable law or agreed to in writing, software
+1:eb4fa4a:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:eb4fa4a:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:eb4fa4a:  * See the License for the specific language governing permissions and
+1:eb4fa4a:  * limitations under the License.
+2:eb4fa4a:  */
+1:eb4fa4a: package org.apache.cassandra.repair;
+1:eb4fa4a: 
+1:eb4fa4a: import java.net.InetAddress;
+1:eb4fa4a: import java.security.MessageDigest;
+1:eb4fa4a: import java.util.ArrayList;
+1:eb4fa4a: import java.util.List;
+1:eb4fa4a: import java.util.Random;
+1:eb4fa4a: 
+1:eb4fa4a: import com.google.common.annotations.VisibleForTesting;
+1:eb4fa4a: 
+1:eb4fa4a: import org.slf4j.Logger;
+1:eb4fa4a: import org.slf4j.LoggerFactory;
+1:eb4fa4a: import org.apache.cassandra.concurrent.Stage;
+1:eb4fa4a: import org.apache.cassandra.concurrent.StageManager;
+1:eb4fa4a: import org.apache.cassandra.db.ColumnFamilyStore;
+1:eb4fa4a: import org.apache.cassandra.db.DecoratedKey;
+1:a991b64: import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+1:a991b64: import org.apache.cassandra.db.rows.UnfilteredRowIterators;
+1:eb4fa4a: import org.apache.cassandra.dht.Range;
+1:eb4fa4a: import org.apache.cassandra.dht.Token;
+1:eb4fa4a: import org.apache.cassandra.net.MessagingService;
+1:eb4fa4a: import org.apache.cassandra.repair.messages.ValidationComplete;
+1:f5866ca: import org.apache.cassandra.tracing.Tracing;
+1:eb4fa4a: import org.apache.cassandra.utils.FBUtilities;
+1:eb4fa4a: import org.apache.cassandra.utils.MerkleTree;
+1:e2ad896: import org.apache.cassandra.utils.MerkleTree.RowHash;
+1:0dd50a6: import org.apache.cassandra.utils.MerkleTrees;
+1:eb4fa4a: 
+2:eb4fa4a: /**
+1:93a03fe:  * Handles the building of a merkle tree for a column family.
+1:eb4fa4a:  *
+1:eb4fa4a:  * Lifecycle:
+1:eb4fa4a:  * 1. prepare() - Initialize tree with samples.
+1:eb4fa4a:  * 2. add() - 0 or more times, to add hashes to the tree.
+1:eb4fa4a:  * 3. complete() - Enqueues any operations that were blocked waiting for a valid tree.
+1:eb4fa4a:  */
+1:eb4fa4a: public class Validator implements Runnable
+1:eb4fa4a: {
+1:66f3014:     private static final Logger logger = LoggerFactory.getLogger(Validator.class);
+1:eb4fa4a: 
+1:eb4fa4a:     public final RepairJobDesc desc;
+1:eb4fa4a:     public final InetAddress initiator;
+1:eb4fa4a:     public final int gcBefore;
+1:c70ce63:     private final boolean evenTreeDistribution;
+1:eb4fa4a: 
+1:eb4fa4a:     // null when all rows with the min token have been consumed
+1:ef4a07b:     private long validated;
+1:0dd50a6:     private MerkleTrees trees;
+1:ef4a07b:     // current range being updated
+1:ef4a07b:     private MerkleTree.TreeRange range;
+1:ef4a07b:     // iterator for iterating sub ranges (MT's leaves)
+1:0dd50a6:     private MerkleTrees.TreeRangeIterator ranges;
+1:ef4a07b:     // last key seen
+1:ef4a07b:     private DecoratedKey lastKey;
+1:eb4fa4a: 
+1:eb4fa4a:     public Validator(RepairJobDesc desc, InetAddress initiator, int gcBefore)
+1:eb4fa4a:     {
+1:c70ce63:         this(desc, initiator, gcBefore, false);
+1:eb4fa4a:     }
+1:eb4fa4a: 
+1:c70ce63:     public Validator(RepairJobDesc desc, InetAddress initiator, int gcBefore, boolean evenTreeDistribution)
+1:eb4fa4a:     {
+1:eb4fa4a:         this.desc = desc;
+1:eb4fa4a:         this.initiator = initiator;
+1:eb4fa4a:         this.gcBefore = gcBefore;
+1:eb4fa4a:         validated = 0;
+1:eb4fa4a:         range = null;
+1:eb4fa4a:         ranges = null;
+1:c70ce63:         this.evenTreeDistribution = evenTreeDistribution;
+1:eb4fa4a:     }
+1:ef4a07b: 
+1:0dd50a6:     public void prepare(ColumnFamilyStore cfs, MerkleTrees tree)
+1:eb4fa4a:     {
+1:0dd50a6:         this.trees = tree;
+1:eb4fa4a: 
+1:c70ce63:         if (!tree.partitioner().preservesOrder() || evenTreeDistribution)
+1:eb4fa4a:         {
+1:eb4fa4a:             // You can't beat an even tree distribution for md5
+2:eb4fa4a:             tree.init();
+1:eb4fa4a:         }
+1:eb4fa4a:         else
+1:eb4fa4a:         {
+1:eb4fa4a:             List<DecoratedKey> keys = new ArrayList<>();
+1:eb4fa4a:             Random random = new Random();
+1:eb4fa4a: 
+1:0dd50a6:             for (Range<Token> range : tree.ranges())
+1:eb4fa4a:             {
+1:0dd50a6:                 for (DecoratedKey sample : cfs.keySamples(range))
+1:c70ce63:                 {
+1:0dd50a6:                     assert range.contains(sample.getToken()) : "Token " + sample.getToken() + " is not within range " + desc.ranges;
+1:eb4fa4a:                     keys.add(sample);
+1:eb4fa4a:                 }
+1:eb4fa4a: 
+1:eb4fa4a:                 if (keys.isEmpty())
+1:eb4fa4a:                 {
+1:eb4fa4a:                     // use an even tree distribution
+1:0dd50a6:                     tree.init(range);
+1:eb4fa4a:                 }
+1:eb4fa4a:                 else
+1:eb4fa4a:                 {
+1:0dd50a6:                     int numKeys = keys.size();
+1:eb4fa4a:                     // sample the column family using random keys from the index
+1:eb4fa4a:                     while (true)
+1:eb4fa4a:                     {
+1:0dd50a6:                         DecoratedKey dk = keys.get(random.nextInt(numKeys));
+1:0dd50a6:                         if (!tree.split(dk.getToken()))
+1:eb4fa4a:                             break;
+1:eb4fa4a:                     }
+1:867fd8e:                     keys.clear();
+1:eb4fa4a:                 }
+1:eb4fa4a:             }
+1:c70ce63:         }
+1:0dd50a6:         logger.debug("Prepared AEService trees of size {} for {}", trees.size(), desc);
+1:eb4fa4a:         ranges = tree.invalids();
+1:eb4fa4a:     }
+1:eb4fa4a: 
+1:eb4fa4a:     /**
+1:eb4fa4a:      * Called (in order) for every row present in the CF.
+1:eb4fa4a:      * Hashes the row, and adds it to the tree being built.
+1:eb4fa4a:      *
+1:6536c05:      * @param partition Partition to add hash
+1:eb4fa4a:      */
+1:a991b64:     public void add(UnfilteredRowIterator partition)
+1:eb4fa4a:     {
+1:0dd50a6:         assert Range.isInRanges(partition.partitionKey().getToken(), desc.ranges) : partition.partitionKey().getToken() + " is not contained in " + desc.ranges;
+1:a991b64:         assert lastKey == null || lastKey.compareTo(partition.partitionKey()) < 0
+1:a991b64:                : "partition " + partition.partitionKey() + " received out of order wrt " + lastKey;
+1:a991b64:         lastKey = partition.partitionKey();
+1:eb4fa4a: 
+1:eb4fa4a:         if (range == null)
+1:eb4fa4a:             range = ranges.next();
+1:eb4fa4a: 
+1:eb4fa4a:         // generate new ranges as long as case 1 is true
+1:0dd50a6:         if (!findCorrectRange(lastKey.getToken()))
+1:eb4fa4a:         {
+1:eb4fa4a:             // add the empty hash, and move to the next range
+1:0dd50a6:             ranges = trees.invalids();
+1:0dd50a6:             findCorrectRange(lastKey.getToken());
+1:eb4fa4a:         }
+1:eb4fa4a: 
+1:0dd50a6:         assert range.contains(lastKey.getToken()) : "Token not in MerkleTree: " + lastKey.getToken();
+1:eb4fa4a:         // case 3 must be true: mix in the hashed row
+1:a991b64:         RowHash rowHash = rowHash(partition);
+1:e2ad896:         if (rowHash != null)
+1:eb4fa4a:         {
+1:e2ad896:             range.addHash(rowHash);
+1:eb4fa4a:         }
+1:0dd50a6:     }
+1:eb4fa4a: 
+1:0dd50a6:     public boolean findCorrectRange(Token t)
+1:0dd50a6:     {
+1:0dd50a6:         while (!range.contains(t) && ranges.hasNext())
+1:0dd50a6:         {
+1:eb4fa4a:             range = ranges.next();
+1:0dd50a6:         }
+1:c70ce63: 
+1:0dd50a6:         return range.contains(t);
+1:0dd50a6:     }
+1:2dc2bb8: 
+1:18f0234:     static class CountingDigest extends MessageDigest
+1:0dd50a6:     {
+1:18f0234:         private long count;
+1:18f0234:         private MessageDigest underlying;
+1:867fd8e: 
+1:18f0234:         public CountingDigest(MessageDigest underlying)
+1:0dd50a6:         {
+1:18f0234:             super(underlying.getAlgorithm());
+1:18f0234:             this.underlying = underlying;
+1:0dd50a6:         }
+1:0dd50a6: 
+1:18f0234:         @Override
+1:18f0234:         protected void engineUpdate(byte input)
+1:0dd50a6:         {
+1:18f0234:             underlying.update(input);
+1:18f0234:             count += 1;
+1:0dd50a6:         }
+1:0dd50a6: 
+1:18f0234:         @Override
+1:18f0234:         protected void engineUpdate(byte[] input, int offset, int len)
+1:e2ad896:         {
+1:18f0234:             underlying.update(input, offset, len);
+1:18f0234:             count += len;
+1:e2ad896:         }
+1:0dd50a6: 
+1:18f0234:         @Override
+1:18f0234:         protected byte[] engineDigest()
+1:f5866ca:         {
+1:18f0234:             return underlying.digest();
+1:e2ad896:         }
+1:e2ad896: 
+1:18f0234:         @Override
+1:18f0234:         protected void engineReset()
+5:18f0234:         {
+1:18f0234:             underlying.reset();
+5:18f0234:         }
+5:18f0234: 
+1:18f0234:     }
+1:18f0234: 
+1:a991b64:     private MerkleTree.RowHash rowHash(UnfilteredRowIterator partition)
+1:18f0234:     {
+1:eb4fa4a:         validated++;
+1:eb4fa4a:         // MerkleTree uses XOR internally, so we want lots of output bits here
+1:18f0234:         CountingDigest digest = new CountingDigest(FBUtilities.newMessageDigest("SHA-256"));
+1:3e37b4a:         UnfilteredRowIterators.digest(null, partition, digest, MessagingService.current_version);
+1:e2ad896:         // only return new hash for merkle tree in case digest was updated - see CASSANDRA-8979
+1:a991b64:         return digest.count > 0
+1:a991b64:              ? new MerkleTree.RowHash(partition.partitionKey().getToken(), digest.digest(), digest.count)
+1:a991b64:              : null;
+1:eb4fa4a:     }
+1:eb4fa4a: 
+1:eb4fa4a:     /**
+1:eb4fa4a:      * Registers the newly created tree for rendezvous in Stage.ANTIENTROPY.
+1:eb4fa4a:      */
+1:eb4fa4a:     public void complete()
+1:eb4fa4a:     {
+1:eb4fa4a:         completeTree();
+1:eb4fa4a: 
+1:eb4fa4a:         StageManager.getStage(Stage.ANTI_ENTROPY).execute(this);
+1:eb4fa4a: 
+1:18f0234:         if (logger.isDebugEnabled())
+1:e2ad896:         {
+1:18f0234:             // log distribution of rows in tree
+1:c0ba85a:             logger.debug("Validated {} partitions for {}.  Partitions per leaf are:", validated, desc.sessionId);
+1:0dd50a6:             trees.logRowCountPerLeaf(logger);
+1:c0ba85a:             logger.debug("Validated {} partitions for {}.  Partition sizes are:", validated, desc.sessionId);
+1:0dd50a6:             trees.logRowSizePerLeaf(logger);
+1:eb4fa4a:         }
+1:e2ad896:     }
+1:18f0234: 
+1:eb4fa4a:     @VisibleForTesting
+1:eb4fa4a:     public void completeTree()
+1:eb4fa4a:     {
+1:eb4fa4a:         assert ranges != null : "Validator was not prepared()";
+1:eb4fa4a: 
+1:0dd50a6:         ranges = trees.invalids();
+1:0dd50a6: 
+1:eb4fa4a:         while (ranges.hasNext())
+1:eb4fa4a:         {
+1:eb4fa4a:             range = ranges.next();
+1:18f0234:             range.ensureHashInitialised();
+1:eb4fa4a:         }
+1:eb4fa4a:     }
+1:eb4fa4a: 
+1:eb4fa4a:     /**
+1:eb4fa4a:      * Called when some error during the validation happened.
+1:eb4fa4a:      * This sends RepairStatus to inform the initiator that the validation has failed.
+1:eb4fa4a:      * The actual reason for failure should be looked up in the log of the host calling this function.
+1:eb4fa4a:      */
+1:eb4fa4a:     public void fail()
+1:eb4fa4a:     {
+1:db9bc69:         logger.error("Failed creating a merkle tree for {}, {} (see log for details)", desc, initiator);
+1:eb4fa4a:         // send fail message only to nodes >= version 2.0
+1:eb4fa4a:         MessagingService.instance().sendOneWay(new ValidationComplete(desc).createMessage(), initiator);
+1:eb4fa4a:     }
+1:eb4fa4a: 
+1:eb4fa4a:     /**
+1:eb4fa4a:      * Called after the validation lifecycle to respond with the now valid tree. Runs in Stage.ANTIENTROPY.
+1:eb4fa4a:      */
+1:eb4fa4a:     public void run()
+1:eb4fa4a:     {
+1:eb4fa4a:         // respond to the request that triggered this validation
+1:eb4fa4a:         if (!initiator.equals(FBUtilities.getBroadcastAddress()))
+1:e2ad896:         {
+1:2dc2bb8:             logger.info("[repair #{}] Sending completed merkle tree to {} for {}.{}", desc.sessionId, initiator, desc.keyspace, desc.columnFamily);
+1:f5866ca:             Tracing.traceRepair("Sending completed merkle tree to {} for {}.{}", initiator, desc.keyspace, desc.columnFamily);
+1:eb4fa4a:         }
+1:0dd50a6:         MessagingService.instance().sendOneWay(new ValidationComplete(desc, trees).createMessage(), initiator);
+1:eb4fa4a:     }
+1:f5866ca: }
+============================================================================
+author:Yuki Morishita
+-------------------------------------------------------------------------------
+commit:e3b34dc
+commit:413e48e
+commit:05a86fd
+commit:89a8f4a
+commit:ef4a07b
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private long validated;
+0:     private MerkleTree tree;
+1:     // current range being updated
+1:     private MerkleTree.TreeRange range;
+1:     // iterator for iterating sub ranges (MT's leaves)
+0:     private MerkleTree.TreeRangeIterator ranges;
+1:     // last key seen
+1:     private DecoratedKey lastKey;
+0:     public void prepare(ColumnFamilyStore cfs, MerkleTree tree)
+0:         this.tree = tree;
+1: 
+commit:eb4fa4a
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.repair;
+1: 
+1: import java.net.InetAddress;
+1: import java.security.MessageDigest;
+1: import java.util.ArrayList;
+1: import java.util.List;
+1: import java.util.Random;
+1: 
+1: import com.google.common.annotations.VisibleForTesting;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import org.apache.cassandra.concurrent.Stage;
+1: import org.apache.cassandra.concurrent.StageManager;
+0: import org.apache.cassandra.config.DatabaseDescriptor;
+1: import org.apache.cassandra.db.ColumnFamilyStore;
+1: import org.apache.cassandra.db.DecoratedKey;
+0: import org.apache.cassandra.db.compaction.AbstractCompactedRow;
+1: import org.apache.cassandra.dht.Range;
+1: import org.apache.cassandra.dht.Token;
+1: import org.apache.cassandra.net.MessagingService;
+1: import org.apache.cassandra.repair.messages.ValidationComplete;
+0: import org.apache.cassandra.service.ActiveRepairService;
+1: import org.apache.cassandra.utils.FBUtilities;
+1: import org.apache.cassandra.utils.MerkleTree;
+1: 
+1: /**
+0:  * A Strategy to handle building and validating a merkle tree for a column family.
+1:  *
+1:  * Lifecycle:
+1:  * 1. prepare() - Initialize tree with samples.
+1:  * 2. add() - 0 or more times, to add hashes to the tree.
+1:  * 3. complete() - Enqueues any operations that were blocked waiting for a valid tree.
+1:  */
+1: public class Validator implements Runnable
+1: {
+0:     private static final Logger logger = LoggerFactory.getLogger(ActiveRepairService.class);
+1: 
+1:     public final RepairJobDesc desc;
+1:     public final InetAddress initiator;
+0:     public final MerkleTree tree;
+1:     public final int gcBefore;
+1: 
+1:     // null when all rows with the min token have been consumed
+0:     private transient long validated;
+0:     private transient MerkleTree.TreeRange range;
+0:     private transient MerkleTree.TreeRangeIterator ranges;
+0:     private transient DecoratedKey lastKey;
+1: 
+0:     public final static MerkleTree.RowHash EMPTY_ROW = new MerkleTree.RowHash(null, new byte[0]);
+1: 
+1:     /**
+0:      * Create Validator with default size of initial Merkle Tree.
+1:      */
+1:     public Validator(RepairJobDesc desc, InetAddress initiator, int gcBefore)
+1:     {
+0:         this(desc,
+0:              initiator,
+0:              // TODO: memory usage (maxsize) should either be tunable per
+0:              // CF, globally, or as shared for all CFs in a cluster
+0:              new MerkleTree(DatabaseDescriptor.getPartitioner(), desc.range, MerkleTree.RECOMMENDED_DEPTH, (int)Math.pow(2, 15)),
+0:              gcBefore);
+1:     }
+1: 
+0:     public Validator(RepairJobDesc desc, InetAddress initiator, MerkleTree tree, int gcBefore)
+1:     {
+1:         this.desc = desc;
+1:         this.initiator = initiator;
+0:         this.tree = tree;
+1:         this.gcBefore = gcBefore;
+1:         validated = 0;
+1:         range = null;
+1:         ranges = null;
+1:     }
+1: 
+0:     public void prepare(ColumnFamilyStore cfs)
+1:     {
+0:         if (!tree.partitioner().preservesOrder())
+1:         {
+1:             // You can't beat an even tree distribution for md5
+1:             tree.init();
+1:         }
+1:         else
+1:         {
+1:             List<DecoratedKey> keys = new ArrayList<>();
+0:             for (DecoratedKey sample : cfs.keySamples(desc.range))
+1:             {
+0:                 assert desc.range.contains(sample.token): "Token " + sample.token + " is not within range " + desc.range;
+1:                 keys.add(sample);
+1:             }
+1: 
+1:             if (keys.isEmpty())
+1:             {
+1:                 // use an even tree distribution
+1:                 tree.init();
+1:             }
+1:             else
+1:             {
+0:                 int numkeys = keys.size();
+1:                 Random random = new Random();
+1:                 // sample the column family using random keys from the index
+1:                 while (true)
+1:                 {
+0:                     DecoratedKey dk = keys.get(random.nextInt(numkeys));
+0:                     if (!tree.split(dk.token))
+1:                         break;
+1:                 }
+1:             }
+1:         }
+0:         logger.debug("Prepared AEService tree of size " + tree.size() + " for " + desc);
+1:         ranges = tree.invalids();
+1:     }
+1: 
+1:     /**
+1:      * Called (in order) for every row present in the CF.
+1:      * Hashes the row, and adds it to the tree being built.
+1:      *
+0:      * @param row Row to add hash
+1:      */
+0:     public void add(AbstractCompactedRow row)
+1:     {
+0:         assert desc.range.contains(row.key.token) : row.key.token + " is not contained in " + desc.range;
+0:         assert lastKey == null || lastKey.compareTo(row.key) < 0
+0:                : "row " + row.key + " received out of order wrt " + lastKey;
+0:         lastKey = row.key;
+1: 
+1:         if (range == null)
+1:             range = ranges.next();
+1: 
+1:         // generate new ranges as long as case 1 is true
+0:         while (!range.contains(row.key.token))
+1:         {
+1:             // add the empty hash, and move to the next range
+0:             range.addHash(EMPTY_ROW);
+1:             range = ranges.next();
+1:         }
+1: 
+1:         // case 3 must be true: mix in the hashed row
+0:         range.addHash(rowHash(row));
+1:     }
+1: 
+0:     private MerkleTree.RowHash rowHash(AbstractCompactedRow row)
+1:     {
+1:         validated++;
+1:         // MerkleTree uses XOR internally, so we want lots of output bits here
+0:         MessageDigest digest = FBUtilities.newMessageDigest("SHA-256");
+0:         row.update(digest);
+0:         return new MerkleTree.RowHash(row.key.token, digest.digest());
+1:     }
+1: 
+1:     /**
+1:      * Registers the newly created tree for rendezvous in Stage.ANTIENTROPY.
+1:      */
+1:     public void complete()
+1:     {
+1:         completeTree();
+1: 
+1:         StageManager.getStage(Stage.ANTI_ENTROPY).execute(this);
+0:         logger.debug("Validated " + validated + " rows into AEService tree for " + desc);
+1:     }
+1: 
+1:     @VisibleForTesting
+1:     public void completeTree()
+1:     {
+1:         assert ranges != null : "Validator was not prepared()";
+1: 
+0:         if (range != null)
+0:             range.addHash(EMPTY_ROW);
+1:         while (ranges.hasNext())
+1:         {
+1:             range = ranges.next();
+0:             range.addHash(EMPTY_ROW);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Called when some error during the validation happened.
+1:      * This sends RepairStatus to inform the initiator that the validation has failed.
+1:      * The actual reason for failure should be looked up in the log of the host calling this function.
+1:      */
+1:     public void fail()
+1:     {
+0:         logger.error("Failed creating a merkle tree for " + desc + ", " + initiator + " (see log for details)");
+1:         // send fail message only to nodes >= version 2.0
+1:         MessagingService.instance().sendOneWay(new ValidationComplete(desc).createMessage(), initiator);
+1:     }
+1: 
+1:     /**
+1:      * Called after the validation lifecycle to respond with the now valid tree. Runs in Stage.ANTIENTROPY.
+1:      */
+1:     public void run()
+1:     {
+1:         // respond to the request that triggered this validation
+1:         if (!initiator.equals(FBUtilities.getBroadcastAddress()))
+0:             logger.info(String.format("[repair #%s] Sending completed merkle tree to %s for %s/%s", desc.sessionId, initiator, desc.keyspace, desc.columnFamily));
+0:         MessagingService.instance().sendOneWay(new ValidationComplete(desc, tree).createMessage(), initiator);
+1:     }
+1: }
+author:Paulo Motta
+-------------------------------------------------------------------------------
+commit:c70ce63
+/////////////////////////////////////////////////////////////////////////
+1:     private final boolean evenTreeDistribution;
+/////////////////////////////////////////////////////////////////////////
+1:         this(desc, initiator, gcBefore, false);
+1:     }
+1: 
+1:     public Validator(RepairJobDesc desc, InetAddress initiator, int gcBefore, boolean evenTreeDistribution)
+1:     {
+1:         this.evenTreeDistribution = evenTreeDistribution;
+1:         if (!tree.partitioner().preservesOrder() || evenTreeDistribution)
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:2dc2bb8
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             logger.info("[repair #{}] Sending completed merkle tree to {} for {}.{}", desc.sessionId, initiator, desc.keyspace, desc.columnFamily);
+commit:6536c05
+/////////////////////////////////////////////////////////////////////////
+1:      * @param partition Partition to add hash
+commit:867fd8e
+/////////////////////////////////////////////////////////////////////////
+0:             List<DecoratedKey> keys = new ArrayList<>();
+0:             Random random = new Random();
+1:             
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:                     keys.clear();
+commit:db9bc69
+/////////////////////////////////////////////////////////////////////////
+0:         logger.debug("Prepared AEService tree of size {} for {}", tree.size(), desc);
+/////////////////////////////////////////////////////////////////////////
+0:             logger.debug("Validated {} rows into AEService tree for {} with row count distribution:", validated, desc);
+0:             logger.debug("Validated {} rows into AEService tree for {} with row size distribution:", validated, desc);
+/////////////////////////////////////////////////////////////////////////
+1:         logger.error("Failed creating a merkle tree for {}, {} (see log for details)", desc, initiator);
+commit:66f3014
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private static final Logger logger = LoggerFactory.getLogger(Validator.class);
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:5956000
+commit:3e37b4a
+/////////////////////////////////////////////////////////////////////////
+1:         UnfilteredRowIterators.digest(null, partition, digest, MessagingService.current_version);
+commit:782a1c3
+/////////////////////////////////////////////////////////////////////////
+0:         UnfilteredRowIterators.digest(partition, digest, MessagingService.current_version);
+commit:a991b64
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+1: import org.apache.cassandra.db.rows.UnfilteredRowIterators;
+/////////////////////////////////////////////////////////////////////////
+1:     public void add(UnfilteredRowIterator partition)
+0:         assert desc.range.contains(partition.partitionKey().getToken()) : partition.partitionKey().getToken() + " is not contained in " + desc.range;
+1:         assert lastKey == null || lastKey.compareTo(partition.partitionKey()) < 0
+1:                : "partition " + partition.partitionKey() + " received out of order wrt " + lastKey;
+1:         lastKey = partition.partitionKey();
+0:         while (!range.contains(lastKey.getToken()))
+/////////////////////////////////////////////////////////////////////////
+1:         RowHash rowHash = rowHash(partition);
+/////////////////////////////////////////////////////////////////////////
+1:     private MerkleTree.RowHash rowHash(UnfilteredRowIterator partition)
+0:         UnfilteredRowIterators.digest(partition, digest);
+1:         return digest.count > 0
+1:              ? new MerkleTree.RowHash(partition.partitionKey().getToken(), digest.digest(), digest.count)
+1:              : null;
+commit:93a03fe
+/////////////////////////////////////////////////////////////////////////
+1:  * Handles the building of a merkle tree for a column family.
+author:Marcus Olsson
+-------------------------------------------------------------------------------
+commit:0dd50a6
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.dht.Range;
+0: import org.apache.cassandra.dht.Token;
+1: import org.apache.cassandra.utils.MerkleTrees;
+/////////////////////////////////////////////////////////////////////////
+1:     private MerkleTrees trees;
+1:     private MerkleTrees.TreeRangeIterator ranges;
+/////////////////////////////////////////////////////////////////////////
+1:     public void prepare(ColumnFamilyStore cfs, MerkleTrees tree)
+1:         this.trees = tree;
+/////////////////////////////////////////////////////////////////////////
+1:             for (Range<Token> range : tree.ranges())
+0:                 List<DecoratedKey> keys = new ArrayList<>();
+1:                 for (DecoratedKey sample : cfs.keySamples(range))
+1:                     assert range.contains(sample.getToken()) : "Token " + sample.getToken() + " is not within range " + desc.ranges;
+0:                     keys.add(sample);
+1:                 }
+1: 
+0:                 if (keys.isEmpty())
+1:                 {
+0:                     // use an even tree distribution
+1:                     tree.init(range);
+1:                 }
+0:                 else
+1:                 {
+1:                     int numKeys = keys.size();
+0:                     Random random = new Random();
+0:                     // sample the column family using random keys from the index
+0:                     while (true)
+1:                     {
+1:                         DecoratedKey dk = keys.get(random.nextInt(numKeys));
+1:                         if (!tree.split(dk.getToken()))
+0:                             break;
+1:                     }
+1:         logger.debug("Prepared AEService trees of size {} for {}", trees.size(), desc);
+/////////////////////////////////////////////////////////////////////////
+1:         assert Range.isInRanges(partition.partitionKey().getToken(), desc.ranges) : partition.partitionKey().getToken() + " is not contained in " + desc.ranges;
+/////////////////////////////////////////////////////////////////////////
+1:         if (!findCorrectRange(lastKey.getToken()))
+1:             ranges = trees.invalids();
+1:             findCorrectRange(lastKey.getToken());
+1:         assert range.contains(lastKey.getToken()) : "Token not in MerkleTree: " + lastKey.getToken();
+/////////////////////////////////////////////////////////////////////////
+1:     public boolean findCorrectRange(Token t)
+1:     {
+1:         while (!range.contains(t) && ranges.hasNext())
+1:         {
+0:             range = ranges.next();
+1:         }
+1: 
+1:         return range.contains(t);
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             trees.logRowCountPerLeaf(logger);
+1:             trees.logRowSizePerLeaf(logger);
+/////////////////////////////////////////////////////////////////////////
+1:         ranges = trees.invalids();
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         MessagingService.instance().sendOneWay(new ValidationComplete(desc, trees).createMessage(), initiator);
+author:Stefan Podkowinski
+-------------------------------------------------------------------------------
+commit:e2ad896
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.MerkleTree.RowHash;
+/////////////////////////////////////////////////////////////////////////
+0:         RowHash rowHash = rowHash(row);
+1:         if (rowHash != null)
+1:         {
+1:             range.addHash(rowHash);
+1:         }
+/////////////////////////////////////////////////////////////////////////
+1:         // only return new hash for merkle tree in case digest was updated - see CASSANDRA-8979
+0:         if (digest.count > 0)
+1:         {
+0:             return new MerkleTree.RowHash(row.key.token, digest.digest(), digest.count);
+1:         }
+0:         else
+1:         {
+0:             return null;
+1:         }
+author:Ben Chan
+-------------------------------------------------------------------------------
+commit:f5866ca
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.tracing.Tracing;
+/////////////////////////////////////////////////////////////////////////
+1:         {
+0:             logger.info(String.format("[repair #%s] Sending completed merkle tree to %s for %s.%s", desc.sessionId, initiator, desc.keyspace, desc.columnFamily));
+1:             Tracing.traceRepair("Sending completed merkle tree to {} for {}.{}", initiator, desc.keyspace, desc.columnFamily);
+1:         }
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:8541cca
+/////////////////////////////////////////////////////////////////////////
+0:                 assert desc.range.contains(sample.getToken()): "Token " + sample.getToken() + " is not within range " + desc.range;
+/////////////////////////////////////////////////////////////////////////
+0:                     if (!tree.split(dk.getToken()))
+/////////////////////////////////////////////////////////////////////////
+0:         assert desc.range.contains(row.key.getToken()) : row.key.getToken() + " is not contained in " + desc.range;
+/////////////////////////////////////////////////////////////////////////
+0:         while (!range.contains(row.key.getToken()))
+/////////////////////////////////////////////////////////////////////////
+0:         return new MerkleTree.RowHash(row.key.getToken(), digest.digest(), digest.count);
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:bb95c1d
+commit:c0ba85a
+/////////////////////////////////////////////////////////////////////////
+1:             logger.debug("Validated {} partitions for {}.  Partitions per leaf are:", validated, desc.sessionId);
+1:             logger.debug("Validated {} partitions for {}.  Partition sizes are:", validated, desc.sessionId);
+author:Benedict
+-------------------------------------------------------------------------------
+commit:18f0234
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:             range.ensureHashInitialised();
+/////////////////////////////////////////////////////////////////////////
+1:     static class CountingDigest extends MessageDigest
+1:     {
+1:         private long count;
+1:         private MessageDigest underlying;
+1: 
+1:         public CountingDigest(MessageDigest underlying)
+1:         {
+1:             super(underlying.getAlgorithm());
+1:             this.underlying = underlying;
+1:         }
+1: 
+1:         @Override
+1:         protected void engineUpdate(byte input)
+1:         {
+1:             underlying.update(input);
+1:             count += 1;
+1:         }
+1: 
+1:         @Override
+1:         protected void engineUpdate(byte[] input, int offset, int len)
+1:         {
+1:             underlying.update(input, offset, len);
+1:             count += len;
+1:         }
+1: 
+1:         @Override
+1:         protected byte[] engineDigest()
+1:         {
+1:             return underlying.digest();
+1:         }
+1: 
+1:         @Override
+1:         protected void engineReset()
+1:         {
+1:             underlying.reset();
+1:         }
+1: 
+1:     }
+1: 
+1:         CountingDigest digest = new CountingDigest(FBUtilities.newMessageDigest("SHA-256"));
+0:         return new MerkleTree.RowHash(row.key.token, digest.digest(), digest.count);
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:         if (logger.isDebugEnabled())
+0:         {
+1:             // log distribution of rows in tree
+0:             logger.debug("Validated " + validated + " rows into AEService tree for " + desc + " with row count distribution:");
+0:             tree.histogramOfRowCountPerLeaf().log(logger);
+0:             logger.debug("Validated " + validated + " rows into AEService tree for " + desc + " with row size distribution:");
+0:             tree.histogramOfRowSizePerLeaf().log(logger);
+0:         }
+/////////////////////////////////////////////////////////////////////////
+0:             range.ensureHashInitialised();
+0:             range.ensureHashInitialised();
+============================================================================

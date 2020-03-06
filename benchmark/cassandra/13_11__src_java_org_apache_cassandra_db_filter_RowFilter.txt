@@ -1,0 +1,2603 @@
+1:a991b64: /*
+1:a991b64:  * Licensed to the Apache Software Foundation (ASF) under one
+1:a991b64:  * or more contributor license agreements.  See the NOTICE file
+1:a991b64:  * distributed with this work for additional information
+1:a991b64:  * regarding copyright ownership.  The ASF licenses this file
+1:a991b64:  * to you under the Apache License, Version 2.0 (the
+1:a991b64:  * "License"); you may not use this file except in compliance
+1:a991b64:  * with the License.  You may obtain a copy of the License at
+1:a991b64:  *
+1:a991b64:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:a991b64:  *
+1:a991b64:  * Unless required by applicable law or agreed to in writing, software
+1:a991b64:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:a991b64:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:a991b64:  * See the License for the specific language governing permissions and
+1:a991b64:  * limitations under the License.
+1:a991b64:  */
+1:a991b64: package org.apache.cassandra.db.filter;
+1:a991b64: 
+1:a991b64: import java.io.IOException;
+1:a991b64: import java.nio.ByteBuffer;
+1:a991b64: import java.util.*;
+1:1a73af7: import java.util.concurrent.ConcurrentHashMap;
+1:1a73af7: import java.util.concurrent.ConcurrentMap;
+1:1a73af7: import java.util.concurrent.atomic.AtomicInteger;
+1:a991b64: 
+1:a991b64: import com.google.common.base.Objects;
+1:3f49c32: import com.google.common.collect.Iterables;
+1:1a73af7: import org.slf4j.Logger;
+1:1a73af7: import org.slf4j.LoggerFactory;
+1:a991b64: 
+1:a991b64: import org.apache.cassandra.config.CFMetaData;
+1:a991b64: import org.apache.cassandra.config.ColumnDefinition;
+1:a991b64: import org.apache.cassandra.cql3.Operator;
+1:a991b64: import org.apache.cassandra.db.*;
+1:c08eeaf: import org.apache.cassandra.db.context.*;
+1:a991b64: import org.apache.cassandra.db.marshal.*;
+1:1a73af7: import org.apache.cassandra.db.partitions.ImmutableBTreePartition;
+1:a991b64: import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+1:a991b64: import org.apache.cassandra.db.rows.*;
+1:6094974: import org.apache.cassandra.db.transform.Transformation;
+1:a991b64: import org.apache.cassandra.exceptions.InvalidRequestException;
+1:a59be26: import org.apache.cassandra.io.util.DataInputPlus;
+1:a991b64: import org.apache.cassandra.io.util.DataOutputPlus;
+1:a991b64: import org.apache.cassandra.net.MessagingService;
+1:64e2f5d: import org.apache.cassandra.schema.IndexMetadata;
+1:a991b64: import org.apache.cassandra.utils.ByteBufferUtil;
+1:a991b64: import org.apache.cassandra.utils.FBUtilities;
+1:a991b64: 
+1:0626be8: import static org.apache.cassandra.cql3.statements.RequestValidations.checkBindValueSet;
+1:0626be8: import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
+1:0626be8: import static org.apache.cassandra.cql3.statements.RequestValidations.checkNotNull;
+1:a991b64: 
+1:a991b64: /**
+1:a991b64:  * A filter on which rows a given query should include or exclude.
+1:a991b64:  * <p>
+1:a991b64:  * This corresponds to the restrictions on rows that are not handled by the query
+1:a991b64:  * {@link ClusteringIndexFilter}. Some of the expressions of this filter may
+1:a991b64:  * be handled by a 2ndary index, and the rest is simply filtered out from the
+1:a991b64:  * result set (the later can only happen if the query was using ALLOW FILTERING).
+1:a991b64:  */
+1:a991b64: public abstract class RowFilter implements Iterable<RowFilter.Expression>
+1:a991b64: {
+1:1a73af7:     private static final Logger logger = LoggerFactory.getLogger(RowFilter.class);
+1:1a73af7: 
+1:a991b64:     public static final Serializer serializer = new Serializer();
+1:64e2f5d:     public static final RowFilter NONE = new CQLFilter(Collections.emptyList());
+1:a991b64: 
+1:a991b64:     protected final List<Expression> expressions;
+1:a991b64: 
+1:a991b64:     protected RowFilter(List<Expression> expressions)
+1:a991b64:     {
+1:a991b64:         this.expressions = expressions;
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public static RowFilter create()
+1:a991b64:     {
+1:64e2f5d:         return new CQLFilter(new ArrayList<>());
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public static RowFilter create(int capacity)
+1:a991b64:     {
+1:64e2f5d:         return new CQLFilter(new ArrayList<>(capacity));
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public static RowFilter forThrift(int capacity)
+1:a991b64:     {
+1:64e2f5d:         return new ThriftFilter(new ArrayList<>(capacity));
+1:a991b64:     }
+1:a991b64: 
+1:bdae452:     public SimpleExpression add(ColumnDefinition def, Operator op, ByteBuffer value)
+1:a991b64:     {
+1:bdae452:         SimpleExpression expression = new SimpleExpression(def, op, value);
+1:bdae452:         add(expression);
+1:bdae452:         return expression;
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public void addMapEquality(ColumnDefinition def, ByteBuffer key, Operator op, ByteBuffer value)
+1:a991b64:     {
+1:9c3855b:         add(new MapEqualityExpression(def, key, op, value));
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public void addThriftExpression(CFMetaData metadata, ByteBuffer name, Operator op, ByteBuffer value)
+1:a991b64:     {
+1:a991b64:         assert (this instanceof ThriftFilter);
+1:9c3855b:         add(new ThriftExpression(metadata, name, op, value));
+1:a991b64:     }
+1:a991b64: 
+1:64e2f5d:     public void addCustomIndexExpression(CFMetaData cfm, IndexMetadata targetIndex, ByteBuffer value)
+1:64e2f5d:     {
+1:9c3855b:         add(new CustomExpression(cfm, targetIndex, value));
+1:64e2f5d:     }
+1:64e2f5d: 
+1:9c3855b:     private void add(Expression expression)
+1:64e2f5d:     {
+1:9c3855b:         expression.validate();
+1:9c3855b:         expressions.add(expression);
+1:9c3855b:     }
+1:64e2f5d: 
+1:1a73af7:     public void addUserExpression(UserExpression e)
+1:1a73af7:     {
+1:1a73af7:         expressions.add(e);
+1:1a73af7:     }
+1:1a73af7: 
+1:0626be8:     public List<Expression> getExpressions()
+1:0626be8:     {
+1:0626be8:         return expressions;
+1:0626be8:     }
+1:64e2f5d: 
+1:a991b64:     /**
+1:a991b64:      * Filters the provided iterator so that only the row satisfying the expression of this filter
+1:a991b64:      * are included in the resulting iterator.
+1:a991b64:      *
+1:a991b64:      * @param iter the iterator to filter
+1:a991b64:      * @param nowInSec the time of query in seconds.
+1:a991b64:      * @return the filtered iterator.
+1:a991b64:      */
+1:a991b64:     public abstract UnfilteredPartitionIterator filter(UnfilteredPartitionIterator iter, int nowInSec);
+1:a991b64: 
+1:a991b64:     /**
+1:86ba227:      * Whether the provided row in the provided partition satisfies this filter.
+1:86ba227:      *
+1:86ba227:      * @param metadata the table metadata.
+1:86ba227:      * @param partitionKey the partition key for partition to test.
+1:86ba227:      * @param row the row to test.
+1:86ba227:      * @param nowInSec the current time in seconds (to know what is live and what isn't).
+1:86ba227:      * @return {@code true} if {@code row} in partition {@code partitionKey} satisfies this row filter.
+1:86ba227:      */
+1:86ba227:     public boolean isSatisfiedBy(CFMetaData metadata, DecoratedKey partitionKey, Row row, int nowInSec)
+1:86ba227:     {
+1:86ba227:         // We purge all tombstones as the expressions isSatisfiedBy methods expects it
+1:86ba227:         Row purged = row.purge(DeletionPurger.PURGE_ALL, nowInSec);
+1:86ba227:         if (purged == null)
+1:86ba227:             return expressions.isEmpty();
+1:86ba227: 
+1:86ba227:         for (Expression e : expressions)
+1:86ba227:         {
+1:86ba227:             if (!e.isSatisfiedBy(metadata, partitionKey, purged))
+1:86ba227:                 return false;
+1:86ba227:         }
+1:86ba227:         return true;
+1:86ba227:     }
+1:86ba227: 
+1:86ba227:     /**
+1:5a4253b:      * Returns true if all of the expressions within this filter that apply to the partition key are satisfied by
+1:5a4253b:      * the given key, false otherwise.
+1:a991b64:      */
+1:5a4253b:     public boolean partitionKeyRestrictionsAreSatisfiedBy(DecoratedKey key, AbstractType<?> keyValidator)
+1:9c3855b:     {
+1:a991b64:         for (Expression e : expressions)
+1:72790dc:         {
+1:5a4253b:             if (!e.column.isPartitionKey())
+1:5a4253b:                 continue;
+1:0626be8: 
+1:5a4253b:             ByteBuffer value = keyValidator instanceof CompositeType
+1:5a4253b:                              ? ((CompositeType) keyValidator).split(key.getKey())[e.column.position()]
+1:5a4253b:                              : key.getKey();
+1:5a4253b:             if (!e.operator().isSatisfiedBy(e.column.type, value, e.value))
+1:a991b64:                 return false;
+1:9c3855b:         }
+1:a991b64:         return true;
+1:6094974:     }
+1:c08eeaf: 
+1:a991b64:     /**
+1:5a4253b:      * Returns true if all of the expressions within this filter that apply to the clustering key are satisfied by
+1:5a4253b:      * the given Clustering, false otherwise.
+2:5a4253b:      */
+1:5a4253b:     public boolean clusteringKeyRestrictionsAreSatisfiedBy(Clustering clustering)
+1:6094974:     {
+1:6094974:         for (Expression e : expressions)
+4:5a4253b:         {
+1:5a4253b:             if (!e.column.isClusteringColumn())
+1:5a4253b:                 continue;
+1:c08eeaf: 
+1:5a4253b:             if (!e.operator().isSatisfiedBy(e.column.type, clustering.get(e.column.position()), e.value))
+1:5a4253b:             {
+2:5a4253b:                 return false;
+3:5a4253b:             }
+1:5a4253b:         }
+1:64e2f5d:         return true;
+1:5a4253b:     }
+1:9c3855b: 
+1:1a73af7:     /**
+1:a991b64:      * Returns this filter but without the provided expression. This method
+1:a991b64:      * *assumes* that the filter contains the provided expression.
+1:a991b64:      */
+1:a991b64:     public RowFilter without(Expression expression)
+1:a991b64:     {
+1:a991b64:         assert expressions.contains(expression);
+1:a991b64:         if (expressions.size() == 1)
+1:a991b64:             return RowFilter.NONE;
+1:a991b64: 
+1:a991b64:         List<Expression> newExpressions = new ArrayList<>(expressions.size() - 1);
+1:a991b64:         for (Expression e : expressions)
+1:a991b64:             if (!e.equals(expression))
+1:a991b64:                 newExpressions.add(e);
+1:a991b64: 
+1:a991b64:         return withNewExpressions(newExpressions);
+1:a991b64:     }
+1:a991b64: 
+1:72790dc:     public RowFilter withoutExpressions()
+1:a991b64:     {
+1:72790dc:         return withNewExpressions(Collections.emptyList());
+1:72790dc:     }
+1:9c3855b: 
+1:a991b64:     protected abstract RowFilter withNewExpressions(List<Expression> expressions);
+1:a991b64: 
+1:a991b64:     public boolean isEmpty()
+1:a991b64:     {
+1:a991b64:         return expressions.isEmpty();
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public Iterator<Expression> iterator()
+1:a991b64:     {
+1:a991b64:         return expressions.iterator();
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     private static Clustering makeCompactClustering(CFMetaData metadata, ByteBuffer name)
+1:a991b64:     {
+1:a991b64:         assert metadata.isCompactTable();
+1:a991b64:         if (metadata.isCompound())
+1:a991b64:         {
+1:a991b64:             List<ByteBuffer> values = CompositeType.splitName(name);
+1:2f41243:             return Clustering.make(values.toArray(new ByteBuffer[metadata.comparator.size()]));
+1:a991b64:         }
+1:a991b64:         else
+1:a991b64:         {
+1:2f41243:             return Clustering.make(name);
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: 
+2:a991b64:     @Override
+1:a991b64:     public String toString()
+1:a991b64:     {
+1:a991b64:         StringBuilder sb = new StringBuilder();
+1:a991b64:         for (int i = 0; i < expressions.size(); i++)
+1:a991b64:         {
+1:a991b64:             if (i > 0)
+1:a991b64:                 sb.append(" AND ");
+1:a991b64:             sb.append(expressions.get(i));
+1:a991b64:         }
+1:a991b64:         return sb.toString();
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     private static class CQLFilter extends RowFilter
+1:a991b64:     {
+1:a991b64:         private CQLFilter(List<Expression> expressions)
+1:a991b64:         {
+1:a991b64:             super(expressions);
+1:a991b64:         }
+1:a991b64: 
+1:2457599:         public UnfilteredPartitionIterator filter(UnfilteredPartitionIterator iter, int nowInSec)
+1:a991b64:         {
+1:a991b64:             if (expressions.isEmpty())
+1:a991b64:                 return iter;
+1:a991b64: 
+1:5343a75:             final CFMetaData metadata = iter.metadata();
+1:3f49c32: 
+1:3f49c32:             List<Expression> partitionLevelExpressions = new ArrayList<>();
+1:3f49c32:             List<Expression> rowLevelExpressions = new ArrayList<>();
+1:3f49c32:             for (Expression e: expressions)
+1:3f49c32:             {
+1:3f49c32:                 if (e.column.isStatic() || e.column.isPartitionKey())
+1:3f49c32:                     partitionLevelExpressions.add(e);
+1:3f49c32:                 else
+1:3f49c32:                     rowLevelExpressions.add(e);
+1:3f49c32:             }
+1:3f49c32: 
+1:3f49c32:             long numberOfRegularColumnExpressions = rowLevelExpressions.size();
+1:3f49c32:             final boolean filterNonStaticColumns = numberOfRegularColumnExpressions > 0;
+1:5343a75: 
+1:6094974:             class IsSatisfiedFilter extends Transformation<UnfilteredRowIterator>
+1:a991b64:             {
+1:6094974:                 DecoratedKey pk;
+1:6094974:                 public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+1:a991b64:                 {
+1:1a73af7:                     pk = partition.partitionKey();
+1:a991b64: 
+1:3f49c32:                     // Short-circuit all partitions that won't match based on static and partition keys
+1:3f49c32:                     for (Expression e : partitionLevelExpressions)
+1:3f49c32:                         if (!e.isSatisfiedBy(metadata, partition.partitionKey(), partition.staticRow()))
+1:3f49c32:                             return null;
+1:a991b64: 
+1:9c3855b:                     UnfilteredRowIterator iterator = Transformation.apply(partition, this);
+1:9c3855b:                     return (filterNonStaticColumns && !iterator.hasNext()) ? null : iterator;
+1:a991b64:                 }
+1:a991b64: 
+1:6094974:                 public Row applyToRow(Row row)
+1:a991b64:                 {
+1:2457599:                     Row purged = row.purge(DeletionPurger.PURGE_ALL, nowInSec);
+1:6094974:                     if (purged == null)
+1:9c3855b:                         return null;
+1:a991b64: 
+1:3f49c32:                     for (Expression e : rowLevelExpressions)
+1:5343a75:                         if (!e.isSatisfiedBy(metadata, pk, purged))
+2:6094974:                             return null;
+1:3f49c32: 
+1:6094974:                     return row;
+1:a991b64:                 }
+1:a991b64:             }
+1:1a73af7: 
+1:6094974:             return Transformation.apply(iter, new IsSatisfiedFilter());
+1:a991b64:         }
+1:9c3855b: 
+1:a991b64:         protected RowFilter withNewExpressions(List<Expression> expressions)
+1:a991b64:         {
+1:a991b64:             return new CQLFilter(expressions);
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     private static class ThriftFilter extends RowFilter
+1:a991b64:     {
+1:a991b64:         private ThriftFilter(List<Expression> expressions)
+1:a991b64:         {
+1:a991b64:             super(expressions);
+1:a991b64:         }
+1:a991b64: 
+2:a991b64:         public UnfilteredPartitionIterator filter(UnfilteredPartitionIterator iter, final int nowInSec)
+1:a991b64:         {
+1:a991b64:             if (expressions.isEmpty())
+1:a991b64:                 return iter;
+1:a991b64: 
+1:6094974:             class IsSatisfiedThriftFilter extends Transformation<UnfilteredRowIterator>
+1:a991b64:             {
+1:a991b64:                 @Override
+1:6094974:                 public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator iter)
+1:a991b64:                 {
+1:a991b64:                     // Thrift does not filter rows, it filters entire partition if any of the expression is not
+1:a991b64:                     // satisfied, which forces us to materialize the result (in theory we could materialize only
+1:a991b64:                     // what we need which might or might not be everything, but we keep it simple since in practice
+1:a991b64:                     // it's not worth that it has ever been).
+1:e51f83b:                     ImmutableBTreePartition result = ImmutableBTreePartition.create(iter);
+1:6094974:                     iter.close();
+1:a991b64: 
+1:a991b64:                     // The partition needs to have a row for every expression, and the expression needs to be valid.
+1:a991b64:                     for (Expression expr : expressions)
+1:a991b64:                     {
+1:a991b64:                         assert expr instanceof ThriftExpression;
+1:a991b64:                         Row row = result.getRow(makeCompactClustering(iter.metadata(), expr.column().name.bytes));
+1:5343a75:                         if (row == null || !expr.isSatisfiedBy(iter.metadata(), iter.partitionKey(), row))
+1:a991b64:                             return null;
+1:a991b64:                     }
+1:a991b64:                     // If we get there, it means all expressions where satisfied, so return the original result
+1:a991b64:                     return result.unfilteredIterator();
+1:a991b64:                 }
+1:a991b64:             }
+1:6094974:             return Transformation.apply(iter, new IsSatisfiedThriftFilter());
+1:6094974:         }
+1:a991b64: 
+1:a991b64:         protected RowFilter withNewExpressions(List<Expression> expressions)
+1:a991b64:         {
+1:a991b64:             return new ThriftFilter(expressions);
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public static abstract class Expression
+1:a991b64:     {
+1:a991b64:         private static final Serializer serializer = new Serializer();
+1:a991b64: 
+1:a991b64:         // Note: the order of this enum matter, it's used for serialization
+1:1a73af7:         protected enum Kind { SIMPLE, MAP_EQUALITY, THRIFT_DYN_EXPR, CUSTOM, USER }
+1:a991b64: 
+1:72790dc:         protected abstract Kind kind();
+1:a991b64:         protected final ColumnDefinition column;
+1:a991b64:         protected final Operator operator;
+1:a991b64:         protected final ByteBuffer value;
+1:a991b64: 
+1:a991b64:         protected Expression(ColumnDefinition column, Operator operator, ByteBuffer value)
+1:a991b64:         {
+1:a991b64:             this.column = column;
+1:a991b64:             this.operator = operator;
+1:a991b64:             this.value = value;
+1:a991b64:         }
+1:a991b64: 
+1:64e2f5d:         public boolean isCustom()
+1:a991b64:         {
+1:64e2f5d:             return kind() == Kind.CUSTOM;
+1:64e2f5d:         }
+1:64e2f5d: 
+1:1a73af7:         public boolean isUserDefined()
+1:1a73af7:         {
+1:1a73af7:             return kind() == Kind.USER;
+1:1a73af7:         }
+1:1a73af7: 
+1:a991b64:         public ColumnDefinition column()
+1:a991b64:         {
+1:a991b64:             return column;
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         public Operator operator()
+1:a991b64:         {
+1:a991b64:             return operator;
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         /**
+1:a991b64:          * Checks if the operator of this <code>IndexExpression</code> is a <code>CONTAINS</code> operator.
+1:a991b64:          *
+1:a991b64:          * @return <code>true</code> if the operator of this <code>IndexExpression</code> is a <code>CONTAINS</code>
+1:a991b64:          * operator, <code>false</code> otherwise.
+1:a991b64:          */
+1:a991b64:         public boolean isContains()
+1:a991b64:         {
+1:a991b64:             return Operator.CONTAINS == operator;
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         /**
+1:a991b64:          * Checks if the operator of this <code>IndexExpression</code> is a <code>CONTAINS_KEY</code> operator.
+1:a991b64:          *
+1:a991b64:          * @return <code>true</code> if the operator of this <code>IndexExpression</code> is a <code>CONTAINS_KEY</code>
+1:a991b64:          * operator, <code>false</code> otherwise.
+1:a991b64:          */
+1:a991b64:         public boolean isContainsKey()
+1:a991b64:         {
+1:a991b64:             return Operator.CONTAINS_KEY == operator;
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         /**
+1:a991b64:          * If this expression is used to query an index, the value to use as
+1:a991b64:          * partition key for that index query.
+1:a991b64:          */
+1:a991b64:         public ByteBuffer getIndexValue()
+1:a991b64:         {
+1:a991b64:             return value;
+1:a991b64:         }
+1:a991b64: 
+1:9c3855b:         public void validate()
+1:a991b64:         {
+1:9c3855b:             checkNotNull(value, "Unsupported null value for column %s", column.name);
+1:9c3855b:             checkBindValueSet(value, "Unsupported unset value for column %s", column.name);
+1:a991b64:         }
+1:a991b64: 
+1:9c3855b:         @Deprecated
+1:9c3855b:         public void validateForIndexing()
+1:9c3855b:         {
+1:9c3855b:             checkFalse(value.remaining() > FBUtilities.MAX_UNSIGNED_SHORT,
+1:9c3855b:                        "Index expression values may not be larger than 64K");
+1:6094974:         }
+1:9c3855b: 
+1:a991b64:         /**
+1:a991b64:          * Returns whether the provided row satisfied this expression or not.
+1:a991b64:          *
+1:a991b64:          * @param partitionKey the partition key for row to check.
+1:a991b64:          * @param row the row to check. It should *not* contain deleted cells
+1:a991b64:          * (i.e. it should come from a RowIterator).
+1:a991b64:          * @return whether the row is satisfied by this expression.
+1:a991b64:          */
+1:5343a75:         public abstract boolean isSatisfiedBy(CFMetaData metadata, DecoratedKey partitionKey, Row row);
+1:a991b64: 
+1:5343a75:         protected ByteBuffer getValue(CFMetaData metadata, DecoratedKey partitionKey, Row row)
+1:a991b64:         {
+1:a991b64:             switch (column.kind)
+1:a991b64:             {
+1:a991b64:                 case PARTITION_KEY:
+1:5343a75:                     return metadata.getKeyValidator() instanceof CompositeType
+1:5343a75:                          ? CompositeType.extractComponent(partitionKey.getKey(), column.position())
+1:5343a75:                          : partitionKey.getKey();
+1:8d7c608:                 case CLUSTERING:
+1:a991b64:                     return row.clustering().get(column.position());
+1:a991b64:                 default:
+1:a991b64:                     Cell cell = row.getCell(column);
+1:a991b64:                     return cell == null ? null : cell.value();
+1:a991b64:             }
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         @Override
+1:a991b64:         public boolean equals(Object o)
+1:a991b64:         {
+1:a991b64:             if (this == o)
+1:a991b64:                 return true;
+1:a991b64: 
+1:a991b64:             if (!(o instanceof Expression))
+1:a991b64:                 return false;
+1:a991b64: 
+1:a991b64:             Expression that = (Expression)o;
+1:a991b64: 
+1:a991b64:             return Objects.equal(this.kind(), that.kind())
+1:a991b64:                 && Objects.equal(this.column.name, that.column.name)
+1:a991b64:                 && Objects.equal(this.operator, that.operator)
+1:a991b64:                 && Objects.equal(this.value, that.value);
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         @Override
+1:a991b64:         public int hashCode()
+1:a991b64:         {
+1:a991b64:             return Objects.hashCode(column.name, operator, value);
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         private static class Serializer
+1:a991b64:         {
+1:a991b64:             public void serialize(Expression expression, DataOutputPlus out, int version) throws IOException
+1:a991b64:             {
+1:a991b64:                 if (version >= MessagingService.VERSION_30)
+1:a991b64:                     out.writeByte(expression.kind().ordinal());
+1:a991b64: 
+1:64e2f5d:                 // Custom expressions include neither a column or operator, but all
+1:64e2f5d:                 // other expressions do. Also, custom expressions are 3.0+ only, so
+1:64e2f5d:                 // the column & operator will always be the first things written for
+1:64e2f5d:                 // any pre-3.0 version
+1:64e2f5d:                 if (expression.kind() == Kind.CUSTOM)
+1:64e2f5d:                 {
+1:64e2f5d:                     assert version >= MessagingService.VERSION_30;
+1:64e2f5d:                     IndexMetadata.serializer.serialize(((CustomExpression)expression).targetIndex, out, version);
+1:64e2f5d:                     ByteBufferUtil.writeWithShortLength(expression.value, out);
+1:64e2f5d:                     return;
+1:64e2f5d:                 }
+1:64e2f5d: 
+1:1a73af7:                 if (expression.kind() == Kind.USER)
+1:1a73af7:                 {
+1:1a73af7:                     assert version >= MessagingService.VERSION_30;
+1:1a73af7:                     UserExpression.serialize((UserExpression)expression, out, version);
+1:1a73af7:                     return;
+1:1a73af7:                 }
+1:1a73af7: 
+1:a991b64:                 ByteBufferUtil.writeWithShortLength(expression.column.name.bytes, out);
+1:a991b64:                 expression.operator.writeTo(out);
+1:a991b64: 
+1:a991b64:                 switch (expression.kind())
+1:a991b64:                 {
+1:a991b64:                     case SIMPLE:
+1:a991b64:                         ByteBufferUtil.writeWithShortLength(((SimpleExpression)expression).value, out);
+1:a991b64:                         break;
+1:a991b64:                     case MAP_EQUALITY:
+1:a991b64:                         MapEqualityExpression mexpr = (MapEqualityExpression)expression;
+1:a991b64:                         if (version < MessagingService.VERSION_30)
+1:a991b64:                         {
+1:a991b64:                             ByteBufferUtil.writeWithShortLength(mexpr.getIndexValue(), out);
+1:a991b64:                         }
+1:a991b64:                         else
+1:a991b64:                         {
+1:a991b64:                             ByteBufferUtil.writeWithShortLength(mexpr.key, out);
+1:a991b64:                             ByteBufferUtil.writeWithShortLength(mexpr.value, out);
+1:a991b64:                         }
+1:a991b64:                         break;
+1:a991b64:                     case THRIFT_DYN_EXPR:
+1:a991b64:                         ByteBufferUtil.writeWithShortLength(((ThriftExpression)expression).value, out);
+1:a991b64:                         break;
+1:a991b64:                 }
+1:a991b64:             }
+1:a991b64: 
+1:a59be26:             public Expression deserialize(DataInputPlus in, int version, CFMetaData metadata) throws IOException
+1:a991b64:             {
+1:64e2f5d:                 Kind kind = null;
+1:64e2f5d:                 ByteBuffer name;
+1:64e2f5d:                 Operator operator;
+1:64e2f5d:                 ColumnDefinition column;
+1:a991b64: 
+1:a991b64:                 if (version >= MessagingService.VERSION_30)
+1:64e2f5d:                 {
+1:a991b64:                     kind = Kind.values()[in.readByte()];
+1:64e2f5d:                     // custom expressions (3.0+ only) do not contain a column or operator, only a value
+1:64e2f5d:                     if (kind == Kind.CUSTOM)
+1:a991b64:                     {
+1:64e2f5d:                         return new CustomExpression(metadata,
+1:64e2f5d:                                                     IndexMetadata.serializer.deserialize(in, version, metadata),
+1:64e2f5d:                                                     ByteBufferUtil.readWithShortLength(in));
+1:a991b64:                     }
+1:1a73af7: 
+1:1a73af7:                     if (kind == Kind.USER)
+1:1a73af7:                     {
+1:1a73af7:                         return UserExpression.deserialize(in, version, metadata);
+1:1a73af7:                     }
+1:64e2f5d:                 }
+1:64e2f5d: 
+1:64e2f5d:                 name = ByteBufferUtil.readWithShortLength(in);
+1:64e2f5d:                 operator = Operator.readFrom(in);
+1:64e2f5d:                 column = metadata.getColumnDefinition(name);
+1:a991b64:                 if (!metadata.isCompactTable() && column == null)
+1:a991b64:                     throw new RuntimeException("Unknown (or dropped) column " + UTF8Type.instance.getString(name) + " during deserialization");
+1:a991b64: 
+1:64e2f5d:                 if (version < MessagingService.VERSION_30)
+1:a991b64:                 {
+1:a991b64:                     if (column == null)
+1:a991b64:                         kind = Kind.THRIFT_DYN_EXPR;
+1:a991b64:                     else if (column.type instanceof MapType && operator == Operator.EQ)
+1:a991b64:                         kind = Kind.MAP_EQUALITY;
+1:a991b64:                     else
+1:a991b64:                         kind = Kind.SIMPLE;
+1:a991b64:                 }
+1:a991b64: 
+1:64e2f5d:                 assert kind != null;
+1:a991b64:                 switch (kind)
+1:a991b64:                 {
+1:a991b64:                     case SIMPLE:
+1:a991b64:                         return new SimpleExpression(column, operator, ByteBufferUtil.readWithShortLength(in));
+1:a991b64:                     case MAP_EQUALITY:
+1:a991b64:                         ByteBuffer key, value;
+1:a991b64:                         if (version < MessagingService.VERSION_30)
+1:a991b64:                         {
+1:a991b64:                             ByteBuffer composite = ByteBufferUtil.readWithShortLength(in);
+1:a991b64:                             key = CompositeType.extractComponent(composite, 0);
+1:a991b64:                             value = CompositeType.extractComponent(composite, 0);
+1:a991b64:                         }
+1:a991b64:                         else
+1:a991b64:                         {
+1:a991b64:                             key = ByteBufferUtil.readWithShortLength(in);
+1:a991b64:                             value = ByteBufferUtil.readWithShortLength(in);
+1:a991b64:                         }
+1:a991b64:                         return new MapEqualityExpression(column, key, operator, value);
+1:a991b64:                     case THRIFT_DYN_EXPR:
+1:a991b64:                         return new ThriftExpression(metadata, name, operator, ByteBufferUtil.readWithShortLength(in));
+1:a991b64:                 }
+1:a991b64:                 throw new AssertionError();
+1:a991b64:             }
+1:a991b64: 
+1:64e2f5d: 
+1:a991b64:             public long serializedSize(Expression expression, int version)
+1:a991b64:             {
+1:64e2f5d:                 // version 3.0+ includes a byte for Kind
+1:64e2f5d:                 long size = version >= MessagingService.VERSION_30 ? 1 : 0;
+1:a991b64: 
+1:1a73af7:                 // Custom expressions include neither a column or operator, but all
+1:1a73af7:                 // other expressions do. Also, custom expressions are 3.0+ only, so
+1:1a73af7:                 // the column & operator will always be the first things written for
+1:1a73af7:                 // any pre-3.0 version
+1:1a73af7:                 if (expression.kind() != Kind.CUSTOM && expression.kind() != Kind.USER)
+1:64e2f5d:                     size += ByteBufferUtil.serializedSizeWithShortLength(expression.column().name.bytes)
+1:a991b64:                             + expression.operator.serializedSize();
+1:a991b64: 
+1:a991b64:                 switch (expression.kind())
+1:a991b64:                 {
+1:a991b64:                     case SIMPLE:
+1:03f72ac:                         size += ByteBufferUtil.serializedSizeWithShortLength(((SimpleExpression)expression).value);
+1:a991b64:                         break;
+1:a991b64:                     case MAP_EQUALITY:
+1:a991b64:                         MapEqualityExpression mexpr = (MapEqualityExpression)expression;
+1:a991b64:                         if (version < MessagingService.VERSION_30)
+1:03f72ac:                             size += ByteBufferUtil.serializedSizeWithShortLength(mexpr.getIndexValue());
+1:a991b64:                         else
+1:03f72ac:                             size += ByteBufferUtil.serializedSizeWithShortLength(mexpr.key)
+1:03f72ac:                                   + ByteBufferUtil.serializedSizeWithShortLength(mexpr.value);
+1:a991b64:                         break;
+1:a991b64:                     case THRIFT_DYN_EXPR:
+1:03f72ac:                         size += ByteBufferUtil.serializedSizeWithShortLength(((ThriftExpression)expression).value);
+1:a991b64:                         break;
+1:64e2f5d:                     case CUSTOM:
+1:64e2f5d:                         if (version >= MessagingService.VERSION_30)
+1:64e2f5d:                             size += IndexMetadata.serializer.serializedSize(((CustomExpression)expression).targetIndex, version)
+1:1a73af7:                                    + ByteBufferUtil.serializedSizeWithShortLength(expression.value);
+1:64e2f5d:                         break;
+1:1a73af7:                     case USER:
+1:1a73af7:                         if (version >= MessagingService.VERSION_30)
+1:1a73af7:                             size += UserExpression.serializedSize((UserExpression)expression, version);
+1:a991b64:                 }
+1:a991b64:                 return size;
+1:a991b64:             }
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:a991b64:      * An expression of the form 'column' 'op' 'value'.
+1:a991b64:      */
+1:bdae452:     public static class SimpleExpression extends Expression
+1:a991b64:     {
+1:bdae452:         SimpleExpression(ColumnDefinition column, Operator operator, ByteBuffer value)
+1:a991b64:         {
+1:a991b64:             super(column, operator, value);
+1:a991b64:         }
+1:a991b64: 
+1:5343a75:         public boolean isSatisfiedBy(CFMetaData metadata, DecoratedKey partitionKey, Row row)
+1:a991b64:         {
+1:a991b64:             // We support null conditions for LWT (in ColumnCondition) but not for RowFilter.
+1:a991b64:             // TODO: we should try to merge both code someday.
+1:a991b64:             assert value != null;
+1:a991b64: 
+1:a991b64:             switch (operator)
+1:a991b64:             {
+1:a991b64:                 case EQ:
+1:a991b64:                 case LT:
+1:a991b64:                 case LTE:
+1:a991b64:                 case GTE:
+1:a991b64:                 case GT:
+1:c08eeaf:                     {
+1:c08eeaf:                         assert !column.isComplex() : "Only CONTAINS and CONTAINS_KEY are supported for 'complex' types";
+1:64e2f5d: 
+1:c08eeaf:                         // In order to support operators on Counter types, their value has to be extracted from internal
+1:c08eeaf:                         // representation. See CASSANDRA-11629
+1:c08eeaf:                         if (column.type.isCounter())
+1:c08eeaf:                         {
+1:5343a75:                             ByteBuffer foundValue = getValue(metadata, partitionKey, row);
+1:c08eeaf:                             if (foundValue == null)
+1:c08eeaf:                                 return false;
+1:64e2f5d: 
+1:c08eeaf:                             ByteBuffer counterValue = LongType.instance.decompose(CounterContext.instance().total(foundValue));
+1:c08eeaf:                             return operator.isSatisfiedBy(LongType.instance, counterValue, value);
+1:c08eeaf:                         }
+1:a991b64:                         else
+1:c08eeaf:                         {
+1:c08eeaf:                             // Note that CQL expression are always of the form 'x < 4', i.e. the tested value is on the left.
+1:5343a75:                             ByteBuffer foundValue = getValue(metadata, partitionKey, row);
+1:c08eeaf:                             return foundValue != null && operator.isSatisfiedBy(column.type, foundValue, value);
+1:c08eeaf:                         }
+1:c08eeaf:                     }
+1:a991b64:                 case NEQ:
+1:3928665:                 case LIKE_PREFIX:
+1:3928665:                 case LIKE_SUFFIX:
+1:3928665:                 case LIKE_CONTAINS:
+1:479e8af:                 case LIKE_MATCHES:
+1:a991b64:                     {
+1:a991b64:                         assert !column.isComplex() : "Only CONTAINS and CONTAINS_KEY are supported for 'complex' types";
+1:5343a75:                         ByteBuffer foundValue = getValue(metadata, partitionKey, row);
+1:a991b64:                         // Note that CQL expression are always of the form 'x < 4', i.e. the tested value is on the left.
+1:a991b64:                         return foundValue != null && operator.isSatisfiedBy(column.type, foundValue, value);
+1:a991b64:                     }
+1:a991b64:                 case CONTAINS:
+1:a991b64:                     assert column.type.isCollection();
+1:a991b64:                     CollectionType<?> type = (CollectionType<?>)column.type;
+1:a991b64:                     if (column.isComplex())
+1:a991b64:                     {
+1:2457599:                         ComplexColumnData complexData = row.getComplexColumnData(column);
+1:2457599:                         for (Cell cell : complexData)
+1:a991b64:                         {
+1:a991b64:                             if (type.kind == CollectionType.Kind.SET)
+1:a991b64:                             {
+1:a991b64:                                 if (type.nameComparator().compare(cell.path().get(0), value) == 0)
+1:a991b64:                                     return true;
+1:a991b64:                             }
+1:a991b64:                             else
+1:a991b64:                             {
+1:a991b64:                                 if (type.valueComparator().compare(cell.value(), value) == 0)
+1:a991b64:                                     return true;
+1:a991b64:                             }
+1:a991b64:                         }
+1:a991b64:                         return false;
+1:a991b64:                     }
+1:a991b64:                     else
+1:a991b64:                     {
+1:c08eeaf:                         ByteBuffer foundValue = getValue(metadata, partitionKey, row);
+1:a991b64:                         if (foundValue == null)
+1:a991b64:                             return false;
+1:a991b64: 
+1:a991b64:                         switch (type.kind)
+1:a991b64:                         {
+1:a991b64:                             case LIST:
+1:a991b64:                                 ListType<?> listType = (ListType<?>)type;
+1:a991b64:                                 return listType.compose(foundValue).contains(listType.getElementsType().compose(value));
+1:a991b64:                             case SET:
+1:a991b64:                                 SetType<?> setType = (SetType<?>)type;
+1:a991b64:                                 return setType.compose(foundValue).contains(setType.getElementsType().compose(value));
+1:a991b64:                             case MAP:
+1:a991b64:                                 MapType<?,?> mapType = (MapType<?, ?>)type;
+1:a991b64:                                 return mapType.compose(foundValue).containsValue(mapType.getValuesType().compose(value));
+1:a991b64:                         }
+1:a991b64:                         throw new AssertionError();
+1:a991b64:                     }
+1:a991b64:                 case CONTAINS_KEY:
+1:a991b64:                     assert column.type.isCollection() && column.type instanceof MapType;
+1:a991b64:                     MapType<?, ?> mapType = (MapType<?, ?>)column.type;
+1:a991b64:                     if (column.isComplex())
+1:a991b64:                     {
+1:a991b64:                          return row.getCell(column, CellPath.create(value)) != null;
+1:a991b64:                     }
+1:a991b64:                     else
+1:a991b64:                     {
+1:c08eeaf:                         ByteBuffer foundValue = getValue(metadata, partitionKey, row);
+1:a991b64:                         return foundValue != null && mapType.getSerializer().getSerializedValue(foundValue, value, mapType.getKeysType()) != null;
+1:a991b64:                     }
+1:a991b64: 
+1:a991b64:                 case IN:
+1:a991b64:                     // It wouldn't be terribly hard to support this (though doing so would imply supporting
+1:a991b64:                     // IN for 2ndary index) but currently we don't.
+1:a991b64:                     throw new AssertionError();
+1:a991b64:             }
+1:a991b64:             throw new AssertionError();
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         @Override
+1:a991b64:         public String toString()
+1:a991b64:         {
+1:a991b64:             AbstractType<?> type = column.type;
+1:a991b64:             switch (operator)
+1:a991b64:             {
+1:a991b64:                 case CONTAINS:
+1:a991b64:                     assert type instanceof CollectionType;
+1:a991b64:                     CollectionType<?> ct = (CollectionType<?>)type;
+1:a991b64:                     type = ct.kind == CollectionType.Kind.SET ? ct.nameComparator() : ct.valueComparator();
+1:a991b64:                     break;
+1:a991b64:                 case CONTAINS_KEY:
+1:a991b64:                     assert type instanceof MapType;
+1:a991b64:                     type = ((MapType<?, ?>)type).nameComparator();
+1:a991b64:                     break;
+1:a991b64:                 case IN:
+1:a991b64:                     type = ListType.getInstance(type, false);
+1:a991b64:                     break;
+1:a991b64:                 default:
+1:a991b64:                     break;
+1:a991b64:             }
+1:a991b64:             return String.format("%s %s %s", column.name, operator, type.getString(value));
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         @Override
+1:72790dc:         protected Kind kind()
+1:a991b64:         {
+1:a991b64:             return Kind.SIMPLE;
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:a991b64:      * An expression of the form 'column' ['key'] = 'value' (which is only
+1:a991b64:      * supported when 'column' is a map).
+1:a991b64:      */
+1:a991b64:     private static class MapEqualityExpression extends Expression
+1:a991b64:     {
+1:a991b64:         private final ByteBuffer key;
+1:a991b64: 
+1:a991b64:         public MapEqualityExpression(ColumnDefinition column, ByteBuffer key, Operator operator, ByteBuffer value)
+1:a991b64:         {
+1:a991b64:             super(column, operator, value);
+1:a991b64:             assert column.type instanceof MapType && operator == Operator.EQ;
+1:a991b64:             this.key = key;
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         @Override
+1:9c3855b:         public void validate() throws InvalidRequestException
+1:a991b64:         {
+1:9c3855b:             checkNotNull(key, "Unsupported null map key for column %s", column.name);
+1:9c3855b:             checkBindValueSet(key, "Unsupported unset map key for column %s", column.name);
+1:9c3855b:             checkNotNull(value, "Unsupported null map value for column %s", column.name);
+1:9c3855b:             checkBindValueSet(value, "Unsupported unset map value for column %s", column.name);
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         @Override
+1:a991b64:         public ByteBuffer getIndexValue()
+1:a991b64:         {
+1:a991b64:             return CompositeType.build(key, value);
+1:a991b64:         }
+1:a991b64: 
+1:5343a75:         public boolean isSatisfiedBy(CFMetaData metadata, DecoratedKey partitionKey, Row row)
+1:a991b64:         {
+1:a991b64:             assert key != null;
+1:a991b64:             // We support null conditions for LWT (in ColumnCondition) but not for RowFilter.
+1:a991b64:             // TODO: we should try to merge both code someday.
+1:a991b64:             assert value != null;
+1:a991b64: 
+2:a991b64:             if (row.isStatic() != column.isStatic())
+1:a991b64:                 return true;
+1:a991b64: 
+1:a991b64:             MapType<?, ?> mt = (MapType<?, ?>)column.type;
+1:a991b64:             if (column.isComplex())
+1:a991b64:             {
+1:a991b64:                 Cell cell = row.getCell(column, CellPath.create(key));
+1:a991b64:                 return cell != null && mt.valueComparator().compare(cell.value(), value) == 0;
+1:a991b64:             }
+1:a991b64:             else
+1:a991b64:             {
+1:5343a75:                 ByteBuffer serializedMap = getValue(metadata, partitionKey, row);
+1:a991b64:                 if (serializedMap == null)
+1:a991b64:                     return false;
+1:a991b64: 
+1:a991b64:                 ByteBuffer foundValue = mt.getSerializer().getSerializedValue(serializedMap, key, mt.getKeysType());
+1:a991b64:                 return foundValue != null && mt.valueComparator().compare(foundValue, value) == 0;
+1:a991b64:             }
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         @Override
+1:a991b64:         public String toString()
+1:a991b64:         {
+1:a991b64:             MapType<?, ?> mt = (MapType<?, ?>)column.type;
+1:a991b64:             return String.format("%s[%s] = %s", column.name, mt.nameComparator().getString(key), mt.valueComparator().getString(value));
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         @Override
+1:a991b64:         public boolean equals(Object o)
+1:a991b64:         {
+1:a991b64:             if (this == o)
+1:a991b64:                 return true;
+1:a991b64: 
+1:a991b64:             if (!(o instanceof MapEqualityExpression))
+1:a991b64:                 return false;
+1:a991b64: 
+1:a991b64:             MapEqualityExpression that = (MapEqualityExpression)o;
+1:a991b64: 
+1:a991b64:             return Objects.equal(this.column.name, that.column.name)
+1:a991b64:                 && Objects.equal(this.operator, that.operator)
+1:a991b64:                 && Objects.equal(this.key, that.key)
+1:a991b64:                 && Objects.equal(this.value, that.value);
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         @Override
+1:a991b64:         public int hashCode()
+1:a991b64:         {
+1:a991b64:             return Objects.hashCode(column.name, operator, key, value);
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         @Override
+1:72790dc:         protected Kind kind()
+1:a991b64:         {
+1:a991b64:             return Kind.MAP_EQUALITY;
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:a991b64:      * An expression of the form 'name' = 'value', but where 'name' is actually the
+1:a991b64:      * clustering value for a compact table. This is only for thrift.
+1:a991b64:      */
+1:a991b64:     private static class ThriftExpression extends Expression
+1:a991b64:     {
+1:a991b64:         public ThriftExpression(CFMetaData metadata, ByteBuffer name, Operator operator, ByteBuffer value)
+1:a991b64:         {
+1:a991b64:             super(makeDefinition(metadata, name), operator, value);
+1:a991b64:             assert metadata.isCompactTable();
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         private static ColumnDefinition makeDefinition(CFMetaData metadata, ByteBuffer name)
+1:a991b64:         {
+1:a991b64:             ColumnDefinition def = metadata.getColumnDefinition(name);
+1:a991b64:             if (def != null)
+1:a991b64:                 return def;
+1:a991b64: 
+1:a991b64:             // In thrift, we actually allow expression on non-defined columns for the sake of filtering. To accomodate
+1:a991b64:             // this we create a "fake" definition. This is messy but it works so is probably good enough.
+1:2457599:             return ColumnDefinition.regularDef(metadata, name, metadata.compactValueColumn().type);
+1:a991b64:         }
+1:a991b64: 
+1:5343a75:         public boolean isSatisfiedBy(CFMetaData metadata, DecoratedKey partitionKey, Row row)
+1:a991b64:         {
+1:a991b64:             assert value != null;
+1:a991b64: 
+1:a991b64:             // On thrift queries, even if the column expression is a "static" one, we'll have convert it as a "dynamic"
+1:a991b64:             // one in ThriftResultsMerger, so we always expect it to be a dynamic one. Further, we expect this is only
+1:a991b64:             // called when the row clustering does match the column (see ThriftFilter above).
+1:a991b64:             assert row.clustering().equals(makeCompactClustering(metadata, column.name.bytes));
+1:a991b64:             Cell cell = row.getCell(metadata.compactValueColumn());
+1:a991b64:             return cell != null && operator.isSatisfiedBy(column.type, cell.value(), value);
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         @Override
+1:a991b64:         public String toString()
+1:a991b64:         {
+1:a991b64:             return String.format("%s %s %s", column.name, operator, column.type.getString(value));
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         @Override
+1:72790dc:         protected Kind kind()
+1:a991b64:         {
+1:a991b64:             return Kind.THRIFT_DYN_EXPR;
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: 
+1:64e2f5d:     /**
+1:64e2f5d:      * A custom index expression for use with 2i implementations which support custom syntax and which are not
+1:64e2f5d:      * necessarily linked to a single column in the base table.
+1:64e2f5d:      */
+1:64e2f5d:     public static final class CustomExpression extends Expression
+1:64e2f5d:     {
+1:64e2f5d:         private final IndexMetadata targetIndex;
+1:64e2f5d:         private final CFMetaData cfm;
+1:a991b64: 
+1:64e2f5d:         public CustomExpression(CFMetaData cfm, IndexMetadata targetIndex, ByteBuffer value)
+1:64e2f5d:         {
+1:64e2f5d:             // The operator is not relevant, but Expression requires it so for now we just hardcode EQ
+1:64e2f5d:             super(makeDefinition(cfm, targetIndex), Operator.EQ, value);
+1:64e2f5d:             this.targetIndex = targetIndex;
+1:64e2f5d:             this.cfm = cfm;
+1:64e2f5d:         }
+1:64e2f5d: 
+1:64e2f5d:         private static ColumnDefinition makeDefinition(CFMetaData cfm, IndexMetadata index)
+1:64e2f5d:         {
+1:64e2f5d:             // Similarly to how we handle non-defined columns in thift, we create a fake column definition to
+1:64e2f5d:             // represent the target index. This is definitely something that can be improved though.
+1:64e2f5d:             return ColumnDefinition.regularDef(cfm, ByteBuffer.wrap(index.name.getBytes()), BytesType.instance);
+1:64e2f5d:         }
+1:64e2f5d: 
+1:64e2f5d:         public IndexMetadata getTargetIndex()
+1:64e2f5d:         {
+1:64e2f5d:             return targetIndex;
+1:64e2f5d:         }
+1:64e2f5d: 
+1:64e2f5d:         public ByteBuffer getValue()
+1:64e2f5d:         {
+1:64e2f5d:             return value;
+1:64e2f5d:         }
+1:64e2f5d: 
+1:64e2f5d:         public String toString()
+1:64e2f5d:         {
+1:64e2f5d:             return String.format("expr(%s, %s)",
+1:64e2f5d:                                  targetIndex.name,
+1:64e2f5d:                                  Keyspace.openAndGetStore(cfm)
+1:64e2f5d:                                          .indexManager
+1:64e2f5d:                                          .getIndex(targetIndex)
+1:64e2f5d:                                          .customExpressionValueType());
+1:64e2f5d:         }
+1:64e2f5d: 
+1:72790dc:         protected Kind kind()
+1:64e2f5d:         {
+1:64e2f5d:             return Kind.CUSTOM;
+1:64e2f5d:         }
+1:64e2f5d: 
+1:64e2f5d:         // Filtering by custom expressions isn't supported yet, so just accept any row
+1:5343a75:         public boolean isSatisfiedBy(CFMetaData metadata, DecoratedKey partitionKey, Row row)
+1:64e2f5d:         {
+1:a991b64:             return true;
+1:64e2f5d:         }
+1:64e2f5d:     }
+1:64e2f5d: 
+2:5a4253b:     /**
+1:1a73af7:      * A user defined filtering expression. These may be added to RowFilter programmatically by a
+1:1a73af7:      * QueryHandler implementation. No concrete implementations are provided and adding custom impls
+1:1a73af7:      * to the classpath is a task for operators (needless to say, this is something of a power
+1:1a73af7:      * user feature). Care must also be taken to register implementations, via the static register
+1:1a73af7:      * method during system startup. An implementation and its corresponding Deserializer must be
+1:1a73af7:      * registered before sending or receiving any messages containing expressions of that type.
+1:1a73af7:      * Use of custom filtering expressions in a mixed version cluster should be handled with caution
+1:1a73af7:      * as the order in which types are registered is significant: if continuity of use during upgrades
+1:79c5bc3:      * is important, new types should registered last and obsoleted types should still be registered (
+1:1a73af7:      * or dummy implementations registered in their place) to preserve consistent identifiers across
+1:1a73af7:      * the cluster).
+1:1a73af7:      *
+1:1a73af7:      * During serialization, the identifier for the Deserializer implementation is prepended to the
+1:1a73af7:      * implementation specific payload. To deserialize, the identifier is read first to obtain the
+1:1a73af7:      * Deserializer, which then provides the concrete expression instance.
+1:1a73af7:      */
+1:1a73af7:     public static abstract class UserExpression extends Expression
+1:1a73af7:     {
+1:1a73af7:         private static final DeserializerRegistry deserializers = new DeserializerRegistry();
+1:1a73af7:         private static final class DeserializerRegistry
+1:1a73af7:         {
+1:1a73af7:             private final AtomicInteger counter = new AtomicInteger(0);
+1:1a73af7:             private final ConcurrentMap<Integer, Deserializer> deserializers = new ConcurrentHashMap<>();
+1:1a73af7:             private final ConcurrentMap<Class<? extends UserExpression>, Integer> registeredClasses = new ConcurrentHashMap<>();
+1:1a73af7: 
+1:1a73af7:             public void registerUserExpressionClass(Class<? extends UserExpression> expressionClass,
+1:1a73af7:                                                     UserExpression.Deserializer deserializer)
+1:1a73af7:             {
+1:1a73af7:                 int id = registeredClasses.computeIfAbsent(expressionClass, (cls) -> counter.getAndIncrement());
+1:1a73af7:                 deserializers.put(id, deserializer);
+1:1a73af7: 
+1:1a73af7:                 logger.debug("Registered user defined expression type {} and serializer {} with identifier {}",
+1:1a73af7:                              expressionClass.getName(), deserializer.getClass().getName(), id);
+1:1a73af7:             }
+1:1a73af7: 
+1:1a73af7:             public Integer getId(UserExpression expression)
+1:1a73af7:             {
+1:1a73af7:                 return registeredClasses.get(expression.getClass());
+1:1a73af7:             }
+1:1a73af7: 
+1:1a73af7:             public Deserializer getDeserializer(int id)
+1:1a73af7:             {
+1:1a73af7:                 return deserializers.get(id);
+1:1a73af7:             }
+1:1a73af7:         }
+1:1a73af7: 
+1:1a73af7:         protected static abstract class Deserializer
+1:1a73af7:         {
+1:1a73af7:             protected abstract UserExpression deserialize(DataInputPlus in,
+1:1a73af7:                                                           int version,
+1:1a73af7:                                                           CFMetaData metadata) throws IOException;
+1:1a73af7:         }
+1:1a73af7: 
+1:1a73af7:         public static void register(Class<? extends UserExpression> expressionClass, Deserializer deserializer)
+1:1a73af7:         {
+1:1a73af7:             deserializers.registerUserExpressionClass(expressionClass, deserializer);
+1:1a73af7:         }
+1:1a73af7: 
+1:1a73af7:         private static UserExpression deserialize(DataInputPlus in, int version, CFMetaData metadata) throws IOException
+1:1a73af7:         {
+1:1a73af7:             int id = in.readInt();
+1:1a73af7:             Deserializer deserializer = deserializers.getDeserializer(id);
+1:1a73af7:             assert deserializer != null : "No user defined expression type registered with id " + id;
+1:1a73af7:             return deserializer.deserialize(in, version, metadata);
+1:1a73af7:         }
+1:1a73af7: 
+1:1a73af7:         private static void serialize(UserExpression expression, DataOutputPlus out, int version) throws IOException
+1:1a73af7:         {
+1:1a73af7:             Integer id = deserializers.getId(expression);
+1:1a73af7:             assert id != null : "User defined expression type " + expression.getClass().getName() + " is not registered";
+1:1a73af7:             out.writeInt(id);
+1:1a73af7:             expression.serialize(out, version);
+1:1a73af7:         }
+1:1a73af7: 
+1:1a73af7:         private static long serializedSize(UserExpression expression, int version)
+1:1a73af7:         {   // 4 bytes for the expression type id
+1:1a73af7:             return 4 + expression.serializedSize(version);
+1:1a73af7:         }
+1:1a73af7: 
+1:1a73af7:         protected UserExpression(ColumnDefinition column, Operator operator, ByteBuffer value)
+1:1a73af7:         {
+1:1a73af7:             super(column, operator, value);
+1:1a73af7:         }
+1:1a73af7: 
+1:1a73af7:         protected Kind kind()
+1:1a73af7:         {
+1:1a73af7:             return Kind.USER;
+1:1a73af7:         }
+1:1a73af7: 
+1:1a73af7:         protected abstract void serialize(DataOutputPlus out, int version) throws IOException;
+1:1a73af7:         protected abstract long serializedSize(int version);
+1:1a73af7:     }
+1:1a73af7: 
+1:a991b64:     public static class Serializer
+1:a991b64:     {
+1:a991b64:         public void serialize(RowFilter filter, DataOutputPlus out, int version) throws IOException
+1:a991b64:         {
+1:a991b64:             out.writeBoolean(filter instanceof ThriftFilter);
+1:649a106:             out.writeUnsignedVInt(filter.expressions.size());
+1:a991b64:             for (Expression expr : filter.expressions)
+1:a991b64:                 Expression.serializer.serialize(expr, out, version);
+1:a991b64: 
+1:a991b64:         }
+1:64e2f5d: 
+1:a59be26:         public RowFilter deserialize(DataInputPlus in, int version, CFMetaData metadata) throws IOException
+1:a991b64:         {
+1:a991b64:             boolean forThrift = in.readBoolean();
+1:649a106:             int size = (int)in.readUnsignedVInt();
+1:a991b64:             List<Expression> expressions = new ArrayList<>(size);
+1:a991b64:             for (int i = 0; i < size; i++)
+1:a991b64:                 expressions.add(Expression.serializer.deserialize(in, version, metadata));
+1:64e2f5d: 
+1:a991b64:             return forThrift
+1:a991b64:                  ? new ThriftFilter(expressions)
+1:a991b64:                  : new CQLFilter(expressions);
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         public long serializedSize(RowFilter filter, int version)
+1:a991b64:         {
+1:a991b64:             long size = 1 // forThrift
+1:649a106:                       + TypeSizes.sizeofUnsignedVInt(filter.expressions.size());
+1:a991b64:             for (Expression expr : filter.expressions)
+1:a991b64:                 size += Expression.serializer.serializedSize(expr, version);
+1:a991b64:             return size;
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: }
+============================================================================
+author:ZhaoYang
+-------------------------------------------------------------------------------
+commit:3f49c32
+/////////////////////////////////////////////////////////////////////////
+1: import com.google.common.collect.Iterables;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:             List<Expression> partitionLevelExpressions = new ArrayList<>();
+1:             List<Expression> rowLevelExpressions = new ArrayList<>();
+1:             for (Expression e: expressions)
+1:             {
+1:                 if (e.column.isStatic() || e.column.isPartitionKey())
+1:                     partitionLevelExpressions.add(e);
+1:                 else
+1:                     rowLevelExpressions.add(e);
+1:             }
+1: 
+1:             long numberOfRegularColumnExpressions = rowLevelExpressions.size();
+1:             final boolean filterNonStaticColumns = numberOfRegularColumnExpressions > 0;
+/////////////////////////////////////////////////////////////////////////
+1:                     // Short-circuit all partitions that won't match based on static and partition keys
+1:                     for (Expression e : partitionLevelExpressions)
+1:                         if (!e.isSatisfiedBy(metadata, partition.partitionKey(), partition.staticRow()))
+1:                             return null;
+/////////////////////////////////////////////////////////////////////////
+1:                     for (Expression e : rowLevelExpressions)
+1: 
+/////////////////////////////////////////////////////////////////////////
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:79c5bc3
+/////////////////////////////////////////////////////////////////////////
+1:      * is important, new types should registered last and obsoleted types should still be registered (
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:a87fd71
+commit:86ba227
+/////////////////////////////////////////////////////////////////////////
+1:      * Whether the provided row in the provided partition satisfies this filter.
+1:      *
+1:      * @param metadata the table metadata.
+1:      * @param partitionKey the partition key for partition to test.
+1:      * @param row the row to test.
+1:      * @param nowInSec the current time in seconds (to know what is live and what isn't).
+1:      * @return {@code true} if {@code row} in partition {@code partitionKey} satisfies this row filter.
+1:      */
+1:     public boolean isSatisfiedBy(CFMetaData metadata, DecoratedKey partitionKey, Row row, int nowInSec)
+1:     {
+1:         // We purge all tombstones as the expressions isSatisfiedBy methods expects it
+1:         Row purged = row.purge(DeletionPurger.PURGE_ALL, nowInSec);
+1:         if (purged == null)
+1:             return expressions.isEmpty();
+1: 
+1:         for (Expression e : expressions)
+1:         {
+1:             if (!e.isSatisfiedBy(metadata, partitionKey, purged))
+1:                 return false;
+1:         }
+1:         return true;
+1:     }
+1: 
+1:     /**
+commit:5343a75
+/////////////////////////////////////////////////////////////////////////
+1:             final CFMetaData metadata = iter.metadata();
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                         if (!e.isSatisfiedBy(metadata, pk, purged))
+/////////////////////////////////////////////////////////////////////////
+1:                         if (row == null || !expr.isSatisfiedBy(iter.metadata(), iter.partitionKey(), row))
+/////////////////////////////////////////////////////////////////////////
+1:         public abstract boolean isSatisfiedBy(CFMetaData metadata, DecoratedKey partitionKey, Row row);
+1:         protected ByteBuffer getValue(CFMetaData metadata, DecoratedKey partitionKey, Row row)
+1:                     return metadata.getKeyValidator() instanceof CompositeType
+1:                          ? CompositeType.extractComponent(partitionKey.getKey(), column.position())
+1:                          : partitionKey.getKey();
+/////////////////////////////////////////////////////////////////////////
+1:         public boolean isSatisfiedBy(CFMetaData metadata, DecoratedKey partitionKey, Row row)
+/////////////////////////////////////////////////////////////////////////
+1:                         ByteBuffer foundValue = getValue(metadata, partitionKey, row);
+/////////////////////////////////////////////////////////////////////////
+1:                         ByteBuffer foundValue = getValue(metadata, partitionKey, row);
+/////////////////////////////////////////////////////////////////////////
+1:                         ByteBuffer foundValue = getValue(metadata, partitionKey, row);
+/////////////////////////////////////////////////////////////////////////
+1:         public boolean isSatisfiedBy(CFMetaData metadata, DecoratedKey partitionKey, Row row)
+/////////////////////////////////////////////////////////////////////////
+1:                 ByteBuffer serializedMap = getValue(metadata, partitionKey, row);
+/////////////////////////////////////////////////////////////////////////
+1:         public boolean isSatisfiedBy(CFMetaData metadata, DecoratedKey partitionKey, Row row)
+/////////////////////////////////////////////////////////////////////////
+1:         public boolean isSatisfiedBy(CFMetaData metadata, DecoratedKey partitionKey, Row row)
+commit:a59be26
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.io.util.DataInputPlus;
+/////////////////////////////////////////////////////////////////////////
+1:             public Expression deserialize(DataInputPlus in, int version, CFMetaData metadata) throws IOException
+/////////////////////////////////////////////////////////////////////////
+0:             out.writeVInt(filter.expressions.size());
+1:         public RowFilter deserialize(DataInputPlus in, int version, CFMetaData metadata) throws IOException
+0:             int size = (int)in.readVInt();
+/////////////////////////////////////////////////////////////////////////
+0:                       + TypeSizes.sizeofVInt(filter.expressions.size());
+commit:2457599
+/////////////////////////////////////////////////////////////////////////
+0:             return new Clustering(values.toArray(new ByteBuffer[metadata.comparator.size()]));
+0:             return new Clustering(name);
+/////////////////////////////////////////////////////////////////////////
+1:         public UnfilteredPartitionIterator filter(UnfilteredPartitionIterator iter, int nowInSec)
+0:             return new AlteringUnfilteredPartitionIterator(iter)
+0:                 protected Row computeNext(DecoratedKey partitionKey, Row row)
+0:                     // We filter tombstones when passing the row to isSatisfiedBy so that the method doesn't have to bother with them.
+1:                     Row purged = row.purge(DeletionPurger.PURGE_ALL, nowInSec);
+0:                     return purged != null && CQLFilter.this.isSatisfiedBy(partitionKey, purged) ? row : null;
+/////////////////////////////////////////////////////////////////////////
+1:                         ComplexColumnData complexData = row.getComplexColumnData(column);
+1:                         for (Cell cell : complexData)
+/////////////////////////////////////////////////////////////////////////
+1:             return ColumnDefinition.regularDef(metadata, name, metadata.compactValueColumn().type);
+commit:a991b64
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.db.filter;
+1: 
+0: import java.io.DataInput;
+1: import java.io.IOException;
+1: import java.nio.ByteBuffer;
+1: import java.util.*;
+1: 
+1: import com.google.common.base.Objects;
+1: 
+1: import org.apache.cassandra.config.CFMetaData;
+1: import org.apache.cassandra.config.ColumnDefinition;
+1: import org.apache.cassandra.cql3.Operator;
+1: import org.apache.cassandra.db.*;
+1: import org.apache.cassandra.db.rows.*;
+0: import org.apache.cassandra.db.partitions.*;
+1: import org.apache.cassandra.db.marshal.*;
+1: import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+1: import org.apache.cassandra.exceptions.InvalidRequestException;
+1: import org.apache.cassandra.io.util.DataOutputPlus;
+1: import org.apache.cassandra.net.MessagingService;
+1: import org.apache.cassandra.utils.ByteBufferUtil;
+1: import org.apache.cassandra.utils.FBUtilities;
+1: 
+0: import static org.apache.cassandra.cql3.statements.RequestValidations.*;
+1: 
+1: /**
+1:  * A filter on which rows a given query should include or exclude.
+1:  * <p>
+1:  * This corresponds to the restrictions on rows that are not handled by the query
+1:  * {@link ClusteringIndexFilter}. Some of the expressions of this filter may
+1:  * be handled by a 2ndary index, and the rest is simply filtered out from the
+1:  * result set (the later can only happen if the query was using ALLOW FILTERING).
+1:  */
+1: public abstract class RowFilter implements Iterable<RowFilter.Expression>
+1: {
+1:     public static final Serializer serializer = new Serializer();
+0:     public static final RowFilter NONE = new CQLFilter(Collections.<Expression>emptyList());
+1: 
+1:     protected final List<Expression> expressions;
+1: 
+1:     protected RowFilter(List<Expression> expressions)
+1:     {
+1:         this.expressions = expressions;
+1:     }
+1: 
+1:     public static RowFilter create()
+1:     {
+0:         return new CQLFilter(new ArrayList<Expression>());
+1:     }
+1: 
+1:     public static RowFilter create(int capacity)
+1:     {
+0:         return new CQLFilter(new ArrayList<Expression>(capacity));
+1:     }
+1: 
+1:     public static RowFilter forThrift(int capacity)
+1:     {
+0:         return new ThriftFilter(new ArrayList<Expression>(capacity));
+1:     }
+1: 
+0:     public void add(ColumnDefinition def, Operator op, ByteBuffer value)
+1:     {
+0:         expressions.add(new SimpleExpression(def, op, value));
+1:     }
+1: 
+1:     public void addMapEquality(ColumnDefinition def, ByteBuffer key, Operator op, ByteBuffer value)
+1:     {
+0:         expressions.add(new MapEqualityExpression(def, key, op, value));
+1:     }
+1: 
+1:     public void addThriftExpression(CFMetaData metadata, ByteBuffer name, Operator op, ByteBuffer value)
+1:     {
+1:         assert (this instanceof ThriftFilter);
+0:         expressions.add(new ThriftExpression(metadata, name, op, value));
+1:     }
+1: 
+1:     /**
+1:      * Filters the provided iterator so that only the row satisfying the expression of this filter
+1:      * are included in the resulting iterator.
+1:      *
+1:      * @param iter the iterator to filter
+1:      * @param nowInSec the time of query in seconds.
+1:      * @return the filtered iterator.
+1:      */
+1:     public abstract UnfilteredPartitionIterator filter(UnfilteredPartitionIterator iter, int nowInSec);
+1: 
+1:     /**
+1:      * Returns this filter but without the provided expression. This method
+1:      * *assumes* that the filter contains the provided expression.
+1:      */
+1:     public RowFilter without(Expression expression)
+1:     {
+1:         assert expressions.contains(expression);
+1:         if (expressions.size() == 1)
+1:             return RowFilter.NONE;
+1: 
+1:         List<Expression> newExpressions = new ArrayList<>(expressions.size() - 1);
+1:         for (Expression e : expressions)
+1:             if (!e.equals(expression))
+1:                 newExpressions.add(e);
+1: 
+1:         return withNewExpressions(newExpressions);
+1:     }
+1: 
+1:     protected abstract RowFilter withNewExpressions(List<Expression> expressions);
+1: 
+1:     public boolean isEmpty()
+1:     {
+1:         return expressions.isEmpty();
+1:     }
+1: 
+1:     public Iterator<Expression> iterator()
+1:     {
+1:         return expressions.iterator();
+1:     }
+1: 
+1:     private static Clustering makeCompactClustering(CFMetaData metadata, ByteBuffer name)
+1:     {
+1:         assert metadata.isCompactTable();
+1:         if (metadata.isCompound())
+1:         {
+1:             List<ByteBuffer> values = CompositeType.splitName(name);
+0:             return new SimpleClustering(values.toArray(new ByteBuffer[metadata.comparator.size()]));
+1:         }
+1:         else
+1:         {
+0:             return new SimpleClustering(name);
+1:         }
+1:     }
+1: 
+1:     @Override
+1:     public String toString()
+1:     {
+1:         StringBuilder sb = new StringBuilder();
+1:         for (int i = 0; i < expressions.size(); i++)
+1:         {
+1:             if (i > 0)
+1:                 sb.append(" AND ");
+1:             sb.append(expressions.get(i));
+1:         }
+1:         return sb.toString();
+1:     }
+1: 
+1:     private static class CQLFilter extends RowFilter
+1:     {
+1:         private CQLFilter(List<Expression> expressions)
+1:         {
+1:             super(expressions);
+1:         }
+1: 
+1:         public UnfilteredPartitionIterator filter(UnfilteredPartitionIterator iter, final int nowInSec)
+1:         {
+1:             if (expressions.isEmpty())
+1:                 return iter;
+1: 
+0:             return new WrappingUnfilteredPartitionIterator(iter)
+1:             {
+1:                 @Override
+0:                 public UnfilteredRowIterator computeNext(final UnfilteredRowIterator iter)
+1:                 {
+0:                     return new FilteringRowIterator(iter)
+1:                     {
+0:                         // We filter tombstones when passing the row to isSatisfiedBy so that the method doesn't have to bother with them.
+0:                         // (we should however not filter them in the output of the method, hence it's not used as row filter for the
+0:                         // FilteringRowIterator)
+0:                         private final TombstoneFilteringRow filter = new TombstoneFilteringRow(nowInSec);
+1: 
+0:                         protected boolean includeRow(Row row)
+1:                         {
+0:                             return CQLFilter.this.isSatisfiedBy(iter.partitionKey(), filter.setTo(row));
+1:                         }
+0:                     };
+1:                 }
+0:             };
+1:         }
+1: 
+1:         /**
+0:          * Returns whether the provided row (with it's partition key) satisfies
+0:          * this row filter or not (that is, if it satisfies all of its expressions).
+1:          */
+0:         private boolean isSatisfiedBy(DecoratedKey partitionKey, Row row)
+1:         {
+1:             for (Expression e : expressions)
+0:                 if (!e.isSatisfiedBy(partitionKey, row))
+1:                     return false;
+1: 
+1:             return true;
+1:         }
+1: 
+1:         protected RowFilter withNewExpressions(List<Expression> expressions)
+1:         {
+1:             return new CQLFilter(expressions);
+1:         }
+1:     }
+1: 
+1:     private static class ThriftFilter extends RowFilter
+1:     {
+1:         private ThriftFilter(List<Expression> expressions)
+1:         {
+1:             super(expressions);
+1:         }
+1: 
+1:         public UnfilteredPartitionIterator filter(UnfilteredPartitionIterator iter, final int nowInSec)
+1:         {
+1:             if (expressions.isEmpty())
+1:                 return iter;
+1: 
+0:             return new WrappingUnfilteredPartitionIterator(iter)
+1:             {
+1:                 @Override
+0:                 public UnfilteredRowIterator computeNext(final UnfilteredRowIterator iter)
+1:                 {
+1:                     // Thrift does not filter rows, it filters entire partition if any of the expression is not
+1:                     // satisfied, which forces us to materialize the result (in theory we could materialize only
+1:                     // what we need which might or might not be everything, but we keep it simple since in practice
+1:                     // it's not worth that it has ever been).
+0:                     ArrayBackedPartition result = ArrayBackedPartition.create(iter);
+1: 
+1:                     // The partition needs to have a row for every expression, and the expression needs to be valid.
+1:                     for (Expression expr : expressions)
+1:                     {
+1:                         assert expr instanceof ThriftExpression;
+1:                         Row row = result.getRow(makeCompactClustering(iter.metadata(), expr.column().name.bytes));
+0:                         if (row == null || !expr.isSatisfiedBy(iter.partitionKey(), row))
+1:                             return null;
+1:                     }
+1:                     // If we get there, it means all expressions where satisfied, so return the original result
+1:                     return result.unfilteredIterator();
+1:                 }
+0:             };
+1:         }
+1: 
+1:         protected RowFilter withNewExpressions(List<Expression> expressions)
+1:         {
+1:             return new ThriftFilter(expressions);
+1:         }
+1:     }
+1: 
+1:     public static abstract class Expression
+1:     {
+1:         private static final Serializer serializer = new Serializer();
+1: 
+1:         // Note: the order of this enum matter, it's used for serialization
+0:         protected enum Kind { SIMPLE, MAP_EQUALITY, THRIFT_DYN_EXPR }
+1: 
+0:         abstract Kind kind();
+1:         protected final ColumnDefinition column;
+1:         protected final Operator operator;
+1:         protected final ByteBuffer value;
+1: 
+1:         protected Expression(ColumnDefinition column, Operator operator, ByteBuffer value)
+1:         {
+1:             this.column = column;
+1:             this.operator = operator;
+1:             this.value = value;
+1:         }
+1: 
+1:         public ColumnDefinition column()
+1:         {
+1:             return column;
+1:         }
+1: 
+1:         public Operator operator()
+1:         {
+1:             return operator;
+1:         }
+1: 
+1:         /**
+1:          * Checks if the operator of this <code>IndexExpression</code> is a <code>CONTAINS</code> operator.
+1:          *
+1:          * @return <code>true</code> if the operator of this <code>IndexExpression</code> is a <code>CONTAINS</code>
+1:          * operator, <code>false</code> otherwise.
+1:          */
+1:         public boolean isContains()
+1:         {
+1:             return Operator.CONTAINS == operator;
+1:         }
+1: 
+1:         /**
+1:          * Checks if the operator of this <code>IndexExpression</code> is a <code>CONTAINS_KEY</code> operator.
+1:          *
+1:          * @return <code>true</code> if the operator of this <code>IndexExpression</code> is a <code>CONTAINS_KEY</code>
+1:          * operator, <code>false</code> otherwise.
+1:          */
+1:         public boolean isContainsKey()
+1:         {
+1:             return Operator.CONTAINS_KEY == operator;
+1:         }
+1: 
+1:         /**
+1:          * If this expression is used to query an index, the value to use as
+1:          * partition key for that index query.
+1:          */
+1:         public ByteBuffer getIndexValue()
+1:         {
+1:             return value;
+1:         }
+1: 
+0:         public void validateForIndexing() throws InvalidRequestException
+1:         {
+0:             checkNotNull(value, "Unsupported null value for indexed column %s", column.name);
+0:             checkBindValueSet(value, "Unsupported unset value for indexed column %s", column.name);
+0:             checkFalse(value.remaining() > FBUtilities.MAX_UNSIGNED_SHORT, "Index expression values may not be larger than 64K");
+1:         }
+1: 
+1:         /**
+1:          * Returns whether the provided row satisfied this expression or not.
+1:          *
+1:          * @param partitionKey the partition key for row to check.
+1:          * @param row the row to check. It should *not* contain deleted cells
+1:          * (i.e. it should come from a RowIterator).
+1:          * @return whether the row is satisfied by this expression.
+1:          */
+0:         public abstract boolean isSatisfiedBy(DecoratedKey partitionKey, Row row);
+1: 
+0:         protected ByteBuffer getValue(DecoratedKey partitionKey, Row row)
+1:         {
+1:             switch (column.kind)
+1:             {
+1:                 case PARTITION_KEY:
+0:                     return column.isOnAllComponents()
+0:                          ? partitionKey.getKey()
+0:                          : CompositeType.extractComponent(partitionKey.getKey(), column.position());
+0:                 case CLUSTERING_COLUMN:
+1:                     return row.clustering().get(column.position());
+1:                 default:
+1:                     Cell cell = row.getCell(column);
+1:                     return cell == null ? null : cell.value();
+1:             }
+1:         }
+1: 
+1:         @Override
+1:         public boolean equals(Object o)
+1:         {
+1:             if (this == o)
+1:                 return true;
+1: 
+1:             if (!(o instanceof Expression))
+1:                 return false;
+1: 
+1:             Expression that = (Expression)o;
+1: 
+1:             return Objects.equal(this.kind(), that.kind())
+1:                 && Objects.equal(this.column.name, that.column.name)
+1:                 && Objects.equal(this.operator, that.operator)
+1:                 && Objects.equal(this.value, that.value);
+1:         }
+1: 
+1:         @Override
+1:         public int hashCode()
+1:         {
+1:             return Objects.hashCode(column.name, operator, value);
+1:         }
+1: 
+1:         private static class Serializer
+1:         {
+1:             public void serialize(Expression expression, DataOutputPlus out, int version) throws IOException
+1:             {
+1:                 ByteBufferUtil.writeWithShortLength(expression.column.name.bytes, out);
+1:                 expression.operator.writeTo(out);
+1: 
+1:                 if (version >= MessagingService.VERSION_30)
+1:                     out.writeByte(expression.kind().ordinal());
+1: 
+1:                 switch (expression.kind())
+1:                 {
+1:                     case SIMPLE:
+1:                         ByteBufferUtil.writeWithShortLength(((SimpleExpression)expression).value, out);
+1:                         break;
+1:                     case MAP_EQUALITY:
+1:                         MapEqualityExpression mexpr = (MapEqualityExpression)expression;
+1:                         if (version < MessagingService.VERSION_30)
+1:                         {
+1:                             ByteBufferUtil.writeWithShortLength(mexpr.getIndexValue(), out);
+1:                         }
+1:                         else
+1:                         {
+1:                             ByteBufferUtil.writeWithShortLength(mexpr.key, out);
+1:                             ByteBufferUtil.writeWithShortLength(mexpr.value, out);
+1:                         }
+1:                         break;
+1:                     case THRIFT_DYN_EXPR:
+1:                         ByteBufferUtil.writeWithShortLength(((ThriftExpression)expression).value, out);
+1:                         break;
+1:                 }
+1:             }
+1: 
+0:             public Expression deserialize(DataInput in, int version, CFMetaData metadata) throws IOException
+1:             {
+0:                 ByteBuffer name = ByteBufferUtil.readWithShortLength(in);
+0:                 Operator operator = Operator.readFrom(in);
+1: 
+0:                 ColumnDefinition column = metadata.getColumnDefinition(name);
+1:                 if (!metadata.isCompactTable() && column == null)
+1:                     throw new RuntimeException("Unknown (or dropped) column " + UTF8Type.instance.getString(name) + " during deserialization");
+1: 
+0:                 Kind kind;
+1:                 if (version >= MessagingService.VERSION_30)
+1:                 {
+1:                     kind = Kind.values()[in.readByte()];
+1:                 }
+1:                 else
+1:                 {
+1:                     if (column == null)
+1:                         kind = Kind.THRIFT_DYN_EXPR;
+1:                     else if (column.type instanceof MapType && operator == Operator.EQ)
+1:                         kind = Kind.MAP_EQUALITY;
+1:                     else
+1:                         kind = Kind.SIMPLE;
+1:                 }
+1: 
+1:                 switch (kind)
+1:                 {
+1:                     case SIMPLE:
+1:                         return new SimpleExpression(column, operator, ByteBufferUtil.readWithShortLength(in));
+1:                     case MAP_EQUALITY:
+1:                         ByteBuffer key, value;
+1:                         if (version < MessagingService.VERSION_30)
+1:                         {
+1:                             ByteBuffer composite = ByteBufferUtil.readWithShortLength(in);
+1:                             key = CompositeType.extractComponent(composite, 0);
+1:                             value = CompositeType.extractComponent(composite, 0);
+1:                         }
+1:                         else
+1:                         {
+1:                             key = ByteBufferUtil.readWithShortLength(in);
+1:                             value = ByteBufferUtil.readWithShortLength(in);
+1:                         }
+1:                         return new MapEqualityExpression(column, key, operator, value);
+1:                     case THRIFT_DYN_EXPR:
+1:                         return new ThriftExpression(metadata, name, operator, ByteBufferUtil.readWithShortLength(in));
+1:                 }
+1:                 throw new AssertionError();
+1:             }
+1: 
+1:             public long serializedSize(Expression expression, int version)
+1:             {
+0:                 TypeSizes sizes = TypeSizes.NATIVE;
+0:                 long size = ByteBufferUtil.serializedSizeWithShortLength(expression.column().name.bytes, sizes)
+1:                           + expression.operator.serializedSize();
+1: 
+1:                 switch (expression.kind())
+1:                 {
+1:                     case SIMPLE:
+0:                         size += ByteBufferUtil.serializedSizeWithShortLength(((SimpleExpression)expression).value, sizes);
+1:                         break;
+1:                     case MAP_EQUALITY:
+1:                         MapEqualityExpression mexpr = (MapEqualityExpression)expression;
+1:                         if (version < MessagingService.VERSION_30)
+0:                             size += ByteBufferUtil.serializedSizeWithShortLength(mexpr.getIndexValue(), sizes);
+1:                         else
+0:                             size += ByteBufferUtil.serializedSizeWithShortLength(mexpr.key, sizes)
+0:                                   + ByteBufferUtil.serializedSizeWithShortLength(mexpr.value, sizes);
+1:                         break;
+1:                     case THRIFT_DYN_EXPR:
+0:                         size += ByteBufferUtil.serializedSizeWithShortLength(((ThriftExpression)expression).value, sizes);
+1:                         break;
+1:                 }
+1:                 return size;
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * An expression of the form 'column' 'op' 'value'.
+1:      */
+0:     private static class SimpleExpression extends Expression
+1:     {
+0:         public SimpleExpression(ColumnDefinition column, Operator operator, ByteBuffer value)
+1:         {
+1:             super(column, operator, value);
+1:         }
+1: 
+0:         public boolean isSatisfiedBy(DecoratedKey partitionKey, Row row)
+1:         {
+1:             // We support null conditions for LWT (in ColumnCondition) but not for RowFilter.
+1:             // TODO: we should try to merge both code someday.
+1:             assert value != null;
+1: 
+1:             if (row.isStatic() != column.isStatic())
+1:                 return true;
+1: 
+1:             switch (operator)
+1:             {
+1:                 case EQ:
+1:                 case LT:
+1:                 case LTE:
+1:                 case GTE:
+1:                 case GT:
+1:                 case NEQ:
+1:                     {
+1:                         assert !column.isComplex() : "Only CONTAINS and CONTAINS_KEY are supported for 'complex' types";
+0:                         ByteBuffer foundValue = getValue(partitionKey, row);
+1:                         // Note that CQL expression are always of the form 'x < 4', i.e. the tested value is on the left.
+1:                         return foundValue != null && operator.isSatisfiedBy(column.type, foundValue, value);
+1:                     }
+1:                 case CONTAINS:
+1:                     assert column.type.isCollection();
+1:                     CollectionType<?> type = (CollectionType<?>)column.type;
+1:                     if (column.isComplex())
+1:                     {
+0:                         Iterator<Cell> iter = row.getCells(column);
+0:                         while (iter.hasNext())
+1:                         {
+0:                             Cell cell = iter.next();
+1:                             if (type.kind == CollectionType.Kind.SET)
+1:                             {
+1:                                 if (type.nameComparator().compare(cell.path().get(0), value) == 0)
+1:                                     return true;
+1:                             }
+1:                             else
+1:                             {
+1:                                 if (type.valueComparator().compare(cell.value(), value) == 0)
+1:                                     return true;
+1:                             }
+1:                         }
+1:                         return false;
+1:                     }
+1:                     else
+1:                     {
+0:                         ByteBuffer foundValue = getValue(partitionKey, row);
+1:                         if (foundValue == null)
+1:                             return false;
+1: 
+1:                         switch (type.kind)
+1:                         {
+1:                             case LIST:
+1:                                 ListType<?> listType = (ListType<?>)type;
+1:                                 return listType.compose(foundValue).contains(listType.getElementsType().compose(value));
+1:                             case SET:
+1:                                 SetType<?> setType = (SetType<?>)type;
+1:                                 return setType.compose(foundValue).contains(setType.getElementsType().compose(value));
+1:                             case MAP:
+1:                                 MapType<?,?> mapType = (MapType<?, ?>)type;
+1:                                 return mapType.compose(foundValue).containsValue(mapType.getValuesType().compose(value));
+1:                         }
+1:                         throw new AssertionError();
+1:                     }
+1:                 case CONTAINS_KEY:
+1:                     assert column.type.isCollection() && column.type instanceof MapType;
+1:                     MapType<?, ?> mapType = (MapType<?, ?>)column.type;
+1:                     if (column.isComplex())
+1:                     {
+1:                          return row.getCell(column, CellPath.create(value)) != null;
+1:                     }
+1:                     else
+1:                     {
+0:                         ByteBuffer foundValue = getValue(partitionKey, row);
+1:                         return foundValue != null && mapType.getSerializer().getSerializedValue(foundValue, value, mapType.getKeysType()) != null;
+1:                     }
+1: 
+1:                 case IN:
+1:                     // It wouldn't be terribly hard to support this (though doing so would imply supporting
+1:                     // IN for 2ndary index) but currently we don't.
+1:                     throw new AssertionError();
+1:             }
+1:             throw new AssertionError();
+1:         }
+1: 
+1:         @Override
+1:         public String toString()
+1:         {
+1:             AbstractType<?> type = column.type;
+1:             switch (operator)
+1:             {
+1:                 case CONTAINS:
+1:                     assert type instanceof CollectionType;
+1:                     CollectionType<?> ct = (CollectionType<?>)type;
+1:                     type = ct.kind == CollectionType.Kind.SET ? ct.nameComparator() : ct.valueComparator();
+1:                     break;
+1:                 case CONTAINS_KEY:
+1:                     assert type instanceof MapType;
+1:                     type = ((MapType<?, ?>)type).nameComparator();
+1:                     break;
+1:                 case IN:
+1:                     type = ListType.getInstance(type, false);
+1:                     break;
+1:                 default:
+1:                     break;
+1:             }
+1:             return String.format("%s %s %s", column.name, operator, type.getString(value));
+1:         }
+1: 
+1:         @Override
+0:         Kind kind()
+1:         {
+1:             return Kind.SIMPLE;
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * An expression of the form 'column' ['key'] = 'value' (which is only
+1:      * supported when 'column' is a map).
+1:      */
+1:     private static class MapEqualityExpression extends Expression
+1:     {
+1:         private final ByteBuffer key;
+1: 
+1:         public MapEqualityExpression(ColumnDefinition column, ByteBuffer key, Operator operator, ByteBuffer value)
+1:         {
+1:             super(column, operator, value);
+1:             assert column.type instanceof MapType && operator == Operator.EQ;
+1:             this.key = key;
+1:         }
+1: 
+1:         @Override
+0:         public void validateForIndexing() throws InvalidRequestException
+1:         {
+0:             super.validateForIndexing();
+0:             checkNotNull(key, "Unsupported null value for key of map column %s", column.name);
+0:             checkBindValueSet(key, "Unsupported unset value for key of map column %s", column.name);
+1:         }
+1: 
+1:         @Override
+1:         public ByteBuffer getIndexValue()
+1:         {
+1:             return CompositeType.build(key, value);
+1:         }
+1: 
+0:         public boolean isSatisfiedBy(DecoratedKey partitionKey, Row row)
+1:         {
+1:             assert key != null;
+1:             // We support null conditions for LWT (in ColumnCondition) but not for RowFilter.
+1:             // TODO: we should try to merge both code someday.
+1:             assert value != null;
+1: 
+1:             if (row.isStatic() != column.isStatic())
+1:                 return true;
+1: 
+1:             MapType<?, ?> mt = (MapType<?, ?>)column.type;
+1:             if (column.isComplex())
+1:             {
+1:                 Cell cell = row.getCell(column, CellPath.create(key));
+1:                 return cell != null && mt.valueComparator().compare(cell.value(), value) == 0;
+1:             }
+1:             else
+1:             {
+0:                 ByteBuffer serializedMap = getValue(partitionKey, row);
+1:                 if (serializedMap == null)
+1:                     return false;
+1: 
+1:                 ByteBuffer foundValue = mt.getSerializer().getSerializedValue(serializedMap, key, mt.getKeysType());
+1:                 return foundValue != null && mt.valueComparator().compare(foundValue, value) == 0;
+1:             }
+1:         }
+1: 
+1:         @Override
+1:         public String toString()
+1:         {
+1:             MapType<?, ?> mt = (MapType<?, ?>)column.type;
+1:             return String.format("%s[%s] = %s", column.name, mt.nameComparator().getString(key), mt.valueComparator().getString(value));
+1:         }
+1: 
+1:         @Override
+1:         public boolean equals(Object o)
+1:         {
+1:             if (this == o)
+1:                 return true;
+1: 
+1:             if (!(o instanceof MapEqualityExpression))
+1:                 return false;
+1: 
+1:             MapEqualityExpression that = (MapEqualityExpression)o;
+1: 
+1:             return Objects.equal(this.column.name, that.column.name)
+1:                 && Objects.equal(this.operator, that.operator)
+1:                 && Objects.equal(this.key, that.key)
+1:                 && Objects.equal(this.value, that.value);
+1:         }
+1: 
+1:         @Override
+1:         public int hashCode()
+1:         {
+1:             return Objects.hashCode(column.name, operator, key, value);
+1:         }
+1: 
+1:         @Override
+0:         Kind kind()
+1:         {
+1:             return Kind.MAP_EQUALITY;
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * An expression of the form 'name' = 'value', but where 'name' is actually the
+1:      * clustering value for a compact table. This is only for thrift.
+1:      */
+1:     private static class ThriftExpression extends Expression
+1:     {
+0:         private final CFMetaData metadata;
+1: 
+1:         public ThriftExpression(CFMetaData metadata, ByteBuffer name, Operator operator, ByteBuffer value)
+1:         {
+1:             super(makeDefinition(metadata, name), operator, value);
+1:             assert metadata.isCompactTable();
+0:             this.metadata = metadata;
+1:         }
+1: 
+1:         private static ColumnDefinition makeDefinition(CFMetaData metadata, ByteBuffer name)
+1:         {
+1:             ColumnDefinition def = metadata.getColumnDefinition(name);
+1:             if (def != null)
+1:                 return def;
+1: 
+1:             // In thrift, we actually allow expression on non-defined columns for the sake of filtering. To accomodate
+1:             // this we create a "fake" definition. This is messy but it works so is probably good enough.
+0:             return ColumnDefinition.regularDef(metadata, name, metadata.compactValueColumn().type, null);
+1:         }
+1: 
+0:         public boolean isSatisfiedBy(DecoratedKey partitionKey, Row row)
+1:         {
+1:             assert value != null;
+1: 
+1:             // On thrift queries, even if the column expression is a "static" one, we'll have convert it as a "dynamic"
+1:             // one in ThriftResultsMerger, so we always expect it to be a dynamic one. Further, we expect this is only
+1:             // called when the row clustering does match the column (see ThriftFilter above).
+1:             assert row.clustering().equals(makeCompactClustering(metadata, column.name.bytes));
+1:             Cell cell = row.getCell(metadata.compactValueColumn());
+1:             return cell != null && operator.isSatisfiedBy(column.type, cell.value(), value);
+1:         }
+1: 
+1:         @Override
+1:         public String toString()
+1:         {
+1:             return String.format("%s %s %s", column.name, operator, column.type.getString(value));
+1:         }
+1: 
+1:         @Override
+0:         Kind kind()
+1:         {
+1:             return Kind.THRIFT_DYN_EXPR;
+1:         }
+1:     }
+1: 
+1:     public static class Serializer
+1:     {
+1:         public void serialize(RowFilter filter, DataOutputPlus out, int version) throws IOException
+1:         {
+1:             out.writeBoolean(filter instanceof ThriftFilter);
+0:             out.writeShort(filter.expressions.size());
+1:             for (Expression expr : filter.expressions)
+1:                 Expression.serializer.serialize(expr, out, version);
+1:         }
+1: 
+0:         public RowFilter deserialize(DataInput in, int version, CFMetaData metadata) throws IOException
+1:         {
+1:             boolean forThrift = in.readBoolean();
+0:             int size = in.readUnsignedShort();
+1:             List<Expression> expressions = new ArrayList<>(size);
+1:             for (int i = 0; i < size; i++)
+1:                 expressions.add(Expression.serializer.deserialize(in, version, metadata));
+1:             return forThrift
+1:                  ? new ThriftFilter(expressions)
+1:                  : new CQLFilter(expressions);
+1:         }
+1: 
+1:         public long serializedSize(RowFilter filter, int version)
+1:         {
+0:             TypeSizes sizes = TypeSizes.NATIVE;
+1:             long size = 1 // forThrift
+0:                       + sizes.sizeof((short)filter.expressions.size());
+1:             for (Expression expr : filter.expressions)
+1:                 size += Expression.serializer.serializedSize(expr, version);
+1:             return size;
+1:         }
+1:     }
+1: }
+author:Sam Tunnicliffe
+-------------------------------------------------------------------------------
+commit:1800a5b
+commit:1a73af7
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.ConcurrentHashMap;
+1: import java.util.concurrent.ConcurrentMap;
+1: import java.util.concurrent.atomic.AtomicInteger;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: import org.apache.cassandra.db.partitions.ImmutableBTreePartition;
+0: import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+/////////////////////////////////////////////////////////////////////////
+1:     private static final Logger logger = LoggerFactory.getLogger(RowFilter.class);
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     public void addUserExpression(UserExpression e)
+1:     {
+1:         expressions.add(e);
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                     pk = partition.partitionKey();
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         protected enum Kind { SIMPLE, MAP_EQUALITY, THRIFT_DYN_EXPR, CUSTOM, USER }
+/////////////////////////////////////////////////////////////////////////
+1:         public boolean isUserDefined()
+1:         {
+1:             return kind() == Kind.USER;
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 if (expression.kind() == Kind.USER)
+1:                 {
+1:                     assert version >= MessagingService.VERSION_30;
+1:                     UserExpression.serialize((UserExpression)expression, out, version);
+1:                     return;
+1:                 }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:                     if (kind == Kind.USER)
+1:                     {
+1:                         return UserExpression.deserialize(in, version, metadata);
+1:                     }
+/////////////////////////////////////////////////////////////////////////
+1:                 // Custom expressions include neither a column or operator, but all
+1:                 // other expressions do. Also, custom expressions are 3.0+ only, so
+1:                 // the column & operator will always be the first things written for
+1:                 // any pre-3.0 version
+1:                 if (expression.kind() != Kind.CUSTOM && expression.kind() != Kind.USER)
+/////////////////////////////////////////////////////////////////////////
+1:                                    + ByteBufferUtil.serializedSizeWithShortLength(expression.value);
+1:                     case USER:
+1:                         if (version >= MessagingService.VERSION_30)
+1:                             size += UserExpression.serializedSize((UserExpression)expression, version);
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * A user defined filtering expression. These may be added to RowFilter programmatically by a
+1:      * QueryHandler implementation. No concrete implementations are provided and adding custom impls
+1:      * to the classpath is a task for operators (needless to say, this is something of a power
+1:      * user feature). Care must also be taken to register implementations, via the static register
+1:      * method during system startup. An implementation and its corresponding Deserializer must be
+1:      * registered before sending or receiving any messages containing expressions of that type.
+1:      * Use of custom filtering expressions in a mixed version cluster should be handled with caution
+1:      * as the order in which types are registered is significant: if continuity of use during upgrades
+0:      * is important, new types should registered last & obsoleted types should still be registered (
+1:      * or dummy implementations registered in their place) to preserve consistent identifiers across
+1:      * the cluster).
+1:      *
+1:      * During serialization, the identifier for the Deserializer implementation is prepended to the
+1:      * implementation specific payload. To deserialize, the identifier is read first to obtain the
+1:      * Deserializer, which then provides the concrete expression instance.
+1:      */
+1:     public static abstract class UserExpression extends Expression
+1:     {
+1:         private static final DeserializerRegistry deserializers = new DeserializerRegistry();
+1:         private static final class DeserializerRegistry
+1:         {
+1:             private final AtomicInteger counter = new AtomicInteger(0);
+1:             private final ConcurrentMap<Integer, Deserializer> deserializers = new ConcurrentHashMap<>();
+1:             private final ConcurrentMap<Class<? extends UserExpression>, Integer> registeredClasses = new ConcurrentHashMap<>();
+1: 
+1:             public void registerUserExpressionClass(Class<? extends UserExpression> expressionClass,
+1:                                                     UserExpression.Deserializer deserializer)
+1:             {
+1:                 int id = registeredClasses.computeIfAbsent(expressionClass, (cls) -> counter.getAndIncrement());
+1:                 deserializers.put(id, deserializer);
+1: 
+1:                 logger.debug("Registered user defined expression type {} and serializer {} with identifier {}",
+1:                              expressionClass.getName(), deserializer.getClass().getName(), id);
+1:             }
+1: 
+1:             public Integer getId(UserExpression expression)
+1:             {
+1:                 return registeredClasses.get(expression.getClass());
+1:             }
+1: 
+1:             public Deserializer getDeserializer(int id)
+1:             {
+1:                 return deserializers.get(id);
+1:             }
+1:         }
+1: 
+1:         protected static abstract class Deserializer
+1:         {
+1:             protected abstract UserExpression deserialize(DataInputPlus in,
+1:                                                           int version,
+1:                                                           CFMetaData metadata) throws IOException;
+1:         }
+1: 
+1:         public static void register(Class<? extends UserExpression> expressionClass, Deserializer deserializer)
+1:         {
+1:             deserializers.registerUserExpressionClass(expressionClass, deserializer);
+1:         }
+1: 
+1:         private static UserExpression deserialize(DataInputPlus in, int version, CFMetaData metadata) throws IOException
+1:         {
+1:             int id = in.readInt();
+1:             Deserializer deserializer = deserializers.getDeserializer(id);
+1:             assert deserializer != null : "No user defined expression type registered with id " + id;
+1:             return deserializer.deserialize(in, version, metadata);
+1:         }
+1: 
+1:         private static void serialize(UserExpression expression, DataOutputPlus out, int version) throws IOException
+1:         {
+1:             Integer id = deserializers.getId(expression);
+1:             assert id != null : "User defined expression type " + expression.getClass().getName() + " is not registered";
+1:             out.writeInt(id);
+1:             expression.serialize(out, version);
+1:         }
+1: 
+1:         private static long serializedSize(UserExpression expression, int version)
+1:         {   // 4 bytes for the expression type id
+1:             return 4 + expression.serializedSize(version);
+1:         }
+1: 
+1:         protected UserExpression(ColumnDefinition column, Operator operator, ByteBuffer value)
+1:         {
+1:             super(column, operator, value);
+1:         }
+1: 
+1:         protected Kind kind()
+1:         {
+1:             return Kind.USER;
+1:         }
+1: 
+1:         protected abstract void serialize(DataOutputPlus out, int version) throws IOException;
+1:         protected abstract long serializedSize(int version);
+1:     }
+1: 
+commit:bdae452
+/////////////////////////////////////////////////////////////////////////
+1:     public SimpleExpression add(ColumnDefinition def, Operator op, ByteBuffer value)
+1:         SimpleExpression expression = new SimpleExpression(def, op, value);
+1:         add(expression);
+1:         return expression;
+/////////////////////////////////////////////////////////////////////////
+1:     public static class SimpleExpression extends Expression
+1:         SimpleExpression(ColumnDefinition column, Operator operator, ByteBuffer value)
+commit:64e2f5d
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.commons.lang3.builder.ToStringBuilder;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.schema.IndexMetadata;
+/////////////////////////////////////////////////////////////////////////
+1:     public static final RowFilter NONE = new CQLFilter(Collections.emptyList());
+/////////////////////////////////////////////////////////////////////////
+1:         return new CQLFilter(new ArrayList<>());
+1:         return new CQLFilter(new ArrayList<>(capacity));
+1:         return new ThriftFilter(new ArrayList<>(capacity));
+/////////////////////////////////////////////////////////////////////////
+1:     public void addCustomIndexExpression(CFMetaData cfm, IndexMetadata targetIndex, ByteBuffer value)
+1:     {
+0:         expressions.add(new CustomExpression(cfm, targetIndex, value));
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         protected enum Kind { SIMPLE, MAP_EQUALITY, THRIFT_DYN_EXPR, CUSTOM }
+/////////////////////////////////////////////////////////////////////////
+1:         public boolean isCustom()
+1:         {
+1:             return kind() == Kind.CUSTOM;
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 // Custom expressions include neither a column or operator, but all
+1:                 // other expressions do. Also, custom expressions are 3.0+ only, so
+1:                 // the column & operator will always be the first things written for
+1:                 // any pre-3.0 version
+1:                 if (expression.kind() == Kind.CUSTOM)
+1:                 {
+1:                     assert version >= MessagingService.VERSION_30;
+1:                     IndexMetadata.serializer.serialize(((CustomExpression)expression).targetIndex, out, version);
+1:                     ByteBufferUtil.writeWithShortLength(expression.value, out);
+1:                     return;
+1:                 }
+1: 
+0:                 ByteBufferUtil.writeWithShortLength(expression.column.name.bytes, out);
+0:                 expression.operator.writeTo(out);
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 Kind kind = null;
+1:                 ByteBuffer name;
+1:                 Operator operator;
+1:                 ColumnDefinition column;
+1:                     // custom expressions (3.0+ only) do not contain a column or operator, only a value
+1:                     if (kind == Kind.CUSTOM)
+1:                     {
+1:                         return new CustomExpression(metadata,
+1:                                                     IndexMetadata.serializer.deserialize(in, version, metadata),
+1:                                                     ByteBufferUtil.readWithShortLength(in));
+1:                     }
+1: 
+1:                 name = ByteBufferUtil.readWithShortLength(in);
+1:                 operator = Operator.readFrom(in);
+1:                 column = metadata.getColumnDefinition(name);
+0:                 if (!metadata.isCompactTable() && column == null)
+0:                     throw new RuntimeException("Unknown (or dropped) column " + UTF8Type.instance.getString(name) + " during deserialization");
+1: 
+1:                 if (version < MessagingService.VERSION_30)
+/////////////////////////////////////////////////////////////////////////
+1:                 assert kind != null;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:                 // version 3.0+ includes a byte for Kind
+1:                 long size = version >= MessagingService.VERSION_30 ? 1 : 0;
+1: 
+0:                 // custom expressions don't include a column or operator, all other expressions do
+0:                 if (expression.kind() != Kind.CUSTOM)
+1:                     size += ByteBufferUtil.serializedSizeWithShortLength(expression.column().name.bytes)
+0:                             + expression.operator.serializedSize();
+/////////////////////////////////////////////////////////////////////////
+1:                     case CUSTOM:
+1:                         if (version >= MessagingService.VERSION_30)
+1:                             size += IndexMetadata.serializer.serializedSize(((CustomExpression)expression).targetIndex, version)
+0:                                   + ByteBufferUtil.serializedSizeWithShortLength(expression.value);
+1:                         break;
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * A custom index expression for use with 2i implementations which support custom syntax and which are not
+1:      * necessarily linked to a single column in the base table.
+1:      */
+1:     public static final class CustomExpression extends Expression
+1:     {
+1:         private final IndexMetadata targetIndex;
+1:         private final CFMetaData cfm;
+1: 
+1:         public CustomExpression(CFMetaData cfm, IndexMetadata targetIndex, ByteBuffer value)
+1:         {
+1:             // The operator is not relevant, but Expression requires it so for now we just hardcode EQ
+1:             super(makeDefinition(cfm, targetIndex), Operator.EQ, value);
+1:             this.targetIndex = targetIndex;
+1:             this.cfm = cfm;
+1:         }
+1: 
+1:         private static ColumnDefinition makeDefinition(CFMetaData cfm, IndexMetadata index)
+1:         {
+1:             // Similarly to how we handle non-defined columns in thift, we create a fake column definition to
+1:             // represent the target index. This is definitely something that can be improved though.
+1:             return ColumnDefinition.regularDef(cfm, ByteBuffer.wrap(index.name.getBytes()), BytesType.instance);
+1:         }
+1: 
+1:         public IndexMetadata getTargetIndex()
+1:         {
+1:             return targetIndex;
+1:         }
+1: 
+1:         public ByteBuffer getValue()
+1:         {
+1:             return value;
+1:         }
+1: 
+1:         public String toString()
+1:         {
+1:             return String.format("expr(%s, %s)",
+1:                                  targetIndex.name,
+1:                                  Keyspace.openAndGetStore(cfm)
+1:                                          .indexManager
+1:                                          .getIndex(targetIndex)
+1:                                          .customExpressionValueType());
+1:         }
+1: 
+0:         Kind kind()
+1:         {
+1:             return Kind.CUSTOM;
+1:         }
+1: 
+1:         // Filtering by custom expressions isn't supported yet, so just accept any row
+0:         public boolean isSatisfiedBy(DecoratedKey partitionKey, Row row)
+1:         {
+1:             return true;
+1:         }
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+commit:0626be8
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.partitions.*;
+0: import org.apache.cassandra.db.rows.*;
+/////////////////////////////////////////////////////////////////////////
+1: import static org.apache.cassandra.cql3.statements.RequestValidations.checkBindValueSet;
+1: import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
+1: import static org.apache.cassandra.cql3.statements.RequestValidations.checkNotNull;
+/////////////////////////////////////////////////////////////////////////
+1:     public List<Expression> getExpressions()
+1:     {
+1:         return expressions;
+1:     }
+1: 
+author:Alex Petrov
+-------------------------------------------------------------------------------
+commit:c08eeaf
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.context.*;
+/////////////////////////////////////////////////////////////////////////
+1:                     {
+1:                         assert !column.isComplex() : "Only CONTAINS and CONTAINS_KEY are supported for 'complex' types";
+1: 
+1:                         // In order to support operators on Counter types, their value has to be extracted from internal
+1:                         // representation. See CASSANDRA-11629
+1:                         if (column.type.isCounter())
+1:                         {
+1:                             ByteBuffer foundValue = getValue(metadata, partitionKey, row);
+1:                             if (foundValue == null)
+1:                                 return false;
+1: 
+1:                             ByteBuffer counterValue = LongType.instance.decompose(CounterContext.instance().total(foundValue));
+1:                             return operator.isSatisfiedBy(LongType.instance, counterValue, value);
+1:                         }
+0:                         else
+1:                         {
+1:                             // Note that CQL expression are always of the form 'x < 4', i.e. the tested value is on the left.
+1:                             ByteBuffer foundValue = getValue(metadata, partitionKey, row);
+1:                             return foundValue != null && operator.isSatisfiedBy(column.type, foundValue, value);
+1:                         }
+1:                     }
+author:Benjamin Lerer
+-------------------------------------------------------------------------------
+commit:8c83c8e
+commit:9c3855b
+/////////////////////////////////////////////////////////////////////////
+0:         add(new SimpleExpression(def, op, value));
+1:         add(new MapEqualityExpression(def, key, op, value));
+1:         add(new ThriftExpression(metadata, name, op, value));
+1:         add(new CustomExpression(cfm, targetIndex, value));
+1:     }
+1: 
+1:     private void add(Expression expression)
+1:     {
+1:         expression.validate();
+1:         expressions.add(expression);
+/////////////////////////////////////////////////////////////////////////
+0:             long numberOfStaticColumnExpressions = expressions.stream().filter(e -> e.column.isStatic()).count();
+0:             final boolean filterStaticColumns = numberOfStaticColumnExpressions != 0;
+0:             final boolean filterNonStaticColumns = (expressions.size() - numberOfStaticColumnExpressions) > 0;
+0:                     // The filter might be on static columns, so need to check static row first.
+0:                     if (filterStaticColumns && applyToRow(partition.staticRow()) == null)
+1:                         return null;
+1: 
+1:                     UnfilteredRowIterator iterator = Transformation.apply(partition, this);
+1: 
+1:                     return (filterNonStaticColumns && !iterator.hasNext()) ? null : iterator;
+/////////////////////////////////////////////////////////////////////////
+1:         public void validate()
+1:             checkNotNull(value, "Unsupported null value for column %s", column.name);
+1:             checkBindValueSet(value, "Unsupported unset value for column %s", column.name);
+1:         }
+1: 
+1:         @Deprecated
+1:         public void validateForIndexing()
+1:         {
+1:             checkFalse(value.remaining() > FBUtilities.MAX_UNSIGNED_SHORT,
+1:                        "Index expression values may not be larger than 64K");
+/////////////////////////////////////////////////////////////////////////
+1:         public void validate() throws InvalidRequestException
+1:             checkNotNull(key, "Unsupported null map key for column %s", column.name);
+1:             checkBindValueSet(key, "Unsupported unset map key for column %s", column.name);
+1:             checkNotNull(value, "Unsupported null map value for column %s", column.name);
+1:             checkBindValueSet(value, "Unsupported unset map value for column %s", column.name);
+/////////////////////////////////////////////////////////////////////////
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:479e8af
+/////////////////////////////////////////////////////////////////////////
+1:                 case LIKE_MATCHES:
+commit:3928665
+/////////////////////////////////////////////////////////////////////////
+1:                 case LIKE_PREFIX:
+1:                 case LIKE_SUFFIX:
+1:                 case LIKE_CONTAINS:
+commit:72790dc
+/////////////////////////////////////////////////////////////////////////
+1:     public RowFilter withoutExpressions()
+1:     {
+1:         return withNewExpressions(Collections.emptyList());
+1:     }
+0: 
+/////////////////////////////////////////////////////////////////////////
+1:         protected abstract Kind kind();
+/////////////////////////////////////////////////////////////////////////
+1:         protected Kind kind()
+/////////////////////////////////////////////////////////////////////////
+1:         protected Kind kind()
+/////////////////////////////////////////////////////////////////////////
+1:         protected Kind kind()
+/////////////////////////////////////////////////////////////////////////
+1:         protected Kind kind()
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:2f41243
+/////////////////////////////////////////////////////////////////////////
+1:             return Clustering.make(values.toArray(new ByteBuffer[metadata.comparator.size()]));
+1:             return Clustering.make(name);
+commit:6094974
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.transform.Transformation;
+/////////////////////////////////////////////////////////////////////////
+1:             class IsSatisfiedFilter extends Transformation<UnfilteredRowIterator>
+1:                 DecoratedKey pk;
+1:                 public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+0:                     pk = partition.partitionKey();
+0:                     return Transformation.apply(partition, this);
+1:                 public Row applyToRow(Row row)
+1:                 {
+0:                     Row purged = row.purge(DeletionPurger.PURGE_ALL, nowInSec);
+1:                     if (purged == null)
+1:                         return null;
+1:                     for (Expression e : expressions)
+0:                         if (!e.isSatisfiedBy(pk, purged))
+1:                             return null;
+1:                     return row;
+1:                 }
+1:             }
+0: 
+1:             return Transformation.apply(iter, new IsSatisfiedFilter());
+/////////////////////////////////////////////////////////////////////////
+1:             class IsSatisfiedThriftFilter extends Transformation<UnfilteredRowIterator>
+1:                 public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator iter)
+1:                     iter.close();
+/////////////////////////////////////////////////////////////////////////
+1:             }
+1:             return Transformation.apply(iter, new IsSatisfiedThriftFilter());
+commit:649a106
+/////////////////////////////////////////////////////////////////////////
+1:             out.writeUnsignedVInt(filter.expressions.size());
+/////////////////////////////////////////////////////////////////////////
+1:             int size = (int)in.readUnsignedVInt();
+/////////////////////////////////////////////////////////////////////////
+1:                       + TypeSizes.sizeofUnsignedVInt(filter.expressions.size());
+commit:e51f83b
+/////////////////////////////////////////////////////////////////////////
+1:                     ImmutableBTreePartition result = ImmutableBTreePartition.create(iter);
+author:Taiyuan Zhang
+-------------------------------------------------------------------------------
+commit:9e74891
+/////////////////////////////////////////////////////////////////////////
+0:                     // The filter might be on static columns, so need to check static row first.
+0:                     Row staticRow = applyToRow(partition.staticRow());
+0:                     if (staticRow == null)
+0:                         return null;
+0: 
+author:Tyler Hobbs
+-------------------------------------------------------------------------------
+commit:5a4253b
+/////////////////////////////////////////////////////////////////////////
+1:      * Returns true if all of the expressions within this filter that apply to the partition key are satisfied by
+1:      * the given key, false otherwise.
+1:      */
+1:     public boolean partitionKeyRestrictionsAreSatisfiedBy(DecoratedKey key, AbstractType<?> keyValidator)
+1:     {
+0:         for (Expression e : expressions)
+1:         {
+1:             if (!e.column.isPartitionKey())
+1:                 continue;
+0: 
+1:             ByteBuffer value = keyValidator instanceof CompositeType
+1:                              ? ((CompositeType) keyValidator).split(key.getKey())[e.column.position()]
+1:                              : key.getKey();
+1:             if (!e.operator().isSatisfiedBy(e.column.type, value, e.value))
+1:                 return false;
+1:         }
+0:         return true;
+1:     }
+0: 
+1:     /**
+1:      * Returns true if all of the expressions within this filter that apply to the clustering key are satisfied by
+1:      * the given Clustering, false otherwise.
+1:      */
+1:     public boolean clusteringKeyRestrictionsAreSatisfiedBy(Clustering clustering)
+1:     {
+0:         for (Expression e : expressions)
+1:         {
+1:             if (!e.column.isClusteringColumn())
+1:                 continue;
+0: 
+1:             if (!e.operator().isSatisfiedBy(e.column.type, clustering.get(e.column.position()), e.value))
+1:             {
+1:                 return false;
+1:             }
+1:         }
+0:         return true;
+1:     }
+0: 
+1:     /**
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:2fea59d
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.util.DataInputPlus;
+/////////////////////////////////////////////////////////////////////////
+0:             public Expression deserialize(DataInputPlus in, int version, CFMetaData metadata) throws IOException
+/////////////////////////////////////////////////////////////////////////
+0:             out.writeVInt(filter.expressions.size());
+0:         public RowFilter deserialize(DataInputPlus in, int version, CFMetaData metadata) throws IOException
+0:             int size = (int)in.readVInt();
+/////////////////////////////////////////////////////////////////////////
+0:                       + TypeSizes.sizeofVInt(filter.expressions.size());
+commit:8d7c608
+/////////////////////////////////////////////////////////////////////////
+1:                 case CLUSTERING:
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:59a2861
+/////////////////////////////////////////////////////////////////////////
+0: import java.io.DataInput;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:             public Expression deserialize(DataInput in, int version, CFMetaData metadata) throws IOException
+/////////////////////////////////////////////////////////////////////////
+0:             out.writeShort(filter.expressions.size());
+0:         public RowFilter deserialize(DataInput in, int version, CFMetaData metadata) throws IOException
+0:             int size = in.readUnsignedShort();
+/////////////////////////////////////////////////////////////////////////
+0:                       + TypeSizes.sizeof((short)filter.expressions.size());
+author:Ariel Weisberg
+-------------------------------------------------------------------------------
+commit:03f72ac
+/////////////////////////////////////////////////////////////////////////
+0:                 long size = ByteBufferUtil.serializedSizeWithShortLength(expression.column().name.bytes)
+1:                         size += ByteBufferUtil.serializedSizeWithShortLength(((SimpleExpression)expression).value);
+1:                             size += ByteBufferUtil.serializedSizeWithShortLength(mexpr.getIndexValue());
+1:                             size += ByteBufferUtil.serializedSizeWithShortLength(mexpr.key)
+1:                                   + ByteBufferUtil.serializedSizeWithShortLength(mexpr.value);
+1:                         size += ByteBufferUtil.serializedSizeWithShortLength(((ThriftExpression)expression).value);
+/////////////////////////////////////////////////////////////////////////
+0:                       + TypeSizes.sizeof((short)filter.expressions.size());
+============================================================================

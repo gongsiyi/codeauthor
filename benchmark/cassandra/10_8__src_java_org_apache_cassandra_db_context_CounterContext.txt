@@ -1,0 +1,3524 @@
+1:07cf56f: /*
+1:2c4ac98:  * Licensed to the Apache Software Foundation (ASF) under one
+1:2c4ac98:  * or more contributor license agreements.  See the NOTICE file
+1:2c4ac98:  * distributed with this work for additional information
+1:2c4ac98:  * regarding copyright ownership.  The ASF licenses this file
+1:2c4ac98:  * to you under the Apache License, Version 2.0 (the
+1:2c4ac98:  * "License"); you may not use this file except in compliance
+1:2c4ac98:  * with the License.  You may obtain a copy of the License at
+1:8bef247:  *
+1:2c4ac98:  *     http://www.apache.org/licenses/LICENSE-2.0
+5:2c4ac98:  *
+1:2c4ac98:  * Unless required by applicable law or agreed to in writing, software
+1:2c4ac98:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:2c4ac98:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:2c4ac98:  * See the License for the specific language governing permissions and
+1:2c4ac98:  * limitations under the License.
+4:2c4ac98:  */
+1:2c4ac98: package org.apache.cassandra.db.context;
+1:83cd80b: 
+1:f3630a6: import java.nio.ByteBuffer;
+1:ab5a8c7: import java.security.MessageDigest;
+1:3f4ca5b: import java.util.ArrayList;
+1:3f4ca5b: import java.util.List;
+1:640deaa: 
+1:83cd80b: import com.google.common.annotations.VisibleForTesting;
+1:3f4ca5b: import org.slf4j.Logger;
+1:3f4ca5b: import org.slf4j.LoggerFactory;
+1:640deaa: 
+1:714c423: import org.apache.cassandra.db.ClockAndCount;
+1:2ae5272: import org.apache.cassandra.db.TypeSizes;
+1:5b511b6: import org.apache.cassandra.db.compaction.CompactionManager;
+1:fc8b76f: import org.apache.cassandra.serializers.MarshalException;
+1:3b13457: import org.apache.cassandra.utils.*;
+1:640deaa: 
+4:2c4ac98: /**
+1:2c4ac98:  * An implementation of a partitioned counter context.
+1:2c4ac98:  *
+1:3b13457:  * A context is primarily a list of tuples (counter id, clock, count) -- called
+1:83cd80b:  * shards, with some shards flagged as global or local (with
+1:ab5a8c7:  * special resolution rules in merge()).
+1:2c4ac98:  *
+1:ab5a8c7:  * The data structure has two parts:
+1:83cd80b:  *   a) a header containing the lists of global and local shard indexes in the body
+1:83cd80b:  *   b) a list of shards -- (counter id, logical clock, count) tuples -- (the so-called 'body' below)
+1:2c4ac98:  *
+1:ab5a8c7:  * The exact layout is:
+1:ab5a8c7:  *            | header  |   body   |
+1:ab5a8c7:  * context :  |--|------|----------|
+1:ab5a8c7:  *             ^     ^
+1:ab5a8c7:  *             |   list of indices in the body list (2*#elt bytes)
+1:ab5a8c7:  *    #elt in rest of header (2 bytes)
+1:2c4ac98:  *
+1:83cd80b:  * Non-negative indices refer to local shards. Global shard indices are encoded as [idx + Short.MIN_VALUE],
+1:83cd80b:  * and are thus always negative.
+1:83cd80b:  *
+1:ab5a8c7:  * The body layout being:
+1:ab5a8c7:  *
+1:ab5a8c7:  * body:     |----|----|----|----|----|----|....
+1:ab5a8c7:  *             ^    ^    ^     ^   ^    ^
+1:ab5a8c7:  *             |    |  count_1 |   |   count_2
+1:ab5a8c7:  *             |  clock_1      |  clock_2
+1:3b13457:  *       counterid_1         counterid_2
+1:ab5a8c7:  *
+1:83cd80b:  * The rules when merging two shard with the same counter id are:
+1:83cd80b:  *   - global + global = keep the shard with the highest logical clock
+1:83cd80b:  *   - global + local  = keep the global one
+1:83cd80b:  *   - global + remote = keep the global one
+1:83cd80b:  *   - local  + local  = sum counts (and logical clocks)
+1:83cd80b:  *   - local  + remote = keep the local one
+1:83cd80b:  *   - remote + remote = keep the shard with the highest logical clock
+1:2c4ac98:  *
+1:83cd80b:  * For a detailed description of the meaning of a local and why the merging
+1:8bef247:  * rules work this way, see CASSANDRA-1938 - specifically the 1938_discussion
+1:83cd80b:  * attachment (doesn't cover global shards, see CASSANDRA-4775 for that).
+1:2c4ac98:  */
+1:714c423: public class CounterContext
+1:714c423: {
+1:03f72ac:     private static final int HEADER_SIZE_LENGTH = TypeSizes.sizeof(Short.MAX_VALUE);
+1:03f72ac:     private static final int HEADER_ELT_LENGTH = TypeSizes.sizeof(Short.MAX_VALUE);
+1:03f72ac:     private static final int CLOCK_LENGTH = TypeSizes.sizeof(Long.MAX_VALUE);
+1:03f72ac:     private static final int COUNT_LENGTH = TypeSizes.sizeof(Long.MAX_VALUE);
+1:3b13457:     private static final int STEP_LENGTH = CounterId.LENGTH + CLOCK_LENGTH + COUNT_LENGTH;
+1:640deaa: 
+1:3f4ca5b:     private static final Logger logger = LoggerFactory.getLogger(CounterContext.class);
+1:a79d54e: 
+1:714c423:     public static enum Relationship
+1:17ad4cc:     {
+1:714c423:         EQUAL, GREATER_THAN, LESS_THAN, DISJOINT
+1:17ad4cc:     }
+1:4d8ae4d: 
+1:2c4ac98:     // lazy-load singleton
+1:2c4ac98:     private static class LazyHolder
+1:4d8ae4d:     {
+1:2c4ac98:         private static final CounterContext counterContext = new CounterContext();
+1:4d8ae4d:     }
+1:1c78dd9: 
+1:2c4ac98:     public static CounterContext instance()
+1:1c78dd9:     {
+1:2c4ac98:         return LazyHolder.counterContext;
+1:1c78dd9:     }
+1:17ad4cc: 
+1:ab5a8c7:     /**
+1:714c423:      * Creates a counter context with a single global, 2.1+ shard (a result of increment).
+1:714c423:      */
+1:8a2a0c3:     public ByteBuffer createGlobal(CounterId id, long clock, long count)
+1:17ad4cc:     {
+1:8a2a0c3:         ContextState state = ContextState.allocate(1, 0, 0);
+1:714c423:         state.writeGlobal(id, clock, count);
+1:714c423:         return state.context;
+1:17ad4cc:     }
+1:17ad4cc: 
+1:714c423:     /**
+1:83cd80b:      * Creates a counter context with a single local shard.
+1:a991b64:      * This is only used in a PartitionUpdate until the update has gone through
+1:a991b64:      * CounterMutation.apply(), at which point all the local shard are replaced by
+1:a991b64:      * global ones. In other words, local shards should never hit the disk or
+1:a991b64:      * memtables. And we use this so that if an update statement has multiple increment
+1:a991b64:      * of the same counter we properly add them rather than keeping only one of them.
+1:a991b64:      * (this is also used for tests of compatibility with pre-2.1 counters)
+1:ab5a8c7:      */
+1:8a2a0c3:     public ByteBuffer createLocal(long count)
+1:17ad4cc:     {
+1:8a2a0c3:         ContextState state = ContextState.allocate(0, 1, 0);
+1:83cd80b:         state.writeLocal(CounterId.getLocalId(), 1L, count);
+1:83cd80b:         return state.context;
+1:17ad4cc:     }
+1:17ad4cc: 
+1:83cd80b:     /**
+1:83cd80b:      * Creates a counter context with a single remote shard.
+1:714c423:      * For use by tests of compatibility with pre-2.1 counters only.
+1:83cd80b:      */
+1:8a2a0c3:     public ByteBuffer createRemote(CounterId id, long clock, long count)
+1:17ad4cc:     {
+1:8a2a0c3:         ContextState state = ContextState.allocate(0, 0, 1);
+1:83cd80b:         state.writeRemote(id, clock, count);
+1:83cd80b:         return state.context;
+1:17ad4cc:     }
+1:17ad4cc: 
+1:ab5a8c7:     private static int headerLength(ByteBuffer context)
+1:17ad4cc:     {
+1:2ba21e1:         return HEADER_SIZE_LENGTH + Math.abs(context.getShort(context.position())) * HEADER_ELT_LENGTH;
+1:17ad4cc:     }
+1:17ad4cc: 
+1:ab5a8c7:     private static int compareId(ByteBuffer bb1, int pos1, ByteBuffer bb2, int pos2)
+1:17ad4cc:     {
+1:3b13457:         return ByteBufferUtil.compareSubArrays(bb1, pos1, bb2, pos2, CounterId.LENGTH);
+1:17ad4cc:     }
+1:17ad4cc: 
+1:2c4ac98:     /**
+1:2c4ac98:      * Determine the count relationship between two contexts.
+1:b95a49c:      *
+1:2c4ac98:      * EQUAL:        Equal set of nodes and every count is equal.
+1:2c4ac98:      * GREATER_THAN: Superset of nodes and every count is equal or greater than its corollary.
+1:2c4ac98:      * LESS_THAN:    Subset of nodes and every count is equal or less than its corollary.
+1:2c4ac98:      * DISJOINT:     Node sets are not equal and/or counts are not all greater or less than.
+1:f3630a6:      *
+1:ab5a8c7:      * Strategy: compare node logical clocks (like a version vector).
+1:ab5a8c7:      *
+1:ab5a8c7:      * @param left counter context.
+1:ab5a8c7:      * @param right counter context.
+1:714c423:      * @return the Relationship between the contexts.
+1:2c4ac98:      */
+1:714c423:     public Relationship diff(ByteBuffer left, ByteBuffer right)
+1:17ad4cc:     {
+1:714c423:         Relationship relationship = Relationship.EQUAL;
+1:83cd80b:         ContextState leftState = ContextState.wrap(left);
+1:83cd80b:         ContextState rightState = ContextState.wrap(right);
+1:1fa6264: 
+1:ab5a8c7:         while (leftState.hasRemaining() && rightState.hasRemaining())
+1:17ad4cc:         {
+1:2c4ac98:             // compare id bytes
+1:ab5a8c7:             int compareId = leftState.compareIdTo(rightState);
+1:2c4ac98:             if (compareId == 0)
+1:17ad4cc:             {
+1:ab5a8c7:                 long leftClock  = leftState.getClock();
+2:83cd80b:                 long rightClock = rightState.getClock();
+1:329dd75:                 long leftCount = leftState.getCount();
+1:329dd75:                 long rightCount = rightState.getCount();
+1:329dd75: 
+1:ab5a8c7:                 // advance
+1:ab5a8c7:                 leftState.moveToNext();
+1:ab5a8c7:                 rightState.moveToNext();
+1:329dd75: 
+1:2c4ac98:                 // process clock comparisons
+1:329dd75:                 if (leftClock == rightClock)
+1:329dd75:                 {
+1:329dd75:                     if (leftCount != rightCount)
+1:329dd75:                     {
+1:329dd75:                         // Inconsistent shard (see the corresponding code in merge()). We return DISJOINT in this
+1:329dd75:                         // case so that it will be treated as a difference, allowing read-repair to work.
+1:714c423:                         return Relationship.DISJOINT;
+1:329dd75:                     }
+1:329dd75:                 }
+1:ab5a8c7:                 else if ((leftClock >= 0 && rightClock > 0 && leftClock > rightClock)
+1:a79d54e:                       || (leftClock < 0 && (rightClock > 0 || leftClock < rightClock)))
+1:329dd75:                 {
+1:714c423:                     if (relationship == Relationship.EQUAL)
+1:714c423:                         relationship = Relationship.GREATER_THAN;
+1:714c423:                     else if (relationship == Relationship.LESS_THAN)
+1:714c423:                         return Relationship.DISJOINT;
+1:714c423:                     // relationship == Relationship.GREATER_THAN
+1:329dd75:                 }
+1:329dd75:                 else
+1:329dd75:                 {
+1:714c423:                     if (relationship == Relationship.EQUAL)
+1:714c423:                         relationship = Relationship.LESS_THAN;
+1:714c423:                     else if (relationship == Relationship.GREATER_THAN)
+1:714c423:                         return Relationship.DISJOINT;
+1:714c423:                     // relationship == Relationship.LESS_THAN
+1:17ad4cc:                 }
+1:17ad4cc:             }
+1:2c4ac98:             else if (compareId > 0)
+1:329dd75:             {
+1:2c4ac98:                 // only advance the right context
+1:ab5a8c7:                 rightState.moveToNext();
+1:329dd75: 
+1:714c423:                 if (relationship == Relationship.EQUAL)
+1:714c423:                     relationship = Relationship.LESS_THAN;
+1:714c423:                 else if (relationship == Relationship.GREATER_THAN)
+1:714c423:                     return Relationship.DISJOINT;
+1:714c423:                 // relationship == Relationship.LESS_THAN
+1:17ad4cc:             }
+1:ab5a8c7:             else // compareId < 0
+1:17ad4cc:             {
+1:2c4ac98:                 // only advance the left context
+1:ab5a8c7:                 leftState.moveToNext();
+1:17ad4cc: 
+1:714c423:                 if (relationship == Relationship.EQUAL)
+1:714c423:                     relationship = Relationship.GREATER_THAN;
+1:714c423:                 else if (relationship == Relationship.LESS_THAN)
+1:714c423:                     return Relationship.DISJOINT;
+1:714c423:                 // relationship == Relationship.GREATER_THAN
+1:17ad4cc:             }
+1:1fa6264:         }
+1:1fa6264: 
+1:2c4ac98:         // check final lengths
+1:a79d54e:         if (leftState.hasRemaining())
+1:17ad4cc:         {
+1:714c423:             if (relationship == Relationship.EQUAL)
+1:714c423:                 return Relationship.GREATER_THAN;
+1:714c423:             else if (relationship == Relationship.LESS_THAN)
+1:714c423:                 return Relationship.DISJOINT;
+1:1fa6264:         }
+1:1fa6264: 
+1:714c423:         if (rightState.hasRemaining())
+1:1fa6264:         {
+1:714c423:             if (relationship == Relationship.EQUAL)
+1:714c423:                 return Relationship.LESS_THAN;
+1:714c423:             else if (relationship == Relationship.GREATER_THAN)
+1:714c423:                 return Relationship.DISJOINT;
+1:1fa6264:         }
+1:1fa6264: 
+1:2c4ac98:         return relationship;
+1:1fa6264:     }
+1:1fa6264: 
+1:ab5a8c7:     /**
+1:3b13457:      * Return a context w/ an aggregated count for each counter id.
+1:2c4ac98:      *
+1:ab5a8c7:      * @param left counter context.
+1:ab5a8c7:      * @param right counter context.
+1:ab5a8c7:      */
+1:8a2a0c3:     public ByteBuffer merge(ByteBuffer left, ByteBuffer right)
+1:1fa6264:     {
+1:a79d54e:         boolean leftIsSuperSet = true;
+1:a79d54e:         boolean rightIsSuperSet = true;
+1:1fa6264: 
+1:83cd80b:         int globalCount = 0;
+1:83cd80b:         int localCount = 0;
+1:83cd80b:         int remoteCount = 0;
+1:1fa6264: 
+1:83cd80b:         ContextState leftState = ContextState.wrap(left);
+1:83cd80b:         ContextState rightState = ContextState.wrap(right);
+1:640deaa: 
+1:ab5a8c7:         while (leftState.hasRemaining() && rightState.hasRemaining())
+1:1fa6264:         {
+1:ab5a8c7:             int cmp = leftState.compareIdTo(rightState);
+1:9ef94eb:             if (cmp == 0)
+1:1fa6264:             {
+1:a79d54e:                 Relationship rel = compare(leftState, rightState);
+1:a79d54e:                 if (rel == Relationship.GREATER_THAN)
+1:a79d54e:                     rightIsSuperSet = false;
+1:a79d54e:                 else if (rel == Relationship.LESS_THAN)
+1:a79d54e:                     leftIsSuperSet = false;
+1:a79d54e:                 else if (rel == Relationship.DISJOINT)
+1:a79d54e:                     leftIsSuperSet = rightIsSuperSet = false;
+1:57b18e6: 
+1:83cd80b:                 if (leftState.isGlobal() || rightState.isGlobal())
+1:83cd80b:                     globalCount += 1;
+1:83cd80b:                 else if (leftState.isLocal() || rightState.isLocal())
+1:83cd80b:                     localCount += 1;
+1:329dd75:                 else
+1:83cd80b:                     remoteCount += 1;
+1:57b18e6: 
+1:ab5a8c7:                 leftState.moveToNext();
+1:ab5a8c7:                 rightState.moveToNext();
+1:1fa6264:             }
+1:9ef94eb:             else if (cmp > 0)
+1:1fa6264:             {
+1:a79d54e:                 leftIsSuperSet = false;
+1:a79d54e: 
+1:83cd80b:                 if (rightState.isGlobal())
+1:83cd80b:                     globalCount += 1;
+1:83cd80b:                 else if (rightState.isLocal())
+1:83cd80b:                     localCount += 1;
+1:17ad4cc:                 else
+1:83cd80b:                     remoteCount += 1;
+1:a79d54e: 
+1:ab5a8c7:                 rightState.moveToNext();
+1:1fa6264:             }
+1:9ef94eb:             else // cmp < 0
+1:1fa6264:             {
+1:a79d54e:                 rightIsSuperSet = false;
+1:a79d54e: 
+1:83cd80b:                 if (leftState.isGlobal())
+1:83cd80b:                     globalCount += 1;
+1:83cd80b:                 else if (leftState.isLocal())
+1:83cd80b:                     localCount += 1;
+1:1fa6264:                 else
+1:83cd80b:                     remoteCount += 1;
+1:714c423: 
+1:ab5a8c7:                 leftState.moveToNext();
+1:1fa6264:             }
+1:1fa6264:         }
+1:714c423: 
+1:ab5a8c7:         if (leftState.hasRemaining())
+1:a79d54e:             rightIsSuperSet = false;
+1:a79d54e:         else if (rightState.hasRemaining())
+1:a79d54e:             leftIsSuperSet = false;
+1:a79d54e: 
+1:a79d54e:         // if one of the contexts is a superset, return it early.
+1:a79d54e:         if (leftIsSuperSet)
+1:a79d54e:             return left;
+1:a79d54e:         else if (rightIsSuperSet)
+1:a79d54e:             return right;
+1:a79d54e: 
+1:83cd80b:         while (leftState.hasRemaining())
+1:1fa6264:         {
+1:83cd80b:             if (leftState.isGlobal())
+1:83cd80b:                 globalCount += 1;
+1:83cd80b:             else if (leftState.isLocal())
+1:83cd80b:                 localCount += 1;
+1:640deaa:             else
+1:83cd80b:                 remoteCount += 1;
+1:714c423: 
+1:83cd80b:             leftState.moveToNext();
+1:1fa6264:         }
+1:83cd80b: 
+1:83cd80b:         while (rightState.hasRemaining())
+1:1fa6264:         {
+1:83cd80b:             if (rightState.isGlobal())
+1:83cd80b:                 globalCount += 1;
+1:83cd80b:             else if (rightState.isLocal())
+1:83cd80b:                 localCount += 1;
+2:83cd80b:             else
+1:83cd80b:                 remoteCount += 1;
+1:83cd80b: 
+1:83cd80b:             rightState.moveToNext();
+1:1fa6264:         }
+1:83cd80b: 
+1:ab5a8c7:         leftState.reset();
+1:ab5a8c7:         rightState.reset();
+1:83cd80b: 
+1:8a2a0c3:         return merge(ContextState.allocate(globalCount, localCount, remoteCount), leftState, rightState);
+1:640deaa:     }
+1:83cd80b: 
+1:83cd80b:     private ByteBuffer merge(ContextState mergedState, ContextState leftState, ContextState rightState)
+1:1fa6264:     {
+1:ab5a8c7:         while (leftState.hasRemaining() && rightState.hasRemaining())
+1:1fa6264:         {
+1:ab5a8c7:             int cmp = leftState.compareIdTo(rightState);
+2:9ef94eb:             if (cmp == 0)
+1:1fa6264:             {
+1:a79d54e:                 Relationship rel = compare(leftState, rightState);
+1:a79d54e:                 if (rel == Relationship.DISJOINT) // two local shards
+1:a79d54e:                     mergedState.writeLocal(leftState.getCounterId(),
+1:a79d54e:                                            leftState.getClock() + rightState.getClock(),
+1:a79d54e:                                            leftState.getCount() + rightState.getCount());
+1:a79d54e:                 else if (rel == Relationship.GREATER_THAN)
+1:329dd75:                     leftState.copyTo(mergedState);
+1:a79d54e:                 else // EQUAL or LESS_THAN
+1:329dd75:                     rightState.copyTo(mergedState);
+1:a79d54e: 
+1:ab5a8c7:                 rightState.moveToNext();
+1:ab5a8c7:                 leftState.moveToNext();
+1:329dd75:             }
+1:9ef94eb:             else if (cmp > 0)
+1:329dd75:             {
+1:329dd75:                 rightState.copyTo(mergedState);
+1:ab5a8c7:                 rightState.moveToNext();
+1:329dd75:             }
+1:9ef94eb:             else // cmp < 0
+1:329dd75:             {
+1:329dd75:                 leftState.copyTo(mergedState);
+1:ab5a8c7:                 leftState.moveToNext();
+1:329dd75:             }
+1:640deaa:         }
+1:83cd80b: 
+1:ab5a8c7:         while (leftState.hasRemaining())
+1:2ba21e1:         {
+1:a79d54e:             leftState.copyTo(mergedState);
+1:ab5a8c7:             leftState.moveToNext();
+1:640deaa:         }
+1:83cd80b: 
+1:ab5a8c7:         while (rightState.hasRemaining())
+1:640deaa:         {
+1:a79d54e:             rightState.copyTo(mergedState);
+1:ab5a8c7:             rightState.moveToNext();
+1:714c423:         }
+1:83cd80b: 
+1:83cd80b:         return mergedState.context;
+1:714c423:     }
+1:83cd80b: 
+1:a79d54e:     /*
+1:a79d54e:      * Compares two shards, returns:
+1:a79d54e:      * - GREATER_THAN if leftState overrides rightState
+1:a79d54e:      * - LESS_THAN if rightState overrides leftState
+1:a79d54e:      * - EQUAL for two equal, non-local, shards
+1:a79d54e:      * - DISJOINT for any two local shards
+1:a79d54e:      */
+1:a79d54e:     private Relationship compare(ContextState leftState, ContextState rightState)
+1:640deaa:     {
+1:a79d54e:         long leftClock = leftState.getClock();
+1:329dd75:         long leftCount = leftState.getCount();
+1:a79d54e:         long rightClock = rightState.getClock();
+1:329dd75:         long rightCount = rightState.getCount();
+1:a79d54e: 
+1:83cd80b:         if (leftState.isGlobal() || rightState.isGlobal())
+1:57b18e6:         {
+1:83cd80b:             if (leftState.isGlobal() && rightState.isGlobal())
+1:714c423:             {
+2:83cd80b:                 if (leftClock == rightClock)
+1:83cd80b:                 {
+1:83cd80b:                     // Can happen if an sstable gets lost and disk failure policy is set to 'best effort'
+2:83cd80b:                     if (leftCount != rightCount && CompactionManager.isCompactionManager.get())
+1:83cd80b:                     {
+1:83cd80b:                         logger.warn("invalid global counter shard detected; ({}, {}, {}) and ({}, {}, {}) differ only in "
+2:83cd80b:                                     + "count; will pick highest to self-heal on compaction",
+1:3b13457:                                     leftState.getCounterId(), leftClock, leftCount,
+2:83cd80b:                                     rightState.getCounterId(), rightClock, rightCount);
+1:83cd80b:                     }
+1:83cd80b: 
+1:a79d54e:                     if (leftCount > rightCount)
+1:a79d54e:                         return Relationship.GREATER_THAN;
+1:a79d54e:                     else if (leftCount == rightCount)
+1:a79d54e:                         return Relationship.EQUAL;
+1:83cd80b:                     else
+1:a79d54e:                         return Relationship.LESS_THAN;
+1:83cd80b:                 }
+1:83cd80b:                 else
+1:83cd80b:                 {
+1:a79d54e:                     return leftClock > rightClock ? Relationship.GREATER_THAN : Relationship.LESS_THAN;
+1:83cd80b:                 }
+1:83cd80b:             }
+1:83cd80b:             else // only one is global - keep that one
+1:83cd80b:             {
+1:a79d54e:                 return leftState.isGlobal() ? Relationship.GREATER_THAN : Relationship.LESS_THAN;
+1:83cd80b:             }
+1:83cd80b:         }
+1:a79d54e: 
+1:a79d54e:         if (leftState.isLocal() || rightState.isLocal())
+1:83cd80b:         {
+1:83cd80b:             // Local id and at least one is a local shard.
+1:83cd80b:             if (leftState.isLocal() && rightState.isLocal())
+1:a79d54e:                 return Relationship.DISJOINT;
+1:83cd80b:             else // only one is local - keep that one
+1:a79d54e:                 return leftState.isLocal() ? Relationship.GREATER_THAN : Relationship.LESS_THAN;
+1:83cd80b:         }
+1:a79d54e: 
+1:a79d54e:         // both are remote shards
+1:a79d54e:         if (leftClock == rightClock)
+1:83cd80b:         {
+1:a79d54e:             // We should never see non-local shards w/ same id+clock but different counts. However, if we do
+1:329dd75:             // we should "heal" the problem by being deterministic in our selection of shard - and
+1:329dd75:             // log the occurrence so that the operator will know something is wrong.
+1:a79d54e:             if (leftCount != rightCount && CompactionManager.isCompactionManager.get())
+1:83cd80b:             {
+1:a79d54e:                 logger.warn("invalid remote counter shard detected; ({}, {}, {}) and ({}, {}, {}) differ only in "
+1:a79d54e:                             + "count; will pick highest to self-heal on compaction",
+1:a79d54e:                             leftState.getCounterId(), leftClock, leftCount,
+1:a79d54e:                             rightState.getCounterId(), rightClock, rightCount);
+1:a79d54e:             }
+1:a79d54e: 
+1:329dd75:             if (leftCount > rightCount)
+1:a79d54e:                 return Relationship.GREATER_THAN;
+1:a79d54e:             else if (leftCount == rightCount)
+1:a79d54e:                 return Relationship.EQUAL;
+1:a79d54e:             else
+1:a79d54e:                 return Relationship.LESS_THAN;
+1:83cd80b:         }
+1:a79d54e:         else
+1:a79d54e:         {
+1:329dd75:             if ((leftClock >= 0 && rightClock > 0 && leftClock >= rightClock)
+1:329dd75:                     || (leftClock < 0 && (rightClock > 0 || leftClock < rightClock)))
+1:a79d54e:                 return Relationship.GREATER_THAN;
+1:329dd75:             else
+1:a79d54e:                 return Relationship.LESS_THAN;
+1:329dd75:         }
+1:83cd80b:     }
+1:83cd80b: 
+1:2c4ac98:     /**
+1:2c4ac98:      * Human-readable String from context.
+1:2c4ac98:      *
+1:ab5a8c7:      * @param context counter context.
+1:2c4ac98:      * @return a human-readable String of the context.
+1:ab5a8c7:      */
+1:f3630a6:     public String toString(ByteBuffer context)
+1:83cd80b:     {
+1:83cd80b:         ContextState state = ContextState.wrap(context);
+1:2c4ac98:         StringBuilder sb = new StringBuilder();
+1:2c4ac98:         sb.append("[");
+1:83cd80b: 
+2:17ad4cc:         while (state.hasRemaining())
+1:640deaa:         {
+1:83cd80b:             if (state.getElementIndex() > 0)
+1:2c4ac98:                 sb.append(",");
+1:2c4ac98:             sb.append("{");
+1:182051c:             sb.append(state.getCounterId()).append(", ");
+1:83cd80b:             sb.append(state.getClock()).append(", ");
+1:ab5a8c7:             sb.append(state.getCount());
+1:2c4ac98:             sb.append("}");
+1:83cd80b:             if (state.isGlobal())
+1:83cd80b:                 sb.append("$");
+1:83cd80b:             else if (state.isLocal())
+1:ab5a8c7:                 sb.append("*");
+3:17ad4cc:             state.moveToNext();
+1:17ad4cc:         }
+1:17ad4cc: 
+1:2c4ac98:         sb.append("]");
+1:2c4ac98:         return sb.toString();
+1:17ad4cc:     }
+1:17ad4cc: 
+1:ab5a8c7:     /**
+1:3b13457:      * Returns the aggregated count across all counter ids.
+1:ab5a8c7:      *
+1:ab5a8c7:      * @param context a counter context
+1:5001907:      * @return the aggregated count represented by {@code context}
+1:ab5a8c7:      */
+1:f3630a6:     public long total(ByteBuffer context)
+1:17ad4cc:     {
+1:2c4ac98:         long total = 0L;
+2:ab5a8c7:         // we could use a ContextState but it is easy enough that we avoid the object creation
+2:ab5a8c7:         for (int offset = context.position() + headerLength(context); offset < context.limit(); offset += STEP_LENGTH)
+1:714c423:             total += context.getLong(offset + CounterId.LENGTH + CLOCK_LENGTH);
+1:f3630a6:         return total;
+1:17ad4cc:     }
+1:17ad4cc: 
+1:83cd80b:     public boolean shouldClearLocal(ByteBuffer context)
+1:17ad4cc:     {
+1:83cd80b:         // #elt being negative means we have to clean local shards.
+1:83cd80b:         return context.getShort(context.position()) < 0;
+1:17ad4cc:     }
+1:17ad4cc: 
+1:ab5a8c7:     /**
+1:57b18e6:      * Detects whether or not the context has any legacy (local or remote) shards in it.
+1:57b18e6:      */
+1:57b18e6:     public boolean hasLegacyShards(ByteBuffer context)
+1:17ad4cc:     {
+1:57b18e6:         int totalCount = (context.remaining() - headerLength(context)) / STEP_LENGTH;
+1:57b18e6:         int localAndGlobalCount = Math.abs(context.getShort(context.position()));
+1:1fa6264: 
+1:57b18e6:         if (localAndGlobalCount < totalCount)
+1:57b18e6:             return true; // remote shard(s) present
+1:1fa6264: 
+1:57b18e6:         for (int i = 0; i < localAndGlobalCount; i++)
+1:57b18e6:             if (context.getShort(context.position() + HEADER_SIZE_LENGTH + i * HEADER_ELT_LENGTH) >= 0)
+1:57b18e6:                 return true; // found a local shard
+1:1fa6264: 
+1:57b18e6:         return false;
+1:1fa6264:     }
+1:1fa6264: 
+1:57b18e6:     /**
+1:83cd80b:      * Mark context to delete local references afterward.
+1:2ba21e1:      * Marking is done by multiply #elt by -1 to preserve header length
+1:83cd80b:      * and #elt count in order to clear all local refs later.
+1:2ba21e1:      *
+1:2ba21e1:      * @param context a counter context
+1:83cd80b:      * @return context that marked to delete local refs
+1:2ba21e1:      */
+1:83cd80b:     public ByteBuffer markLocalToBeCleared(ByteBuffer context)
+1:1fa6264:     {
+1:2ba21e1:         short count = context.getShort(context.position());
+1:83cd80b:         if (count <= 0)
+1:83cd80b:             return context; // already marked or all are remote.
+1:2ba21e1: 
+1:83cd80b:         boolean hasLocalShards = false;
+1:83cd80b:         for (int i = 0; i < count; i++)
+1:1fa6264:         {
+1:83cd80b:             if (context.getShort(context.position() + HEADER_SIZE_LENGTH + i * HEADER_ELT_LENGTH) >= 0)
+1:1fa6264:             {
+1:83cd80b:                 hasLocalShards = true;
+1:83cd80b:                 break;
+1:1fa6264:             }
+1:1fa6264:         }
+1:57b18e6: 
+1:83cd80b:         if (!hasLocalShards)
+1:83cd80b:             return context; // all shards are global or remote.
+1:57b18e6: 
+1:83cd80b:         ByteBuffer marked = ByteBuffer.allocate(context.remaining());
+1:2ba21e1:         marked.putShort(marked.position(), (short) (count * -1));
+1:83cd80b:         ByteBufferUtil.arrayCopy(context,
+1:83cd80b:                                  context.position() + HEADER_SIZE_LENGTH,
+1:83cd80b:                                  marked,
+1:83cd80b:                                  marked.position() + HEADER_SIZE_LENGTH,
+1:83cd80b:                                  context.remaining() - HEADER_SIZE_LENGTH);
+1:2ba21e1:         return marked;
+1:1fa6264:     }
+1:2ba21e1: 
+1:2ba21e1:     /**
+1:83cd80b:      * Remove all the local of a context (but keep global).
+1:ab5a8c7:      *
+1:ab5a8c7:      * @param context a counter context
+1:83cd80b:      * @return a version of {@code context} where no shards are local.
+1:ab5a8c7:      */
+1:83cd80b:     public ByteBuffer clearAllLocal(ByteBuffer context)
+1:83cd80b:     {
+1:83cd80b:         int count = Math.abs(context.getShort(context.position()));
+1:83cd80b:         if (count == 0)
+1:83cd80b:             return context; // no local or global shards present.
+1:83cd80b: 
+1:83cd80b:         List<Short> globalShardIndexes = new ArrayList<>(count);
+1:83cd80b:         for (int i = 0; i < count; i++)
+1:83cd80b:         {
+1:83cd80b:             short elt = context.getShort(context.position() + HEADER_SIZE_LENGTH + i * HEADER_ELT_LENGTH);
+1:83cd80b:             if (elt < 0)
+1:83cd80b:                 globalShardIndexes.add(elt);
+1:57b18e6:         }
+1:83cd80b: 
+1:83cd80b:         if (count == globalShardIndexes.size())
+1:83cd80b:             return context; // no local shards detected.
+1:83cd80b: 
+1:83cd80b:         // allocate a smaller BB for the cleared context - with no local header elts.
+1:83cd80b:         ByteBuffer cleared = ByteBuffer.allocate(context.remaining() - (count - globalShardIndexes.size()) * HEADER_ELT_LENGTH);
+1:83cd80b: 
+1:83cd80b:         cleared.putShort(cleared.position(), (short) globalShardIndexes.size());
+1:83cd80b:         for (int i = 0; i < globalShardIndexes.size(); i++)
+1:83cd80b:             cleared.putShort(cleared.position() + HEADER_SIZE_LENGTH + i * HEADER_ELT_LENGTH, globalShardIndexes.get(i));
+1:83cd80b: 
+1:83cd80b:         int origHeaderLength = headerLength(context);
+1:83cd80b:         ByteBufferUtil.arrayCopy(context,
+1:83cd80b:                                  context.position() + origHeaderLength,
+1:83cd80b:                                  cleared,
+1:83cd80b:                                  cleared.position() + headerLength(cleared),
+1:83cd80b:                                  context.remaining() - origHeaderLength);
+1:83cd80b: 
+1:83cd80b:         return cleared;
+1:83cd80b:     }
+1:83cd80b: 
+1:e771943:     public void validateContext(ByteBuffer context) throws MarshalException
+1:e771943:     {
+1:eb57745:         if ((context.remaining() - headerLength(context)) % STEP_LENGTH != 0)
+1:e771943:             throw new MarshalException("Invalid size for a counter context");
+1:e771943:     }
+1:e771943: 
+1:ab5a8c7:     /**
+1:ab5a8c7:      * Update a MessageDigest with the content of a context.
+1:ab5a8c7:      * Note that this skips the header entirely since the header information
+1:83cd80b:      * has local meaning only, while digests are meant for comparison across
+1:ab5a8c7:      * nodes. This means in particular that we always have:
+1:83cd80b:      *  updateDigest(ctx) == updateDigest(clearAllLocal(ctx))
+1:ab5a8c7:      */
+1:ab5a8c7:     public void updateDigest(MessageDigest message, ByteBuffer context)
+1:83cd80b:     {
+1:ab5a8c7:         ByteBuffer dup = context.duplicate();
+1:83cd80b:         dup.position(context.position() + headerLength(context));
+1:ab5a8c7:         message.update(dup);
+1:83cd80b:     }
+1:83cd80b: 
+1:ab5a8c7:     /**
+1:714c423:      * Returns the clock and the count associated with the local counter id, or (0, 0) if no such shard is present.
+1:ab5a8c7:      */
+1:714c423:     public ClockAndCount getLocalClockAndCount(ByteBuffer context)
+1:83cd80b:     {
+1:714c423:         return getClockAndCountOf(context, CounterId.getLocalId());
+1:714c423:     }
+1:714c423: 
+1:714c423:     /**
+1:df7c658:      * Returns the count associated with the local counter id, or 0 if no such shard is present.
+1:df7c658:      */
+1:df7c658:     public long getLocalCount(ByteBuffer context)
+1:df7c658:     {
+1:df7c658:         return getLocalClockAndCount(context).count;
+1:df7c658:     }
+1:df7c658: 
+1:df7c658:     /**
+1:df7c658:      * Checks if a context is local
+1:df7c658:      */
+1:df7c658:     public boolean isLocal(ByteBuffer context)
+1:df7c658:     {
+1:df7c658:         return ContextState.wrap(context).isLocal();
+1:df7c658:     }
+1:df7c658: 
+1:df7c658:     /**
+1:714c423:      * Returns the clock and the count associated with the given counter id, or (0, 0) if no such shard is present.
+1:714c423:      */
+1:714c423:     @VisibleForTesting
+1:714c423:     public ClockAndCount getClockAndCountOf(ByteBuffer context, CounterId id)
+1:714c423:     {
+1:714c423:         int position = findPositionOf(context, id);
+1:714c423:         if (position == -1)
+1:714c423:             return ClockAndCount.BLANK;
+1:714c423: 
+1:714c423:         long clock = context.getLong(position + CounterId.LENGTH);
+1:714c423:         long count = context.getLong(position + CounterId.LENGTH + CLOCK_LENGTH);
+1:714c423:         return ClockAndCount.create(clock, count);
+1:714c423:     }
+1:714c423: 
+1:714c423:     /**
+1:714c423:      * Finds the position of a shard with the given id within the context (via binary search).
+1:714c423:      */
+1:714c423:     @VisibleForTesting
+1:714c423:     public int findPositionOf(ByteBuffer context, CounterId id)
+1:714c423:     {
+1:2ba21e1:         int headerLength = headerLength(context);
+1:714c423:         int offset = context.position() + headerLength;
+1:714c423: 
+1:714c423:         int left = 0;
+1:714c423:         int right = (context.remaining() - headerLength) / STEP_LENGTH - 1;
+1:714c423: 
+1:714c423:         while (right >= left)
+1:83cd80b:         {
+1:714c423:             int middle = (left + right) / 2;
+1:714c423:             int cmp = compareId(context, offset + middle * STEP_LENGTH, id.bytes(), id.bytes().position());
+1:714c423: 
+1:714c423:             if (cmp == -1)
+1:714c423:                 left = middle + 1;
+1:714c423:             else if (cmp == 0)
+1:714c423:                 return offset + middle * STEP_LENGTH;
+1:714c423:             else
+1:714c423:                 right = middle - 1;
+1:2ba21e1:         }
+1:714c423: 
+1:714c423:         return -1; // position not found
+1:83cd80b:     }
+1:83cd80b: 
+1:ab5a8c7:     /**
+1:ab5a8c7:      * Helper class to work on contexts (works by iterating over them).
+1:3b13457:      * A context being abstractly a list of tuple (counterid, clock, count), a
+1:ab5a8c7:      * ContextState encapsulate a context and a position to one of the tuple.
+1:ab5a8c7:      * It also allow to create new context iteratively.
+1:ab5a8c7:      *
+1:ab5a8c7:      * Note: this is intrinsically a private class intended for use by the
+1:ab5a8c7:      * methods of CounterContext only. It is however public because it is
+1:ab5a8c7:      * convenient to create handcrafted context for unit tests.
+1:ab5a8c7:      */
+1:ab5a8c7:     public static class ContextState
+1:83cd80b:     {
+1:ab5a8c7:         public final ByteBuffer context;
+1:ab5a8c7:         public final int headerLength;
+1:83cd80b: 
+1:83cd80b:         private int headerOffset;        // offset from context.position()
+1:83cd80b:         private int bodyOffset;          // offset from context.position()
+1:83cd80b:         private boolean currentIsGlobal;
+1:83cd80b:         private boolean currentIsLocal;
+1:83cd80b: 
+1:83cd80b:         private ContextState(ByteBuffer context)
+1:83cd80b:         {
+1:ab5a8c7:             this.context = context;
+1:83cd80b:             this.headerLength = this.bodyOffset = headerLength(context);
+1:83cd80b:             this.headerOffset = HEADER_SIZE_LENGTH;
+1:83cd80b:             updateIsGlobalOrLocal();
+1:83cd80b:         }
+1:83cd80b: 
+1:83cd80b:         public static ContextState wrap(ByteBuffer context)
+1:83cd80b:         {
+1:83cd80b:             return new ContextState(context);
+1:83cd80b:         }
+1:83cd80b: 
+1:83cd80b:         /**
+1:83cd80b:          * Allocate a new context big enough for globalCount + localCount + remoteCount elements
+1:83cd80b:          * and return the initial corresponding ContextState.
+1:83cd80b:          */
+1:8a2a0c3:         public static ContextState allocate(int globalCount, int localCount, int remoteCount)
+1:83cd80b:         {
+1:83cd80b:             int headerLength = HEADER_SIZE_LENGTH + (globalCount + localCount) * HEADER_ELT_LENGTH;
+1:83cd80b:             int bodyLength = (globalCount + localCount + remoteCount) * STEP_LENGTH;
+1:83cd80b: 
+1:8a2a0c3:             ByteBuffer buffer = ByteBuffer.allocate(headerLength + bodyLength);
+1:83cd80b:             buffer.putShort(buffer.position(), (short) (globalCount + localCount));
+1:83cd80b: 
+1:83cd80b:             return ContextState.wrap(buffer);
+1:83cd80b:         }
+1:83cd80b: 
+1:83cd80b:         public boolean isGlobal()
+1:83cd80b:         {
+1:83cd80b:             return currentIsGlobal;
+1:83cd80b:         }
+1:83cd80b: 
+1:83cd80b:         public boolean isLocal()
+1:83cd80b:         {
+1:83cd80b:             return currentIsLocal;
+1:83cd80b:         }
+1:83cd80b: 
+1:83cd80b:         public boolean isRemote()
+1:83cd80b:         {
+1:83cd80b:             return !(currentIsGlobal || currentIsLocal);
+1:83cd80b:         }
+1:83cd80b: 
+1:83cd80b:         private void updateIsGlobalOrLocal()
+1:83cd80b:         {
+1:83cd80b:             if (headerOffset >= headerLength)
+1:83cd80b:             {
+1:83cd80b:                 currentIsGlobal = currentIsLocal = false;
+1:83cd80b:             }
+1:83cd80b:             else
+1:83cd80b:             {
+1:83cd80b:                 short headerElt = context.getShort(context.position() + headerOffset);
+1:83cd80b:                 currentIsGlobal = headerElt == getElementIndex() + Short.MIN_VALUE;
+1:83cd80b:                 currentIsLocal = headerElt == getElementIndex();
+1:83cd80b:             }
+1:83cd80b:         }
+1:83cd80b: 
+1:ab5a8c7:         public boolean hasRemaining()
+1:83cd80b:         {
+1:ab5a8c7:             return bodyOffset < context.remaining();
+1:83cd80b:         }
+1:b95a49c: 
+1:ab5a8c7:         public void moveToNext()
+1:83cd80b:         {
+1:ab5a8c7:             bodyOffset += STEP_LENGTH;
+1:83cd80b:             if (currentIsGlobal || currentIsLocal)
+1:ab5a8c7:                 headerOffset += HEADER_ELT_LENGTH;
+1:83cd80b:             updateIsGlobalOrLocal();
+1:83cd80b:         }
+1:9ef94eb: 
+1:ab5a8c7:         public void copyTo(ContextState other)
+1:83cd80b:         {
+1:714c423:             other.writeElement(getCounterId(), getClock(), getCount(), currentIsGlobal, currentIsLocal);
+1:83cd80b:         }
+1:83cd80b: 
+1:ab5a8c7:         public int compareIdTo(ContextState other)
+1:83cd80b:         {
+1:ab5a8c7:             return compareId(context, context.position() + bodyOffset, other.context, other.context.position() + other.bodyOffset);
+1:83cd80b:         }
+1:83cd80b: 
+1:ab5a8c7:         public void reset()
+1:b95a49c:         {
+1:ab5a8c7:             this.headerOffset = HEADER_SIZE_LENGTH;
+1:ab5a8c7:             this.bodyOffset = headerLength;
+1:83cd80b:             updateIsGlobalOrLocal();
+1:83cd80b:         }
+1:83cd80b: 
+1:83cd80b:         public int getElementIndex()
+1:83cd80b:         {
+1:83cd80b:             return (bodyOffset - headerLength) / STEP_LENGTH;
+1:83cd80b:         }
+1:9ef94eb: 
+1:3b13457:         public CounterId getCounterId()
+1:9ef94eb:         {
+1:3b13457:             return CounterId.wrap(context, context.position() + bodyOffset);
+1:83cd80b:         }
+1:9ef94eb: 
+1:ab5a8c7:         public long getClock()
+1:9ef94eb:         {
+1:3b13457:             return context.getLong(context.position() + bodyOffset + CounterId.LENGTH);
+1:b95a49c:         }
+1:9ef94eb: 
+1:ab5a8c7:         public long getCount()
+2:9ef94eb:         {
+1:3b13457:             return context.getLong(context.position() + bodyOffset + CounterId.LENGTH + CLOCK_LENGTH);
+1:9ef94eb:         }
+1:e98eb1c: 
+1:83cd80b:         public void writeGlobal(CounterId id, long clock, long count)
+1:83cd80b:         {
+1:83cd80b:             writeElement(id, clock, count, true, false);
+1:83cd80b:         }
+1:83cd80b: 
+1:714c423:         // In 2.1 only used by the unit tests.
+1:83cd80b:         public void writeLocal(CounterId id, long clock, long count)
+1:83cd80b:         {
+1:83cd80b:             writeElement(id, clock, count, false, true);
+1:83cd80b:         }
+1:83cd80b: 
+1:714c423:         // In 2.1 only used by the unit tests.
+1:83cd80b:         public void writeRemote(CounterId id, long clock, long count)
+1:83cd80b:         {
+1:83cd80b:             writeElement(id, clock, count, false, false);
+1:83cd80b:         }
+1:83cd80b: 
+1:83cd80b:         private void writeElement(CounterId id, long clock, long count, boolean isGlobal, boolean isLocal)
+1:9ef94eb:         {
+1:ab5a8c7:             writeElementAtOffset(context, context.position() + bodyOffset, id, clock, count);
+1:83cd80b: 
+1:83cd80b:             if (isGlobal)
+1:83cd80b:                 context.putShort(context.position() + headerOffset, (short) (getElementIndex() + Short.MIN_VALUE));
+1:83cd80b:             else if (isLocal)
+1:83cd80b:                 context.putShort(context.position() + headerOffset, (short) getElementIndex());
+1:83cd80b: 
+1:83cd80b:             currentIsGlobal = isGlobal;
+1:83cd80b:             currentIsLocal = isLocal;
+1:ab5a8c7:             moveToNext();
+1:9ef94eb:         }
+1:ab5a8c7: 
+1:3b13457:         // write a tuple (counter id, clock, count) at an absolute (bytebuffer-wise) offset
+1:83cd80b:         private void writeElementAtOffset(ByteBuffer ctx, int offset, CounterId id, long clock, long count)
+1:9ef94eb:         {
+1:83cd80b:             ctx = ctx.duplicate();
+1:83cd80b:             ctx.position(offset);
+1:83cd80b:             ctx.put(id.bytes().duplicate());
+1:83cd80b:             ctx.putLong(clock);
+1:83cd80b:             ctx.putLong(count);
+2:9ef94eb:         }
+1:9ef94eb:     }
+1:9ef94eb: }
+============================================================================
+author:Paulo Motta
+-------------------------------------------------------------------------------
+commit:df7c658
+/////////////////////////////////////////////////////////////////////////
+1:      * Returns the count associated with the local counter id, or 0 if no such shard is present.
+1:      */
+1:     public long getLocalCount(ByteBuffer context)
+1:     {
+1:         return getLocalClockAndCount(context).count;
+1:     }
+1: 
+1:     /**
+1:      * Checks if a context is local
+1:      */
+1:     public boolean isLocal(ByteBuffer context)
+1:     {
+1:         return ContextState.wrap(context).isLocal();
+1:     }
+1: 
+1:     /**
+author:Ariel Weisberg
+-------------------------------------------------------------------------------
+commit:03f72ac
+/////////////////////////////////////////////////////////////////////////
+1:     private static final int HEADER_SIZE_LENGTH = TypeSizes.sizeof(Short.MAX_VALUE);
+1:     private static final int HEADER_ELT_LENGTH = TypeSizes.sizeof(Short.MAX_VALUE);
+1:     private static final int CLOCK_LENGTH = TypeSizes.sizeof(Long.MAX_VALUE);
+1:     private static final int COUNT_LENGTH = TypeSizes.sizeof(Long.MAX_VALUE);
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:a991b64
+/////////////////////////////////////////////////////////////////////////
+1:      * This is only used in a PartitionUpdate until the update has gone through
+1:      * CounterMutation.apply(), at which point all the local shard are replaced by
+1:      * global ones. In other words, local shards should never hit the disk or
+1:      * memtables. And we use this so that if an update statement has multiple increment
+1:      * of the same counter we properly add them rather than keeping only one of them.
+1:      * (this is also used for tests of compatibility with pre-2.1 counters)
+commit:fc8b76f
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.serializers.MarshalException;
+commit:e9c6742
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.type.MarshalException;
+commit:3b13457
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.*;
+1:  * A context is primarily a list of tuples (counter id, clock, count) -- called
+0:  *   b) a list of shard -- (counter id, logical clock, count) tuples -- (the so-called 'body' below)
+/////////////////////////////////////////////////////////////////////////
+1:  *       counterid_1         counterid_2
+0:  * The rules when merging two shard with the same counterid are:
+/////////////////////////////////////////////////////////////////////////
+1:     private static final int STEP_LENGTH = CounterId.LENGTH + CLOCK_LENGTH + COUNT_LENGTH;
+/////////////////////////////////////////////////////////////////////////
+0:         writeElementAtOffset(context, context.position() + HEADER_SIZE_LENGTH + HEADER_ELT_LENGTH, CounterId.getLocalId(), 1L, value);
+0:     public ByteBuffer create(CounterId id, long clock, long value, boolean isDelta)
+/////////////////////////////////////////////////////////////////////////
+1:     // write a tuple (counter id, clock, count) at an absolute (bytebuffer-wise) offset
+0:     private static void writeElementAtOffset(ByteBuffer context, int offset, CounterId id, long clock, long count)
+/////////////////////////////////////////////////////////////////////////
+1:         return ByteBufferUtil.compareSubArrays(bb1, pos1, bb2, pos2, CounterId.LENGTH);
+/////////////////////////////////////////////////////////////////////////
+1:      * Return a context w/ an aggregated count for each counter id.
+/////////////////////////////////////////////////////////////////////////
+0:                         mergedState.writeElement(leftState.getCounterId(), clock, count, true);
+/////////////////////////////////////////////////////////////////////////
+1:                                             leftState.getCounterId(), leftClock, leftCount,
+0:                                             rightState.getCounterId(), rightClock, rightCount,
+/////////////////////////////////////////////////////////////////////////
+0:             sb.append(state.getCounterId().toString()).append(", ");
+/////////////////////////////////////////////////////////////////////////
+1:      * Returns the aggregated count across all counter ids.
+/////////////////////////////////////////////////////////////////////////
+0:             long count = context.getLong(offset + CounterId.LENGTH + CLOCK_LENGTH);
+/////////////////////////////////////////////////////////////////////////
+0:      * CounterId.
+0:     public boolean hasCounterId(ByteBuffer context, CounterId id)
+0:             if (id.equals(CounterId.wrap(context, offset)))
+/////////////////////////////////////////////////////////////////////////
+0:      * total but with old local counter ids nulified and there content merged to
+0:      * the current localCounterId.
+0:     public ByteBuffer computeOldShardMerger(ByteBuffer context, List<CounterId.CounterIdRecord> oldIds, long mergeBefore)
+0:         CounterId localId = CounterId.getLocalId();
+0:         Iterator<CounterId.CounterIdRecord> recordIterator = oldIds.iterator();
+0:         CounterId.CounterIdRecord currRecord = recordIterator.hasNext() ? recordIterator.next() : null;
+0:         List<CounterId> toMerge = new ArrayList<CounterId>();
+0:             CounterId counterId = state.getCounterId();
+0:             int c = counterId.compareTo(currRecord.id);
+/////////////////////////////////////////////////////////////////////////
+0:                     if (counterId.equals(localId))
+0:                         throw new RuntimeException("Current counterId with a negative clock (likely due to #2968). You need to restart this node with -Dcassandra.renew_counter_id=true to fix.");
+0:                         logger.error(String.format("Invalid counter context (clock is %d and count is %d for CounterId %s), will fix", state.getCount(), state.getCount(), counterId.toString()));
+0:                         toMerge.add(counterId);
+/////////////////////////////////////////////////////////////////////////
+0:                         toMerge.add(counterId);
+/////////////////////////////////////////////////////////////////////////
+0:             CounterId counterId = state.getCounterId();
+0:                 if (counterId.equals(localId))
+0:                     throw new RuntimeException("Current counterId with a negative clock (likely due to #2968). You need to restart this node with -Dcassandra.renew_counter_id=true to fix.");
+0:                     logger.error(String.format("Invalid counter context (clock is %d and count is %d for CounterId %s), will fix", state.getClock(), state.getCount(), counterId.toString()));
+0:                     toMerge.add(counterId);
+/////////////////////////////////////////////////////////////////////////
+0:             CounterId counterId = state.getCounterId();
+0:             if (counterId.compareTo(localId) > 0)
+0:             else if (i < toMerge.size() && counterId.compareTo(toMerge.get(i)) == 0)
+0:                 merger.writeElement(counterId, -now - state.getClock(), -count, true);
+/////////////////////////////////////////////////////////////////////////
+1:      * A context being abstractly a list of tuple (counterid, clock, count), a
+/////////////////////////////////////////////////////////////////////////
+1:         public CounterId getCounterId()
+1:             return CounterId.wrap(context, context.position() + bodyOffset);
+1:             return context.getLong(context.position() + bodyOffset + CounterId.LENGTH);
+1:             return context.getLong(context.position() + bodyOffset + CounterId.LENGTH + CLOCK_LENGTH);
+0:         public void writeElement(CounterId id, long clock, long count, boolean isDelta)
+/////////////////////////////////////////////////////////////////////////
+0:         public void writeElement(CounterId id, long clock, long count)
+commit:07cf56f
+/////////////////////////////////////////////////////////////////////////
+1: /*
+commit:f95fc45
+/////////////////////////////////////////////////////////////////////////
+0:     private static final int HEADER_SIZE_LENGTH = DBConstants.SHORT_SIZE;
+0:     private static final int HEADER_ELT_LENGTH = DBConstants.SHORT_SIZE;
+0:     private static final int CLOCK_LENGTH = DBConstants.LONG_SIZE;
+0:     private static final int COUNT_LENGTH = DBConstants.LONG_SIZE;
+commit:329dd75
+/////////////////////////////////////////////////////////////////////////
+1:                 long leftCount = leftState.getCount();
+1:                 long rightCount = rightState.getCount();
+/////////////////////////////////////////////////////////////////////////
+1:                     if (leftCount != rightCount)
+1:                     {
+1:                         // Inconsistent shard (see the corresponding code in merge()). We return DISJOINT in this
+1:                         // case so that it will be treated as a difference, allowing read-repair to work.
+0:                         return ContextRelationship.DISJOINT;
+1:                     }
+1:                     else
+1:                     {
+0:                         continue;
+1:                     }
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:                     if (leftClock == rightClock)
+1:                     {
+0:                         // We should never see non-delta shards w/ same id+clock but different counts. However, if we do
+1:                         // we should "heal" the problem by being deterministic in our selection of shard - and
+1:                         // log the occurrence so that the operator will know something is wrong.
+1:                         long leftCount = leftState.getCount();
+1:                         long rightCount = rightState.getCount();
+1: 
+0:                         if (leftCount != rightCount)
+1:                         {
+0:                             logger.error("invalid counter shard detected; ({}, {}, {}) and ({}, {}, {}) differ only in "
+0:                                     + "count; will pick highest to self-heal; this indicates a bug or corruption generated a bad counter shard",
+0:                                     new Object[] {
+0:                                             leftState.getNodeId(), leftClock, leftCount,
+0:                                             rightState.getNodeId(), rightClock, rightCount,
+0:                                      });
+1:                         }
+1: 
+1:                         if (leftCount > rightCount)
+1:                         {
+1:                             leftState.copyTo(mergedState);
+1:                         }
+1:                         else
+1:                         {
+1:                             rightState.copyTo(mergedState);
+1:                         }
+1:                     }
+1:                     {
+1:                         if ((leftClock >= 0 && rightClock > 0 && leftClock >= rightClock)
+1:                                 || (leftClock < 0 && (rightClock > 0 || leftClock < rightClock)))
+1:                             leftState.copyTo(mergedState);
+1:                         else
+1:                             rightState.copyTo(mergedState);
+1:                     }
+commit:8bef247
+/////////////////////////////////////////////////////////////////////////
+1:  *
+0:  * For a detailed description of the meaning of a delta and why the merging
+1:  * rules work this way, see CASSANDRA-1938 - specifically the 1938_discussion
+0:  * attachment.
+commit:4d8ae4d
+/////////////////////////////////////////////////////////////////////////
+0:         int removedDelta = 0;
+/////////////////////////////////////////////////////////////////////////
+1:                 {
+0:                     if (state.isDelta())
+0:                         removedDelta++;
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+0:         int removedHeaderSize = removedDelta * HEADER_ELT_LENGTH;
+0:         int removedBodySize = removedShards * STEP_LENGTH;
+0:         int newSize = context.remaining() - removedHeaderSize - removedBodySize;
+/////////////////////////////////////////////////////////////////////////
+0:             if (clock >= 0 || state.getCount() != 0 || -((int)(clock / 1000)) >= gcBefore)
+1: 
+commit:1c78dd9
+/////////////////////////////////////////////////////////////////////////
+0:         int removedDelta = 0;
+/////////////////////////////////////////////////////////////////////////
+1:                 {
+0:                     if (state.isDelta())
+0:                         removedDelta++;
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+0:         int removedHeaderSize = removedDelta * HEADER_ELT_LENGTH;
+0:         int removedBodySize = removedShards * STEP_LENGTH;
+0:         int newSize = context.remaining() - removedHeaderSize - removedBodySize;
+/////////////////////////////////////////////////////////////////////////
+0:             if (clock >= 0 || state.getCount() != 0 || -((int)(clock / 1000)) >= gcBefore)
+1: 
+commit:17ad4cc
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:      * total but with old local node ids nulified and there content merged to
+0:      * the current localNodeId.
+0:     public ByteBuffer computeOldShardMerger(ByteBuffer context, List<NodeId.NodeIdRecord> oldIds, long mergeBefore)
+0:         NodeId localId = NodeId.getLocalId();
+0:         NodeId.NodeIdRecord currRecord = recordIterator.hasNext() ? recordIterator.next() : null;
+0:         List<NodeId> toMerge = new ArrayList<NodeId>();
+0:         long mergeTotal = 0;
+0:             assert !currRecord.id.equals(localId);
+0:             NodeId nodeId = state.getNodeId();
+0:             int c = nodeId.compareTo(currRecord.id);
+0:             if (c > 0)
+0:                 continue;
+1: 
+0:             if (state.isDelta())
+1:             {
+0:                 if (state.getClock() < 0)
+1:                 {
+0:                     // Already merged shard, waiting to be collected
+1: 
+0:                     if (nodeId.equals(localId))
+0:                         // we should not get there, but we have been creating problematic context prior to #2968
+0:                         throw new RuntimeException("Current nodeId with a negative clock (likely due to #2968). You need to restart this node with -Dcassandra.renew_counter_id=true to fix.");
+1: 
+0:                     if (state.getCount() != 0)
+1:                     {
+0:                         // This should not happen, but previous bugs have generated this (#2968 in particular) so fixing it.
+0:                         logger.error(String.format("Invalid counter context (clock is %d and count is %d for NodeId %s), will fix", state.getCount(), state.getCount(), nodeId.toString()));
+0:                         toMerge.add(nodeId);
+0:                         mergeTotal += state.getCount();
+1:                     }
+1:                 }
+0:                 else if (c == 0)
+1:                 {
+0:                     // Found an old id. However, merging an oldId that has just been renewed isn't safe, so
+0:                     // we check that it has been renewed before mergeBefore.
+0:                     if (currRecord.timestamp < mergeBefore)
+1:                     {
+0:                         toMerge.add(nodeId);
+0:                         mergeTotal += state.getCount();
+1:                     }
+1:                 }
+1:             }
+1: 
+0:             if (c == 0)
+0:                 currRecord = recordIterator.hasNext() ? recordIterator.next() : null;
+1: 
+1:             state.moveToNext();
+0:         // Continuing the iteration so that we can repair invalid shards
+1:         while (state.hasRemaining())
+1:         {
+0:             NodeId nodeId = state.getNodeId();
+0:             if (state.isDelta() && state.getClock() < 0)
+1:             {
+0:                 if (nodeId.equals(localId))
+0:                     // we should not get there, but we have been creating problematic context prior to #2968
+0:                     throw new RuntimeException("Current nodeId with a negative clock (likely due to #2968). You need to restart this node with -Dcassandra.renew_counter_id=true to fix.");
+1: 
+0:                 if (state.getCount() != 0)
+1:                 {
+0:                     // This should not happen, but previous bugs have generated this (#2968 in particular) so fixing it.
+0:                     logger.error(String.format("Invalid counter context (clock is %d and count is %d for NodeId %s), will fix", state.getClock(), state.getCount(), nodeId.toString()));
+0:                     toMerge.add(nodeId);
+0:                     mergeTotal += state.getCount();
+1:                 }
+1:             }
+1:             state.moveToNext();
+1:         }
+1: 
+0:         if (toMerge.isEmpty())
+0:             return null;
+1: 
+0:         ContextState merger = ContextState.allocate(toMerge.size() + 1, toMerge.size() + 1);
+0:         state.reset();
+0:         int i = 0;
+0:         int removedTotal = 0;
+0:         boolean localWritten = false;
+1:         while (state.hasRemaining())
+1:         {
+0:             NodeId nodeId = state.getNodeId();
+0:             if (nodeId.compareTo(localId) > 0)
+1:             {
+0:                 merger.writeElement(localId, 1L, mergeTotal, true);
+0:                 localWritten = true;
+1:             }
+0:             else if (i < toMerge.size() && nodeId.compareTo(toMerge.get(i)) == 0)
+1:             {
+0:                 long count = state.getCount();
+0:                 removedTotal += count;
+0:                 merger.writeElement(nodeId, -now - state.getClock(), -count, true);
+0:                 ++i;
+1:             }
+1:             state.moveToNext();
+1:         }
+0:         if (!localWritten)
+0:             merger.writeElement(localId, 1L, mergeTotal, true);
+1: 
+0:         // sanity check
+0:         assert mergeTotal == removedTotal;
+0:         return merger.context;
+/////////////////////////////////////////////////////////////////////////
+0:         int removedShards = 0;
+0:             if (clock < 0)
+0:                 // We should never have a count != 0 when clock < 0.
+0:                 // We know that previous may have created those situation though, so:
+0:                 //   * for delta shard: we throw an exception since computeOldShardMerger should
+0:                 //     have corrected that situation
+0:                 //   * for non-delta shard: it is a much more crappier situation because there is
+0:                 //     not much we can do since we are not responsible for that shard. So we simply
+0:                 //     ignore the shard.
+0:                 if (state.getCount() != 0)
+1:                 {
+0:                     if (state.isDelta())
+1:                     {
+0:                         throw new IllegalStateException("Counter shard with negative clock but count != 0; context = " + toString(context));
+1:                     }
+1:                     else
+1:                     {
+0:                         logger.debug("Ignoring non-removable non-delta corrupted shard in context " + toString(context));
+0:                         state.moveToNext();
+0:                         continue;
+1:                     }
+1:                 }
+1: 
+0:                 if (-((int)(clock / 1000)) < gcBefore)
+0:                     removedShards++;
+0:         if (removedShards == 0)
+1: 
+0:         int removedHeaderSize = removedShards * HEADER_ELT_LENGTH;
+0:         int newSize = context.remaining() - removedHeaderSize - (removedShards * STEP_LENGTH);
+0:         ByteBuffer cleanedContext = HeapAllocator.instance.allocate(newSize);
+0:             if (!(clock < 0 && state.getCount() == 0))
+0:                 state.copyTo(cleaned);
+0:         return cleanedContext;
+commit:1fa6264
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:      * total but with old local node ids nulified and there content merged to
+0:      * the current localNodeId.
+0:     public ByteBuffer computeOldShardMerger(ByteBuffer context, List<NodeId.NodeIdRecord> oldIds, long mergeBefore)
+0:         NodeId localId = NodeId.getLocalId();
+0:         NodeId.NodeIdRecord currRecord = recordIterator.hasNext() ? recordIterator.next() : null;
+0:         List<NodeId> toMerge = new ArrayList<NodeId>();
+0:         long mergeTotal = 0;
+0:             assert !currRecord.id.equals(localId);
+0:             NodeId nodeId = state.getNodeId();
+0:             int c = nodeId.compareTo(currRecord.id);
+0:             if (c > 0)
+0:                 continue;
+1: 
+0:             if (state.isDelta())
+1:             {
+0:                 if (state.getClock() < 0)
+1:                 {
+0:                     // Already merged shard, waiting to be collected
+1: 
+0:                     if (nodeId.equals(localId))
+0:                         // we should not get there, but we have been creating problematic context prior to #2968
+0:                         throw new RuntimeException("Current nodeId with a negative clock (likely due to #2968). You need to restart this node with -Dcassandra.renew_counter_id=true to fix.");
+1: 
+0:                     if (state.getCount() != 0)
+1:                     {
+0:                         // This should not happen, but previous bugs have generated this (#2968 in particular) so fixing it.
+0:                         logger.error(String.format("Invalid counter context (clock is %d and count is %d for NodeId %s), will fix", state.getCount(), state.getCount(), nodeId.toString()));
+0:                         toMerge.add(nodeId);
+0:                         mergeTotal += state.getCount();
+1:                     }
+1:                 }
+0:                 else if (c == 0)
+1:                 {
+0:                     // Found an old id. However, merging an oldId that has just been renewed isn't safe, so
+0:                     // we check that it has been renewed before mergeBefore.
+0:                     if (currRecord.timestamp < mergeBefore)
+1:                     {
+0:                         toMerge.add(nodeId);
+0:                         mergeTotal += state.getCount();
+1:                     }
+1:                 }
+1:             }
+1: 
+0:             if (c == 0)
+0:                 currRecord = recordIterator.hasNext() ? recordIterator.next() : null;
+1: 
+0:             state.moveToNext();
+0:         // Continuing the iteration so that we can repair invalid shards
+0:         while (state.hasRemaining())
+1:         {
+0:             NodeId nodeId = state.getNodeId();
+0:             if (state.isDelta() && state.getClock() < 0)
+1:             {
+0:                 if (nodeId.equals(localId))
+0:                     // we should not get there, but we have been creating problematic context prior to #2968
+0:                     throw new RuntimeException("Current nodeId with a negative clock (likely due to #2968). You need to restart this node with -Dcassandra.renew_counter_id=true to fix.");
+1: 
+0:                 if (state.getCount() != 0)
+1:                 {
+0:                     // This should not happen, but previous bugs have generated this (#2968 in particular) so fixing it.
+0:                     logger.error(String.format("Invalid counter context (clock is %d and count is %d for NodeId %s), will fix", state.getClock(), state.getCount(), nodeId.toString()));
+0:                     toMerge.add(nodeId);
+0:                     mergeTotal += state.getCount();
+1:                 }
+1:             }
+0:             state.moveToNext();
+1:         }
+1: 
+0:         if (toMerge.isEmpty())
+0:             return null;
+1: 
+0:         ContextState merger = ContextState.allocate(toMerge.size() + 1, toMerge.size() + 1);
+0:         state.reset();
+0:         int i = 0;
+0:         int removedTotal = 0;
+0:         boolean localWritten = false;
+0:         while (state.hasRemaining())
+1:         {
+0:             NodeId nodeId = state.getNodeId();
+0:             if (nodeId.compareTo(localId) > 0)
+1:             {
+0:                 merger.writeElement(localId, 1L, mergeTotal, true);
+0:                 localWritten = true;
+1:             }
+0:             else if (i < toMerge.size() && nodeId.compareTo(toMerge.get(i)) == 0)
+1:             {
+0:                 long count = state.getCount();
+0:                 removedTotal += count;
+0:                 merger.writeElement(nodeId, -now - state.getClock(), -count, true);
+0:                 ++i;
+1:             }
+0:             state.moveToNext();
+1:         }
+0:         if (!localWritten)
+0:             merger.writeElement(localId, 1L, mergeTotal, true);
+1: 
+0:         // sanity check
+0:         assert mergeTotal == removedTotal;
+0:         return merger.context;
+/////////////////////////////////////////////////////////////////////////
+0:         int removedShards = 0;
+0:             if (clock < 0)
+0:                 // We should never have a count != 0 when clock < 0.
+0:                 // We know that previous may have created those situation though, so:
+0:                 //   * for delta shard: we throw an exception since computeOldShardMerger should
+0:                 //     have corrected that situation
+0:                 //   * for non-delta shard: it is a much more crappier situation because there is
+0:                 //     not much we can do since we are not responsible for that shard. So we simply
+0:                 //     ignore the shard.
+0:                 if (state.getCount() != 0)
+1:                 {
+0:                     if (state.isDelta())
+1:                     {
+0:                         throw new IllegalStateException("Counter shard with negative clock but count != 0; context = " + toString(context));
+1:                     }
+1:                     else
+1:                     {
+0:                         logger.debug("Ignoring non-removable non-delta corrupted shard in context " + toString(context));
+0:                         state.moveToNext();
+0:                         continue;
+1:                     }
+1:                 }
+1: 
+0:                 if (-((int)(clock / 1000)) < gcBefore)
+0:                     removedShards++;
+0:         if (removedShards == 0)
+1: 
+0:         int removedHeaderSize = removedShards * HEADER_ELT_LENGTH;
+0:         int newSize = context.remaining() - removedHeaderSize - (removedShards * STEP_LENGTH);
+0:         ByteBuffer cleanedContext = HeapAllocator.instance.allocate(newSize);
+0:             if (!(clock < 0 && state.getCount() == 0))
+0:                 state.copyTo(cleaned);
+0:         return cleanedContext;
+commit:2ba21e1
+/////////////////////////////////////////////////////////////////////////
+1:         return HEADER_SIZE_LENGTH + Math.abs(context.getShort(context.position())) * HEADER_ELT_LENGTH;
+/////////////////////////////////////////////////////////////////////////
+0:      * Mark context to delete delta afterward.
+1:      * Marking is done by multiply #elt by -1 to preserve header length
+0:      * and #elt count in order to clear all delta later.
+1:      *
+1:      * @param context a counter context
+0:      * @return context that marked to delete delta
+1:      */
+0:     public ByteBuffer markDeltaToBeCleared(ByteBuffer context)
+1:     {
+1:         int headerLength = headerLength(context);
+0:         if (headerLength == 0)
+0:             return context;
+1: 
+0:         ByteBuffer marked = context.duplicate();
+1:         short count = context.getShort(context.position());
+0:         // negate #elt to mark as deleted, without changing its size.
+0:         if (count > 0)
+1:             marked.putShort(marked.position(), (short) (count * -1));
+1:         return marked;
+1:     }
+1: 
+1:     /**
+commit:640deaa
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.log4j.Logger;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:     private static final Logger logger = Logger.getLogger(CounterContext.class);
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:             assert !currRecord.id.equals(NodeId.getLocalId());
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:                     assert !foundState.getNodeId().equals(state.getNodeId());
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         boolean forceFixing = false;
+0:             if (clock < 0 && -((int)(clock / 1000)) < gcBefore && (state.getCount() == 0 || !state.isDelta()))
+0:             else if (clock < 0 && state.getCount() != 0 && state.isDelta())
+1:             {
+0:                 forceFixing = true;
+1:             }
+0:         if (removedBodySize == 0 && !forceFixing)
+/////////////////////////////////////////////////////////////////////////
+0:         long toAddBack = 0;
+0:             if (!(clock < 0 && -((int)(clock / 1000)) < gcBefore && (state.getCount() == 0 || !state.isDelta())))
+0:                 if (clock < 0 && state.getCount() != 0 && state.isDelta())
+1:                 {
+0:                     // we should not get there, but we have been creating problematic context prior to #2968
+0:                     if (state.getNodeId().equals(NodeId.getLocalId()))
+0:                         throw new RuntimeException("Merged counter shard with a count != 0 (likely due to #2968). You need to restart this node with -Dcassandra.renew_counter_id=true to fix.");
+1: 
+0:                     // we will "fix" it, but log a message
+0:                     logger.info("Collectable old shard with a count != 0. Will fix.");
+0:                     cleaned.writeElement(state.getNodeId(), clock - 1L, 0, true);
+0:                     toAddBack += state.getCount();
+1:                 }
+1:                 else
+1:                 {
+0:                     state.copyTo(cleaned);
+1:                 }
+0:         return toAddBack == 0 ? cleanedContext : merge(cleanedContext, create(toAddBack));
+commit:e771943
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.marshal.MarshalException;
+/////////////////////////////////////////////////////////////////////////
+1:     public void validateContext(ByteBuffer context) throws MarshalException
+1:     {
+0:         int headerLength = headerLength(context);
+0:         if (headerLength < 0 || (context.remaining() - headerLength) %  STEP_LENGTH != 0)
+1:             throw new MarshalException("Invalid size for a counter context");
+1:     }
+1: 
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:182051c
+/////////////////////////////////////////////////////////////////////////
+1:             sb.append(state.getCounterId()).append(", ");
+commit:02fb218
+/////////////////////////////////////////////////////////////////////////
+commit:7588f74
+/////////////////////////////////////////////////////////////////////////
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:57b18e6
+/////////////////////////////////////////////////////////////////////////
+1:      * Detects whether or not the context has any legacy (local or remote) shards in it.
+1:      */
+1:     public boolean hasLegacyShards(ByteBuffer context)
+1:     {
+1:         int totalCount = (context.remaining() - headerLength(context)) / STEP_LENGTH;
+1:         int localAndGlobalCount = Math.abs(context.getShort(context.position()));
+1: 
+1:         if (localAndGlobalCount < totalCount)
+1:             return true; // remote shard(s) present
+1: 
+1:         for (int i = 0; i < localAndGlobalCount; i++)
+1:             if (context.getShort(context.position() + HEADER_SIZE_LENGTH + i * HEADER_ELT_LENGTH) >= 0)
+1:                 return true; // found a local shard
+1: 
+1:         return false;
+1:     }
+1: 
+1:     /**
+commit:a79d54e
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.serializers.MarshalException;
+/////////////////////////////////////////////////////////////////////////
+1:         boolean leftIsSuperSet = true;
+1:         boolean rightIsSuperSet = true;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 Relationship rel = compare(leftState, rightState);
+1:                 if (rel == Relationship.GREATER_THAN)
+1:                     rightIsSuperSet = false;
+1:                 else if (rel == Relationship.LESS_THAN)
+1:                     leftIsSuperSet = false;
+1:                 else if (rel == Relationship.DISJOINT)
+1:                     leftIsSuperSet = rightIsSuperSet = false;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 leftIsSuperSet = false;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 rightIsSuperSet = false;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         if (leftState.hasRemaining())
+1:             rightIsSuperSet = false;
+1:         else if (rightState.hasRemaining())
+1:             leftIsSuperSet = false;
+1: 
+1:         // if one of the contexts is a superset, return it early.
+1:         if (leftIsSuperSet)
+1:             return left;
+1:         else if (rightIsSuperSet)
+1:             return right;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 Relationship rel = compare(leftState, rightState);
+1:                 if (rel == Relationship.DISJOINT) // two local shards
+1:                     mergedState.writeLocal(leftState.getCounterId(),
+1:                                            leftState.getClock() + rightState.getClock(),
+1:                                            leftState.getCount() + rightState.getCount());
+1:                 else if (rel == Relationship.GREATER_THAN)
+1:                     leftState.copyTo(mergedState);
+1:                 else // EQUAL or LESS_THAN
+1:                     rightState.copyTo(mergedState);
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     /*
+1:      * Compares two shards, returns:
+1:      * - GREATER_THAN if leftState overrides rightState
+1:      * - LESS_THAN if rightState overrides leftState
+1:      * - EQUAL for two equal, non-local, shards
+1:      * - DISJOINT for any two local shards
+1:      */
+1:     private Relationship compare(ContextState leftState, ContextState rightState)
+1:         long leftClock = leftState.getClock();
+0:         long leftCount = leftState.getCount();
+1:         long rightClock = rightState.getClock();
+0:         long rightCount = rightState.getCount();
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                         return Relationship.GREATER_THAN;
+1:                     else if (leftCount == rightCount)
+1:                         return Relationship.EQUAL;
+1:                         return Relationship.LESS_THAN;
+1:                     return leftClock > rightClock ? Relationship.GREATER_THAN : Relationship.LESS_THAN;
+1:                 return leftState.isGlobal() ? Relationship.GREATER_THAN : Relationship.LESS_THAN;
+1: 
+1:         if (leftState.isLocal() || rightState.isLocal())
+1:                 return Relationship.DISJOINT;
+1:                 return leftState.isLocal() ? Relationship.GREATER_THAN : Relationship.LESS_THAN;
+1: 
+1:         // both are remote shards
+1:         if (leftClock == rightClock)
+1:             // We should never see non-local shards w/ same id+clock but different counts. However, if we do
+0:             // we should "heal" the problem by being deterministic in our selection of shard - and
+0:             // log the occurrence so that the operator will know something is wrong.
+1:             if (leftCount != rightCount && CompactionManager.isCompactionManager.get())
+1:                 logger.warn("invalid remote counter shard detected; ({}, {}, {}) and ({}, {}, {}) differ only in "
+1:                             + "count; will pick highest to self-heal on compaction",
+1:                             leftState.getCounterId(), leftClock, leftCount,
+1:                             rightState.getCounterId(), rightClock, rightCount);
+1: 
+1:             if (leftCount > rightCount)
+1:                 return Relationship.GREATER_THAN;
+1:             else if (leftCount == rightCount)
+1:                 return Relationship.EQUAL;
+1:                 return Relationship.LESS_THAN;
+1:         }
+1:         else
+1:         {
+0:             if ((leftClock >= 0 && rightClock > 0 && leftClock >= rightClock)
+1:                     || (leftClock < 0 && (rightClock > 0 || leftClock < rightClock)))
+1:                 return Relationship.GREATER_THAN;
+1:             else
+1:                 return Relationship.LESS_THAN;
+commit:8a2a0c3
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     public ByteBuffer createGlobal(CounterId id, long clock, long count)
+1:         ContextState state = ContextState.allocate(1, 0, 0);
+/////////////////////////////////////////////////////////////////////////
+1:     public ByteBuffer createLocal(long count)
+1:         ContextState state = ContextState.allocate(0, 1, 0);
+/////////////////////////////////////////////////////////////////////////
+1:     public ByteBuffer createRemote(CounterId id, long clock, long count)
+1:         ContextState state = ContextState.allocate(0, 0, 1);
+/////////////////////////////////////////////////////////////////////////
+1:     public ByteBuffer merge(ByteBuffer left, ByteBuffer right)
+/////////////////////////////////////////////////////////////////////////
+1:         return merge(ContextState.allocate(globalCount, localCount, remoteCount), leftState, rightState);
+/////////////////////////////////////////////////////////////////////////
+1:         public static ContextState allocate(int globalCount, int localCount, int remoteCount)
+1:             ByteBuffer buffer = ByteBuffer.allocate(headerLength + bodyLength);
+commit:714c423
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.ClockAndCount;
+/////////////////////////////////////////////////////////////////////////
+1: public class CounterContext
+/////////////////////////////////////////////////////////////////////////
+1:     public static enum Relationship
+1:     {
+1:         EQUAL, GREATER_THAN, LESS_THAN, DISJOINT
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:      * Creates a counter context with a single global, 2.1+ shard (a result of increment).
+1:      */
+0:     public ByteBuffer createGlobal(CounterId id, long clock, long count, Allocator allocator)
+1:     {
+0:         ContextState state = ContextState.allocate(1, 0, 0, allocator);
+1:         state.writeGlobal(id, clock, count);
+1:         return state.context;
+1:     }
+1: 
+1:     /**
+1:      * For use by tests of compatibility with pre-2.1 counters only.
+/////////////////////////////////////////////////////////////////////////
+0:      * For use by tests of compatibility with pre-2.1 counters only.
+/////////////////////////////////////////////////////////////////////////
+1:      * @return the Relationship between the contexts.
+1:     public Relationship diff(ByteBuffer left, ByteBuffer right)
+1:         Relationship relationship = Relationship.EQUAL;
+/////////////////////////////////////////////////////////////////////////
+1:                         return Relationship.DISJOINT;
+1:                     if (relationship == Relationship.EQUAL)
+1:                         relationship = Relationship.GREATER_THAN;
+1:                     else if (relationship == Relationship.LESS_THAN)
+1:                         return Relationship.DISJOINT;
+1:                     // relationship == Relationship.GREATER_THAN
+1:                     if (relationship == Relationship.EQUAL)
+1:                         relationship = Relationship.LESS_THAN;
+1:                     else if (relationship == Relationship.GREATER_THAN)
+1:                         return Relationship.DISJOINT;
+1:                     // relationship == Relationship.LESS_THAN
+/////////////////////////////////////////////////////////////////////////
+1:                 if (relationship == Relationship.EQUAL)
+1:                     relationship = Relationship.LESS_THAN;
+1:                 else if (relationship == Relationship.GREATER_THAN)
+1:                     return Relationship.DISJOINT;
+1:                 // relationship == Relationship.LESS_THAN
+1:                 if (relationship == Relationship.EQUAL)
+1:                     relationship = Relationship.GREATER_THAN;
+1:                 else if (relationship == Relationship.LESS_THAN)
+1:                     return Relationship.DISJOINT;
+1:                 // relationship == Relationship.GREATER_THAN
+1:             if (relationship == Relationship.EQUAL)
+1:                 return Relationship.GREATER_THAN;
+1:             else if (relationship == Relationship.LESS_THAN)
+1:                 return Relationship.DISJOINT;
+1: 
+1:         if (rightState.hasRemaining())
+1:             if (relationship == Relationship.EQUAL)
+1:                 return Relationship.LESS_THAN;
+1:             else if (relationship == Relationship.GREATER_THAN)
+1:                 return Relationship.DISJOINT;
+/////////////////////////////////////////////////////////////////////////
+1:             total += context.getLong(offset + CounterId.LENGTH + CLOCK_LENGTH);
+/////////////////////////////////////////////////////////////////////////
+1:      * Returns the clock and the count associated with the local counter id, or (0, 0) if no such shard is present.
+1:     public ClockAndCount getLocalClockAndCount(ByteBuffer context)
+1:         return getClockAndCountOf(context, CounterId.getLocalId());
+1:     }
+1: 
+1:     /**
+1:      * Returns the clock and the count associated with the given counter id, or (0, 0) if no such shard is present.
+1:      */
+1:     @VisibleForTesting
+1:     public ClockAndCount getClockAndCountOf(ByteBuffer context, CounterId id)
+1:     {
+1:         int position = findPositionOf(context, id);
+1:         if (position == -1)
+1:             return ClockAndCount.BLANK;
+1: 
+1:         long clock = context.getLong(position + CounterId.LENGTH);
+1:         long count = context.getLong(position + CounterId.LENGTH + CLOCK_LENGTH);
+1:         return ClockAndCount.create(clock, count);
+1:     }
+1: 
+1:     /**
+1:      * Finds the position of a shard with the given id within the context (via binary search).
+1:      */
+1:     @VisibleForTesting
+1:     public int findPositionOf(ByteBuffer context, CounterId id)
+1:     {
+0:         int headerLength = headerLength(context);
+1:         int offset = context.position() + headerLength;
+1: 
+1:         int left = 0;
+1:         int right = (context.remaining() - headerLength) / STEP_LENGTH - 1;
+1: 
+1:         while (right >= left)
+1:             int middle = (left + right) / 2;
+1:             int cmp = compareId(context, offset + middle * STEP_LENGTH, id.bytes(), id.bytes().position());
+1: 
+1:             if (cmp == -1)
+1:                 left = middle + 1;
+1:             else if (cmp == 0)
+1:                 return offset + middle * STEP_LENGTH;
+1:             else
+1:                 right = middle - 1;
+1: 
+1:         return -1; // position not found
+/////////////////////////////////////////////////////////////////////////
+1:             other.writeElement(getCounterId(), getClock(), getCount(), currentIsGlobal, currentIsLocal);
+/////////////////////////////////////////////////////////////////////////
+1:         // In 2.1 only used by the unit tests.
+1:         // In 2.1 only used by the unit tests.
+commit:83cd80b
+/////////////////////////////////////////////////////////////////////////
+1: import com.google.common.annotations.VisibleForTesting;
+0: import org.apache.cassandra.serializers.MarshalException;
+1:  * shards, with some shards flagged as global or local (with
+1:  *   a) a header containing the lists of global and local shard indexes in the body
+1:  *   b) a list of shards -- (counter id, logical clock, count) tuples -- (the so-called 'body' below)
+/////////////////////////////////////////////////////////////////////////
+1:  * Non-negative indices refer to local shards. Global shard indices are encoded as [idx + Short.MIN_VALUE],
+1:  * and are thus always negative.
+1:  *
+/////////////////////////////////////////////////////////////////////////
+1:  * The rules when merging two shard with the same counter id are:
+1:  *   - global + global = keep the shard with the highest logical clock
+1:  *   - global + local  = keep the global one
+1:  *   - global + remote = keep the global one
+1:  *   - local  + local  = sum counts (and logical clocks)
+1:  *   - local  + remote = keep the local one
+1:  *   - remote + remote = keep the shard with the highest logical clock
+1:  * For a detailed description of the meaning of a local and why the merging
+1:  * attachment (doesn't cover global shards, see CASSANDRA-4775 for that).
+/////////////////////////////////////////////////////////////////////////
+1:      * Creates a counter context with a single local shard.
+0:     public ByteBuffer createLocal(long count, Allocator allocator)
+0:         ContextState state = ContextState.allocate(0, 1, 0, allocator);
+1:         state.writeLocal(CounterId.getLocalId(), 1L, count);
+1:         return state.context;
+1:     /**
+1:      * Creates a counter context with a single remote shard.
+1:      */
+0:     public ByteBuffer createRemote(CounterId id, long clock, long count, Allocator allocator)
+0:         ContextState state = ContextState.allocate(0, 0, 1, allocator);
+1:         state.writeRemote(id, clock, count);
+1:         return state.context;
+/////////////////////////////////////////////////////////////////////////
+1:         ContextState leftState = ContextState.wrap(left);
+1:         ContextState rightState = ContextState.wrap(right);
+/////////////////////////////////////////////////////////////////////////
+1:         int globalCount = 0;
+1:         int localCount = 0;
+1:         int remoteCount = 0;
+1:         ContextState leftState = ContextState.wrap(left);
+1:         ContextState rightState = ContextState.wrap(right);
+1:                 if (leftState.isGlobal() || rightState.isGlobal())
+1:                     globalCount += 1;
+1:                 else if (leftState.isLocal() || rightState.isLocal())
+1:                     localCount += 1;
+1:                 else
+1:                     remoteCount += 1;
+1: 
+1:                 if (rightState.isGlobal())
+1:                     globalCount += 1;
+1:                 else if (rightState.isLocal())
+1:                     localCount += 1;
+1:                 else
+1:                     remoteCount += 1;
+1: 
+1:                 if (leftState.isGlobal())
+1:                     globalCount += 1;
+1:                 else if (leftState.isLocal())
+1:                     localCount += 1;
+1:                 else
+1:                     remoteCount += 1;
+1: 
+1:         while (leftState.hasRemaining())
+1:         {
+1:             if (leftState.isGlobal())
+1:                 globalCount += 1;
+1:             else if (leftState.isLocal())
+1:                 localCount += 1;
+1:             else
+1:                 remoteCount += 1;
+1: 
+1:             leftState.moveToNext();
+1:         }
+1: 
+1:         while (rightState.hasRemaining())
+1:         {
+1:             if (rightState.isGlobal())
+1:                 globalCount += 1;
+1:             else if (rightState.isLocal())
+1:                 localCount += 1;
+1:             else
+1:                 remoteCount += 1;
+1: 
+1:             rightState.moveToNext();
+1:         }
+1: 
+1: 
+0:         return merge(ContextState.allocate(globalCount, localCount, remoteCount, allocator), leftState, rightState);
+1:     }
+1: 
+1:     private ByteBuffer merge(ContextState mergedState, ContextState leftState, ContextState rightState)
+1:     {
+0:                 mergeTie(mergedState, leftState, rightState);
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: 
+1:         return mergedState.context;
+1:     }
+1: 
+0:     private void mergeTie(ContextState mergedState, ContextState leftState, ContextState rightState)
+1:     {
+1:         if (leftState.isGlobal() || rightState.isGlobal())
+1:         {
+1:             if (leftState.isGlobal() && rightState.isGlobal())
+1:             {
+0:                 long leftClock = leftState.getClock();
+1:                 long rightClock = rightState.getClock();
+1: 
+1:                 if (leftClock == rightClock)
+1:                 {
+0:                     long leftCount = leftState.getCount();
+0:                     long rightCount = rightState.getCount();
+1: 
+1:                     // Can happen if an sstable gets lost and disk failure policy is set to 'best effort'
+1:                     if (leftCount != rightCount && CompactionManager.isCompactionManager.get())
+1:                     {
+1:                         logger.warn("invalid global counter shard detected; ({}, {}, {}) and ({}, {}, {}) differ only in "
+1:                                     + "count; will pick highest to self-heal on compaction",
+0:                                     leftState.getCounterId(), leftClock, leftCount,
+1:                                     rightState.getCounterId(), rightClock, rightCount);
+1:                     }
+1: 
+0:                     if (leftCount > rightCount)
+0:                         leftState.copyTo(mergedState);
+0:                     else
+0:                         rightState.copyTo(mergedState);
+1:                 }
+0:                 else
+1:                 {
+0:                     (leftClock > rightClock ? leftState : rightState).copyTo(mergedState);
+1:                 }
+1:             }
+1:             else // only one is global - keep that one
+1:             {
+0:                 (leftState.isGlobal() ? leftState : rightState).copyTo(mergedState);
+1:             }
+1:         }
+0:         else if (leftState.isLocal() || rightState.isLocal())
+1:         {
+1:             // Local id and at least one is a local shard.
+1:             if (leftState.isLocal() && rightState.isLocal())
+1:             {
+0:                 // both local - sum
+0:                 long clock = leftState.getClock() + rightState.getClock();
+0:                 long count = leftState.getCount() + rightState.getCount();
+0:                 mergedState.writeLocal(leftState.getCounterId(), clock, count);
+1:             }
+1:             else // only one is local - keep that one
+1:             {
+0:                 (leftState.isLocal() ? leftState : rightState).copyTo(mergedState);
+1:             }
+1:         }
+0:         else // both are remote shards
+1:         {
+0:             long leftClock = leftState.getClock();
+1:             long rightClock = rightState.getClock();
+1: 
+1:             if (leftClock == rightClock)
+1:             {
+0:                 // We should never see non-local shards w/ same id+clock but different counts. However, if we do
+0:                 // we should "heal" the problem by being deterministic in our selection of shard - and
+0:                 // log the occurrence so that the operator will know something is wrong.
+0:                 long leftCount = leftState.getCount();
+0:                 long rightCount = rightState.getCount();
+1: 
+1:                 if (leftCount != rightCount && CompactionManager.isCompactionManager.get())
+1:                 {
+0:                     logger.warn("invalid remote counter shard detected; ({}, {}, {}) and ({}, {}, {}) differ only in "
+1:                                 + "count; will pick highest to self-heal on compaction",
+0:                                 leftState.getCounterId(), leftClock, leftCount,
+1:                                 rightState.getCounterId(), rightClock, rightCount);
+1:                 }
+1: 
+0:                 if (leftCount > rightCount)
+0:                     leftState.copyTo(mergedState);
+0:                 else
+0:                     rightState.copyTo(mergedState);
+1:             }
+0:             else
+1:             {
+0:                 if ((leftClock >= 0 && rightClock > 0 && leftClock >= rightClock)
+0:                         || (leftClock < 0 && (rightClock > 0 || leftClock < rightClock)))
+0:                     leftState.copyTo(mergedState);
+0:                 else
+0:                     rightState.copyTo(mergedState);
+1:             }
+1:         }
+/////////////////////////////////////////////////////////////////////////
+1:         ContextState state = ContextState.wrap(context);
+1:             if (state.getElementIndex() > 0)
+1:             sb.append(state.getClock()).append(", ");
+1:             if (state.isGlobal())
+1:                 sb.append("$");
+1:             else if (state.isLocal())
+/////////////////////////////////////////////////////////////////////////
+1:     public boolean shouldClearLocal(ByteBuffer context)
+1:     {
+1:         // #elt being negative means we have to clean local shards.
+1:         return context.getShort(context.position()) < 0;
+1:     }
+1: 
+1:      * Mark context to delete local references afterward.
+1:      * and #elt count in order to clear all local refs later.
+1:      * @return context that marked to delete local refs
+1:     public ByteBuffer markLocalToBeCleared(ByteBuffer context)
+1:         if (count <= 0)
+1:             return context; // already marked or all are remote.
+1: 
+1:         boolean hasLocalShards = false;
+1:         for (int i = 0; i < count; i++)
+1:         {
+1:             if (context.getShort(context.position() + HEADER_SIZE_LENGTH + i * HEADER_ELT_LENGTH) >= 0)
+1:             {
+1:                 hasLocalShards = true;
+1:                 break;
+1:             }
+1:         }
+1: 
+1:         if (!hasLocalShards)
+1:             return context; // all shards are global or remote.
+1: 
+1:         ByteBuffer marked = ByteBuffer.allocate(context.remaining());
+0:         marked.putShort(marked.position(), (short) (count * -1));
+1:         ByteBufferUtil.arrayCopy(context,
+1:                                  context.position() + HEADER_SIZE_LENGTH,
+1:                                  marked,
+1:                                  marked.position() + HEADER_SIZE_LENGTH,
+1:                                  context.remaining() - HEADER_SIZE_LENGTH);
+1:      * Remove all the local of a context (but keep global).
+1:      * @return a version of {@code context} where no shards are local.
+1:     public ByteBuffer clearAllLocal(ByteBuffer context)
+1:         int count = Math.abs(context.getShort(context.position()));
+1:         if (count == 0)
+1:             return context; // no local or global shards present.
+1:         List<Short> globalShardIndexes = new ArrayList<>(count);
+1:         for (int i = 0; i < count; i++)
+1:         {
+1:             short elt = context.getShort(context.position() + HEADER_SIZE_LENGTH + i * HEADER_ELT_LENGTH);
+1:             if (elt < 0)
+1:                 globalShardIndexes.add(elt);
+1:         }
+1: 
+1:         if (count == globalShardIndexes.size())
+1:             return context; // no local shards detected.
+1: 
+1:         // allocate a smaller BB for the cleared context - with no local header elts.
+1:         ByteBuffer cleared = ByteBuffer.allocate(context.remaining() - (count - globalShardIndexes.size()) * HEADER_ELT_LENGTH);
+1: 
+1:         cleared.putShort(cleared.position(), (short) globalShardIndexes.size());
+1:         for (int i = 0; i < globalShardIndexes.size(); i++)
+1:             cleared.putShort(cleared.position() + HEADER_SIZE_LENGTH + i * HEADER_ELT_LENGTH, globalShardIndexes.get(i));
+1: 
+1:         int origHeaderLength = headerLength(context);
+1:         ByteBufferUtil.arrayCopy(context,
+1:                                  context.position() + origHeaderLength,
+1:                                  cleared,
+1:                                  cleared.position() + headerLength(cleared),
+1:                                  context.remaining() - origHeaderLength);
+1: 
+1:         return cleared;
+/////////////////////////////////////////////////////////////////////////
+1:      * has local meaning only, while digests are meant for comparison across
+1:      *  updateDigest(ctx) == updateDigest(clearAllLocal(ctx))
+1:         dup.position(context.position() + headerLength(context));
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         private int headerOffset;        // offset from context.position()
+1:         private int bodyOffset;          // offset from context.position()
+1:         private boolean currentIsGlobal;
+1:         private boolean currentIsLocal;
+1:         private ContextState(ByteBuffer context)
+1:             this.headerLength = this.bodyOffset = headerLength(context);
+1:             this.headerOffset = HEADER_SIZE_LENGTH;
+1:             updateIsGlobalOrLocal();
+1:         public static ContextState wrap(ByteBuffer context)
+1:             return new ContextState(context);
+1:         /**
+1:          * Allocate a new context big enough for globalCount + localCount + remoteCount elements
+1:          * and return the initial corresponding ContextState.
+1:          */
+0:         public static ContextState allocate(int globalCount, int localCount, int remoteCount, Allocator allocator)
+1:             int headerLength = HEADER_SIZE_LENGTH + (globalCount + localCount) * HEADER_ELT_LENGTH;
+1:             int bodyLength = (globalCount + localCount + remoteCount) * STEP_LENGTH;
+1: 
+0:             ByteBuffer buffer = allocator.allocate(headerLength + bodyLength);
+1:             buffer.putShort(buffer.position(), (short) (globalCount + localCount));
+1: 
+1:             return ContextState.wrap(buffer);
+1:         }
+1: 
+1:         public boolean isGlobal()
+1:         {
+1:             return currentIsGlobal;
+1:         }
+1: 
+1:         public boolean isLocal()
+1:         {
+1:             return currentIsLocal;
+1:         }
+1: 
+1:         public boolean isRemote()
+1:         {
+1:             return !(currentIsGlobal || currentIsLocal);
+1:         }
+1: 
+1:         private void updateIsGlobalOrLocal()
+1:         {
+1:             if (headerOffset >= headerLength)
+1:             {
+1:                 currentIsGlobal = currentIsLocal = false;
+1:             }
+0:             else
+1:             {
+1:                 short headerElt = context.getShort(context.position() + headerOffset);
+1:                 currentIsGlobal = headerElt == getElementIndex() + Short.MIN_VALUE;
+1:                 currentIsLocal = headerElt == getElementIndex();
+1:             }
+/////////////////////////////////////////////////////////////////////////
+1:             if (currentIsGlobal || currentIsLocal)
+1:             updateIsGlobalOrLocal();
+0:             ByteBufferUtil.arrayCopy(context,
+0:                                      context.position() + bodyOffset,
+0:                                      other.context,
+0:                                      other.context.position() + other.bodyOffset,
+0:                                      STEP_LENGTH);
+1: 
+0:             if (currentIsGlobal)
+0:                 other.context.putShort(other.context.position() + other.headerOffset, (short) (other.getElementIndex() + Short.MIN_VALUE));
+0:             else if (currentIsLocal)
+0:                 context.putShort(other.context.position() + other.headerOffset, (short) other.getElementIndex());
+1: 
+0:             other.currentIsGlobal = currentIsGlobal;
+0:             other.currentIsLocal = currentIsLocal;
+/////////////////////////////////////////////////////////////////////////
+1:             updateIsGlobalOrLocal();
+1:         }
+1: 
+1:         public int getElementIndex()
+1:         {
+1:             return (bodyOffset - headerLength) / STEP_LENGTH;
+/////////////////////////////////////////////////////////////////////////
+0:         // In 2.0 only used by the unit tests.
+1:         public void writeGlobal(CounterId id, long clock, long count)
+1:         {
+1:             writeElement(id, clock, count, true, false);
+1:         }
+1: 
+1:         public void writeLocal(CounterId id, long clock, long count)
+1:         {
+1:             writeElement(id, clock, count, false, true);
+1:         }
+1: 
+1:         public void writeRemote(CounterId id, long clock, long count)
+1:         {
+1:             writeElement(id, clock, count, false, false);
+1:         }
+1: 
+1:         private void writeElement(CounterId id, long clock, long count, boolean isGlobal, boolean isLocal)
+1: 
+1:             if (isGlobal)
+1:                 context.putShort(context.position() + headerOffset, (short) (getElementIndex() + Short.MIN_VALUE));
+1:             else if (isLocal)
+1:                 context.putShort(context.position() + headerOffset, (short) getElementIndex());
+1: 
+1:             currentIsGlobal = isGlobal;
+1:             currentIsLocal = isLocal;
+0:         // write a tuple (counter id, clock, count) at an absolute (bytebuffer-wise) offset
+1:         private void writeElementAtOffset(ByteBuffer ctx, int offset, CounterId id, long clock, long count)
+1:             ctx = ctx.duplicate();
+1:             ctx.position(offset);
+1:             ctx.put(id.bytes().duplicate());
+1:             ctx.putLong(clock);
+1:             ctx.putLong(count);
+commit:00a6839
+commit:eb57745
+/////////////////////////////////////////////////////////////////////////
+0:         if (headerLength == HEADER_SIZE_LENGTH)
+/////////////////////////////////////////////////////////////////////////
+0:         if (headerLength == HEADER_SIZE_LENGTH)
+/////////////////////////////////////////////////////////////////////////
+1:         if ((context.remaining() - headerLength(context)) % STEP_LENGTH != 0)
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:4b54b8a
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.serializers.MarshalException;
+0: import org.apache.cassandra.utils.memory.AbstractAllocator;
+/////////////////////////////////////////////////////////////////////////
+0:     public ByteBuffer createGlobal(CounterId id, long clock, long count, AbstractAllocator allocator)
+/////////////////////////////////////////////////////////////////////////
+0:     public ByteBuffer createLocal(long count, AbstractAllocator allocator)
+/////////////////////////////////////////////////////////////////////////
+0:     public ByteBuffer createRemote(CounterId id, long clock, long count, AbstractAllocator allocator)
+/////////////////////////////////////////////////////////////////////////
+0:     public ByteBuffer merge(ByteBuffer left, ByteBuffer right, AbstractAllocator allocator)
+/////////////////////////////////////////////////////////////////////////
+0:         public static ContextState allocate(int globalCount, int localCount, int remoteCount, AbstractAllocator allocator)
+commit:66706d1
+commit:5b511b6
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.compaction.CompactionManager;
+/////////////////////////////////////////////////////////////////////////
+0:                         if (leftCount != rightCount && CompactionManager.isCompactionManager.get())
+0:                             logger.warn("invalid counter shard detected; ({}, {}, {}) and ({}, {}, {}) differ only in "
+0:                                         + "count; will pick highest to self-heal on compaction",
+0:                                         new Object[] { leftState.getNodeId(), leftClock, leftCount, rightState.getNodeId(), rightClock, rightCount, });
+commit:2ae5272
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.TypeSizes;
+/////////////////////////////////////////////////////////////////////////
+0:     private static final int HEADER_SIZE_LENGTH = TypeSizes.NATIVE.sizeof(Short.MAX_VALUE);
+0:     private static final int HEADER_ELT_LENGTH = TypeSizes.NATIVE.sizeof(Short.MAX_VALUE);
+0:     private static final int CLOCK_LENGTH = TypeSizes.NATIVE.sizeof(Long.MAX_VALUE);
+0:     private static final int COUNT_LENGTH = TypeSizes.NATIVE.sizeof(Long.MAX_VALUE);
+commit:3f4ca5b
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.ArrayList;
+0: import java.util.Iterator;
+1: import java.util.List;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+0: import org.apache.cassandra.db.marshal.MarshalException;
+0: import org.apache.cassandra.utils.HeapAllocator;
+/////////////////////////////////////////////////////////////////////////
+1:     private static final Logger logger = LoggerFactory.getLogger(CounterContext.class);
+commit:5001907
+/////////////////////////////////////////////////////////////////////////
+1:      * @return the aggregated count represented by {@code context}
+commit:b95a49c
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.utils.Allocator;
+0: import org.apache.cassandra.utils.HeapAllocator;
+/////////////////////////////////////////////////////////////////////////
+0:      * Creates an initial counter context with an initial value for the local node.
+1:      *
+0:      * @param allocator
+0:     public ByteBuffer create(long value, Allocator allocator)
+0:         ByteBuffer context = allocator.allocate(HEADER_SIZE_LENGTH + HEADER_ELT_LENGTH + STEP_LENGTH);
+0:         context.putShort(context.position(), (short)1);
+0:         context.putShort(context.position() + HEADER_SIZE_LENGTH, (short)0);
+0:         writeElementAtOffset(context, context.position() + HEADER_SIZE_LENGTH + HEADER_ELT_LENGTH, NodeId.getLocalId(), 1L, value);
+/////////////////////////////////////////////////////////////////////////
+0:         context.putShort(context.position(), (short)(isDelta ? 1 : 0));
+0:             context.putShort(context.position() + HEADER_SIZE_LENGTH, (short)0);
+0:         writeElementAtOffset(context, context.position() + HEADER_SIZE_LENGTH + (isDelta ? HEADER_ELT_LENGTH : 0), id, clock, value);
+0:     // write a tuple (node id, clock, count) at an absolute (bytebuffer-wise) offset
+0:         context = context.duplicate();
+0:         context.position(offset);
+0:         context.put(id.bytes().duplicate());
+0:         context.putLong(clock);
+0:         context.putLong(count);
+/////////////////////////////////////////////////////////////////////////
+0:      * @param allocator An allocator for the merged value.
+0:     public ByteBuffer merge(ByteBuffer left, ByteBuffer right, Allocator allocator)
+/////////////////////////////////////////////////////////////////////////
+0:         ByteBuffer merged = allocator.allocate(mergedHeaderLength + mergedBodyLength);
+/////////////////////////////////////////////////////////////////////////
+0:                     ContextState merger = ContextState.allocate(2, nbDelta, HeapAllocator.instance);
+/////////////////////////////////////////////////////////////////////////
+0:         return toAddBack == 0 ? cleanedContext : merge(cleanedContext, create(toAddBack, HeapAllocator.instance), HeapAllocator.instance);
+/////////////////////////////////////////////////////////////////////////
+0:             return allocate(elementCount, deltaCount, HeapAllocator.instance);
+1:         }
+1: 
+0:         public static ContextState allocate(int elementCount, int deltaCount, Allocator allocator)
+1:         {
+0:             ByteBuffer context = allocator.allocate(hlength + elementCount * STEP_LENGTH);
+0:             context.putShort(context.position(), (short)deltaCount);
+commit:51481b6
+/////////////////////////////////////////////////////////////////////////
+0:     private static final int HEADER_SIZE_LENGTH = DBConstants.shortSize;
+0:     private static final int HEADER_ELT_LENGTH = DBConstants.shortSize;
+0:     private static final int CLOCK_LENGTH = DBConstants.longSize;
+0:     private static final int COUNT_LENGTH = DBConstants.longSize;
+commit:6a0df02
+/////////////////////////////////////////////////////////////////////////
+commit:f3630a6
+/////////////////////////////////////////////////////////////////////////
+1: import java.nio.ByteBuffer;
+0: import org.apache.cassandra.utils.ByteBufferUtil;
+/////////////////////////////////////////////////////////////////////////
+0:     private static final ByteBuffer wrappedLocalId;
+/////////////////////////////////////////////////////////////////////////
+0:         wrappedLocalId = ByteBuffer.wrap(localId);
+/////////////////////////////////////////////////////////////////////////
+0:      * Creates an initial counter context with an initial value for the local node with.
+1:      *
+0:      * @param value the value for this initial update
+0:     public ByteBuffer create(long value)
+0:         ByteBuffer context = ByteBuffer.allocate(stepLength);
+0:         writeElementAtOffset(context, 0, localId, 1L, value);
+0:         return context;
+0:     // For testing purposes
+0:     public ByteBuffer create(byte[] id, long clock, long value)
+0:         ByteBuffer context = ByteBuffer.allocate(stepLength);
+0:         writeElementAtOffset(context, 0, id, clock, value);
+0:         return context;
+0:     // write a tuple (node id, clock, count) at offset
+0:     protected static void writeElementAtOffset(ByteBuffer context, int offset, byte[] id, long clock, long count)
+0:         System.arraycopy(id, 0, context.array(), offset + context.arrayOffset(), idLength);
+0:         context.putLong(offset + idLength, clock);
+0:         context.putLong(offset + idLength + clockLength, count);
+/////////////////////////////////////////////////////////////////////////
+0:     public ContextRelationship diff(ByteBuffer left, ByteBuffer right)
+0:         int leftIndex  = left.position();
+0:         int rightIndex = right.position();
+0:         while (leftIndex < left.remaining() && rightIndex < right.remaining())
+0:             int compareId = ByteBufferUtil.compareSubArrays(left, leftIndex, right, rightIndex, idLength);
+0:                 long leftClock  = left.getLong(leftIndex + idLength);
+0:                 long rightClock = right.getLong(rightIndex + idLength);
+/////////////////////////////////////////////////////////////////////////
+0:         if (leftIndex < left.remaining())
+/////////////////////////////////////////////////////////////////////////
+0:         else if (rightIndex < right.remaining())
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     public ByteBuffer merge(ByteBuffer left, ByteBuffer right)
+0:         int leftOffset  = left.position();
+0:         int rightOffset = right.position();
+0:         while ((leftOffset < left.limit()) && (rightOffset < right.limit()))
+0:             int cmp = ByteBufferUtil.compareSubArrays(left, leftOffset, right, rightOffset, idLength);
+/////////////////////////////////////////////////////////////////////////
+0:         size += (left.limit() - leftOffset)  / stepLength;
+0:         size += (right.limit() - rightOffset) / stepLength;
+0:         ByteBuffer merged = ByteBuffer.allocate(size * stepLength);
+0:         int mergedOffset = merged.position();
+0:         leftOffset = left.position();
+0:         rightOffset = right.position();
+0:         while ((leftOffset < left.limit()) && (rightOffset < right.limit()))
+0:             int cmp = ByteBufferUtil.compareSubArrays(left, leftOffset, right, rightOffset, idLength);
+0:                 long leftClock = left.getLong(leftOffset + idLength);
+0:                 long rightClock = right.getLong(rightOffset + idLength);
+0:                 if (ByteBufferUtil.compareSubArrays(left, leftOffset, wrappedLocalId, 0, idLength) == 0)
+0:                     long leftCount = left.getLong(leftOffset + idLength + clockLength);
+0:                     long rightCount = right.getLong(rightOffset + idLength + clockLength);
+0:                     writeElementAtOffset(merged, mergedOffset, localId, leftClock + rightClock, leftCount + rightCount);
+0:                         ByteBufferUtil.arrayCopy(left, leftOffset, merged, mergedOffset, stepLength);
+0:                         ByteBufferUtil.arrayCopy(right, rightOffset, merged, mergedOffset, stepLength);
+/////////////////////////////////////////////////////////////////////////
+0:                 ByteBufferUtil.arrayCopy(right, rightOffset, merged, mergedOffset, stepLength);
+0:                 ByteBufferUtil.arrayCopy(left, leftOffset, merged, mergedOffset, stepLength);
+0:         if (leftOffset < left.limit())
+0:             ByteBufferUtil.arrayCopy(
+0:                 left.limit() - leftOffset);
+0:         if (rightOffset < right.limit())
+0:             ByteBufferUtil.arrayCopy(
+0:                 right.limit() - rightOffset);
+/////////////////////////////////////////////////////////////////////////
+1:     public String toString(ByteBuffer context)
+0:         for (int offset = context.position(); offset < context.limit(); offset += stepLength)
+0:             if (offset > context.position())
+0:                 int absOffset = context.arrayOffset() + offset;
+0:                             ArrayUtils.subarray(context.array(), absOffset, absOffset + idLength));
+/////////////////////////////////////////////////////////////////////////
+0:             sb.append(context.getLong(offset + idLength));
+0:             sb.append(context.getLong(offset + idLength + clockLength));
+/////////////////////////////////////////////////////////////////////////
+1:     public long total(ByteBuffer context)
+0:         for (int offset = context.position(); offset < context.limit(); offset += stepLength)
+0:             long count = context.getLong(offset + idLength + clockLength);
+1:         return total;
+0:     public ByteBuffer cleanNodeCounts(ByteBuffer context, InetAddress node)
+0:         ByteBuffer nodeId = ByteBuffer.wrap(node.getAddress());
+0:         for (int offset = 0; offset < context.remaining(); offset += stepLength)
+0:             int cmp = ByteBufferUtil.compareSubArrays(context, context.position() + offset, nodeId, 0, idLength);
+0:                 ByteBuffer truncatedContext = ByteBuffer.allocate(context.remaining() - stepLength);
+0:                 ByteBufferUtil.arrayCopy(context, context.position(), truncatedContext, 0, offset);
+0:                 ByteBufferUtil.arrayCopy(
+0:                         context.position() + offset + stepLength,
+0:                         context.remaining() - (offset + stepLength));
+commit:9ef94eb
+/////////////////////////////////////////////////////////////////////////
+0:     private static final byte[] localId;
+/////////////////////////////////////////////////////////////////////////
+0:         localId  = FBUtilities.getLocalAddress().getAddress();
+0:         idLength   = localId.length;
+/////////////////////////////////////////////////////////////////////////
+0:     public byte[] insertElementAtStepOffset(byte[] context, int stepOffset, byte[] id, long clock, long count)
+1:     {
+0:         int offset = stepOffset * stepLength;
+0:         byte[] newContext = new byte[context.length + stepLength];
+0:         System.arraycopy(context, 0, newContext, 0, offset);
+0:         writeElementAtStepOffset(newContext, stepOffset, id, clock, count);
+0:         System.arraycopy(context, offset, newContext, offset + stepLength, context.length - offset);
+0:         return newContext;
+1:     }
+1: 
+0:         int idCount = context.length / stepLength;
+0:         for (int stepOffset = 0; stepOffset < idCount; ++stepOffset)
+0:             int offset = stepOffset * stepLength;
+0:             int cmp = FBUtilities.compareByteSubArrays(nodeId, 0, context, offset, idLength);
+1:             if (cmp == 0)
+0:                 // node id found: increment clock, update count; shift to front
+0:                 long clock = FBUtilities.byteArrayToLong(context, offset + idLength);
+0:                 long count = FBUtilities.byteArrayToLong(context, offset + idLength + clockLength);
+1: 
+0:                 writeElementAtStepOffset(context, stepOffset, nodeId, clock + 1L, count + delta);
+0:                 return context;
+1:             }
+0:             if (cmp < 0)
+1:             {
+0:                 // id at offset is greater that the one we are updating, inserting
+0:                 return insertElementAtStepOffset(context, stepOffset, nodeId, 1L, delta);
+0:         // node id not found: adding at the end
+0:         return insertElementAtStepOffset(context, idCount, nodeId, 1L, delta);
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         if (left.length > right.length)
+0:             byte[] tmp = right;
+0:             right = left;
+0:             left = tmp;
+0:         // Compute size of result
+0:         int size = 0;
+0:         int leftOffset  = 0;
+0:         int rightOffset = 0;
+0:         while ((leftOffset < left.length) && (rightOffset < right.length))
+0:             int cmp = FBUtilities.compareByteSubArrays(left, leftOffset, right, rightOffset, idLength);
+1:             if (cmp == 0)
+0:                 ++size;
+0:                 rightOffset += stepLength;
+0:                 leftOffset += stepLength;
+1:             else if (cmp > 0)
+0:                 ++size;
+0:                 rightOffset += stepLength;
+1:             else // cmp < 0
+0:                 ++size;
+0:                 leftOffset += stepLength;
+0:         size += (left.length  - leftOffset)  / stepLength;
+0:         size += (right.length - rightOffset) / stepLength;
+0:         byte[] merged = new byte[size * stepLength];
+1: 
+0:         // Do the actual merge:
+0:         //   a) local id:  sum clocks, counts
+0:         //   b) remote id: keep highest clock, count (reconcile)
+0:         int mergedOffset = 0; leftOffset = 0; rightOffset = 0;
+0:         while ((leftOffset < left.length) && (rightOffset < right.length))
+1:         {
+0:             int cmp = FBUtilities.compareByteSubArrays(left, leftOffset, right, rightOffset, idLength);
+1:             if (cmp == 0)
+0:                 // sum for local id, keep highest othewise
+0:                 long leftClock = FBUtilities.byteArrayToLong(left, leftOffset + idLength);
+0:                 long rightClock = FBUtilities.byteArrayToLong(right, rightOffset + idLength);
+0:                 if (FBUtilities.compareByteSubArrays(left, leftOffset, localId, 0, idLength) == 0)
+0:                     long leftCount = FBUtilities.byteArrayToLong(left, leftOffset + idLength + clockLength);
+0:                     long rightCount = FBUtilities.byteArrayToLong(right, rightOffset + idLength + clockLength);
+0:                     writeElementAtStepOffset(merged, mergedOffset / stepLength, localId, leftClock + rightClock, leftCount + rightCount);
+0:                 else
+1:                 {
+0:                     if (leftClock >= rightClock)
+0:                         System.arraycopy(left, leftOffset, merged, mergedOffset, stepLength);
+0:                     else
+0:                         System.arraycopy(right, rightOffset, merged, mergedOffset, stepLength);
+1:                 }
+0:                 mergedOffset += stepLength;
+0:                 rightOffset += stepLength;
+0:                 leftOffset += stepLength;
+1:             }
+1:             else if (cmp > 0)
+1:             {
+0:                 System.arraycopy(right, rightOffset, merged, mergedOffset, stepLength);
+0:                 mergedOffset += stepLength;
+0:                 rightOffset += stepLength;
+1:             }
+1:             else // cmp < 0
+1:             {
+0:                 System.arraycopy(left, leftOffset, merged, mergedOffset, stepLength);
+0:                 mergedOffset += stepLength;
+0:                 leftOffset += stepLength;
+1:             }
+0:         if (leftOffset < left.length)
+0:             System.arraycopy(
+0:                 left,
+0:                 leftOffset,
+0:                 merged,
+0:                 mergedOffset,
+0:                 left.length - leftOffset);
+0:         if (rightOffset < right.length)
+0:             System.arraycopy(
+0:                 right,
+0:                 rightOffset,
+0:                 merged,
+0:                 mergedOffset,
+0:                 right.length - rightOffset);
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:             int cmp = FBUtilities.compareByteSubArrays(context, offset, nodeId, 0, idLength);
+0:             if (cmp < 0)
+0:             else if (cmp == 0)
+0:             {
+0:                 // node id found: remove node count
+0:                 byte[] truncatedContext = new byte[context.length - stepLength];
+0:                 System.arraycopy(context, 0, truncatedContext, 0, offset);
+0:                 System.arraycopy(
+0:                         context,
+0:                         offset + stepLength,
+0:                         truncatedContext,
+0:                         offset,
+0:                         context.length - (offset + stepLength));
+0:                 return truncatedContext;
+0:             }
+0:             else // cmp > 0
+0:             {
+0:                 break; // node id not present
+0:             }
+commit:e98eb1c
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.*;
+1: 
+0: import org.apache.commons.lang.ArrayUtils;
+author:Vijay Parthasarathy
+-------------------------------------------------------------------------------
+commit:cb25a8f
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.DBTypeSizes;
+/////////////////////////////////////////////////////////////////////////
+0:     private static final int HEADER_SIZE_LENGTH = DBTypeSizes.NATIVE.sizeof(Short.MAX_VALUE);
+0:     private static final int HEADER_ELT_LENGTH = DBTypeSizes.NATIVE.sizeof(Short.MAX_VALUE);
+0:     private static final int CLOCK_LENGTH = DBTypeSizes.NATIVE.sizeof(Long.MAX_VALUE);
+0:     private static final int COUNT_LENGTH = DBTypeSizes.NATIVE.sizeof(Long.MAX_VALUE);
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:9b7421a
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:ab5a8c7
+/////////////////////////////////////////////////////////////////////////
+1: import java.security.MessageDigest;
+0: import java.util.*;
+0: import org.apache.cassandra.utils.NodeId;
+0:  * A context is primarily a list of tuples (node id, clock, count) -- called
+0:  * shard in the following. But with some shard are flagged as delta (with
+1:  * special resolution rules in merge()).
+1:  * The data structure has two parts:
+0:  *   a) a header containing the lists of "delta" (a list of references to the second parts)
+0:  *   b) a list of shard -- (node id, logical clock, count) tuples -- (the so-called 'body' below)
+1:  * The exact layout is:
+1:  *            | header  |   body   |
+1:  * context :  |--|------|----------|
+1:  *             ^     ^
+1:  *             |   list of indices in the body list (2*#elt bytes)
+1:  *    #elt in rest of header (2 bytes)
+1:  * The body layout being:
+1:  *
+1:  * body:     |----|----|----|----|----|----|....
+1:  *             ^    ^    ^     ^   ^    ^
+1:  *             |    |  count_1 |   |   count_2
+1:  *             |  clock_1      |  clock_2
+0:  *         nodeid_1          nodeid_2
+1:  *
+0:  * The rules when merging two shard with the same nodeid are:
+0:  *   - delta + delta = sum counts (and logical clock)
+0:  *   - delta + other = keep the delta one
+0:  *   - other + other = keep the shard with highest logical clock
+0:     private static final int HEADER_SIZE_LENGTH = DBConstants.shortSize_;
+0:     private static final int HEADER_ELT_LENGTH = DBConstants.shortSize_;
+0:     private static final int CLOCK_LENGTH = DBConstants.longSize_;
+0:     private static final int COUNT_LENGTH = DBConstants.longSize_;
+0:     private static final int STEP_LENGTH = NodeId.LENGTH + CLOCK_LENGTH + COUNT_LENGTH;
+1: 
+0:     // Time in ms since a node id has been renewed before we consider using it
+0:     // during a merge
+0:     private static final long MIN_MERGE_DELAY = 5 * 60 * 1000; // should be aplenty
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         ByteBuffer context = ByteBuffer.allocate(HEADER_SIZE_LENGTH + HEADER_ELT_LENGTH + STEP_LENGTH);
+0:         // The first (and only) elt is a delta
+0:         context.putShort(0, (short)1);
+0:         context.putShort(HEADER_SIZE_LENGTH, (short)0);
+0:         writeElementAtOffset(context, HEADER_SIZE_LENGTH + HEADER_ELT_LENGTH, NodeId.getLocalId(), 1L, value);
+0:     // Provided for use by unit tests
+0:     public ByteBuffer create(NodeId id, long clock, long value, boolean isDelta)
+0:         ByteBuffer context = ByteBuffer.allocate(HEADER_SIZE_LENGTH + (isDelta ? HEADER_ELT_LENGTH : 0) + STEP_LENGTH);
+0:         context.putShort(0, (short)(isDelta ? 1 : 0));
+0:         if (isDelta)
+0:         {
+0:             context.putShort(HEADER_SIZE_LENGTH, (short)0);
+0:         }
+0:         writeElementAtOffset(context, HEADER_SIZE_LENGTH + (isDelta ? HEADER_ELT_LENGTH : 0), id, clock, value);
+0:     private static void writeElementAtOffset(ByteBuffer context, int offset, NodeId id, long clock, long count)
+0:         ByteBufferUtil.arrayCopy(id.bytes(), id.bytes().position(), context, offset, NodeId.LENGTH);
+0:         context.putLong(offset + NodeId.LENGTH, clock);
+0:         context.putLong(offset + NodeId.LENGTH + CLOCK_LENGTH, count);
+0:     }
+0: 
+1:     private static int headerLength(ByteBuffer context)
+0:     {
+0:         return HEADER_SIZE_LENGTH + context.getShort(context.position()) * HEADER_ELT_LENGTH;
+0:     }
+0: 
+1:     private static int compareId(ByteBuffer bb1, int pos1, ByteBuffer bb2, int pos2)
+0:     {
+0:         return ByteBufferUtil.compareSubArrays(bb1, pos1, bb2, pos2, NodeId.LENGTH);
+/////////////////////////////////////////////////////////////////////////
+1:      * Strategy: compare node logical clocks (like a version vector).
+1:      * @param left counter context.
+1:      * @param right counter context.
+0:         ContextState leftState = new ContextState(left, headerLength(left));
+0:         ContextState rightState = new ContextState(right, headerLength(right));
+1:         while (leftState.hasRemaining() && rightState.hasRemaining())
+1:             int compareId = leftState.compareIdTo(rightState);
+1:                 long leftClock  = leftState.getClock();
+0:                 long rightClock = rightState.getClock();
+1:                 // advance
+1:                 leftState.moveToNext();
+1:                 rightState.moveToNext();
+1:                 else if ((leftClock >= 0 && rightClock > 0 && leftClock > rightClock)
+0:                       || (leftClock < 0 && (rightClock > 0 || leftClock < rightClock)))
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:                 rightState.moveToNext();
+/////////////////////////////////////////////////////////////////////////
+1:             else // compareId < 0
+1:                 leftState.moveToNext();
+/////////////////////////////////////////////////////////////////////////
+1:         if (leftState.hasRemaining())
+/////////////////////////////////////////////////////////////////////////
+0:         else if (rightState.hasRemaining())
+/////////////////////////////////////////////////////////////////////////
+1:      * @param left counter context.
+1:      * @param right counter context.
+0:         ContextState leftState = new ContextState(left, headerLength(left));
+0:         ContextState rightState = new ContextState(right, headerLength(right));
+0: 
+0:         int mergedHeaderLength = HEADER_SIZE_LENGTH;
+0:         int mergedBodyLength = 0;
+0: 
+1:         while (leftState.hasRemaining() && rightState.hasRemaining())
+1:             int cmp = leftState.compareIdTo(rightState);
+0:                 mergedBodyLength += STEP_LENGTH;
+0:                 if (leftState.isDelta() || rightState.isDelta())
+0:                     mergedHeaderLength += HEADER_ELT_LENGTH;
+1:                 leftState.moveToNext();
+1:                 rightState.moveToNext();
+0:                 mergedBodyLength += STEP_LENGTH;
+0:                 if (rightState.isDelta())
+0:                     mergedHeaderLength += HEADER_ELT_LENGTH;
+1:                 rightState.moveToNext();
+0:                 mergedBodyLength += STEP_LENGTH;
+0:                 if (leftState.isDelta())
+0:                     mergedHeaderLength += HEADER_ELT_LENGTH;
+1:                 leftState.moveToNext();
+0:         mergedHeaderLength += leftState.remainingHeaderLength() + rightState.remainingHeaderLength();
+0:         mergedBodyLength += leftState.remainingBodyLength() + rightState.remainingBodyLength();
+0:         // Do the actual merge
+0:         ByteBuffer merged = ByteBuffer.allocate(mergedHeaderLength + mergedBodyLength);
+0:         merged.putShort(merged.position(), (short) ((mergedHeaderLength - HEADER_SIZE_LENGTH) / HEADER_ELT_LENGTH));
+0:         ContextState mergedState = new ContextState(merged, mergedHeaderLength);
+1:         leftState.reset();
+1:         rightState.reset();
+1:         while (leftState.hasRemaining() && rightState.hasRemaining())
+1:             int cmp = leftState.compareIdTo(rightState);
+0:                 if (leftState.isDelta() || rightState.isDelta())
+0:                     // Local id and at least one is a delta
+0:                     if (leftState.isDelta() && rightState.isDelta())
+0:                     {
+0:                         // both delta, sum
+0:                         long clock = leftState.getClock() + rightState.getClock();
+0:                         long count = leftState.getCount() + rightState.getCount();
+0:                         mergedState.writeElement(leftState.getNodeId(), clock, count, true);
+0:                     }
+0:                     else
+0:                     {
+0:                         // Only one have delta, keep that one
+0:                         (leftState.isDelta() ? leftState : rightState).copyTo(mergedState);
+0:                     }
+0:                     long leftClock = leftState.getClock();
+0:                     long rightClock = rightState.getClock();
+0:                     if ((leftClock >= 0 && rightClock > 0 && leftClock >= rightClock)
+0:                      || (leftClock < 0 && (rightClock > 0 || leftClock < rightClock)))
+0:                         leftState.copyTo(mergedState);
+0:                         rightState.copyTo(mergedState);
+1:                 rightState.moveToNext();
+1:                 leftState.moveToNext();
+0:                 rightState.copyTo(mergedState);
+1:                 rightState.moveToNext();
+0:                 leftState.copyTo(mergedState);
+1:                 leftState.moveToNext();
+1:         while (leftState.hasRemaining())
+0:         {
+0:             leftState.copyTo(mergedState);
+1:             leftState.moveToNext();
+0:         }
+1:         while (rightState.hasRemaining())
+0:         {
+0:             rightState.copyTo(mergedState);
+1:             rightState.moveToNext();
+0:         }
+/////////////////////////////////////////////////////////////////////////
+1:      * @param context counter context.
+0:         ContextState state = new ContextState(context, headerLength(context));
+0: 
+0:         while (state.hasRemaining())
+0:             if (state.elementIdx() > 0)
+0:             sb.append(state.getNodeId().toString()).append(", ");
+0:             sb.append(state.getClock()).append(", ");;
+1:             sb.append(state.getCount());
+0:             if (state.isDelta())
+0:             {
+1:                 sb.append("*");
+0:             }
+0:             state.moveToNext();
+0: 
+1:     /**
+0:      * Returns the aggregated count across all node ids.
+1:      *
+1:      * @param context a counter context
+0:      * @terurn the aggregated count represented by {@code context}
+1:      */
+1:         // we could use a ContextState but it is easy enough that we avoid the object creation
+1:         for (int offset = context.position() + headerLength(context); offset < context.limit(); offset += STEP_LENGTH)
+0:             long count = context.getLong(offset + NodeId.LENGTH + CLOCK_LENGTH);
+1:     /**
+0:      * Remove all the delta of a context (i.e, set an empty header).
+1:      *
+1:      * @param context a counter context
+0:      * @return a version of {@code context} where no count are a delta.
+1:      */
+0:     public ByteBuffer clearAllDelta(ByteBuffer context)
+0:         int headerLength = headerLength(context);
+0:         if (headerLength == 0)
+0:             return context;
+0:         ByteBuffer cleaned = ByteBuffer.allocate(context.remaining() - headerLength + HEADER_SIZE_LENGTH);
+0:         cleaned.putShort(cleaned.position(), (short)0);
+0:         ByteBufferUtil.arrayCopy(
+0:                 context,
+0:                 context.position() + headerLength,
+0:                 cleaned,
+0:                 cleaned.position() + HEADER_SIZE_LENGTH,
+0:                 context.remaining() - headerLength);
+0:         return cleaned;
+0:     }
+0: 
+1:     /**
+1:      * Update a MessageDigest with the content of a context.
+1:      * Note that this skips the header entirely since the header information
+0:      * has local meaning only, while digests a meant for comparison across
+1:      * nodes. This means in particular that we always have:
+0:      *  updateDigest(ctx) == updateDigest(clearAllDelta(ctx))
+1:      */
+1:     public void updateDigest(MessageDigest message, ByteBuffer context)
+0:     {
+0:         int hlength = headerLength(context);
+1:         ByteBuffer dup = context.duplicate();
+0:         dup.position(context.position() + hlength);
+1:         message.update(dup);
+0:     }
+0: 
+1:     /**
+0:      * Checks whether the provided context has a count for the provided
+0:      * NodeId.
+1:      *
+0:      * TODO: since the context is sorted, we could implement a binary search.
+0:      * This is however not called in any critical path and contexts will be
+0:      * fairly small so it doesn't matter much.
+1:      */
+0:     public boolean hasNodeId(ByteBuffer context, NodeId id)
+0:     {
+1:         // we could use a ContextState but it is easy enough that we avoid the object creation
+1:         for (int offset = context.position() + headerLength(context); offset < context.limit(); offset += STEP_LENGTH)
+0:             if (id.equals(NodeId.wrap(context, offset)))
+0:                 return true;
+0:         return false;
+0:     }
+1:     /**
+0:      * Compute a new context such that if applied to context yields the same
+0:      * total but with the older local node id merged into the second to older one
+0:      * (excluding current local node id) if need be.
+1:      */
+0:     public ByteBuffer computeOldShardMerger(ByteBuffer context, List<NodeId.NodeIdRecord> oldIds)
+0:     {
+0:         long now = System.currentTimeMillis();
+0:         int hlength = headerLength(context);
+0: 
+0:         // Don't bother if we know we can't find what we are looking for
+0:         if (oldIds.size() < 2
+0:          || now - oldIds.get(0).timestamp < MIN_MERGE_DELAY
+0:          || now - oldIds.get(1).timestamp < MIN_MERGE_DELAY
+0:          || context.remaining() - hlength < 2 * STEP_LENGTH)
+0:             return null;
+0: 
+0:         Iterator<NodeId.NodeIdRecord> recordIterator = oldIds.iterator();
+0:         NodeId.NodeIdRecord currRecord = recordIterator.next();
+0: 
+0:         ContextState state = new ContextState(context, hlength);
+0:         ContextState foundState = null;
+0: 
+0:         while (state.hasRemaining() && currRecord != null)
+0:         {
+0:             if (now - currRecord.timestamp < MIN_MERGE_DELAY)
+0:                 return context;
+0: 
+0:             int c = state.getNodeId().compareTo(currRecord.id);
+0:             if (c == 0)
+0:             {
+0:                 if (foundState == null)
+0:                 {
+0:                     // We found a canditate for being merged
+0:                     if (state.getClock() < 0)
+0:                         return null;
+0: 
+0:                     foundState = state.duplicate();
+0:                     currRecord = recordIterator.hasNext() ? recordIterator.next() : null;
+0:                     state.moveToNext();
+0:                 }
+0:                 else
+0:                 {
+0:                     // Found someone to merge it to
+0:                     int nbDelta = foundState.isDelta() ? 1 : 0;
+0:                     nbDelta += state.isDelta() ? 1 : 0;
+0:                     ContextState merger = ContextState.allocate(2, nbDelta);
+0: 
+0:                     long fclock = foundState.getClock();
+0:                     long fcount = foundState.getCount();
+0:                     long clock = state.getClock();
+0:                     long count = state.getCount();
+0: 
+0:                     if (foundState.isDelta())
+0:                         merger.writeElement(foundState.getNodeId(), -now - fclock, -fcount, true);
+0:                     else
+0:                         merger.writeElement(foundState.getNodeId(), -now, 0);
+0: 
+0:                     if (state.isDelta())
+0:                         merger.writeElement(state.getNodeId(), fclock + clock, fcount, true);
+0:                     else
+0:                         merger.writeElement(state.getNodeId(), fclock + clock, fcount + count);
+0: 
+0:                     return merger.context;
+0:                 }
+0:             }
+0:             else if (c < 0) // nodeid < record
+0:             {
+0:                 state.moveToNext();
+0:             }
+0:             else // c > 0, nodeid > record
+0:             {
+0:                 currRecord = recordIterator.hasNext() ? recordIterator.next() : null;
+0:             }
+0:         }
+0:         return null;
+0:     }
+0: 
+1:     /**
+0:      * Remove shards that have been canceled through computeOldShardMerger
+0:      * since a time older than gcBefore.
+0:      * Used by compaction to strip context of unecessary information,
+0:      * shrinking them.
+1:      */
+0:     public ByteBuffer removeOldShards(ByteBuffer context, int gcBefore)
+0:     {
+0:         int hlength = headerLength(context);
+0:         ContextState state = new ContextState(context, hlength);
+0:         int removedBodySize = 0, removedHeaderSize = 0;
+0:         while (state.hasRemaining())
+0:         {
+0:             long clock = state.getClock();
+0:             if (clock < 0 && -((int)(clock / 1000)) < gcBefore)
+0:             {
+0:                 assert state.getCount() == 0;
+0:                 removedBodySize += STEP_LENGTH;
+0:                 if (state.isDelta())
+0:                     removedHeaderSize += HEADER_ELT_LENGTH;
+0:             }
+0:             state.moveToNext();
+0:         }
+0: 
+0:         if (removedBodySize == 0)
+0:             return context;
+0: 
+0:         int newSize = context.remaining() - removedHeaderSize - removedBodySize;
+0:         int newHlength = hlength - removedHeaderSize;
+0:         ByteBuffer cleanedContext = ByteBuffer.allocate(newSize);
+0:         cleanedContext.putShort(cleanedContext.position(), (short) ((newHlength - HEADER_SIZE_LENGTH) / HEADER_ELT_LENGTH));
+0:         ContextState cleaned = new ContextState(cleanedContext, newHlength);
+0: 
+0:         state.reset();
+0:         while (state.hasRemaining())
+0:         {
+0:             long clock = state.getClock();
+0:             if (clock > 0 || -((int)(clock / 1000)) >= gcBefore)
+0:             {
+0:                 state.copyTo(cleaned);
+0:             }
+0:             state.moveToNext();
+0:         }
+0:         return cleanedContext;
+0:     }
+0: 
+1:     /**
+1:      * Helper class to work on contexts (works by iterating over them).
+0:      * A context being abstractly a list of tuple (nodeid, clock, count), a
+1:      * ContextState encapsulate a context and a position to one of the tuple.
+1:      * It also allow to create new context iteratively.
+1:      *
+1:      * Note: this is intrinsically a private class intended for use by the
+1:      * methods of CounterContext only. It is however public because it is
+1:      * convenient to create handcrafted context for unit tests.
+1:      */
+1:     public static class ContextState
+0:     {
+1:         public final ByteBuffer context;
+1:         public final int headerLength;
+0:         private int headerOffset;  // offset from context.position()
+0:         private int bodyOffset;    // offset from context.position()
+0:         private boolean currentIsDelta;
+0: 
+0:         public ContextState(ByteBuffer context, int headerLength)
+0:         {
+0:             this(context, headerLength, HEADER_SIZE_LENGTH, headerLength, false);
+0:             updateIsDelta();
+0:         }
+0: 
+0:         public ContextState(ByteBuffer context)
+0:         {
+0:             this(context, headerLength(context));
+0:         }
+0: 
+0:         private ContextState(ByteBuffer context, int headerLength, int headerOffset, int bodyOffset, boolean currentIsDelta)
+0:         {
+1:             this.context = context;
+0:             this.headerLength = headerLength;
+0:             this.headerOffset = headerOffset;
+0:             this.bodyOffset = bodyOffset;
+0:             this.currentIsDelta = currentIsDelta;
+0:         }
+0: 
+0:         public boolean isDelta()
+0:         {
+0:             return currentIsDelta;
+0:         }
+0: 
+0:         private void updateIsDelta()
+0:         {
+0:             currentIsDelta = (headerOffset < headerLength) && context.getShort(context.position() + headerOffset) == (short) elementIdx();
+0:         }
+0: 
+1:         public boolean hasRemaining()
+0:         {
+1:             return bodyOffset < context.remaining();
+0:         }
+0: 
+0:         public int remainingHeaderLength()
+0:         {
+0:             return headerLength - headerOffset;
+0:         }
+0: 
+0:         public int remainingBodyLength()
+0:         {
+0:             return context.remaining() - bodyOffset;
+0:         }
+0: 
+1:         public void moveToNext()
+0:         {
+1:             bodyOffset += STEP_LENGTH;
+0:             if (currentIsDelta)
+0:             {
+1:                 headerOffset += HEADER_ELT_LENGTH;
+0:             }
+0:             updateIsDelta();
+0:         }
+0: 
+0:         // This advance other to the next position (but not this)
+1:         public void copyTo(ContextState other)
+0:         {
+0:             ByteBufferUtil.arrayCopy(context, context.position() + bodyOffset, other.context, other.context.position() + other.bodyOffset, STEP_LENGTH);
+0:             if (currentIsDelta)
+0:             {
+0:                 other.context.putShort(other.context.position() + other.headerOffset, (short) other.elementIdx());
+0:             }
+0:             other.currentIsDelta = currentIsDelta;
+0:             other.moveToNext();
+0:         }
+0: 
+1:         public int compareIdTo(ContextState other)
+0:         {
+1:             return compareId(context, context.position() + bodyOffset, other.context, other.context.position() + other.bodyOffset);
+0:         }
+0: 
+1:         public void reset()
+0:         {
+1:             this.headerOffset = HEADER_SIZE_LENGTH;
+1:             this.bodyOffset = headerLength;
+0:             updateIsDelta();
+0:         }
+0: 
+0:         public NodeId getNodeId()
+0:         {
+0:             return NodeId.wrap(context, context.position() + bodyOffset);
+0:         }
+0: 
+1:         public long getClock()
+0:         {
+0:             return context.getLong(context.position() + bodyOffset + NodeId.LENGTH);
+0:         }
+0: 
+1:         public long getCount()
+0:         {
+0:             return context.getLong(context.position() + bodyOffset + NodeId.LENGTH + CLOCK_LENGTH);
+0:         }
+0: 
+0:         // Advance this to the next position
+0:         public void writeElement(NodeId id, long clock, long count, boolean isDelta)
+0:         {
+1:             writeElementAtOffset(context, context.position() + bodyOffset, id, clock, count);
+0:             if (isDelta)
+0:             {
+0:                 context.putShort(context.position() + headerOffset, (short)elementIdx());
+0:             }
+0:             currentIsDelta = isDelta;
+1:             moveToNext();
+0:         }
+0: 
+0:         public void writeElement(NodeId id, long clock, long count)
+0:         {
+0:             writeElement(id, clock, count, false);
+0:         }
+0: 
+0:         public int elementIdx()
+0:         {
+0:             return (bodyOffset - headerLength) / STEP_LENGTH;
+0:         }
+0: 
+0:         public ContextState duplicate()
+0:         {
+0:             return new ContextState(context, headerLength, headerOffset, bodyOffset, currentIsDelta);
+0:         }
+0: 
+0:         /*
+0:          * Allocate a new context big enough for {@code elementCount} elements
+0:          * with {@code deltaCount} of them being delta, and return the initial
+0:          * ContextState corresponding.
+1:          */
+0:         public static ContextState allocate(int elementCount, int deltaCount)
+0:         {
+0:             assert deltaCount <= elementCount;
+0:             int hlength = HEADER_SIZE_LENGTH + deltaCount * HEADER_ELT_LENGTH;
+0:             ByteBuffer context = ByteBuffer.allocate(hlength + elementCount * STEP_LENGTH);
+0:             context.putShort(0, (short)deltaCount);
+0:             return new ContextState(context, hlength);
+0:         }
+author:Johan Oskarsson
+-------------------------------------------------------------------------------
+commit:2c4ac98
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.db.context;
+0: 
+0: import java.net.InetAddress;
+0: import java.net.UnknownHostException;
+0: import java.util.ArrayList;
+0: import java.util.Collections;
+0: import java.util.Comparator;
+0: import java.util.HashMap;
+0: import java.util.List;
+0: import java.util.Map;
+0: 
+0: import org.apache.cassandra.db.DBConstants;
+0: import org.apache.cassandra.db.context.IContext;
+0: import org.apache.cassandra.utils.FBUtilities;
+0: import org.apache.commons.lang.ArrayUtils;
+0: 
+1: /**
+1:  * An implementation of a partitioned counter context.
+1:  *
+0:  * The data structure is:
+0:  *   a vector of (node id, logical clock, count) tuples.
+1:  *
+0:  * On update, the node will:
+0:  *   1) increment the logical clock, and
+0:  *   2) update the count associated w/ its tuple.
+1:  *
+0:  * The logical clock represents the # of operations executed
+0:  * by the node.  The aggregated count can be determined
+0:  * by rolling up all the counts from each tuple.
+1:  *
+0:  * NOTE: only a given node id may increment its associated count and
+0:  * care must be taken to ensure that tuples are correctly made consistent.
+1:  */
+0: public class CounterContext implements IContext
+0: {
+0:     private static final int idLength;
+0:     private static final FBUtilities.ByteArrayWrapper idWrapper;
+0:     private static final int clockLength = DBConstants.longSize_;
+0:     private static final int countLength = DBConstants.longSize_;
+0:     private static final int stepLength; // length: id + logical clock + count
+0: 
+1:     // lazy-load singleton
+1:     private static class LazyHolder
+0:     {
+1:         private static final CounterContext counterContext = new CounterContext();
+0:     }
+0: 
+0:     static
+0:     {
+0:         byte[] id  = FBUtilities.getLocalAddress().getAddress();
+0:         idLength   = id.length;
+0:         idWrapper  = new FBUtilities.ByteArrayWrapper(id);
+0:         stepLength = idLength + clockLength + countLength;
+0:     }
+0: 
+1:     public static CounterContext instance()
+0:     {
+1:         return LazyHolder.counterContext;
+0:     }
+0: 
+1:     /**
+0:      * Creates an initial counter context.
+1:      *
+0:      * @return an empty counter context.
+1:      */
+0:     public byte[] create()
+0:     {
+0:         return new byte[0];
+0:     }
+0:     
+0:     // write a tuple (node id, clock, count) at the front
+0:     protected static void writeElement(byte[] context, byte[] id, long clock, long count)
+0:     {
+0:         writeElementAtStepOffset(context, 0, id, clock, count);
+0:     }
+0: 
+0:     // write a tuple (node id, clock, count) at step offset
+0:     protected static void writeElementAtStepOffset(byte[] context, int stepOffset, byte[] id, long clock, long count)
+0:     {
+0:         int offset = stepOffset * stepLength;
+0:         System.arraycopy(id, 0, context, offset, idLength);
+0:         FBUtilities.copyIntoBytes(context, offset + idLength, clock);
+0:         FBUtilities.copyIntoBytes(context, offset + idLength + clockLength, count);
+0:     }
+0: 
+0:     public byte[] update(byte[] context, InetAddress node, long delta)
+0:     {
+0:         // calculate node id
+0:         byte[] nodeId = node.getAddress();
+0: 
+0:         // look for this node id
+0:         for (int offset = 0; offset < context.length; offset += stepLength)
+0:         {
+0:             if (FBUtilities.compareByteSubArrays(nodeId, 0, context, offset, idLength) != 0)
+0:                 continue;
+0: 
+0:             // node id found: increment clock, update count; shift to front
+0:             long clock = FBUtilities.byteArrayToLong(context, offset + idLength);
+0:             long count = FBUtilities.byteArrayToLong(context, offset + idLength + clockLength);
+0: 
+0:             System.arraycopy(
+0:                 context,
+0:                 0,
+0:                 context,
+0:                 stepLength,
+0:                 offset);
+0:             writeElement(context, nodeId, clock + 1L, count + delta);
+0: 
+0:             return context;
+0:         }
+0: 
+0:         // node id not found: widen context
+0:         byte[] previous = context;
+0:         context = new byte[previous.length + stepLength];
+0: 
+0:         writeElement(context, nodeId, 1L, delta);
+0:         System.arraycopy(
+0:             previous,
+0:             0,
+0:             context,
+0:             stepLength,
+0:             previous.length);
+0: 
+0:         return context;
+0:     }
+0: 
+0:     // swap bytes of step length in context
+0:     protected static void swapElement(byte[] context, int left, int right)
+0:     {
+0:         if (left == right) return;
+0: 
+0:         byte temp;
+0:         for (int i = 0; i < stepLength; i++)
+0:         {
+0:             temp = context[left+i];
+0:             context[left+i] = context[right+i];
+0:             context[right+i] = temp;
+0:         }
+0:     }
+0: 
+0:     // partition bytes of step length in context (for quicksort)
+0:     protected static int partitionElements(byte[] context, int left, int right, int pivotIndex)
+0:     {
+0:         int leftOffset  = left       * stepLength;
+0:         int rightOffset = right      * stepLength;
+0:         int pivotOffset = pivotIndex * stepLength;
+0: 
+0:         byte[] pivotValue = ArrayUtils.subarray(context, pivotOffset, pivotOffset + stepLength);
+0:         swapElement(context, pivotOffset, rightOffset);
+0:         int storeOffset = leftOffset;
+0:         for (int i = leftOffset; i < rightOffset; i += stepLength)
+0:         {
+0:             if (FBUtilities.compareByteSubArrays(context, i, pivotValue, 0, stepLength) <= 0)
+0:             {
+0:                 swapElement(context, i, storeOffset);
+0:                 storeOffset += stepLength;
+0:             }
+0:         }
+0:         swapElement(context, storeOffset, rightOffset);
+0:         return storeOffset / stepLength;
+0:     }
+0: 
+0:     // quicksort helper
+0:     protected static void sortElementsByIdHelper(byte[] context, int left, int right)
+0:     {
+0:         if (right <= left) return;
+0: 
+0:         int pivotIndex = (left + right) / 2;
+0:         int pivotIndexNew = partitionElements(context, left, right, pivotIndex);
+0:         sortElementsByIdHelper(context, left, pivotIndexNew - 1);
+0:         sortElementsByIdHelper(context, pivotIndexNew + 1, right);
+0:     }
+0: 
+0:     // quicksort context by id
+0:     protected static byte[] sortElementsById(byte[] context)
+0:     {
+0:         assert 0 == (context.length % stepLength) : "context size is not correct.";
+0:         sortElementsByIdHelper(
+0:             context,
+0:             0,
+0:             (int)(context.length / stepLength) - 1);
+0:         return context;
+0:     }
+0: 
+1:     /**
+1:      * Determine the count relationship between two contexts.
+1:      *
+1:      * EQUAL:        Equal set of nodes and every count is equal.
+1:      * GREATER_THAN: Superset of nodes and every count is equal or greater than its corollary.
+1:      * LESS_THAN:    Subset of nodes and every count is equal or less than its corollary.
+1:      * DISJOINT:     Node sets are not equal and/or counts are not all greater or less than.
+1:      *
+0:      * Strategy:
+0:      *   compare node logical clocks (like a version vector).
+1:      *
+0:      * @param left
+0:      *            counter context.
+0:      * @param right
+0:      *            counter context.
+0:      * @return the ContextRelationship between the contexts.
+1:      */
+0:     public ContextRelationship diff(byte[] left, byte[] right)
+0:     {
+0:         left  = sortElementsById(left);
+0:         right = sortElementsById(right);
+0: 
+0:         ContextRelationship relationship = ContextRelationship.EQUAL;
+0: 
+0:         int leftIndex  = 0;
+0:         int rightIndex = 0;
+0:         while (leftIndex < left.length && rightIndex < right.length)
+0:         {
+1:             // compare id bytes
+0:             int compareId = FBUtilities.compareByteSubArrays(left, leftIndex, right, rightIndex, idLength);
+1:             if (compareId == 0)
+0:             {
+0:                 long leftClock  = FBUtilities.byteArrayToLong(left,  leftIndex + idLength);
+0:                 long rightClock = FBUtilities.byteArrayToLong(right, rightIndex + idLength);
+0: 
+0:                 // advance indexes
+0:                 leftIndex  += stepLength;
+0:                 rightIndex += stepLength;
+0: 
+1:                 // process clock comparisons
+0:                 if (leftClock == rightClock)
+0:                 {
+0:                     continue;
+0:                 }
+0:                 else if (leftClock > rightClock)
+0:                 {
+0:                     if (relationship == ContextRelationship.EQUAL)
+0:                     {
+0:                         relationship = ContextRelationship.GREATER_THAN;
+0:                     }
+0:                     else if (relationship == ContextRelationship.GREATER_THAN)
+0:                     {
+0:                         continue;
+0:                     }
+0:                     else
+0:                     {
+0:                         // relationship == ContextRelationship.LESS_THAN
+0:                         return ContextRelationship.DISJOINT;
+0:                     }
+0:                 }
+0:                 else
+0:                 // leftClock < rightClock
+0:                 {
+0:                     if (relationship == ContextRelationship.EQUAL)
+0:                     {
+0:                         relationship = ContextRelationship.LESS_THAN;
+0:                     }
+0:                     else if (relationship == ContextRelationship.GREATER_THAN)
+0:                     {
+0:                         return ContextRelationship.DISJOINT;
+0:                     }
+0:                     else
+0:                     {
+0:                         // relationship == ContextRelationship.LESS_THAN
+0:                         continue;
+0:                     }
+0:                 }
+0:             }
+1:             else if (compareId > 0)
+0:             {
+1:                 // only advance the right context
+0:                 rightIndex += stepLength;
+0: 
+0:                 if (relationship == ContextRelationship.EQUAL)
+0:                 {
+0:                     relationship = ContextRelationship.LESS_THAN;
+0:                 }
+0:                 else if (relationship == ContextRelationship.GREATER_THAN)
+0:                 {
+0:                     return ContextRelationship.DISJOINT;
+0:                 }
+0:                 else
+0:                 {
+0:                     // relationship == ContextRelationship.LESS_THAN
+0:                     continue;
+0:                 }
+0:             }
+0:             else
+0:             {
+0:                 // compareId < 0
+1:                 // only advance the left context
+0:                 leftIndex += stepLength;
+0: 
+0:                 if (relationship == ContextRelationship.EQUAL)
+0:                 {
+0:                     relationship = ContextRelationship.GREATER_THAN;
+0:                 }
+0:                 else if (relationship == ContextRelationship.GREATER_THAN)
+0:                 {
+0:                     continue;
+0:                 }
+0:                 else
+0:                 // relationship == ContextRelationship.LESS_THAN
+0:                 {
+0:                     return ContextRelationship.DISJOINT;
+0:                 }
+0:             }
+0:         }
+0: 
+1:         // check final lengths
+0:         if (leftIndex < left.length)
+0:         {
+0:             if (relationship == ContextRelationship.EQUAL)
+0:             {
+0:                 return ContextRelationship.GREATER_THAN;
+0:             }
+0:             else if (relationship == ContextRelationship.LESS_THAN)
+0:             {
+0:                 return ContextRelationship.DISJOINT;
+0:             }
+0:         }
+0:         else if (rightIndex < right.length)
+0:         {
+0:             if (relationship == ContextRelationship.EQUAL)
+0:             {
+0:                 return ContextRelationship.LESS_THAN;
+0:             }
+0:             else if (relationship == ContextRelationship.GREATER_THAN)
+0:             {
+0:                 return ContextRelationship.DISJOINT;
+0:             }
+0:         }
+0: 
+1:         return relationship;
+0:     }
+0: 
+0:     private class CounterNode
+0:     {
+0:         public final long clock;
+0:         public final long count;
+0: 
+0:         public CounterNode(long clock, long count)
+0:         {
+0:             this.clock = clock;
+0:             this.count = count;
+0:         }
+0: 
+0:         public int compareClockTo(CounterNode o)
+0:         {
+0:             if (clock == o.clock)
+0:             {
+0:                 return 0;
+0:             }
+0:             else if (clock > o.clock)
+0:             {
+0:                 return 1;
+0:             }
+0:             // clock < o.clock
+0:             return -1;
+0:         }
+0: 
+0:         @Override
+0:         public String toString()
+0:         {
+0:             return "(" + clock + "," + count + ")";
+0:         }
+0:     }
+0: 
+1:     /**
+0:      * Return a context w/ an aggregated count for each node id.
+1:      *
+0:      * @param left
+0:      *            counter context.
+0:      * @param right
+0:      *            counter context.
+1:      */
+0:     public byte[] merge(byte[] left, byte[] right)
+0:     {
+0:         // strategy:
+0:         //   1) map id -> (clock, count)
+0:         //      a) local id:  sum clocks, counts
+0:         //      b) remote id: keep highest clock, count (reconcile)
+0:         //   2) create a context from sorted array
+0:         Map<FBUtilities.ByteArrayWrapper, CounterNode> contextsMap =
+0:             new HashMap<FBUtilities.ByteArrayWrapper, CounterNode>();
+0: 
+0:         // map left context: id -> (clock, count)
+0:         for (int offset = 0; offset < left.length; offset += stepLength)
+0:         {
+0:             FBUtilities.ByteArrayWrapper id = new FBUtilities.ByteArrayWrapper(
+0:                 ArrayUtils.subarray(left, offset, offset + idLength));
+0:             long clock = FBUtilities.byteArrayToLong(left, offset + idLength);
+0:             long count = FBUtilities.byteArrayToLong(left, offset + idLength + clockLength);
+0: 
+0:             contextsMap.put(id, new CounterNode(clock, count));
+0:         }
+0: 
+0:         // map right context: id -> (clock, count)
+0:         for (int offset = 0; offset < right.length; offset += stepLength)
+0:         {
+0:             FBUtilities.ByteArrayWrapper id = new FBUtilities.ByteArrayWrapper(
+0:                 ArrayUtils.subarray(right, offset, offset + idLength));
+0:             long clock = FBUtilities.byteArrayToLong(right, offset + idLength);
+0:             long count = FBUtilities.byteArrayToLong(right, offset + idLength + clockLength);
+0: 
+0:             if (!contextsMap.containsKey(id))
+0:             {
+0:                 contextsMap.put(id, new CounterNode(clock, count));
+0:                 continue;
+0:             }
+0: 
+0:             CounterNode node = contextsMap.get(id);
+0: 
+0:             // local id: sum clocks, counts
+0:             if (this.idWrapper.equals(id))
+0:             {
+0:                 contextsMap.put(id, new CounterNode(
+0:                     clock + node.clock,
+0:                     count + node.count));
+0:                 continue;
+0:             }
+0: 
+0:             // remote id: keep highest clock and its count
+0:             if (node.clock < clock)
+0:             {
+0:                 contextsMap.put(id, new CounterNode(clock, count));
+0:             }
+0:         }
+0: 
+0:         // sort merged tuples
+0:         List<Map.Entry<FBUtilities.ByteArrayWrapper, CounterNode>> contextsList =
+0:             new ArrayList<Map.Entry<FBUtilities.ByteArrayWrapper, CounterNode>>(
+0:                     contextsMap.entrySet());
+0:         Collections.sort(
+0:             contextsList,
+0:             new Comparator<Map.Entry<FBUtilities.ByteArrayWrapper, CounterNode>>()
+0:             {
+0:                 public int compare(
+0:                     Map.Entry<FBUtilities.ByteArrayWrapper, CounterNode> e1,
+0:                     Map.Entry<FBUtilities.ByteArrayWrapper, CounterNode> e2)
+0:                 {
+0:                     // reversed
+0:                     return e2.getValue().compareClockTo(e1.getValue());
+0:                 }
+0:             });
+0: 
+0:         // create merged context
+0:         int length = contextsList.size();
+0:         byte[] merged = new byte[length * stepLength];
+0:         for (int i = 0; i < length; i++)
+0:         {
+0:             Map.Entry<FBUtilities.ByteArrayWrapper, CounterNode> entry = contextsList.get(i);
+0:             writeElementAtStepOffset(
+0:                 merged,
+0:                 i,
+0:                 entry.getKey().data,
+0:                 entry.getValue().clock,
+0:                 entry.getValue().count);
+0:         }
+0:         return merged;
+0:     }
+0: 
+1:     /**
+1:      * Human-readable String from context.
+1:      *
+0:      * @param context
+0:      *            version context.
+1:      * @return a human-readable String of the context.
+1:      */
+0:     public String toString(byte[] context)
+0:     {
+1:         StringBuilder sb = new StringBuilder();
+1:         sb.append("[");
+0:         for (int offset = 0; offset < context.length; offset += stepLength)
+0:         {
+0:             if (offset > 0)
+0:             {
+1:                 sb.append(",");
+0:             }
+1:             sb.append("{");
+0:             try
+0:             {
+0:                 InetAddress address = InetAddress.getByAddress(
+0:                             ArrayUtils.subarray(context, offset, offset + idLength));
+0:                 sb.append(address.getHostAddress());
+0:             }
+0:             catch (UnknownHostException uhe)
+0:             {
+0:                 sb.append("?.?.?.?");
+0:             }
+0:             sb.append(", ");
+0:             sb.append(FBUtilities.byteArrayToLong(context, offset + idLength));
+0:             sb.append(", ");
+0:             sb.append(FBUtilities.byteArrayToLong(context, offset + idLength + clockLength));
+0: 
+1:             sb.append("}");
+0:         }
+1:         sb.append("]");
+1:         return sb.toString();
+0:     }
+0: 
+0:     // return an aggregated count across all node ids
+0:     public byte[] total(byte[] context)
+0:     {
+1:         long total = 0L;
+0: 
+0:         for (int offset = 0; offset < context.length; offset += stepLength)
+0:         {
+0:             long count = FBUtilities.byteArrayToLong(context, offset + idLength + clockLength);
+0:             total += count;
+0:         }
+0: 
+0:         return FBUtilities.toByteArray(total);
+0:     }
+0: 
+0:     // remove the count for a given node id
+0:     public byte[] cleanNodeCounts(byte[] context, InetAddress node)
+0:     {
+0:         // calculate node id
+0:         byte[] nodeId = node.getAddress();
+0: 
+0:         // look for this node id
+0:         for (int offset = 0; offset < context.length; offset += stepLength)
+0:         {
+0:             if (FBUtilities.compareByteSubArrays(context, offset, nodeId, 0, idLength) != 0)
+0:                 continue;
+0: 
+0:             // node id found: remove node count
+0:             byte[] truncatedContext = new byte[context.length - stepLength];
+0:             System.arraycopy(context, 0, truncatedContext, 0, offset);
+0:             System.arraycopy(
+0:                 context,
+0:                 offset + stepLength,
+0:                 truncatedContext,
+0:                 offset,
+0:                 context.length - (offset + stepLength));
+0:             return truncatedContext;
+0:         }
+0: 
+0:         return context;
+0:     }
+0: }
+============================================================================

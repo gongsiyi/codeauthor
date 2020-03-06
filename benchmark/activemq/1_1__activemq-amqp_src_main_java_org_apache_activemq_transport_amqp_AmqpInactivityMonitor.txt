@@ -1,0 +1,569 @@
+1:8b36701: /**
+1:8b36701:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:8b36701:  * contributor license agreements.  See the NOTICE file distributed with
+1:8b36701:  * this work for additional information regarding copyright ownership.
+1:8b36701:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:8b36701:  * (the "License"); you may not use this file except in compliance with
+1:8b36701:  * the License.  You may obtain a copy of the License at
+1:8b36701:  *
+1:8b36701:  *      http://www.apache.org/licenses/LICENSE-2.0
+1:8b36701:  *
+1:8b36701:  * Unless required by applicable law or agreed to in writing, software
+1:8b36701:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:8b36701:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:8b36701:  * See the License for the specific language governing permissions and
+1:8b36701:  * limitations under the License.
+1:8b36701:  */
+2:8b36701: 
+1:8b36701: package org.apache.activemq.transport.amqp;
+1:8b36701: 
+1:8b36701: import java.io.IOException;
+1:8b36701: import java.util.Timer;
+1:3125cae: import java.util.concurrent.RejectedExecutionException;
+1:8b36701: import java.util.concurrent.SynchronousQueue;
+1:8b36701: import java.util.concurrent.ThreadFactory;
+1:8b36701: import java.util.concurrent.ThreadPoolExecutor;
+1:8b36701: import java.util.concurrent.TimeUnit;
+1:8b36701: import java.util.concurrent.atomic.AtomicBoolean;
+1:8b36701: 
+1:8b36701: import org.apache.activemq.thread.SchedulerTimerTask;
+1:8b36701: import org.apache.activemq.transport.AbstractInactivityMonitor;
+1:8b36701: import org.apache.activemq.transport.InactivityIOException;
+1:8b36701: import org.apache.activemq.transport.Transport;
+1:8b36701: import org.apache.activemq.transport.TransportFilter;
+1:8b36701: import org.apache.activemq.wireformat.WireFormat;
+1:8b36701: import org.slf4j.Logger;
+1:8b36701: import org.slf4j.LoggerFactory;
+1:8b36701: 
+1:8b36701: public class AmqpInactivityMonitor extends TransportFilter {
+1:8b36701: 
+1:8b36701:     private static final Logger LOG = LoggerFactory.getLogger(AmqpInactivityMonitor.class);
+1:8b36701: 
+1:8b36701:     private static ThreadPoolExecutor ASYNC_TASKS;
+1:4b4cf7c:     private static int CONNECTION_CHECK_TASK_COUNTER;
+1:4b4cf7c:     private static Timer CONNECTION_CHECK_TASK_TIMER;
+1:4b4cf7c:     private static int KEEPALIVE_TASK_COUNTER;
+1:4b4cf7c:     private static Timer KEEPALIVE_TASK_TIMER;
+1:8b36701: 
+1:8b36701:     private final AtomicBoolean failed = new AtomicBoolean(false);
+1:4b4cf7c:     private AmqpTransport amqpTransport;
+1:8b36701: 
+1:8b36701:     private long connectionTimeout = AmqpWireFormat.DEFAULT_CONNECTION_TIMEOUT;
+1:4b4cf7c: 
+1:8b36701:     private SchedulerTimerTask connectCheckerTask;
+1:8b36701:     private final Runnable connectChecker = new Runnable() {
+1:8b36701: 
+1:8b36701:         private final long startTime = System.currentTimeMillis();
+1:8b36701: 
+3:8b36701:         @Override
+1:4b4cf7c:         public void run() {
+1:8b36701:             long now = System.currentTimeMillis();
+1:8b36701: 
+1:3125cae:             if ((now - startTime) >= connectionTimeout && connectCheckerTask != null && !ASYNC_TASKS.isShutdown()) {
+1:4b4cf7c:                 LOG.debug("No connection attempt made in time for {}! Throwing InactivityIOException.", AmqpInactivityMonitor.this.toString());
+1:3125cae:                 try {
+1:3125cae:                     ASYNC_TASKS.execute(new Runnable() {
+1:3125cae:                         @Override
+1:3125cae:                         public void run() {
+1:3125cae:                             onException(new InactivityIOException(
+1:3125cae:                                 "Channel was inactive for too (>" + (connectionTimeout) + ") long: " + next.getRemoteAddress()));
+1:3125cae:                         }
+1:3125cae:                     });
+1:3125cae:                 } catch (RejectedExecutionException ex) {
+1:3125cae:                     if (!ASYNC_TASKS.isShutdown()) {
+1:3125cae:                         LOG.error("Async connection timeout task was rejected from the executor: ", ex);
+1:3125cae:                         throw ex;
+1:3125cae:                     }
+1:4b4cf7c:                 }
+1:4b4cf7c:             }
+1:4b4cf7c:         }
+1:4b4cf7c:     };
+1:4b4cf7c: 
+1:4b4cf7c:     private SchedulerTimerTask keepAliveTask;
+1:4b4cf7c:     private final Runnable keepAlive = new Runnable() {
+1:4b4cf7c: 
+1:4b4cf7c:         @Override
+1:4b4cf7c:         public void run() {
+1:3125cae:             if (keepAliveTask != null && !ASYNC_TASKS.isShutdown()) {
+1:3125cae:                 try {
+1:3125cae:                     ASYNC_TASKS.execute(new Runnable() {
+1:3125cae:                         @Override
+1:3125cae:                         public void run() {
+1:3125cae:                             try {
+1:3125cae:                                 long nextIdleUpdate = amqpTransport.keepAlive();
+1:3125cae:                                 if (nextIdleUpdate > 0) {
+1:3125cae:                                     synchronized (AmqpInactivityMonitor.this) {
+1:3125cae:                                         if (keepAliveTask != null) {
+1:3125cae:                                             keepAliveTask = new SchedulerTimerTask(keepAlive);
+1:3125cae:                                             KEEPALIVE_TASK_TIMER.schedule(keepAliveTask, nextIdleUpdate);
+1:3125cae:                                         }
+1:4b4cf7c:                                     }
+1:4b4cf7c:                                 }
+1:3125cae:                             } catch (Exception ex) {
+1:3125cae:                                 onException(new InactivityIOException(
+1:3125cae:                                     "Exception while performing idle checks for connection: " + next.getRemoteAddress()));
+1:3125cae:                             }
+1:4b4cf7c:                         }
+1:3125cae:                     });
+1:3125cae:                 } catch (RejectedExecutionException ex) {
+1:3125cae:                     if (!ASYNC_TASKS.isShutdown()) {
+1:3125cae:                         LOG.error("Async connection timeout task was rejected from the executor: ", ex);
+1:3125cae:                         throw ex;
+1:4b4cf7c:                     }
+2:8b36701:                 }
+1:8b36701:             }
+1:8b36701:         }
+1:8b36701:     };
+1:8b36701: 
+1:8b36701:     public AmqpInactivityMonitor(Transport next, WireFormat wireFormat) {
+1:8b36701:         super(next);
+1:8b36701:     }
+1:8b36701: 
+1:4b4cf7c:     @Override
+1:8b36701:     public void start() throws Exception {
+1:8b36701:         next.start();
+1:8b36701:     }
+1:8b36701: 
+1:8b36701:     @Override
+1:8b36701:     public void stop() throws Exception {
+1:4b4cf7c:         stopConnectionTimeoutChecker();
+1:4b4cf7c:         stopKeepAliveTask();
+1:8b36701:         next.stop();
+1:8b36701:     }
+1:8b36701: 
+1:8b36701:     @Override
+1:8b36701:     public void onException(IOException error) {
+1:8b36701:         if (failed.compareAndSet(false, true)) {
+1:4b4cf7c:             stopConnectionTimeoutChecker();
+1:4b4cf7c:             if (amqpTransport != null) {
+1:4b4cf7c:                 amqpTransport.onException(error);
+1:8b36701:             }
+1:8b36701:             transportListener.onException(error);
+1:8b36701:         }
+1:8b36701:     }
+1:8b36701: 
+1:4b4cf7c:     public void setAmqpTransport(AmqpTransport amqpTransport) {
+1:4b4cf7c:         this.amqpTransport = amqpTransport;
+1:8b36701:     }
+1:8b36701: 
+1:4b4cf7c:     public AmqpTransport getAmqpTransport() {
+1:4b4cf7c:         return amqpTransport;
+1:8b36701:     }
+1:8b36701: 
+1:4b4cf7c:     public synchronized void startConnectionTimeoutChecker(long connectionTimeout) {
+1:8b36701:         this.connectionTimeout = connectionTimeout;
+1:8b36701:         if (connectionTimeout > 0 && connectCheckerTask == null) {
+1:8b36701:             connectCheckerTask = new SchedulerTimerTask(connectChecker);
+1:8b36701: 
+1:8b36701:             long connectionCheckInterval = Math.min(connectionTimeout, 1000);
+1:8b36701: 
+1:8b36701:             synchronized (AbstractInactivityMonitor.class) {
+1:4b4cf7c:                 if (CONNECTION_CHECK_TASK_COUNTER == 0) {
+1:3125cae:                     if (ASYNC_TASKS == null || ASYNC_TASKS.isShutdown()) {
+1:4b4cf7c:                         ASYNC_TASKS = createExecutor();
+1:4b4cf7c:                     }
+1:4b4cf7c:                     CONNECTION_CHECK_TASK_TIMER = new Timer("AMQP InactivityMonitor State Check", true);
+1:8b36701:                 }
+1:4b4cf7c:                 CONNECTION_CHECK_TASK_COUNTER++;
+1:4b4cf7c:                 CONNECTION_CHECK_TASK_TIMER.schedule(connectCheckerTask, connectionCheckInterval, connectionCheckInterval);
+1:8b36701:             }
+1:8b36701:         }
+1:8b36701:     }
+1:8b36701: 
+1:4b4cf7c:     /**
+1:4b4cf7c:      * Starts the keep alive task which will run after the given delay.
+1:4b4cf7c:      *
+1:4b4cf7c:      * @param nextKeepAliveCheck
+1:4b4cf7c:      *        time in milliseconds to wait before performing the next keep-alive check.
+1:4b4cf7c:      */
+1:4b4cf7c:     public synchronized void startKeepAliveTask(long nextKeepAliveCheck) {
+1:4b4cf7c:         if (nextKeepAliveCheck > 0 && keepAliveTask == null) {
+1:4b4cf7c:             keepAliveTask = new SchedulerTimerTask(keepAlive);
+1:4b4cf7c: 
+1:4b4cf7c:             synchronized (AbstractInactivityMonitor.class) {
+1:4b4cf7c:                 if (KEEPALIVE_TASK_COUNTER == 0) {
+1:3125cae:                     if (ASYNC_TASKS == null || ASYNC_TASKS.isShutdown()) {
+1:4b4cf7c:                         ASYNC_TASKS = createExecutor();
+1:4b4cf7c:                     }
+1:4b4cf7c:                     KEEPALIVE_TASK_TIMER = new Timer("AMQP InactivityMonitor Idle Update", true);
+1:4b4cf7c:                 }
+1:4b4cf7c:                 KEEPALIVE_TASK_COUNTER++;
+1:4b4cf7c:                 KEEPALIVE_TASK_TIMER.schedule(keepAliveTask, nextKeepAliveCheck);
+1:4b4cf7c:             }
+1:4b4cf7c:         }
+1:4b4cf7c:     }
+1:4b4cf7c: 
+1:4b4cf7c:     public synchronized void stopConnectionTimeoutChecker() {
+1:8b36701:         if (connectCheckerTask != null) {
+1:8b36701:             connectCheckerTask.cancel();
+1:8b36701:             connectCheckerTask = null;
+1:8b36701: 
+1:8b36701:             synchronized (AbstractInactivityMonitor.class) {
+1:4b4cf7c:                 CONNECTION_CHECK_TASK_TIMER.purge();
+1:4b4cf7c:                 CONNECTION_CHECK_TASK_COUNTER--;
+1:4b4cf7c:                 if (CONNECTION_CHECK_TASK_COUNTER == 0) {
+1:4b4cf7c:                     CONNECTION_CHECK_TASK_TIMER.cancel();
+1:4b4cf7c:                     CONNECTION_CHECK_TASK_TIMER = null;
+1:4b4cf7c:                 }
+1:4b4cf7c:             }
+1:4b4cf7c:         }
+1:4b4cf7c:     }
+1:4b4cf7c: 
+1:4b4cf7c:     public synchronized void stopKeepAliveTask() {
+1:4b4cf7c:         if (keepAliveTask != null) {
+1:4b4cf7c:             keepAliveTask.cancel();
+1:4b4cf7c:             keepAliveTask = null;
+1:4b4cf7c: 
+1:4b4cf7c:             synchronized (AbstractInactivityMonitor.class) {
+1:4b4cf7c:                 KEEPALIVE_TASK_TIMER.purge();
+1:4b4cf7c:                 KEEPALIVE_TASK_COUNTER--;
+1:4b4cf7c:                 if (KEEPALIVE_TASK_COUNTER == 0) {
+1:4b4cf7c:                     KEEPALIVE_TASK_TIMER.cancel();
+1:4b4cf7c:                     KEEPALIVE_TASK_TIMER = null;
+1:8b36701:                 }
+1:8b36701:             }
+1:8b36701:         }
+1:8b36701:     }
+1:8b36701: 
+1:8b36701:     private final ThreadFactory factory = new ThreadFactory() {
+1:8b36701:         @Override
+1:8b36701:         public Thread newThread(Runnable runnable) {
+1:8b36701:             Thread thread = new Thread(runnable, "AmqpInactivityMonitor Async Task: " + runnable);
+1:8b36701:             thread.setDaemon(true);
+1:8b36701:             return thread;
+1:8b36701:         }
+1:8b36701:     };
+1:8b36701: 
+1:8b36701:     private ThreadPoolExecutor createExecutor() {
+1:4b4cf7c:         ThreadPoolExecutor exec = new ThreadPoolExecutor(0, Integer.MAX_VALUE, 90, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(), factory);
+1:8b36701:         exec.allowCoreThreadTimeOut(true);
+1:8b36701:         return exec;
+1:8b36701:     }
+1:8b36701: }
+============================================================================
+author:Timothy Bish
+-------------------------------------------------------------------------------
+commit:3125cae
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.RejectedExecutionException;
+/////////////////////////////////////////////////////////////////////////
+1:             if ((now - startTime) >= connectionTimeout && connectCheckerTask != null && !ASYNC_TASKS.isShutdown()) {
+1:                 try {
+1:                     ASYNC_TASKS.execute(new Runnable() {
+1:                         @Override
+1:                         public void run() {
+1:                             onException(new InactivityIOException(
+1:                                 "Channel was inactive for too (>" + (connectionTimeout) + ") long: " + next.getRemoteAddress()));
+1:                         }
+1:                     });
+1:                 } catch (RejectedExecutionException ex) {
+1:                     if (!ASYNC_TASKS.isShutdown()) {
+1:                         LOG.error("Async connection timeout task was rejected from the executor: ", ex);
+1:                         throw ex;
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+1:             if (keepAliveTask != null && !ASYNC_TASKS.isShutdown()) {
+1:                 try {
+1:                     ASYNC_TASKS.execute(new Runnable() {
+1:                         @Override
+1:                         public void run() {
+1:                             try {
+1:                                 long nextIdleUpdate = amqpTransport.keepAlive();
+1:                                 if (nextIdleUpdate > 0) {
+1:                                     synchronized (AmqpInactivityMonitor.this) {
+1:                                         if (keepAliveTask != null) {
+1:                                             keepAliveTask = new SchedulerTimerTask(keepAlive);
+1:                                             KEEPALIVE_TASK_TIMER.schedule(keepAliveTask, nextIdleUpdate);
+1:                                         }
+1:                             } catch (Exception ex) {
+1:                                 onException(new InactivityIOException(
+1:                                     "Exception while performing idle checks for connection: " + next.getRemoteAddress()));
+1:                     });
+1:                 } catch (RejectedExecutionException ex) {
+1:                     if (!ASYNC_TASKS.isShutdown()) {
+1:                         LOG.error("Async connection timeout task was rejected from the executor: ", ex);
+1:                         throw ex;
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+1:                     if (ASYNC_TASKS == null || ASYNC_TASKS.isShutdown()) {
+/////////////////////////////////////////////////////////////////////////
+1:                     if (ASYNC_TASKS == null || ASYNC_TASKS.isShutdown()) {
+commit:4b4cf7c
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private static int CONNECTION_CHECK_TASK_COUNTER;
+1:     private static Timer CONNECTION_CHECK_TASK_TIMER;
+1:     private static int KEEPALIVE_TASK_COUNTER;
+1:     private static Timer KEEPALIVE_TASK_TIMER;
+1:     private AmqpTransport amqpTransport;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 LOG.debug("No connection attempt made in time for {}! Throwing InactivityIOException.", AmqpInactivityMonitor.this.toString());
+0:                         onException(new InactivityIOException(
+0:                             "Channel was inactive for too (>" + (connectionTimeout) + ") long: " + next.getRemoteAddress()));
+1:                     }
+0:                 });
+1:             }
+1:         }
+1:     };
+1: 
+1:     private SchedulerTimerTask keepAliveTask;
+1:     private final Runnable keepAlive = new Runnable() {
+1: 
+1:         @Override
+1:         public void run() {
+0:             if (keepAliveTask != null && !ASYNC_TASKS.isTerminating() && !ASYNC_TASKS.isTerminated()) {
+0:                 ASYNC_TASKS.execute(new Runnable() {
+1:                     @Override
+1:                     public void run() {
+0:                         try {
+0:                             long nextIdleUpdate = amqpTransport.keepAlive();
+0:                             if (nextIdleUpdate > 0) {
+0:                                 synchronized (AmqpInactivityMonitor.this) {
+1:                                     if (keepAliveTask != null) {
+1:                                         keepAliveTask = new SchedulerTimerTask(keepAlive);
+0:                                         KEEPALIVE_TASK_TIMER.schedule(keepAliveTask, nextIdleUpdate);
+1:                                     }
+1:                                 }
+1:                             }
+0:                         } catch (Exception ex) {
+0:                             onException(new InactivityIOException(
+0:                                 "Exception while performing idle checks for connection: " + next.getRemoteAddress()));
+1:                         }
+/////////////////////////////////////////////////////////////////////////
+1:         stopConnectionTimeoutChecker();
+1:         stopKeepAliveTask();
+1:             stopConnectionTimeoutChecker();
+1:             if (amqpTransport != null) {
+1:                 amqpTransport.onException(error);
+1:     public void setAmqpTransport(AmqpTransport amqpTransport) {
+1:         this.amqpTransport = amqpTransport;
+1:     public AmqpTransport getAmqpTransport() {
+1:         return amqpTransport;
+1:     public synchronized void startConnectionTimeoutChecker(long connectionTimeout) {
+/////////////////////////////////////////////////////////////////////////
+1:                 if (CONNECTION_CHECK_TASK_COUNTER == 0) {
+0:                     if (ASYNC_TASKS == null) {
+1:                         ASYNC_TASKS = createExecutor();
+1:                     }
+1:                     CONNECTION_CHECK_TASK_TIMER = new Timer("AMQP InactivityMonitor State Check", true);
+1:                 CONNECTION_CHECK_TASK_COUNTER++;
+1:                 CONNECTION_CHECK_TASK_TIMER.schedule(connectCheckerTask, connectionCheckInterval, connectionCheckInterval);
+1:     /**
+1:      * Starts the keep alive task which will run after the given delay.
+1:      *
+1:      * @param nextKeepAliveCheck
+1:      *        time in milliseconds to wait before performing the next keep-alive check.
+1:      */
+1:     public synchronized void startKeepAliveTask(long nextKeepAliveCheck) {
+1:         if (nextKeepAliveCheck > 0 && keepAliveTask == null) {
+0:             keepAliveTask = new SchedulerTimerTask(keepAlive);
+1: 
+1:             synchronized (AbstractInactivityMonitor.class) {
+1:                 if (KEEPALIVE_TASK_COUNTER == 0) {
+0:                     if (ASYNC_TASKS == null) {
+1:                         ASYNC_TASKS = createExecutor();
+1:                     }
+1:                     KEEPALIVE_TASK_TIMER = new Timer("AMQP InactivityMonitor Idle Update", true);
+1:                 }
+1:                 KEEPALIVE_TASK_COUNTER++;
+1:                 KEEPALIVE_TASK_TIMER.schedule(keepAliveTask, nextKeepAliveCheck);
+1:             }
+1:         }
+1:     }
+1: 
+1:     public synchronized void stopConnectionTimeoutChecker() {
+1:                 CONNECTION_CHECK_TASK_TIMER.purge();
+1:                 CONNECTION_CHECK_TASK_COUNTER--;
+1:                 if (CONNECTION_CHECK_TASK_COUNTER == 0) {
+1:                     CONNECTION_CHECK_TASK_TIMER.cancel();
+1:                     CONNECTION_CHECK_TASK_TIMER = null;
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+1:     public synchronized void stopKeepAliveTask() {
+0:         if (keepAliveTask != null) {
+1:             keepAliveTask.cancel();
+1:             keepAliveTask = null;
+1: 
+1:             synchronized (AbstractInactivityMonitor.class) {
+1:                 KEEPALIVE_TASK_TIMER.purge();
+1:                 KEEPALIVE_TASK_COUNTER--;
+1:                 if (KEEPALIVE_TASK_COUNTER == 0) {
+1:                     KEEPALIVE_TASK_TIMER.cancel();
+1:                     KEEPALIVE_TASK_TIMER = null;
+/////////////////////////////////////////////////////////////////////////
+1:         ThreadPoolExecutor exec = new ThreadPoolExecutor(0, Integer.MAX_VALUE, 90, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(), factory);
+commit:3306467
+/////////////////////////////////////////////////////////////////////////
+0:     private AmqpProtocolConverter protocolConverter;
+/////////////////////////////////////////////////////////////////////////
+0:     public void setProtocolConverter(AmqpProtocolConverter protocolConverter) {
+0:     public AmqpProtocolConverter getProtocolConverter() {
+0:     public synchronized void startConnectChecker(long connectionTimeout) {
+/////////////////////////////////////////////////////////////////////////
+0:     public synchronized void stopConnectChecker() {
+commit:8b36701
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *      http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: 
+1: package org.apache.activemq.transport.amqp;
+1: 
+1: import java.io.IOException;
+1: import java.util.Timer;
+1: import java.util.concurrent.SynchronousQueue;
+1: import java.util.concurrent.ThreadFactory;
+1: import java.util.concurrent.ThreadPoolExecutor;
+1: import java.util.concurrent.TimeUnit;
+1: import java.util.concurrent.atomic.AtomicBoolean;
+1: 
+1: import org.apache.activemq.thread.SchedulerTimerTask;
+1: import org.apache.activemq.transport.AbstractInactivityMonitor;
+1: import org.apache.activemq.transport.InactivityIOException;
+1: import org.apache.activemq.transport.Transport;
+1: import org.apache.activemq.transport.TransportFilter;
+0: import org.apache.activemq.util.ThreadPoolUtils;
+1: import org.apache.activemq.wireformat.WireFormat;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: public class AmqpInactivityMonitor extends TransportFilter {
+1: 
+1:     private static final Logger LOG = LoggerFactory.getLogger(AmqpInactivityMonitor.class);
+1: 
+1:     private static ThreadPoolExecutor ASYNC_TASKS;
+0:     private static int CHECKER_COUNTER;
+0:     private static Timer ACTIVITY_CHECK_TIMER;
+1: 
+1:     private final AtomicBoolean failed = new AtomicBoolean(false);
+0:     private IAmqpProtocolConverter protocolConverter;
+1: 
+1:     private long connectionTimeout = AmqpWireFormat.DEFAULT_CONNECTION_TIMEOUT;
+1:     private SchedulerTimerTask connectCheckerTask;
+1:     private final Runnable connectChecker = new Runnable() {
+1: 
+1:         private final long startTime = System.currentTimeMillis();
+1: 
+1:         @Override
+0:         public void run() {
+1: 
+1:             long now = System.currentTimeMillis();
+1: 
+0:             if ((now - startTime) >= connectionTimeout && connectCheckerTask != null && !ASYNC_TASKS.isTerminating()) {
+0:                 if (LOG.isDebugEnabled()) {
+0:                     LOG.debug("No connection attempt made in time for " + AmqpInactivityMonitor.this.toString() + "! Throwing InactivityIOException.");
+1:                 }
+0:                 ASYNC_TASKS.execute(new Runnable() {
+1:                     @Override
+0:                     public void run() {
+0:                         onException(new InactivityIOException("Channel was inactive for too (>" + (connectionTimeout) + ") long: "
+0:                             + next.getRemoteAddress()));
+1:                     }
+0:                 });
+1:             }
+1:         }
+1:     };
+1: 
+1:     public AmqpInactivityMonitor(Transport next, WireFormat wireFormat) {
+1:         super(next);
+1:     }
+1: 
+1:     @Override
+1:     public void start() throws Exception {
+1:         next.start();
+1:     }
+1: 
+1:     @Override
+1:     public void stop() throws Exception {
+0:         stopConnectChecker();
+1:         next.stop();
+1:     }
+1: 
+1:     @Override
+1:     public void onException(IOException error) {
+1:         if (failed.compareAndSet(false, true)) {
+0:             stopConnectChecker();
+0:             if (protocolConverter != null) {
+0:                 protocolConverter.onAMQPException(error);
+1:             }
+1:             transportListener.onException(error);
+1:         }
+1:     }
+1: 
+0:     public void setProtocolConverter(IAmqpProtocolConverter protocolConverter) {
+0:         this.protocolConverter = protocolConverter;
+1:     }
+1: 
+0:     public IAmqpProtocolConverter getProtocolConverter() {
+0:         return protocolConverter;
+1:     }
+1: 
+0:     synchronized void startConnectChecker(long connectionTimeout) {
+1:         this.connectionTimeout = connectionTimeout;
+1:         if (connectionTimeout > 0 && connectCheckerTask == null) {
+1:             connectCheckerTask = new SchedulerTimerTask(connectChecker);
+1: 
+1:             long connectionCheckInterval = Math.min(connectionTimeout, 1000);
+1: 
+1:             synchronized (AbstractInactivityMonitor.class) {
+0:                 if (CHECKER_COUNTER == 0) {
+0:                     ASYNC_TASKS = createExecutor();
+0:                     ACTIVITY_CHECK_TIMER = new Timer("AMQP InactivityMonitor State Check", true);
+1:                 }
+0:                 CHECKER_COUNTER++;
+0:                 ACTIVITY_CHECK_TIMER.schedule(connectCheckerTask, connectionCheckInterval, connectionCheckInterval);
+1:             }
+1:         }
+1:     }
+1: 
+0:     synchronized void stopConnectChecker() {
+1:         if (connectCheckerTask != null) {
+1:             connectCheckerTask.cancel();
+1:             connectCheckerTask = null;
+1: 
+1:             synchronized (AbstractInactivityMonitor.class) {
+0:                 ACTIVITY_CHECK_TIMER.purge();
+0:                 CHECKER_COUNTER--;
+0:                 if (CHECKER_COUNTER == 0) {
+0:                     ACTIVITY_CHECK_TIMER.cancel();
+0:                     ACTIVITY_CHECK_TIMER = null;
+0:                     ThreadPoolUtils.shutdown(ASYNC_TASKS);
+0:                     ASYNC_TASKS = null;
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+1:     private final ThreadFactory factory = new ThreadFactory() {
+1:         @Override
+1:         public Thread newThread(Runnable runnable) {
+1:             Thread thread = new Thread(runnable, "AmqpInactivityMonitor Async Task: " + runnable);
+1:             thread.setDaemon(true);
+1:             return thread;
+1:         }
+1:     };
+1: 
+1:     private ThreadPoolExecutor createExecutor() {
+0:         ThreadPoolExecutor exec = new ThreadPoolExecutor(0, Integer.MAX_VALUE, 60, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(), factory);
+1:         exec.allowCoreThreadTimeOut(true);
+1:         return exec;
+1:     }
+1: }
+============================================================================

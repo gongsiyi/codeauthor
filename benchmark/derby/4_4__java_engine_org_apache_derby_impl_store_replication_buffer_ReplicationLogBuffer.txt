@@ -1,0 +1,901 @@
+1:2957f69: /*
+4:2957f69: 
+1:1bac3f3:    Derby - Class org.apache.derby.impl.store.replication.buffer.ReplicationLogBuffer
+1:2957f69: 
+1:2957f69:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:2957f69:    contributor license agreements.  See the NOTICE file distributed with
+1:2957f69:    this work for additional information regarding copyright ownership.
+1:2957f69:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:2957f69:    (the "License"); you may not use this file except in compliance with
+1:2957f69:    the License.  You may obtain a copy of the License at
+1:2957f69: 
+1:2957f69:       http://www.apache.org/licenses/LICENSE-2.0
+1:2957f69: 
+1:2957f69:    Unless required by applicable law or agreed to in writing, software
+1:2957f69:    distributed under the License is distributed on an "AS IS" BASIS,
+1:2957f69:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:2957f69:    See the License for the specific language governing permissions and
+1:2957f69:    limitations under the License.
+1:2957f69: 
+2:2957f69: */
+1:2957f69: 
+1:1bac3f3: package org.apache.derby.impl.store.replication.buffer;
+1:2957f69: 
+1:7e51e9d: import org.apache.derby.shared.common.sanity.SanityManager;
+1:2957f69: 
+1:2957f69: import java.util.NoSuchElementException;
+1:2957f69: import java.util.LinkedList;
+1:2146e78: 
+1:1bac3f3: import org.apache.derby.iapi.store.replication.master.MasterFactory;
+1:2957f69: 
+1:2957f69: /**
+1:2957f69:  * Used for the replication master role only. When a Derby instance
+1:2957f69:  * has the replication master role for a database 'x', all log records
+1:2957f69:  * that are written to the local log file are also appended to this
+1:2957f69:  * log buffer. The replication master service will consume chunks of
+1:2957f69:  * log from this buffer and send it to the Derby instance with the
+1:2957f69:  * slave role for 'x'.
+2:2957f69:  *
+1:2957f69:  * ReplicationLogBuffer consists of a number of LogBufferElements.
+1:2957f69:  * Elements that are not in use are in the freeBuffers list, while
+1:5235dfd:  * elements that contains dirty log are in dirtyBuffers. Chunks of log records
+1:2957f69:  * are appended to the buffer element in currentDirtyBuffer. Hence,
+1:2957f69:  * the life cycle of buffer elements is:
+1:dbed020:  * freeBuffers -&gt; currentDirtyBuffer -&gt; dirtyBuffers -&gt; freeBuffers
+1:2957f69:  *
+1:5235dfd:  * To append chunks of log records to the buffer, use appendLog(...)
+1:2957f69:  *
+1:2957f69:  * To consume chunks of log records, use next() followed by getData(),
+1:2957f69:  * getLastInstant() and getSize(). These get-methods throw
+1:2957f69:  * NoSuchElementException if next() returned false, meaning that there
+1:2957f69:  * were no dirty log at the time next() was called.
+1:2957f69:  *
+1:2957f69:  * Threads: ReplicationLogBuffer is threadsafe. It can be used by a
+1:2957f69:  * logger (LogToFile) and a log consumer (LogShipping service)
+1:2957f69:  * concurrently without further synchronization.
+1:8dd309e:  * 
+1:8dd309e:  * Important: If methods in this class calls methods outside this package
+1:8dd309e:  * (e.g. MasterFactory#workToDo), make sure that deadlocks are not 
+1:8dd309e:  * introduced. If possible, a call to any method in another package should be 
+1:8dd309e:  * done without holding latches in this class.
+1:2957f69:  */
+1:2957f69: 
+1:2957f69: public class ReplicationLogBuffer {
+1:2957f69: 
+1:1d0892e:     public static final int DEFAULT_NUMBER_LOG_BUFFERS = 10;
+1:2957f69: 
+1:7e7a589:     private final LinkedList<LogBufferElement> dirtyBuffers;// LogBufferElements with unsent log
+1:7e7a589:     private final LinkedList<LogBufferElement> freeBuffers; // currently unused LogBufferElements
+1:2957f69: 
+1:5235dfd:     // the buffer we currently APPEND chunks of log records to
+1:2957f69:     private LogBufferElement currentDirtyBuffer;
+1:2957f69: 
+1:2957f69:     // used to GET data from this buffer. next() sets these
+1:2957f69:     private boolean validOutBuffer; // outBuffer contains valid data
+1:2957f69:     private byte[] outBufferData;   // the buffer contents
+1:2957f69:     private int outBufferStored;    // number of bytes currently stored
+1:2957f69:     private long outBufferLastInstant;// highest instant (LSN) in outBufferData
+1:2957f69: 
+1:2957f69:     // Two objects to synchronize on so that the logger (LogToFile)
+1:2957f69:     // and the log consumer (LogShipping service) can use the buffer
+1:5235dfd:     // concurrently (although appendLog may conflict with next).
+1:2957f69:     // In cases where both latches are needed at the same time,
+1:2957f69:     // listLatch is always set first to avoid deadlock. listLatch is
+1:5235dfd:     // used by appendLog and next to synchronize operations on
+1:2957f69:     // the free and dirty buffer lists and on currentDirtyBuffer.
+1:2957f69:     // outputLatch is used by next and getXXX to synchronize on the
+1:2957f69:     // output data variables
+1:2957f69:     private final Object listLatch = new Object();
+1:2957f69:     private final Object outputLatch = new Object();
+1:2957f69: 
+1:2957f69:     private int defaultBufferSize;
+1:2957f69: 
+1:2146e78:     // used to notify the master controller that a log buffer element is full 
+1:2146e78:     // and work needs to be done.
+1:921ac6e:     private final MasterFactory mf;
+1:2146e78: 
+1:2146e78:     /**
+1:2146e78:      * Class constructor specifies the number of buffer elements
+1:2146e78:      * and the master controller that creates this replication log
+1:2146e78:      * buffer.
+1:2146e78:      *
+1:2146e78:      * @param bufferSize the default number of buffer elements
+1:2146e78:      * @param mf         Used to notify the master controller that a log buffer
+1:2146e78:      *                   element is full and work needs to be done.
+1:2146e78:      */
+1:2146e78:     public ReplicationLogBuffer(int bufferSize, MasterFactory mf) {
+1:2957f69:         defaultBufferSize = bufferSize;
+1:01150e0:         
+1:01150e0:         this.mf = mf;
+1:2957f69: 
+1:2957f69:         outBufferData = new byte[bufferSize];
+1:2957f69:         outBufferStored = 0;
+1:2957f69:         outBufferLastInstant = 0;
+1:2957f69:         validOutBuffer = false; // no valid data in outBuffer yet
+1:2957f69: 
+1:7e7a589:         dirtyBuffers = new LinkedList<LogBufferElement>();
+1:7e7a589:         freeBuffers = new LinkedList<LogBufferElement>();
+1:2957f69: 
+1:2957f69:         for (int i = 0; i < DEFAULT_NUMBER_LOG_BUFFERS; i++){
+1:2957f69:             LogBufferElement b = new LogBufferElement(bufferSize);
+1:2957f69:             freeBuffers.addLast(b);
+2:2957f69:         }
+1:7e7a589:         currentDirtyBuffer = freeBuffers.removeFirst();
+1:2957f69:     }
+1:2957f69: 
+1:2146e78:     /**
+1:5235dfd:      * Append a chunk of log records to the log buffer.
+1:2957f69:      *
+1:5235dfd:      * @param greatestInstant   the instant of the log record that was
+1:5235dfd:      *                          added last to this chunk of log
+1:5235dfd:      * @param log               the chunk of log records
+1:5235dfd:      * @param logOffset         offset in log to start copy from
+1:5235dfd:      * @param logLength         number of bytes to copy, starting
+1:5235dfd:      *                          from logOffset
+1:2957f69:      *
+1:2957f69:      * @throws LogBufferFullException - thrown if there is not enough
+1:5235dfd:      * free space in the buffer to store the chunk of log.
+1:2957f69:      **/
+1:5235dfd:     public void appendLog(long greatestInstant,
+1:5235dfd:                           byte[] log, int logOffset, int logLength)
+1:2957f69:         throws LogBufferFullException{
+1:2957f69: 
+1:8dd309e:         boolean switchedBuffer = false; 
+1:2957f69:         synchronized (listLatch) {
+1:2957f69:             if (currentDirtyBuffer == null) {
+1:2957f69:                 switchDirtyBuffer();
+1:2957f69:                 // either sets the currentDirtyBuffer to a buffer
+1:8dd309e:                 // element or throws a LogBufferFullException. No need to call
+1:8dd309e:                 // MasterFactory.workToDo becase switchDirtyBuffer will not add
+1:8dd309e:                 // a buffer to the dirty buffer list when currentDirtyBuffer 
+1:8dd309e:                 // is null
+1:2957f69:             }
+1:2957f69: 
+1:2957f69:             // switch buffer if current buffer does not have enough space
+1:2957f69:             // for the incoming data
+1:5235dfd:             if (logLength > currentDirtyBuffer.freeSize()) {
+1:2957f69:                 switchDirtyBuffer();
+1:8dd309e:                 switchedBuffer = true;
+1:2957f69:             }
+1:2957f69: 
+1:5235dfd:             if (logLength <= currentDirtyBuffer.freeSize()) {
+1:5235dfd:                 currentDirtyBuffer.appendLog(greatestInstant,
+1:5235dfd:                                              log, logOffset, logLength);
+1:2957f69:             } else {
+1:5235dfd:                 // The chunk of log records requires more space than one
+1:2957f69:                 // LogBufferElement with default size. Create a new big
+1:2957f69:                 // enough LogBufferElement
+1:5235dfd:                 LogBufferElement current = new LogBufferElement(logLength);
+1:2957f69:                 current.setRecyclable(false);
+1:5235dfd:                 current.appendLog(greatestInstant, log, logOffset, logLength);
+1:2957f69:                 dirtyBuffers.addLast(current);
+1:2957f69:                 // currentDirtyBuffer has already been handed over to
+1:2957f69:                 // the dirtyBuffers list, and an empty one is in
+1:2957f69:                 // place, so no need to touch currentDirtyBuffer here
+1:2957f69:             }
+1:2957f69:         }
+1:8dd309e:         // DERBY-3472 - we need to release the listLatch before calling workToDo
+1:8dd309e:         // to avoid deadlock with the logShipper thread
+1:8dd309e:         if (switchedBuffer) {
+1:8dd309e:             // Notify the master controller that a log buffer element is full 
+1:8dd309e:             // and work needs to be done.
+1:8dd309e:             mf.workToDo();
+1:8dd309e:         }
+1:2957f69:     }
+1:2957f69: 
+1:2957f69:     /**
+1:2957f69:      * Sets the output data to that of the next (oldest) buffer
+1:2957f69:      * element in dirtyBuffers so that getData(), getLastInstant() and
+1:2957f69:      * getSize() return values from the next oldest chunk of log. Used
+1:2957f69:      * by the log consumer (the LogShipping service) to move to the
+1:2957f69:      * next chunk of log in the buffer.
+1:2957f69:      *
+1:2957f69:      * @return true if there is log in the buffer, resulting in valid
+1:2957f69:      * data for the get-methods
+1:2957f69:      */
+1:2957f69:     public boolean next() {
+1:2957f69:         synchronized (listLatch) {
+1:2957f69: 
+1:2957f69:             if (dirtyBuffers.size() == 0) {
+1:2957f69:                 // if the current buffer has been written to, and
+1:2957f69:                 // there are no other dirty buffers, it should be
+1:2957f69:                 // moved to the dirtyBuffer list so that it can be
+1:2957f69:                 // returned.
+1:2957f69:                 try {
+1:2957f69:                     switchDirtyBuffer();
+1:8dd309e:                     // No need to call MasterFactory.workToDo because the 
+1:8dd309e:                     // caller of next() will perform the work required on the 
+1:8dd309e:                     // buffer that was just moved to the dirty buffer list.
+1:2957f69:                 } catch (LogBufferFullException lbfe) {
+1:2957f69:                     // should not be possible when dirtyBuffers.size() == 0
+1:2957f69:                     if (SanityManager.DEBUG){
+1:2957f69:                         SanityManager.THROWASSERT(
+1:2957f69:                             "Unexpected LogBufferFullException when trying "+
+1:2957f69:                             "to remove elements from the buffer", lbfe);
+1:2957f69:                     }
+1:2957f69:                 }
+1:2957f69:             }
+1:2957f69: 
+1:2957f69:             synchronized (outputLatch) {
+1:2957f69:                 if (dirtyBuffers.size() > 0 ) {
+1:2957f69:                     LogBufferElement current =
+1:7e7a589:                         dirtyBuffers.removeFirst();
+1:2957f69: 
+1:0b25b1a:                     // The outBufferData byte[] should have the
+1:0b25b1a:                     // default size or the size of the current
+1:0b25b1a:                     // LogBufferElement if that is bigger than the
+1:0b25b1a:                     // default size.
+1:0b25b1a:                     int requiredOutBufferSize = Math.max(defaultBufferSize,
+1:0b25b1a:                                                          current.size());
+1:0b25b1a:                     if (outBufferData.length != requiredOutBufferSize) {
+1:0b25b1a:                         // The current buffer has a different size
+1:0b25b1a:                         // than what we need it to be, so we resize.
+1:0b25b1a:                         outBufferData = new byte[requiredOutBufferSize];
+1:2957f69:                     }
+1:2957f69: 
+1:2957f69:                     // set the outBuffer data
+1:2957f69:                     System.arraycopy(current.getData(), 0, outBufferData, 0,
+1:2957f69:                                      current.size());
+1:2957f69:                     outBufferStored = current.size();
+1:2957f69:                     outBufferLastInstant = current.getLastInstant();
+1:2957f69: 
+1:2957f69:                     // recycle = false if the LogBufferElement has been
+1:5235dfd:                     // used to store a very big chunk of log records
+1:2957f69:                     if (current.isRecyclable()) {
+1:2957f69:                         freeBuffers.addLast(current);
+1:2957f69:                     }
+1:2957f69: 
+1:2957f69:                     validOutBuffer = true;
+1:2957f69:                 } else {
+1:2957f69:                     // No more dirty data to get
+1:2957f69:                     validOutBuffer = false;
+1:2957f69:                 }
+1:2957f69:             }
+1:2957f69:         }
+1:2957f69: 
+1:2957f69:         return validOutBuffer;
+1:2957f69:     }
+1:2957f69: 
+1:2957f69:     /**
+1:2957f69:      * Returns a byte[] containing a chunk of serialized log records.
+1:2957f69:      * Always returns the log that was oldest at the time next() was
+1:2957f69:      * called last time. Use next() to move to the next chunk of log
+1:2957f69:      * records.
+1:2957f69:      *
+1:2957f69:      * @return A copy of the current byte[], which is a chunk of log
+1:2957f69:      * @throws NoSuchElementException if there was no log in the
+1:2957f69:      * buffer the last time next() was called.
+1:2957f69:      */
+1:2957f69:     public byte[] getData() throws NoSuchElementException{
+1:2957f69:         synchronized (outputLatch) {
+1:2957f69:             byte [] b = new byte[getSize()];
+1:2957f69:             if (validOutBuffer) {
+1:2957f69:                 System.arraycopy(outBufferData, 0, b, 0, getSize());
+1:2957f69:                 return b;
+1:921ac6e:             } else {
+1:2957f69:                 throw new NoSuchElementException();
+1:921ac6e:             }
+1:2957f69:         }
+1:2957f69:     }
+1:2957f69: 
+1:2957f69:     /**
+1:5235dfd:      * Method to determine whether or not the buffer had any log records
+1:2957f69:      * the last time next() was called.
+1:2957f69:      *
+1:2957f69:      * @return true if the buffer contained log records the last time
+1:2957f69:      * next() was called. False if not, or if next() has not been
+1:2957f69:      * called yet.
+1:2957f69:      */
+1:2957f69:     public boolean validData() {
+1:2957f69:         synchronized (outputLatch) {
+1:2957f69:             return validOutBuffer;
+1:2957f69:         }
+1:2957f69:     }
+1:2957f69: 
+1:2957f69:     /**
+1:2957f69:      * @return The number of bytes returned by getData
+1:2957f69:      * @throws NoSuchElementException if there was no log in the
+1:2957f69:      * buffer the last time next() was called.
+1:2957f69:      */
+1:2957f69:     public int getSize() throws NoSuchElementException{
+1:2957f69:         synchronized (outputLatch) {
+1:2957f69:             if (validOutBuffer) {
+1:2957f69:                 return outBufferStored;
+1:2957f69:             } else {
+1:2957f69:                 throw new NoSuchElementException();
+1:2957f69:             }
+1:2957f69:         }
+1:2957f69:     }
+1:2957f69: 
+1:2957f69:     /**
+1:2957f69:      * Can be used so that only the necessary log records are sent
+1:2957f69:      * when a flush(LogInstant flush_to_this) is called in the log
+1:29fd25c:      * factory. Returns the highest log instant in the chunk of log that can 
+1:29fd25c:      * be read with getData().
+1:2957f69:      *
+1:2957f69:      * @return The highest log instant in the chunk of log returned by
+1:2957f69:      * getData().
+1:2957f69:      * @throws NoSuchElementException if there was no log in the
+1:2957f69:      * buffer the last time next() was called.
+1:2957f69:      */
+1:2957f69:     public long getLastInstant() throws NoSuchElementException{
+1:2957f69:         synchronized (outputLatch) {
+1:2957f69:             if (validOutBuffer) {
+1:2957f69:                 return outBufferLastInstant;
+1:2957f69:             } else {
+1:2957f69:                 throw new NoSuchElementException();
+1:2957f69:             }
+1:2957f69:         }
+1:2957f69:     }
+1:2957f69: 
+1:2957f69:     /**
+1:2957f69:      * Appends the currentDirtyBuffer to dirtyBuffers, and makes a
+1:2957f69:      * fresh buffer element from freeBuffers the currentDirtyBuffer.
+1:2957f69:      * Note: this method is not synchronized since all uses of it is
+1:2957f69:      * inside synchronized(listLatch) code blocks.
+1:2957f69:      *
+1:2957f69:      * @throws LogBufferFullException if the freeBuffers list is empty
+1:2957f69:      */
+1:2957f69:     private void switchDirtyBuffer() throws LogBufferFullException{
+1:2146e78: 
+1:2957f69:         // first, move currentDirtyBuffer to dirtyBuffers list.
+1:2957f69:         // do not switch if current buffer is empty
+1:2957f69:         if (currentDirtyBuffer != null && currentDirtyBuffer.size() > 0) {
+1:2957f69:             dirtyBuffers.addLast(currentDirtyBuffer);
+1:2957f69:             currentDirtyBuffer = null;
+1:2957f69:         }
+1:2957f69: 
+1:2957f69:         // second, make a buffer element from the freeBuffers list the
+1:2957f69:         // new currentDirtyBuffer. If currentDirtyBuffer != null, it
+1:2957f69:         // is empty and has therefore not been moved to dirtyBuffers
+1:2957f69:         if (currentDirtyBuffer == null) {
+1:2957f69:             try {
+1:2957f69:                 currentDirtyBuffer =
+1:7e7a589:                     freeBuffers.removeFirst();
+1:2957f69:                 currentDirtyBuffer.init();
+1:2957f69:             } catch (NoSuchElementException nsee) {
+1:2957f69:                 throw new LogBufferFullException();
+1:2957f69:             }
+1:2957f69:         }
+1:2957f69:     }
+1:2957f69: 
+1:2957f69:     /**
+1:2146e78:      * Used to calculate the Fill Information. The fill information
+1:2146e78:      * is a indicator of how full the buffer is at any point of time
+1:2146e78:      * fill information = (full buffers/Total Buffers)*100. The Fill
+1:2146e78:      * information ranges between 0-100 (both 0 and 100 inclusive).
+1:2146e78:      *
+1:2146e78:      * @return an integer value between 0-100 representing the fill
+1:2146e78:      *         information.
+1:2146e78:      */
+1:2146e78:     public int getFillInformation() {
+1:2146e78:         return ((dirtyBuffers.size()*100)/DEFAULT_NUMBER_LOG_BUFFERS);
+1:2146e78:     }
+1:2146e78: 
+1:2957f69: }
+============================================================================
+author:Richard N. Hillegas
+-------------------------------------------------------------------------------
+commit:dbed020
+/////////////////////////////////////////////////////////////////////////
+1:  * freeBuffers -&gt; currentDirtyBuffer -&gt; dirtyBuffers -&gt; freeBuffers
+commit:7e7a589
+/////////////////////////////////////////////////////////////////////////
+1:     private final LinkedList<LogBufferElement> dirtyBuffers;// LogBufferElements with unsent log
+1:     private final LinkedList<LogBufferElement> freeBuffers; // currently unused LogBufferElements
+/////////////////////////////////////////////////////////////////////////
+1:         dirtyBuffers = new LinkedList<LogBufferElement>();
+1:         freeBuffers = new LinkedList<LogBufferElement>();
+1:         currentDirtyBuffer = freeBuffers.removeFirst();
+/////////////////////////////////////////////////////////////////////////
+1:                         dirtyBuffers.removeFirst();
+/////////////////////////////////////////////////////////////////////////
+1:                     freeBuffers.removeFirst();
+author:Bryan Pendleton
+-------------------------------------------------------------------------------
+commit:7e51e9d
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.shared.common.sanity.SanityManager;
+author:Oystein Grovlen
+-------------------------------------------------------------------------------
+commit:1bac3f3
+/////////////////////////////////////////////////////////////////////////
+1:    Derby - Class org.apache.derby.impl.store.replication.buffer.ReplicationLogBuffer
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.derby.impl.store.replication.buffer;
+1: import org.apache.derby.iapi.store.replication.master.MasterFactory;
+commit:8dd309e
+/////////////////////////////////////////////////////////////////////////
+1:  * 
+1:  * Important: If methods in this class calls methods outside this package
+1:  * (e.g. MasterFactory#workToDo), make sure that deadlocks are not 
+1:  * introduced. If possible, a call to any method in another package should be 
+1:  * done without holding latches in this class.
+/////////////////////////////////////////////////////////////////////////
+1:         boolean switchedBuffer = false; 
+1:                 // element or throws a LogBufferFullException. No need to call
+1:                 // MasterFactory.workToDo becase switchDirtyBuffer will not add
+1:                 // a buffer to the dirty buffer list when currentDirtyBuffer 
+1:                 // is null
+1:                 switchedBuffer = true;
+/////////////////////////////////////////////////////////////////////////
+1:         // DERBY-3472 - we need to release the listLatch before calling workToDo
+1:         // to avoid deadlock with the logShipper thread
+1:         if (switchedBuffer) {
+1:             // Notify the master controller that a log buffer element is full 
+1:             // and work needs to be done.
+1:             mf.workToDo();
+1:         }
+/////////////////////////////////////////////////////////////////////////
+1:                     // No need to call MasterFactory.workToDo because the 
+1:                     // caller of next() will perform the work required on the 
+1:                     // buffer that was just moved to the dirty buffer list.
+/////////////////////////////////////////////////////////////////////////
+commit:29fd25c
+/////////////////////////////////////////////////////////////////////////
+1:      * factory. Returns the highest log instant in the chunk of log that can 
+1:      * be read with getData().
+commit:921ac6e
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private final MasterFactory mf;
+/////////////////////////////////////////////////////////////////////////
+1:             } else {
+1:             }
+commit:01150e0
+/////////////////////////////////////////////////////////////////////////
+1:         
+1:         this.mf = mf;
+commit:2146e78
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.derby.iapi.services.replication.master.MasterFactory;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     // used to notify the master controller that a log buffer element is full 
+1:     // and work needs to be done.
+0:     private MasterFactory mf;
+1: 
+1:     /**
+1:      * Class constructor specifies the number of buffer elements
+1:      * and the master controller that creates this replication log
+1:      * buffer.
+1:      *
+1:      * @param bufferSize the default number of buffer elements
+1:      * @param mf         Used to notify the master controller that a log buffer
+1:      *                   element is full and work needs to be done.
+1:      */
+1:     public ReplicationLogBuffer(int bufferSize, MasterFactory mf) {
+/////////////////////////////////////////////////////////////////////////
+0:         //Notify the master controller that a log buffer element is full and 
+0:         //work needs to be done.
+0:         mf.workToDo();
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Used to calculate the Fill Information. The fill information
+1:      * is a indicator of how full the buffer is at any point of time
+1:      * fill information = (full buffers/Total Buffers)*100. The Fill
+1:      * information ranges between 0-100 (both 0 and 100 inclusive).
+1:      *
+1:      * @return an integer value between 0-100 representing the fill
+1:      *         information.
+1:      */
+1:     public int getFillInformation() {
+1:         return ((dirtyBuffers.size()*100)/DEFAULT_NUMBER_LOG_BUFFERS);
+1:     }
+1: 
+commit:5235dfd
+/////////////////////////////////////////////////////////////////////////
+1:  * elements that contains dirty log are in dirtyBuffers. Chunks of log records
+1:  * To append chunks of log records to the buffer, use appendLog(...)
+/////////////////////////////////////////////////////////////////////////
+1:     // the buffer we currently APPEND chunks of log records to
+/////////////////////////////////////////////////////////////////////////
+1:     // concurrently (although appendLog may conflict with next).
+1:     // used by appendLog and next to synchronize operations on
+/////////////////////////////////////////////////////////////////////////
+1:      * Append a chunk of log records to the log buffer.
+1:      * @param greatestInstant   the instant of the log record that was
+1:      *                          added last to this chunk of log
+1:      * @param log               the chunk of log records
+1:      * @param logOffset         offset in log to start copy from
+1:      * @param logLength         number of bytes to copy, starting
+1:      *                          from logOffset
+1:      * free space in the buffer to store the chunk of log.
+1:     public void appendLog(long greatestInstant,
+1:                           byte[] log, int logOffset, int logLength)
+/////////////////////////////////////////////////////////////////////////
+1:             if (logLength > currentDirtyBuffer.freeSize()) {
+1:             if (logLength <= currentDirtyBuffer.freeSize()) {
+1:                 currentDirtyBuffer.appendLog(greatestInstant,
+1:                                              log, logOffset, logLength);
+1:                 // The chunk of log records requires more space than one
+1:                 LogBufferElement current = new LogBufferElement(logLength);
+1:                 current.appendLog(greatestInstant, log, logOffset, logLength);
+/////////////////////////////////////////////////////////////////////////
+1:                     // used to store a very big chunk of log records
+/////////////////////////////////////////////////////////////////////////
+1:      * Method to determine whether or not the buffer had any log records
+author:Knut Anders Hatlen
+-------------------------------------------------------------------------------
+commit:1d0892e
+/////////////////////////////////////////////////////////////////////////
+1:     public static final int DEFAULT_NUMBER_LOG_BUFFERS = 10;
+commit:0b25b1a
+/////////////////////////////////////////////////////////////////////////
+1:                     // The outBufferData byte[] should have the
+1:                     // default size or the size of the current
+1:                     // LogBufferElement if that is bigger than the
+1:                     // default size.
+1:                     int requiredOutBufferSize = Math.max(defaultBufferSize,
+1:                                                          current.size());
+1:                     if (outBufferData.length != requiredOutBufferSize) {
+1:                         // The current buffer has a different size
+1:                         // than what we need it to be, so we resize.
+1:                         outBufferData = new byte[requiredOutBufferSize];
+commit:2957f69
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1: 
+0:    Derby - Class org.apache.derby.impl.services.replication.buffer.ReplicationLogBuffer
+1: 
+1:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:    contributor license agreements.  See the NOTICE file distributed with
+1:    this work for additional information regarding copyright ownership.
+1:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:    (the "License"); you may not use this file except in compliance with
+1:    the License.  You may obtain a copy of the License at
+1: 
+1:       http://www.apache.org/licenses/LICENSE-2.0
+1: 
+1:    Unless required by applicable law or agreed to in writing, software
+1:    distributed under the License is distributed on an "AS IS" BASIS,
+1:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:    See the License for the specific language governing permissions and
+1:    limitations under the License.
+1: 
+1: */
+1: 
+0: package org.apache.derby.impl.services.replication.buffer;
+1: 
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+1: 
+0: import java.util.Arrays;
+1: import java.util.NoSuchElementException;
+1: import java.util.LinkedList;
+1: 
+1: /**
+1:  * Used for the replication master role only. When a Derby instance
+1:  * has the replication master role for a database 'x', all log records
+1:  * that are written to the local log file are also appended to this
+1:  * log buffer. The replication master service will consume chunks of
+1:  * log from this buffer and send it to the Derby instance with the
+1:  * slave role for 'x'.
+1:  *
+1:  * ReplicationLogBuffer consists of a number of LogBufferElements.
+1:  * Elements that are not in use are in the freeBuffers list, while
+0:  * elements that contains dirty log are in dirtyBuffers. Log records
+1:  * are appended to the buffer element in currentDirtyBuffer. Hence,
+1:  * the life cycle of buffer elements is:
+0:  * freeBuffers -> currentDirtyBuffer -> dirtyBuffers -> freeBuffers
+1:  *
+0:  * To append log records to the buffer, use appendLogRecord(...)
+1:  *
+1:  * To consume chunks of log records, use next() followed by getData(),
+1:  * getLastInstant() and getSize(). These get-methods throw
+1:  * NoSuchElementException if next() returned false, meaning that there
+1:  * were no dirty log at the time next() was called.
+1:  *
+1:  * Threads: ReplicationLogBuffer is threadsafe. It can be used by a
+1:  * logger (LogToFile) and a log consumer (LogShipping service)
+1:  * concurrently without further synchronization.
+1:  */
+1: 
+1: public class ReplicationLogBuffer {
+1: 
+0:     private static final int DEFAULT_NUMBER_LOG_BUFFERS = 10;
+1: 
+0:     protected static final int LOG_RECORD_FIXED_OVERHEAD_SIZE = 24;
+0:     // long instant           - 8
+0:     // int dataLength         - 4
+0:     // int dataOffset         - 4
+0:     // int optionalDataLength - 4
+0:     // int optionalDataOffset - 4
+1: 
+0:     private final LinkedList dirtyBuffers;// LogBufferElements with unsent log
+0:     private final LinkedList freeBuffers; // currently unused LogBufferElements
+1: 
+0:     // the buffer we currently APPEND log records to
+1:     private LogBufferElement currentDirtyBuffer;
+1: 
+1:     // used to GET data from this buffer. next() sets these
+1:     private boolean validOutBuffer; // outBuffer contains valid data
+1:     private byte[] outBufferData;   // the buffer contents
+1:     private int outBufferStored;    // number of bytes currently stored
+1:     private long outBufferLastInstant;// highest instant (LSN) in outBufferData
+1: 
+1:     // Two objects to synchronize on so that the logger (LogToFile)
+1:     // and the log consumer (LogShipping service) can use the buffer
+0:     // concurrently (although appendLogRecord may conflict with next).
+1:     // In cases where both latches are needed at the same time,
+1:     // listLatch is always set first to avoid deadlock. listLatch is
+0:     // used by appendLogRecord and next to synchronize operations on
+1:     // the free and dirty buffer lists and on currentDirtyBuffer.
+1:     // outputLatch is used by next and getXXX to synchronize on the
+1:     // output data variables
+1:     private final Object listLatch = new Object();
+1:     private final Object outputLatch = new Object();
+1: 
+1:     private int defaultBufferSize;
+1: 
+0:     public ReplicationLogBuffer(int bufferSize) {
+1:         defaultBufferSize = bufferSize;
+1: 
+1:         outBufferData = new byte[bufferSize];
+1:         outBufferStored = 0;
+1:         outBufferLastInstant = 0;
+1:         validOutBuffer = false; // no valid data in outBuffer yet
+1: 
+0:         dirtyBuffers = new LinkedList();
+0:         freeBuffers = new LinkedList();
+1: 
+1:         for (int i = 0; i < DEFAULT_NUMBER_LOG_BUFFERS; i++){
+1:             LogBufferElement b = new LogBufferElement(bufferSize);
+1:             freeBuffers.addLast(b);
+1:         }
+0:         currentDirtyBuffer = (LogBufferElement)freeBuffers.removeFirst();
+1:     }
+1: 
+1:     /**
+0:      * Append a single log record to the log buffer.
+1:      *
+0:      * @param instant               the log address of this log record.
+0:      * @param dataLength            number of bytes in data[]
+0:      * @param dataOffset            offset in data[] to start copying from.
+0:      * @param optionalDataLength    number of bytes in optionalData[]
+0:      * @param optionalDataOffset    offset in optionalData[] to start copy from
+0:      * @param data                  "from" array to copy "data" portion of rec
+0:      * @param optionalData          "from" array to copy "optional data" from
+1:      *
+1:      * @throws LogBufferFullException - thrown if there is not enough
+0:      * free space in the buffer to store the log record.
+1:      **/
+0:     public void appendLogRecord(long instant,
+0:                                 int dataLength,
+0:                                 int dataOffset,
+0:                                 int optionalDataLength,
+0:                                 int optionalDataOffset,
+0:                                 byte[] data,
+0:                                 byte[] optionalData)
+1:         throws LogBufferFullException{
+1: 
+0:         /* format of log to write:
+1:          *
+0:          * (long)   instant
+0:          * (int)    dataLength
+0:          * (int)    dataOffset
+0:          * (int)    optionalDataLength
+0:          * (int)    optionalDataOffset
+0:          * (byte[]) data
+0:          * (byte[]) optionalData
+1:          */
+1: 
+0:         int totalLength = dataLength + optionalDataLength +
+0:                           LOG_RECORD_FIXED_OVERHEAD_SIZE;
+1: 
+1:         synchronized (listLatch) {
+1:             if (currentDirtyBuffer == null) {
+1:                 switchDirtyBuffer();
+1:                 // either sets the currentDirtyBuffer to a buffer
+0:                 // element or throws a LogBufferFullException
+1:             }
+1: 
+1:             // switch buffer if current buffer does not have enough space
+1:             // for the incoming data
+0:             if (totalLength > currentDirtyBuffer.freeSize()) {
+1:                 switchDirtyBuffer();
+1:             }
+1: 
+0:             if (totalLength <= currentDirtyBuffer.freeSize()) {
+0:                 currentDirtyBuffer.appendLogRecord(instant,
+0:                                                    dataLength,
+0:                                                    dataOffset,
+0:                                                    optionalDataLength,
+0:                                                    optionalDataOffset,
+0:                                                    data,
+0:                                                    optionalData);
+1:             } else {
+0:                 // The log record requires more space than one
+1:                 // LogBufferElement with default size. Create a new big
+1:                 // enough LogBufferElement
+0:                 LogBufferElement current = new LogBufferElement(totalLength);
+1:                 current.setRecyclable(false);
+0:                 current.appendLogRecord(instant,
+0:                                         dataLength,
+0:                                         dataOffset,
+0:                                         optionalDataLength,
+0:                                         optionalDataOffset,
+0:                                         data,
+0:                                         optionalData);
+1:                 dirtyBuffers.addLast(current);
+1:                 // currentDirtyBuffer has already been handed over to
+1:                 // the dirtyBuffers list, and an empty one is in
+1:                 // place, so no need to touch currentDirtyBuffer here
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Sets the output data to that of the next (oldest) buffer
+1:      * element in dirtyBuffers so that getData(), getLastInstant() and
+1:      * getSize() return values from the next oldest chunk of log. Used
+1:      * by the log consumer (the LogShipping service) to move to the
+1:      * next chunk of log in the buffer.
+1:      *
+1:      * @return true if there is log in the buffer, resulting in valid
+1:      * data for the get-methods
+1:      */
+1:     public boolean next() {
+1:         synchronized (listLatch) {
+1: 
+1:             if (dirtyBuffers.size() == 0) {
+1:                 // if the current buffer has been written to, and
+1:                 // there are no other dirty buffers, it should be
+1:                 // moved to the dirtyBuffer list so that it can be
+1:                 // returned.
+1:                 try {
+1:                     switchDirtyBuffer();
+1:                 } catch (LogBufferFullException lbfe) {
+1:                     // should not be possible when dirtyBuffers.size() == 0
+1:                     if (SanityManager.DEBUG){
+1:                         SanityManager.THROWASSERT(
+1:                             "Unexpected LogBufferFullException when trying "+
+1:                             "to remove elements from the buffer", lbfe);
+1:                     }
+1:                 }
+1:             }
+1: 
+1:             synchronized (outputLatch) {
+1:                 if (dirtyBuffers.size() > 0 ) {
+1:                     LogBufferElement current =
+0:                         (LogBufferElement)dirtyBuffers.removeFirst();
+1: 
+0:                     if (outBufferData.length < current.size()) {
+0:                         // resize outBufferData if it has too few bytes
+0:                         outBufferData = new byte[current.size()];
+0:                     } else if(outBufferData.length != defaultBufferSize) {
+0:                         // the buffer should be resized to default if it has
+0:                         // previously been increased
+0:                         int newSize = defaultBufferSize;
+0:                         if (current.size() > newSize) {
+0:                             // can not be smaller than current LogBufferElement
+0:                             newSize = current.size();
+1:                         }
+0:                         outBufferData = new byte[newSize];
+1:                     }
+1: 
+1:                     // set the outBuffer data
+1:                     System.arraycopy(current.getData(), 0, outBufferData, 0,
+1:                                      current.size());
+1:                     outBufferStored = current.size();
+1:                     outBufferLastInstant = current.getLastInstant();
+1: 
+1:                     // recycle = false if the LogBufferElement has been
+0:                     // used to store a single very big log record
+1:                     if (current.isRecyclable()) {
+1:                         freeBuffers.addLast(current);
+1:                     }
+1: 
+1:                     validOutBuffer = true;
+1:                 } else {
+1:                     // No more dirty data to get
+1:                     validOutBuffer = false;
+1:                 }
+1:             }
+1:         }
+1: 
+1:         return validOutBuffer;
+1:     }
+1: 
+1:     /**
+1:      * Returns a byte[] containing a chunk of serialized log records.
+1:      * Always returns the log that was oldest at the time next() was
+1:      * called last time. Use next() to move to the next chunk of log
+1:      * records.
+1:      *
+1:      * @return A copy of the current byte[], which is a chunk of log
+1:      * @throws NoSuchElementException if there was no log in the
+1:      * buffer the last time next() was called.
+1:      */
+1:     public byte[] getData() throws NoSuchElementException{
+1:         synchronized (outputLatch) {
+1:             byte [] b = new byte[getSize()];
+1:             if (validOutBuffer) {
+1:                 System.arraycopy(outBufferData, 0, b, 0, getSize());
+1:                 return b;
+0:             } else
+1:                 throw new NoSuchElementException();
+1:         }
+1:     }
+1: 
+1:     /**
+0:      * Method to determine whether or not the buffer had log record
+1:      * the last time next() was called.
+1:      *
+1:      * @return true if the buffer contained log records the last time
+1:      * next() was called. False if not, or if next() has not been
+1:      * called yet.
+1:      */
+1:     public boolean validData() {
+1:         synchronized (outputLatch) {
+1:             return validOutBuffer;
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * @return The number of bytes returned by getData
+1:      * @throws NoSuchElementException if there was no log in the
+1:      * buffer the last time next() was called.
+1:      */
+1:     public int getSize() throws NoSuchElementException{
+1:         synchronized (outputLatch) {
+1:             if (validOutBuffer) {
+1:                 return outBufferStored;
+1:             } else {
+1:                 throw new NoSuchElementException();
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Can be used so that only the necessary log records are sent
+1:      * when a flush(LogInstant flush_to_this) is called in the log
+0:      * factory.
+1:      *
+1:      * @return The highest log instant in the chunk of log returned by
+1:      * getData().
+1:      * @throws NoSuchElementException if there was no log in the
+1:      * buffer the last time next() was called.
+1:      */
+1:     public long getLastInstant() throws NoSuchElementException{
+1:         synchronized (outputLatch) {
+1:             if (validOutBuffer) {
+1:                 return outBufferLastInstant;
+1:             } else {
+1:                 throw new NoSuchElementException();
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Appends the currentDirtyBuffer to dirtyBuffers, and makes a
+1:      * fresh buffer element from freeBuffers the currentDirtyBuffer.
+1:      * Note: this method is not synchronized since all uses of it is
+1:      * inside synchronized(listLatch) code blocks.
+1:      *
+1:      * @throws LogBufferFullException if the freeBuffers list is empty
+1:      */
+1:     private void switchDirtyBuffer() throws LogBufferFullException{
+1:         // first, move currentDirtyBuffer to dirtyBuffers list.
+1:         // do not switch if current buffer is empty
+1:         if (currentDirtyBuffer != null && currentDirtyBuffer.size() > 0) {
+1:             dirtyBuffers.addLast(currentDirtyBuffer);
+1:             currentDirtyBuffer = null;
+1:         }
+1: 
+1:         // second, make a buffer element from the freeBuffers list the
+1:         // new currentDirtyBuffer. If currentDirtyBuffer != null, it
+1:         // is empty and has therefore not been moved to dirtyBuffers
+1:         if (currentDirtyBuffer == null) {
+1:             try {
+1:                 currentDirtyBuffer =
+0:                     (LogBufferElement)freeBuffers.removeFirst();
+1:                 currentDirtyBuffer.init();
+1:             } catch (NoSuchElementException nsee) {
+1:                 throw new LogBufferFullException();
+1:             }
+1:         }
+1:     }
+1: 
+1: }
+============================================================================

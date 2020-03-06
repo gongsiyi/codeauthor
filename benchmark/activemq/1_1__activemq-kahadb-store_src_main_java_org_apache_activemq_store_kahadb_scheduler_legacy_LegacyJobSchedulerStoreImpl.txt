@@ -1,0 +1,762 @@
+1:74846bb: /**
+1:74846bb:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:74846bb:  * contributor license agreements.  See the NOTICE file distributed with
+1:74846bb:  * this work for additional information regarding copyright ownership.
+1:74846bb:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:74846bb:  * (the "License"); you may not use this file except in compliance with
+1:74846bb:  * the License.  You may obtain a copy of the License at
+1:74846bb:  *
+1:74846bb:  *      http://www.apache.org/licenses/LICENSE-2.0
+1:74846bb:  *
+1:74846bb:  * Unless required by applicable law or agreed to in writing, software
+1:74846bb:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:74846bb:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:74846bb:  * See the License for the specific language governing permissions and
+1:74846bb:  * limitations under the License.
+1:74846bb:  */
+1:74846bb: package org.apache.activemq.store.kahadb.scheduler.legacy;
+1:74846bb: 
+1:74846bb: import java.io.DataInput;
+1:74846bb: import java.io.DataOutput;
+1:74846bb: import java.io.File;
+1:74846bb: import java.io.IOException;
+1:74846bb: import java.util.ArrayList;
+1:74846bb: import java.util.Collections;
+1:74846bb: import java.util.HashMap;
+1:74846bb: import java.util.Iterator;
+1:74846bb: import java.util.List;
+1:74846bb: import java.util.Map;
+1:74846bb: import java.util.Map.Entry;
+1:74846bb: import java.util.NoSuchElementException;
+1:74846bb: import java.util.Set;
+1:74846bb: import java.util.concurrent.atomic.AtomicLong;
+1:74846bb: 
+1:74846bb: import org.apache.activemq.store.kahadb.disk.index.BTreeIndex;
+1:74846bb: import org.apache.activemq.store.kahadb.disk.journal.Journal;
+1:74846bb: import org.apache.activemq.store.kahadb.disk.journal.Location;
+1:74846bb: import org.apache.activemq.store.kahadb.disk.page.Page;
+1:74846bb: import org.apache.activemq.store.kahadb.disk.page.PageFile;
+1:74846bb: import org.apache.activemq.store.kahadb.disk.page.Transaction;
+1:74846bb: import org.apache.activemq.store.kahadb.disk.util.IntegerMarshaller;
+1:74846bb: import org.apache.activemq.store.kahadb.disk.util.StringMarshaller;
+1:74846bb: import org.apache.activemq.store.kahadb.disk.util.VariableMarshaller;
+1:74846bb: import org.apache.activemq.util.ByteSequence;
+1:74846bb: import org.apache.activemq.util.IOHelper;
+1:74846bb: import org.apache.activemq.util.LockFile;
+1:74846bb: import org.apache.activemq.util.ServiceStopper;
+1:74846bb: import org.apache.activemq.util.ServiceSupport;
+1:74846bb: import org.slf4j.Logger;
+1:74846bb: import org.slf4j.LoggerFactory;
+1:74846bb: 
+1:74846bb: /**
+1:74846bb:  * Read-only view of a legacy JobSchedulerStore implementation.
+1:74846bb:  */
+1:74846bb: final class LegacyJobSchedulerStoreImpl extends ServiceSupport {
+1:74846bb: 
+1:74846bb:     static final Logger LOG = LoggerFactory.getLogger(LegacyJobSchedulerStoreImpl.class);
+1:74846bb: 
+1:74846bb:     private static final int DATABASE_LOCKED_WAIT_DELAY = 10 * 1000;
+1:74846bb: 
+1:74846bb:     private File directory;
+1:74846bb:     private PageFile pageFile;
+1:74846bb:     private Journal journal;
+1:74846bb:     private LockFile lockFile;
+1:74846bb:     private final AtomicLong journalSize = new AtomicLong(0);
+1:74846bb:     private boolean failIfDatabaseIsLocked;
+1:74846bb:     private int journalMaxFileLength = Journal.DEFAULT_MAX_FILE_LENGTH;
+1:74846bb:     private int journalMaxWriteBatchSize = Journal.DEFAULT_MAX_WRITE_BATCH_SIZE;
+1:74846bb:     private boolean enableIndexWriteAsync = false;
+1:74846bb:     private MetaData metaData = new MetaData(this);
+1:74846bb:     private final MetaDataMarshaller metaDataMarshaller = new MetaDataMarshaller(this);
+1:74846bb:     private final Map<String, LegacyJobSchedulerImpl> schedulers = new HashMap<String, LegacyJobSchedulerImpl>();
+1:74846bb: 
+1:74846bb:     protected class MetaData {
+1:74846bb:         protected MetaData(LegacyJobSchedulerStoreImpl store) {
+1:74846bb:             this.store = store;
+1:74846bb:         }
+1:74846bb: 
+1:74846bb:         private final LegacyJobSchedulerStoreImpl store;
+1:74846bb:         Page<MetaData> page;
+1:74846bb:         BTreeIndex<Integer, Integer> journalRC;
+1:74846bb:         BTreeIndex<String, LegacyJobSchedulerImpl> storedSchedulers;
+1:74846bb: 
+1:74846bb:         void createIndexes(Transaction tx) throws IOException {
+1:74846bb:             this.storedSchedulers = new BTreeIndex<String, LegacyJobSchedulerImpl>(pageFile, tx.allocate().getPageId());
+1:74846bb:             this.journalRC = new BTreeIndex<Integer, Integer>(pageFile, tx.allocate().getPageId());
+1:74846bb:         }
+1:74846bb: 
+1:74846bb:         void load(Transaction tx) throws IOException {
+1:74846bb:             this.storedSchedulers.setKeyMarshaller(StringMarshaller.INSTANCE);
+1:74846bb:             this.storedSchedulers.setValueMarshaller(new JobSchedulerMarshaller(this.store));
+1:74846bb:             this.storedSchedulers.load(tx);
+1:74846bb:             this.journalRC.setKeyMarshaller(IntegerMarshaller.INSTANCE);
+1:74846bb:             this.journalRC.setValueMarshaller(IntegerMarshaller.INSTANCE);
+1:74846bb:             this.journalRC.load(tx);
+1:74846bb:         }
+1:74846bb: 
+1:74846bb:         void loadScheduler(Transaction tx, Map<String, LegacyJobSchedulerImpl> schedulers) throws IOException {
+1:74846bb:             for (Iterator<Entry<String, LegacyJobSchedulerImpl>> i = this.storedSchedulers.iterator(tx); i.hasNext();) {
+1:74846bb:                 Entry<String, LegacyJobSchedulerImpl> entry = i.next();
+1:74846bb:                 entry.getValue().load(tx);
+1:74846bb:                 schedulers.put(entry.getKey(), entry.getValue());
+1:74846bb:             }
+1:74846bb:         }
+1:74846bb: 
+1:74846bb:         public void read(DataInput is) throws IOException {
+1:74846bb:             this.storedSchedulers = new BTreeIndex<String, LegacyJobSchedulerImpl>(pageFile, is.readLong());
+1:74846bb:             this.storedSchedulers.setKeyMarshaller(StringMarshaller.INSTANCE);
+1:74846bb:             this.storedSchedulers.setValueMarshaller(new JobSchedulerMarshaller(this.store));
+1:74846bb:             this.journalRC = new BTreeIndex<Integer, Integer>(pageFile, is.readLong());
+1:74846bb:             this.journalRC.setKeyMarshaller(IntegerMarshaller.INSTANCE);
+1:74846bb:             this.journalRC.setValueMarshaller(IntegerMarshaller.INSTANCE);
+1:74846bb:         }
+1:74846bb: 
+1:74846bb:         public void write(DataOutput os) throws IOException {
+1:74846bb:             os.writeLong(this.storedSchedulers.getPageId());
+1:74846bb:             os.writeLong(this.journalRC.getPageId());
+1:74846bb:         }
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     class MetaDataMarshaller extends VariableMarshaller<MetaData> {
+1:74846bb:         private final LegacyJobSchedulerStoreImpl store;
+1:74846bb: 
+1:74846bb:         MetaDataMarshaller(LegacyJobSchedulerStoreImpl store) {
+1:74846bb:             this.store = store;
+1:74846bb:         }
+1:74846bb: 
+1:74846bb:         @Override
+1:74846bb:         public MetaData readPayload(DataInput dataIn) throws IOException {
+1:74846bb:             MetaData rc = new MetaData(this.store);
+1:74846bb:             rc.read(dataIn);
+1:74846bb:             return rc;
+1:74846bb:         }
+1:74846bb: 
+1:74846bb:         @Override
+1:74846bb:         public void writePayload(MetaData object, DataOutput dataOut) throws IOException {
+1:74846bb:             object.write(dataOut);
+1:74846bb:         }
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     class ValueMarshaller extends VariableMarshaller<List<LegacyJobLocation>> {
+1:74846bb:         @Override
+1:74846bb:         public List<LegacyJobLocation> readPayload(DataInput dataIn) throws IOException {
+1:74846bb:             List<LegacyJobLocation> result = new ArrayList<LegacyJobLocation>();
+1:74846bb:             int size = dataIn.readInt();
+1:74846bb:             for (int i = 0; i < size; i++) {
+1:74846bb:                 LegacyJobLocation jobLocation = new LegacyJobLocation();
+1:74846bb:                 jobLocation.readExternal(dataIn);
+1:74846bb:                 result.add(jobLocation);
+1:74846bb:             }
+1:74846bb:             return result;
+1:74846bb:         }
+1:74846bb: 
+1:74846bb:         @Override
+1:74846bb:         public void writePayload(List<LegacyJobLocation> value, DataOutput dataOut) throws IOException {
+1:74846bb:             dataOut.writeInt(value.size());
+1:74846bb:             for (LegacyJobLocation jobLocation : value) {
+1:74846bb:                 jobLocation.writeExternal(dataOut);
+1:74846bb:             }
+1:74846bb:         }
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     class JobSchedulerMarshaller extends VariableMarshaller<LegacyJobSchedulerImpl> {
+1:74846bb:         private final LegacyJobSchedulerStoreImpl store;
+1:74846bb: 
+1:74846bb:         JobSchedulerMarshaller(LegacyJobSchedulerStoreImpl store) {
+1:74846bb:             this.store = store;
+1:74846bb:         }
+1:74846bb: 
+1:74846bb:         @Override
+1:74846bb:         public LegacyJobSchedulerImpl readPayload(DataInput dataIn) throws IOException {
+1:74846bb:             LegacyJobSchedulerImpl result = new LegacyJobSchedulerImpl(this.store);
+1:74846bb:             result.read(dataIn);
+1:74846bb:             return result;
+1:74846bb:         }
+1:74846bb: 
+1:74846bb:         @Override
+1:74846bb:         public void writePayload(LegacyJobSchedulerImpl js, DataOutput dataOut) throws IOException {
+1:74846bb:             js.write(dataOut);
+1:74846bb:         }
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     public File getDirectory() {
+1:74846bb:         return directory;
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     public void setDirectory(File directory) {
+1:74846bb:         this.directory = directory;
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     public long size() {
+1:74846bb:         if (!isStarted()) {
+1:74846bb:             return 0;
+1:74846bb:         }
+1:74846bb:         try {
+1:74846bb:             return journalSize.get() + pageFile.getDiskSize();
+1:74846bb:         } catch (IOException e) {
+1:74846bb:             throw new RuntimeException(e);
+1:74846bb:         }
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     /**
+1:74846bb:      * Returns the named Job Scheduler if it exists, otherwise throws an exception.
+1:74846bb:      *
+1:74846bb:      * @param name
+1:74846bb:      *     The name of the scheduler that is to be returned.
+1:74846bb:      *
+1:74846bb:      * @return the named scheduler if it exists.
+1:74846bb:      *
+1:74846bb:      * @throws Exception if the named scheduler does not exist in this store.
+1:74846bb:      */
+1:74846bb:     public LegacyJobSchedulerImpl getJobScheduler(final String name) throws Exception {
+1:74846bb:         LegacyJobSchedulerImpl result = this.schedulers.get(name);
+1:74846bb:         if (result == null) {
+1:74846bb:             throw new NoSuchElementException("No such Job Scheduler in this store: " + name);
+1:74846bb:         }
+1:74846bb:         return result;
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     /**
+1:74846bb:      * Returns the names of all the schedulers that exist in this scheduler store.
+1:74846bb:      *
+1:74846bb:      * @return a set of names of all scheduler instances in this store.
+1:74846bb:      *
+1:74846bb:      * @throws Exception if an error occurs while collecting the scheduler names.
+1:74846bb:      */
+1:74846bb:     public Set<String> getJobSchedulerNames() throws Exception {
+1:74846bb:         Set<String> names = Collections.emptySet();
+1:74846bb: 
+1:74846bb:         if (!schedulers.isEmpty()) {
+1:74846bb:             return this.schedulers.keySet();
+1:74846bb:         }
+1:74846bb: 
+1:74846bb:         return names;
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     @Override
+1:74846bb:     protected void doStart() throws Exception {
+1:74846bb:         if (this.directory == null) {
+1:74846bb:             this.directory = new File(IOHelper.getDefaultDataDirectory() + File.pathSeparator + "delayedDB");
+1:74846bb:         }
+1:74846bb:         IOHelper.mkdirs(this.directory);
+1:74846bb:         lock();
+1:74846bb:         this.journal = new Journal();
+1:74846bb:         this.journal.setDirectory(directory);
+1:74846bb:         this.journal.setMaxFileLength(getJournalMaxFileLength());
+1:74846bb:         this.journal.setWriteBatchSize(getJournalMaxWriteBatchSize());
+1:74846bb:         this.journal.setSizeAccumulator(this.journalSize);
+1:74846bb:         this.journal.start();
+1:74846bb:         this.pageFile = new PageFile(directory, "scheduleDB");
+1:74846bb:         this.pageFile.setWriteBatchSize(1);
+1:74846bb:         this.pageFile.load();
+1:74846bb: 
+1:74846bb:         this.pageFile.tx().execute(new Transaction.Closure<IOException>() {
+1:74846bb:             @Override
+1:74846bb:             public void execute(Transaction tx) throws IOException {
+1:74846bb:                 if (pageFile.getPageCount() == 0) {
+1:74846bb:                     Page<MetaData> page = tx.allocate();
+1:74846bb:                     assert page.getPageId() == 0;
+1:74846bb:                     page.set(metaData);
+1:74846bb:                     metaData.page = page;
+1:74846bb:                     metaData.createIndexes(tx);
+1:74846bb:                     tx.store(metaData.page, metaDataMarshaller, true);
+1:74846bb: 
+1:74846bb:                 } else {
+1:74846bb:                     Page<MetaData> page = tx.load(0, metaDataMarshaller);
+1:74846bb:                     metaData = page.get();
+1:74846bb:                     metaData.page = page;
+1:74846bb:                 }
+1:74846bb:                 metaData.load(tx);
+1:74846bb:                 metaData.loadScheduler(tx, schedulers);
+1:74846bb:                 for (LegacyJobSchedulerImpl js : schedulers.values()) {
+1:74846bb:                     try {
+1:74846bb:                         js.start();
+1:74846bb:                     } catch (Exception e) {
+1:74846bb:                         LegacyJobSchedulerStoreImpl.LOG.error("Failed to load " + js.getName(), e);
+1:74846bb:                     }
+1:74846bb:                 }
+1:74846bb:             }
+1:74846bb:         });
+1:74846bb: 
+1:74846bb:         this.pageFile.flush();
+1:74846bb:         LOG.info(this + " started");
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     @Override
+1:74846bb:     protected void doStop(ServiceStopper stopper) throws Exception {
+1:74846bb:         for (LegacyJobSchedulerImpl js : this.schedulers.values()) {
+1:74846bb:             js.stop();
+1:74846bb:         }
+1:74846bb:         if (this.pageFile != null) {
+1:74846bb:             this.pageFile.unload();
+1:74846bb:         }
+1:74846bb:         if (this.journal != null) {
+1:74846bb:             journal.close();
+1:74846bb:         }
+1:74846bb:         if (this.lockFile != null) {
+1:74846bb:             this.lockFile.unlock();
+1:74846bb:         }
+1:74846bb:         this.lockFile = null;
+1:74846bb:         LOG.info(this + " stopped");
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     ByteSequence getPayload(Location location) throws IllegalStateException, IOException {
+1:74846bb:         ByteSequence result = null;
+1:74846bb:         result = this.journal.read(location);
+1:74846bb:         return result;
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     Location write(ByteSequence payload, boolean sync) throws IllegalStateException, IOException {
+1:74846bb:         return this.journal.write(payload, sync);
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     private void lock() throws IOException {
+1:74846bb:         if (lockFile == null) {
+1:74846bb:             File lockFileName = new File(directory, "lock");
+1:74846bb:             lockFile = new LockFile(lockFileName, true);
+1:74846bb:             if (failIfDatabaseIsLocked) {
+1:74846bb:                 lockFile.lock();
+1:74846bb:             } else {
+1:74846bb:                 while (true) {
+1:74846bb:                     try {
+1:74846bb:                         lockFile.lock();
+1:74846bb:                         break;
+1:74846bb:                     } catch (IOException e) {
+1:74846bb:                         LOG.info("Database " + lockFileName + " is locked... waiting " + (DATABASE_LOCKED_WAIT_DELAY / 1000)
+1:74846bb:                             + " seconds for the database to be unlocked. Reason: " + e);
+1:74846bb:                         try {
+1:74846bb:                             Thread.sleep(DATABASE_LOCKED_WAIT_DELAY);
+1:74846bb:                         } catch (InterruptedException e1) {
+1:74846bb:                         }
+1:74846bb:                     }
+1:74846bb:                 }
+1:74846bb:             }
+1:74846bb:         }
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     PageFile getPageFile() {
+1:74846bb:         this.pageFile.isLoaded();
+1:74846bb:         return this.pageFile;
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     public boolean isFailIfDatabaseIsLocked() {
+1:74846bb:         return failIfDatabaseIsLocked;
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     public void setFailIfDatabaseIsLocked(boolean failIfDatabaseIsLocked) {
+1:74846bb:         this.failIfDatabaseIsLocked = failIfDatabaseIsLocked;
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     public int getJournalMaxFileLength() {
+1:74846bb:         return journalMaxFileLength;
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     public void setJournalMaxFileLength(int journalMaxFileLength) {
+1:74846bb:         this.journalMaxFileLength = journalMaxFileLength;
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     public int getJournalMaxWriteBatchSize() {
+1:74846bb:         return journalMaxWriteBatchSize;
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     public void setJournalMaxWriteBatchSize(int journalMaxWriteBatchSize) {
+1:74846bb:         this.journalMaxWriteBatchSize = journalMaxWriteBatchSize;
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     public boolean isEnableIndexWriteAsync() {
+1:74846bb:         return enableIndexWriteAsync;
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     public void setEnableIndexWriteAsync(boolean enableIndexWriteAsync) {
+1:74846bb:         this.enableIndexWriteAsync = enableIndexWriteAsync;
+1:74846bb:     }
+1:74846bb: 
+1:74846bb:     @Override
+1:74846bb:     public String toString() {
+1:74846bb:         return "LegacyJobSchedulerStore:" + this.directory;
+1:74846bb:     }
+1:74846bb: }
+============================================================================
+author:Timothy Bish
+-------------------------------------------------------------------------------
+commit:74846bb
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *      http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.activemq.store.kahadb.scheduler.legacy;
+1: 
+1: import java.io.DataInput;
+1: import java.io.DataOutput;
+1: import java.io.File;
+1: import java.io.IOException;
+1: import java.util.ArrayList;
+1: import java.util.Collections;
+1: import java.util.HashMap;
+1: import java.util.Iterator;
+1: import java.util.List;
+1: import java.util.Map;
+1: import java.util.Map.Entry;
+1: import java.util.NoSuchElementException;
+1: import java.util.Set;
+1: import java.util.concurrent.atomic.AtomicLong;
+1: 
+1: import org.apache.activemq.store.kahadb.disk.index.BTreeIndex;
+1: import org.apache.activemq.store.kahadb.disk.journal.Journal;
+1: import org.apache.activemq.store.kahadb.disk.journal.Location;
+1: import org.apache.activemq.store.kahadb.disk.page.Page;
+1: import org.apache.activemq.store.kahadb.disk.page.PageFile;
+1: import org.apache.activemq.store.kahadb.disk.page.Transaction;
+1: import org.apache.activemq.store.kahadb.disk.util.IntegerMarshaller;
+1: import org.apache.activemq.store.kahadb.disk.util.StringMarshaller;
+1: import org.apache.activemq.store.kahadb.disk.util.VariableMarshaller;
+1: import org.apache.activemq.util.ByteSequence;
+1: import org.apache.activemq.util.IOHelper;
+1: import org.apache.activemq.util.LockFile;
+1: import org.apache.activemq.util.ServiceStopper;
+1: import org.apache.activemq.util.ServiceSupport;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: /**
+1:  * Read-only view of a legacy JobSchedulerStore implementation.
+1:  */
+1: final class LegacyJobSchedulerStoreImpl extends ServiceSupport {
+1: 
+1:     static final Logger LOG = LoggerFactory.getLogger(LegacyJobSchedulerStoreImpl.class);
+1: 
+1:     private static final int DATABASE_LOCKED_WAIT_DELAY = 10 * 1000;
+1: 
+1:     private File directory;
+1:     private PageFile pageFile;
+1:     private Journal journal;
+1:     private LockFile lockFile;
+1:     private final AtomicLong journalSize = new AtomicLong(0);
+1:     private boolean failIfDatabaseIsLocked;
+1:     private int journalMaxFileLength = Journal.DEFAULT_MAX_FILE_LENGTH;
+1:     private int journalMaxWriteBatchSize = Journal.DEFAULT_MAX_WRITE_BATCH_SIZE;
+1:     private boolean enableIndexWriteAsync = false;
+1:     private MetaData metaData = new MetaData(this);
+1:     private final MetaDataMarshaller metaDataMarshaller = new MetaDataMarshaller(this);
+1:     private final Map<String, LegacyJobSchedulerImpl> schedulers = new HashMap<String, LegacyJobSchedulerImpl>();
+1: 
+1:     protected class MetaData {
+1:         protected MetaData(LegacyJobSchedulerStoreImpl store) {
+1:             this.store = store;
+1:         }
+1: 
+1:         private final LegacyJobSchedulerStoreImpl store;
+1:         Page<MetaData> page;
+1:         BTreeIndex<Integer, Integer> journalRC;
+1:         BTreeIndex<String, LegacyJobSchedulerImpl> storedSchedulers;
+1: 
+1:         void createIndexes(Transaction tx) throws IOException {
+1:             this.storedSchedulers = new BTreeIndex<String, LegacyJobSchedulerImpl>(pageFile, tx.allocate().getPageId());
+1:             this.journalRC = new BTreeIndex<Integer, Integer>(pageFile, tx.allocate().getPageId());
+1:         }
+1: 
+1:         void load(Transaction tx) throws IOException {
+1:             this.storedSchedulers.setKeyMarshaller(StringMarshaller.INSTANCE);
+1:             this.storedSchedulers.setValueMarshaller(new JobSchedulerMarshaller(this.store));
+1:             this.storedSchedulers.load(tx);
+1:             this.journalRC.setKeyMarshaller(IntegerMarshaller.INSTANCE);
+1:             this.journalRC.setValueMarshaller(IntegerMarshaller.INSTANCE);
+1:             this.journalRC.load(tx);
+1:         }
+1: 
+1:         void loadScheduler(Transaction tx, Map<String, LegacyJobSchedulerImpl> schedulers) throws IOException {
+1:             for (Iterator<Entry<String, LegacyJobSchedulerImpl>> i = this.storedSchedulers.iterator(tx); i.hasNext();) {
+1:                 Entry<String, LegacyJobSchedulerImpl> entry = i.next();
+1:                 entry.getValue().load(tx);
+1:                 schedulers.put(entry.getKey(), entry.getValue());
+1:             }
+1:         }
+1: 
+1:         public void read(DataInput is) throws IOException {
+1:             this.storedSchedulers = new BTreeIndex<String, LegacyJobSchedulerImpl>(pageFile, is.readLong());
+1:             this.storedSchedulers.setKeyMarshaller(StringMarshaller.INSTANCE);
+1:             this.storedSchedulers.setValueMarshaller(new JobSchedulerMarshaller(this.store));
+1:             this.journalRC = new BTreeIndex<Integer, Integer>(pageFile, is.readLong());
+1:             this.journalRC.setKeyMarshaller(IntegerMarshaller.INSTANCE);
+1:             this.journalRC.setValueMarshaller(IntegerMarshaller.INSTANCE);
+1:         }
+1: 
+1:         public void write(DataOutput os) throws IOException {
+1:             os.writeLong(this.storedSchedulers.getPageId());
+1:             os.writeLong(this.journalRC.getPageId());
+1:         }
+1:     }
+1: 
+1:     class MetaDataMarshaller extends VariableMarshaller<MetaData> {
+1:         private final LegacyJobSchedulerStoreImpl store;
+1: 
+1:         MetaDataMarshaller(LegacyJobSchedulerStoreImpl store) {
+1:             this.store = store;
+1:         }
+1: 
+1:         @Override
+1:         public MetaData readPayload(DataInput dataIn) throws IOException {
+1:             MetaData rc = new MetaData(this.store);
+1:             rc.read(dataIn);
+1:             return rc;
+1:         }
+1: 
+1:         @Override
+1:         public void writePayload(MetaData object, DataOutput dataOut) throws IOException {
+1:             object.write(dataOut);
+1:         }
+1:     }
+1: 
+1:     class ValueMarshaller extends VariableMarshaller<List<LegacyJobLocation>> {
+1:         @Override
+1:         public List<LegacyJobLocation> readPayload(DataInput dataIn) throws IOException {
+1:             List<LegacyJobLocation> result = new ArrayList<LegacyJobLocation>();
+1:             int size = dataIn.readInt();
+1:             for (int i = 0; i < size; i++) {
+1:                 LegacyJobLocation jobLocation = new LegacyJobLocation();
+1:                 jobLocation.readExternal(dataIn);
+1:                 result.add(jobLocation);
+1:             }
+1:             return result;
+1:         }
+1: 
+1:         @Override
+1:         public void writePayload(List<LegacyJobLocation> value, DataOutput dataOut) throws IOException {
+1:             dataOut.writeInt(value.size());
+1:             for (LegacyJobLocation jobLocation : value) {
+1:                 jobLocation.writeExternal(dataOut);
+1:             }
+1:         }
+1:     }
+1: 
+1:     class JobSchedulerMarshaller extends VariableMarshaller<LegacyJobSchedulerImpl> {
+1:         private final LegacyJobSchedulerStoreImpl store;
+1: 
+1:         JobSchedulerMarshaller(LegacyJobSchedulerStoreImpl store) {
+1:             this.store = store;
+1:         }
+1: 
+1:         @Override
+1:         public LegacyJobSchedulerImpl readPayload(DataInput dataIn) throws IOException {
+1:             LegacyJobSchedulerImpl result = new LegacyJobSchedulerImpl(this.store);
+1:             result.read(dataIn);
+1:             return result;
+1:         }
+1: 
+1:         @Override
+1:         public void writePayload(LegacyJobSchedulerImpl js, DataOutput dataOut) throws IOException {
+1:             js.write(dataOut);
+1:         }
+1:     }
+1: 
+1:     public File getDirectory() {
+1:         return directory;
+1:     }
+1: 
+1:     public void setDirectory(File directory) {
+1:         this.directory = directory;
+1:     }
+1: 
+1:     public long size() {
+1:         if (!isStarted()) {
+1:             return 0;
+1:         }
+1:         try {
+1:             return journalSize.get() + pageFile.getDiskSize();
+1:         } catch (IOException e) {
+1:             throw new RuntimeException(e);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Returns the named Job Scheduler if it exists, otherwise throws an exception.
+1:      *
+1:      * @param name
+1:      *     The name of the scheduler that is to be returned.
+1:      *
+1:      * @return the named scheduler if it exists.
+1:      *
+1:      * @throws Exception if the named scheduler does not exist in this store.
+1:      */
+1:     public LegacyJobSchedulerImpl getJobScheduler(final String name) throws Exception {
+1:         LegacyJobSchedulerImpl result = this.schedulers.get(name);
+1:         if (result == null) {
+1:             throw new NoSuchElementException("No such Job Scheduler in this store: " + name);
+1:         }
+1:         return result;
+1:     }
+1: 
+1:     /**
+1:      * Returns the names of all the schedulers that exist in this scheduler store.
+1:      *
+1:      * @return a set of names of all scheduler instances in this store.
+1:      *
+1:      * @throws Exception if an error occurs while collecting the scheduler names.
+1:      */
+1:     public Set<String> getJobSchedulerNames() throws Exception {
+1:         Set<String> names = Collections.emptySet();
+1: 
+1:         if (!schedulers.isEmpty()) {
+1:             return this.schedulers.keySet();
+1:         }
+1: 
+1:         return names;
+1:     }
+1: 
+1:     @Override
+1:     protected void doStart() throws Exception {
+1:         if (this.directory == null) {
+1:             this.directory = new File(IOHelper.getDefaultDataDirectory() + File.pathSeparator + "delayedDB");
+1:         }
+1:         IOHelper.mkdirs(this.directory);
+1:         lock();
+1:         this.journal = new Journal();
+1:         this.journal.setDirectory(directory);
+1:         this.journal.setMaxFileLength(getJournalMaxFileLength());
+1:         this.journal.setWriteBatchSize(getJournalMaxWriteBatchSize());
+1:         this.journal.setSizeAccumulator(this.journalSize);
+1:         this.journal.start();
+1:         this.pageFile = new PageFile(directory, "scheduleDB");
+1:         this.pageFile.setWriteBatchSize(1);
+1:         this.pageFile.load();
+1: 
+1:         this.pageFile.tx().execute(new Transaction.Closure<IOException>() {
+1:             @Override
+1:             public void execute(Transaction tx) throws IOException {
+1:                 if (pageFile.getPageCount() == 0) {
+1:                     Page<MetaData> page = tx.allocate();
+1:                     assert page.getPageId() == 0;
+1:                     page.set(metaData);
+1:                     metaData.page = page;
+1:                     metaData.createIndexes(tx);
+1:                     tx.store(metaData.page, metaDataMarshaller, true);
+1: 
+1:                 } else {
+1:                     Page<MetaData> page = tx.load(0, metaDataMarshaller);
+1:                     metaData = page.get();
+1:                     metaData.page = page;
+1:                 }
+1:                 metaData.load(tx);
+1:                 metaData.loadScheduler(tx, schedulers);
+1:                 for (LegacyJobSchedulerImpl js : schedulers.values()) {
+1:                     try {
+1:                         js.start();
+1:                     } catch (Exception e) {
+1:                         LegacyJobSchedulerStoreImpl.LOG.error("Failed to load " + js.getName(), e);
+1:                     }
+1:                 }
+1:             }
+1:         });
+1: 
+1:         this.pageFile.flush();
+1:         LOG.info(this + " started");
+1:     }
+1: 
+1:     @Override
+1:     protected void doStop(ServiceStopper stopper) throws Exception {
+1:         for (LegacyJobSchedulerImpl js : this.schedulers.values()) {
+1:             js.stop();
+1:         }
+1:         if (this.pageFile != null) {
+1:             this.pageFile.unload();
+1:         }
+1:         if (this.journal != null) {
+1:             journal.close();
+1:         }
+1:         if (this.lockFile != null) {
+1:             this.lockFile.unlock();
+1:         }
+1:         this.lockFile = null;
+1:         LOG.info(this + " stopped");
+1:     }
+1: 
+1:     ByteSequence getPayload(Location location) throws IllegalStateException, IOException {
+1:         ByteSequence result = null;
+1:         result = this.journal.read(location);
+1:         return result;
+1:     }
+1: 
+1:     Location write(ByteSequence payload, boolean sync) throws IllegalStateException, IOException {
+1:         return this.journal.write(payload, sync);
+1:     }
+1: 
+1:     private void lock() throws IOException {
+1:         if (lockFile == null) {
+1:             File lockFileName = new File(directory, "lock");
+1:             lockFile = new LockFile(lockFileName, true);
+1:             if (failIfDatabaseIsLocked) {
+1:                 lockFile.lock();
+1:             } else {
+1:                 while (true) {
+1:                     try {
+1:                         lockFile.lock();
+1:                         break;
+1:                     } catch (IOException e) {
+1:                         LOG.info("Database " + lockFileName + " is locked... waiting " + (DATABASE_LOCKED_WAIT_DELAY / 1000)
+1:                             + " seconds for the database to be unlocked. Reason: " + e);
+1:                         try {
+1:                             Thread.sleep(DATABASE_LOCKED_WAIT_DELAY);
+1:                         } catch (InterruptedException e1) {
+1:                         }
+1:                     }
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+1:     PageFile getPageFile() {
+1:         this.pageFile.isLoaded();
+1:         return this.pageFile;
+1:     }
+1: 
+1:     public boolean isFailIfDatabaseIsLocked() {
+1:         return failIfDatabaseIsLocked;
+1:     }
+1: 
+1:     public void setFailIfDatabaseIsLocked(boolean failIfDatabaseIsLocked) {
+1:         this.failIfDatabaseIsLocked = failIfDatabaseIsLocked;
+1:     }
+1: 
+1:     public int getJournalMaxFileLength() {
+1:         return journalMaxFileLength;
+1:     }
+1: 
+1:     public void setJournalMaxFileLength(int journalMaxFileLength) {
+1:         this.journalMaxFileLength = journalMaxFileLength;
+1:     }
+1: 
+1:     public int getJournalMaxWriteBatchSize() {
+1:         return journalMaxWriteBatchSize;
+1:     }
+1: 
+1:     public void setJournalMaxWriteBatchSize(int journalMaxWriteBatchSize) {
+1:         this.journalMaxWriteBatchSize = journalMaxWriteBatchSize;
+1:     }
+1: 
+1:     public boolean isEnableIndexWriteAsync() {
+1:         return enableIndexWriteAsync;
+1:     }
+1: 
+1:     public void setEnableIndexWriteAsync(boolean enableIndexWriteAsync) {
+1:         this.enableIndexWriteAsync = enableIndexWriteAsync;
+1:     }
+1: 
+1:     @Override
+1:     public String toString() {
+1:         return "LegacyJobSchedulerStore:" + this.directory;
+1:     }
+1: }
+============================================================================

@@ -1,0 +1,572 @@
+1:96d41f0: /*
+1:96d41f0:  * Licensed to the Apache Software Foundation (ASF) under one
+1:96d41f0:  * or more contributor license agreements.  See the NOTICE file
+1:96d41f0:  * distributed with this work for additional information
+1:96d41f0:  * regarding copyright ownership.  The ASF licenses this file
+1:96d41f0:  * to you under the Apache License, Version 2.0 (the
+1:96d41f0:  * "License"); you may not use this file except in compliance
+1:96d41f0:  * with the License.  You may obtain a copy of the License at
+1:96d41f0:  *
+1:96d41f0:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:96d41f0:  *
+1:96d41f0:  * Unless required by applicable law or agreed to in writing, software
+1:96d41f0:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:96d41f0:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:96d41f0:  * See the License for the specific language governing permissions and
+1:96d41f0:  * limitations under the License.
+1:96d41f0:  */
+1:96d41f0: package org.apache.cassandra.hints;
+2:96d41f0: 
+1:96d41f0: import java.io.File;
+1:96d41f0: import java.net.InetAddress;
+1:96d41f0: import java.nio.ByteBuffer;
+1:96d41f0: import java.util.*;
+1:96d41f0: import java.util.concurrent.TimeUnit;
+1:cee22ad: import java.util.function.BooleanSupplier;
+1:96d41f0: import java.util.function.Function;
+1:96d41f0: 
+1:96d41f0: import com.google.common.util.concurrent.RateLimiter;
+1:96d41f0: 
+1:39df31a: import org.apache.cassandra.exceptions.RequestFailureReason;
+1:0ac1079: import org.apache.cassandra.metrics.HintsServiceMetrics;
+1:96d41f0: import org.apache.cassandra.net.IAsyncCallbackWithFailure;
+1:96d41f0: import org.apache.cassandra.net.MessageIn;
+1:96d41f0: import org.apache.cassandra.net.MessagingService;
+1:96d41f0: import org.apache.cassandra.utils.concurrent.SimpleCondition;
+1:96d41f0: 
+1:96d41f0: /**
+1:96d41f0:  * Dispatches a single hints file to a specified node in a batched manner.
+1:96d41f0:  *
+1:96d41f0:  * Uses either {@link EncodedHintMessage} - when dispatching hints into a node with the same messaging version as the hints file,
+1:96d41f0:  * or {@link HintMessage}, when conversion is required.
+1:96d41f0:  */
+1:96d41f0: final class HintsDispatcher implements AutoCloseable
+3:96d41f0: {
+1:cee22ad:     private enum Action { CONTINUE, ABORT }
+1:96d41f0: 
+1:96d41f0:     private final HintsReader reader;
+1:96d41f0:     private final UUID hostId;
+1:96d41f0:     private final InetAddress address;
+1:96d41f0:     private final int messagingVersion;
+1:cee22ad:     private final BooleanSupplier abortRequested;
+1:96d41f0: 
+1:cee22ad:     private InputPosition currentPagePosition;
+1:96d41f0: 
+1:cee22ad:     private HintsDispatcher(HintsReader reader, UUID hostId, InetAddress address, int messagingVersion, BooleanSupplier abortRequested)
+1:96d41f0:     {
+1:cee22ad:         currentPagePosition = null;
+1:96d41f0: 
+1:96d41f0:         this.reader = reader;
+1:96d41f0:         this.hostId = hostId;
+1:96d41f0:         this.address = address;
+1:96d41f0:         this.messagingVersion = messagingVersion;
+1:cee22ad:         this.abortRequested = abortRequested;
+3:96d41f0:     }
+1:96d41f0: 
+1:cee22ad:     static HintsDispatcher create(File file, RateLimiter rateLimiter, InetAddress address, UUID hostId, BooleanSupplier abortRequested)
+1:96d41f0:     {
+1:96d41f0:         int messagingVersion = MessagingService.instance().getVersion(address);
+1:cee22ad:         return new HintsDispatcher(HintsReader.open(file, rateLimiter), hostId, address, messagingVersion, abortRequested);
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     public void close()
+1:96d41f0:     {
+1:96d41f0:         reader.close();
+1:96d41f0:     }
+1:96d41f0: 
+1:cee22ad:     void seek(InputPosition position)
+1:96d41f0:     {
+1:cee22ad:         reader.seek(position);
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     /**
+1:96d41f0:      * @return whether or not dispatch completed entirely and successfully
+1:96d41f0:      */
+1:96d41f0:     boolean dispatch()
+1:96d41f0:     {
+1:96d41f0:         for (HintsReader.Page page : reader)
+1:96d41f0:         {
+1:cee22ad:             currentPagePosition = page.position;
+1:96d41f0:             if (dispatch(page) != Action.CONTINUE)
+1:96d41f0:                 return false;
+1:96d41f0:         }
+1:d43b9ce: 
+1:96d41f0:         return true;
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     /**
+1:96d41f0:      * @return offset of the first non-delivered page
+1:96d41f0:      */
+1:cee22ad:     InputPosition dispatchPosition()
+1:96d41f0:     {
+1:cee22ad:         return currentPagePosition;
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0: 
+1:96d41f0:     // retry in case of a timeout; stop in case of a failure, host going down, or delivery paused
+1:96d41f0:     private Action dispatch(HintsReader.Page page)
+1:96d41f0:     {
+1:cee22ad:         return sendHintsAndAwait(page);
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private Action sendHintsAndAwait(HintsReader.Page page)
+1:96d41f0:     {
+1:96d41f0:         Collection<Callback> callbacks = new ArrayList<>();
+1:96d41f0: 
+1:96d41f0:         /*
+1:96d41f0:          * If hints file messaging version matches the version of the target host, we'll use the optimised path -
+1:96d41f0:          * skipping the redundant decoding/encoding cycle of the already encoded hint.
+1:96d41f0:          *
+1:96d41f0:          * If that is not the case, we'll need to perform conversion to a newer (or an older) format, and decoding the hint
+1:96d41f0:          * is an unavoidable intermediate step.
+1:96d41f0:          */
+1:96d41f0:         Action action = reader.descriptor().messagingVersion() == messagingVersion
+1:96d41f0:                       ? sendHints(page.buffersIterator(), callbacks, this::sendEncodedHint)
+1:96d41f0:                       : sendHints(page.hintsIterator(), callbacks, this::sendHint);
+1:96d41f0: 
+1:96d41f0:         if (action == Action.ABORT)
+1:96d41f0:             return action;
+1:96d41f0: 
+1:0ac1079:         boolean hadFailures = false;
+1:96d41f0:         for (Callback cb : callbacks)
+1:0ac1079:         {
+1:0ac1079:             Callback.Outcome outcome = cb.await();
+1:0ac1079:             updateMetrics(outcome);
+1:96d41f0: 
+1:0ac1079:             if (outcome != Callback.Outcome.SUCCESS)
+1:0ac1079:                 hadFailures = true;
+1:0ac1079:         }
+1:0ac1079: 
+1:0ac1079:         return hadFailures ? Action.ABORT : Action.CONTINUE;
+1:0ac1079:     }
+1:0ac1079: 
+1:0ac1079:     private void updateMetrics(Callback.Outcome outcome)
+1:0ac1079:     {
+1:0ac1079:         switch (outcome)
+1:0ac1079:         {
+1:0ac1079:             case SUCCESS:
+1:0ac1079:                 HintsServiceMetrics.hintsSucceeded.mark();
+1:0ac1079:                 break;
+1:0ac1079:             case FAILURE:
+1:0ac1079:                 HintsServiceMetrics.hintsFailed.mark();
+1:0ac1079:                 break;
+1:0ac1079:             case TIMEOUT:
+1:0ac1079:                 HintsServiceMetrics.hintsTimedOut.mark();
+1:0ac1079:                 break;
+1:0ac1079:         }
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     /*
+1:96d41f0:      * Sending hints in compatibility mode.
+1:96d41f0:      */
+1:b2f38ef: 
+1:96d41f0:     private <T> Action sendHints(Iterator<T> hints, Collection<Callback> callbacks, Function<T, Callback> sendFunction)
+1:96d41f0:     {
+1:96d41f0:         while (hints.hasNext())
+1:96d41f0:         {
+1:cee22ad:             if (abortRequested.getAsBoolean())
+1:cee22ad:                 return Action.ABORT;
+1:96d41f0:             callbacks.add(sendFunction.apply(hints.next()));
+1:96d41f0:         }
+2:96d41f0:         return Action.CONTINUE;
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private Callback sendHint(Hint hint)
+1:96d41f0:     {
+1:96d41f0:         Callback callback = new Callback();
+1:96d41f0:         HintMessage message = new HintMessage(hostId, hint);
+1:96d41f0:         MessagingService.instance().sendRRWithFailure(message.createMessageOut(), address, callback);
+1:96d41f0:         return callback;
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     /*
+1:96d41f0:      * Sending hints in raw mode.
+1:96d41f0:      */
+1:96d41f0: 
+1:96d41f0:     private Callback sendEncodedHint(ByteBuffer hint)
+1:96d41f0:     {
+1:96d41f0:         Callback callback = new Callback();
+1:96d41f0:         EncodedHintMessage message = new EncodedHintMessage(hostId, hint, messagingVersion);
+1:96d41f0:         MessagingService.instance().sendRRWithFailure(message.createMessageOut(), address, callback);
+1:96d41f0:         return callback;
+1:96d41f0:     }
+1:96d41f0: 
+1:96d41f0:     private static final class Callback implements IAsyncCallbackWithFailure
+1:96d41f0:     {
+1:96d41f0:         enum Outcome { SUCCESS, TIMEOUT, FAILURE }
+1:96d41f0: 
+1:96d41f0:         private final long start = System.nanoTime();
+1:96d41f0:         private final SimpleCondition condition = new SimpleCondition();
+1:96d41f0:         private volatile Outcome outcome;
+1:96d41f0: 
+1:96d41f0:         Outcome await()
+1:96d41f0:         {
+1:9797511:             long timeout = TimeUnit.MILLISECONDS.toNanos(MessagingService.Verb.HINT.getTimeout()) - (System.nanoTime() - start);
+1:96d41f0:             boolean timedOut;
+1:96d41f0: 
+1:96d41f0:             try
+1:96d41f0:             {
+1:96d41f0:                 timedOut = !condition.await(timeout, TimeUnit.NANOSECONDS);
+1:96d41f0:             }
+1:96d41f0:             catch (InterruptedException e)
+1:96d41f0:             {
+1:96d41f0:                 throw new AssertionError(e);
+1:96d41f0:             }
+1:96d41f0: 
+1:96d41f0:             return timedOut ? Outcome.TIMEOUT : outcome;
+1:96d41f0:         }
+1:96d41f0: 
+1:39df31a:         public void onFailure(InetAddress from, RequestFailureReason failureReason)
+1:96d41f0:         {
+1:96d41f0:             outcome = Outcome.FAILURE;
+1:96d41f0:             condition.signalAll();
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         public void response(MessageIn msg)
+1:96d41f0:         {
+1:96d41f0:             outcome = Outcome.SUCCESS;
+1:96d41f0:             condition.signalAll();
+1:96d41f0:         }
+1:96d41f0: 
+1:96d41f0:         public boolean isLatencyForSnitch()
+1:96d41f0:         {
+1:96d41f0:             return false;
+1:96d41f0:         }
+1:96d41f0: 
+1:d43b9ce:         @Override
+1:d43b9ce:         public boolean supportsBackPressure()
+1:d43b9ce:         {
+1:d43b9ce:             return true;
+1:d43b9ce:         }
+1:96d41f0:     }
+1:96d41f0: }
+============================================================================
+author:Dikang Gu
+-------------------------------------------------------------------------------
+commit:0ac1079
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.metrics.HintsServiceMetrics;
+/////////////////////////////////////////////////////////////////////////
+1:         boolean hadFailures = false;
+1:         {
+1:             Callback.Outcome outcome = cb.await();
+1:             updateMetrics(outcome);
+1:             if (outcome != Callback.Outcome.SUCCESS)
+1:                 hadFailures = true;
+1:         }
+1: 
+1:         return hadFailures ? Action.ABORT : Action.CONTINUE;
+1:     }
+1: 
+1:     private void updateMetrics(Callback.Outcome outcome)
+1:     {
+1:         switch (outcome)
+1:         {
+1:             case SUCCESS:
+1:                 HintsServiceMetrics.hintsSucceeded.mark();
+1:                 break;
+1:             case FAILURE:
+1:                 HintsServiceMetrics.hintsFailed.mark();
+1:                 break;
+1:             case TIMEOUT:
+1:                 HintsServiceMetrics.hintsTimedOut.mark();
+1:                 break;
+1:         }
+author:Sergio Bossa
+-------------------------------------------------------------------------------
+commit:d43b9ce
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         @Override
+1:         public boolean supportsBackPressure()
+1:         {
+1:             return true;
+1:         }
+author:Geoffrey Yu
+-------------------------------------------------------------------------------
+commit:39df31a
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.exceptions.RequestFailureReason;
+/////////////////////////////////////////////////////////////////////////
+1:         public void onFailure(InetAddress from, RequestFailureReason failureReason)
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:9797511
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:             long timeout = TimeUnit.MILLISECONDS.toNanos(MessagingService.Verb.HINT.getTimeout()) - (System.nanoTime() - start);
+author:Stefan Podkowinski
+-------------------------------------------------------------------------------
+commit:cee22ad
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.function.BooleanSupplier;
+/////////////////////////////////////////////////////////////////////////
+1:     private enum Action { CONTINUE, ABORT }
+1:     private final BooleanSupplier abortRequested;
+1:     private InputPosition currentPagePosition;
+1:     private HintsDispatcher(HintsReader reader, UUID hostId, InetAddress address, int messagingVersion, BooleanSupplier abortRequested)
+1:         currentPagePosition = null;
+1:         this.abortRequested = abortRequested;
+1:     static HintsDispatcher create(File file, RateLimiter rateLimiter, InetAddress address, UUID hostId, BooleanSupplier abortRequested)
+1:         return new HintsDispatcher(HintsReader.open(file, rateLimiter), hostId, address, messagingVersion, abortRequested);
+/////////////////////////////////////////////////////////////////////////
+1:     void seek(InputPosition position)
+1:         reader.seek(position);
+/////////////////////////////////////////////////////////////////////////
+1:             currentPagePosition = page.position;
+/////////////////////////////////////////////////////////////////////////
+1:     InputPosition dispatchPosition()
+1:         return currentPagePosition;
+1:         return sendHintsAndAwait(page);
+/////////////////////////////////////////////////////////////////////////
+1:                 return Action.ABORT;
+/////////////////////////////////////////////////////////////////////////
+1:             if (abortRequested.getAsBoolean())
+author:Branimir Lambov
+-------------------------------------------------------------------------------
+commit:b2f38ef
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     static HintsDispatcher create(File file, RateLimiter rateLimiter, InetAddress address, UUID hostId, AtomicBoolean isPaused)
+0:         return new HintsDispatcher(HintsReader.open(file, rateLimiter), hostId, address, messagingVersion, isPaused);
+/////////////////////////////////////////////////////////////////////////
+1: 
+author:Marcus Eriksson
+-------------------------------------------------------------------------------
+commit:959b96e
+/////////////////////////////////////////////////////////////////////////
+0:     static HintsDispatcher create(File file, RateLimiter rateLimiter, UUID hostId, UUID hintFor, AtomicBoolean isPaused)
+0:         return new HintsDispatcher(HintsReader.open(file, rateLimiter), hintFor, address, messagingVersion, isPaused);
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:96d41f0
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.hints;
+1: 
+1: import java.io.File;
+1: import java.net.InetAddress;
+1: import java.nio.ByteBuffer;
+1: import java.util.*;
+1: import java.util.concurrent.TimeUnit;
+0: import java.util.concurrent.atomic.AtomicBoolean;
+1: import java.util.function.Function;
+1: 
+1: import com.google.common.util.concurrent.RateLimiter;
+1: 
+0: import org.apache.cassandra.config.DatabaseDescriptor;
+0: import org.apache.cassandra.gms.FailureDetector;
+1: import org.apache.cassandra.net.IAsyncCallbackWithFailure;
+1: import org.apache.cassandra.net.MessageIn;
+1: import org.apache.cassandra.net.MessagingService;
+0: import org.apache.cassandra.service.StorageService;
+1: import org.apache.cassandra.utils.concurrent.SimpleCondition;
+1: 
+1: /**
+1:  * Dispatches a single hints file to a specified node in a batched manner.
+1:  *
+1:  * Uses either {@link EncodedHintMessage} - when dispatching hints into a node with the same messaging version as the hints file,
+1:  * or {@link HintMessage}, when conversion is required.
+1:  */
+1: final class HintsDispatcher implements AutoCloseable
+1: {
+0:     private enum Action { CONTINUE, ABORT, RETRY }
+1: 
+1:     private final HintsReader reader;
+1:     private final UUID hostId;
+1:     private final InetAddress address;
+1:     private final int messagingVersion;
+0:     private final AtomicBoolean isPaused;
+1: 
+0:     private long currentPageOffset;
+1: 
+0:     private HintsDispatcher(HintsReader reader, UUID hostId, InetAddress address, int messagingVersion, AtomicBoolean isPaused)
+1:     {
+0:         currentPageOffset = 0L;
+1: 
+1:         this.reader = reader;
+1:         this.hostId = hostId;
+1:         this.address = address;
+1:         this.messagingVersion = messagingVersion;
+0:         this.isPaused = isPaused;
+1:     }
+1: 
+0:     static HintsDispatcher create(File file, RateLimiter rateLimiter, UUID hostId, AtomicBoolean isPaused)
+1:     {
+0:         InetAddress address = StorageService.instance.getEndpointForHostId(hostId);
+1:         int messagingVersion = MessagingService.instance().getVersion(address);
+0:         return new HintsDispatcher(HintsReader.open(file, rateLimiter), hostId, address, messagingVersion, isPaused);
+1:     }
+1: 
+1:     public void close()
+1:     {
+1:         reader.close();
+1:     }
+1: 
+0:     void seek(long bytes)
+1:     {
+0:         reader.seek(bytes);
+0:         currentPageOffset = 0L;
+1:     }
+1: 
+1:     /**
+1:      * @return whether or not dispatch completed entirely and successfully
+1:      */
+1:     boolean dispatch()
+1:     {
+1:         for (HintsReader.Page page : reader)
+1:         {
+0:             currentPageOffset = page.offset;
+1:             if (dispatch(page) != Action.CONTINUE)
+1:                 return false;
+1:         }
+1: 
+1:         return true;
+1:     }
+1: 
+1:     /**
+1:      * @return offset of the first non-delivered page
+1:      */
+0:     long dispatchOffset()
+1:     {
+0:         return currentPageOffset;
+1:     }
+1: 
+0:     private boolean isHostAlive()
+1:     {
+0:         return FailureDetector.instance.isAlive(address);
+1:     }
+1: 
+0:     private boolean isPaused()
+1:     {
+0:         return isPaused.get();
+1:     }
+1: 
+1:     // retry in case of a timeout; stop in case of a failure, host going down, or delivery paused
+1:     private Action dispatch(HintsReader.Page page)
+1:     {
+0:         Action action = sendHintsAndAwait(page);
+0:         return action == Action.RETRY
+0:              ? dispatch(page)
+0:              : action;
+1:     }
+1: 
+1:     private Action sendHintsAndAwait(HintsReader.Page page)
+1:     {
+1:         Collection<Callback> callbacks = new ArrayList<>();
+1: 
+1:         /*
+1:          * If hints file messaging version matches the version of the target host, we'll use the optimised path -
+1:          * skipping the redundant decoding/encoding cycle of the already encoded hint.
+1:          *
+1:          * If that is not the case, we'll need to perform conversion to a newer (or an older) format, and decoding the hint
+1:          * is an unavoidable intermediate step.
+1:          */
+1:         Action action = reader.descriptor().messagingVersion() == messagingVersion
+1:                       ? sendHints(page.buffersIterator(), callbacks, this::sendEncodedHint)
+1:                       : sendHints(page.hintsIterator(), callbacks, this::sendHint);
+1: 
+1:         if (action == Action.ABORT)
+1:             return action;
+1: 
+1:         for (Callback cb : callbacks)
+0:             if (cb.await() != Callback.Outcome.SUCCESS)
+0:                 return Action.RETRY;
+1: 
+1:         return Action.CONTINUE;
+1:     }
+1: 
+1:     /*
+1:      * Sending hints in compatibility mode.
+1:      */
+1:     private <T> Action sendHints(Iterator<T> hints, Collection<Callback> callbacks, Function<T, Callback> sendFunction)
+1:     {
+1:         while (hints.hasNext())
+1:         {
+0:             if (!isHostAlive() || isPaused())
+0:                 return Action.ABORT;
+1:             callbacks.add(sendFunction.apply(hints.next()));
+1:         }
+1:         return Action.CONTINUE;
+1:     }
+1: 
+1:     private Callback sendHint(Hint hint)
+1:     {
+1:         Callback callback = new Callback();
+1:         HintMessage message = new HintMessage(hostId, hint);
+1:         MessagingService.instance().sendRRWithFailure(message.createMessageOut(), address, callback);
+1:         return callback;
+1:     }
+1: 
+1:     /*
+1:      * Sending hints in raw mode.
+1:      */
+1: 
+1:     private Callback sendEncodedHint(ByteBuffer hint)
+1:     {
+1:         Callback callback = new Callback();
+1:         EncodedHintMessage message = new EncodedHintMessage(hostId, hint, messagingVersion);
+1:         MessagingService.instance().sendRRWithFailure(message.createMessageOut(), address, callback);
+1:         return callback;
+1:     }
+1: 
+1:     private static final class Callback implements IAsyncCallbackWithFailure
+1:     {
+1:         enum Outcome { SUCCESS, TIMEOUT, FAILURE }
+1: 
+1:         private final long start = System.nanoTime();
+1:         private final SimpleCondition condition = new SimpleCondition();
+1:         private volatile Outcome outcome;
+1: 
+1:         Outcome await()
+1:         {
+0:             long timeout = TimeUnit.MILLISECONDS.toNanos(DatabaseDescriptor.getTimeout(MessagingService.Verb.HINT)) - (System.nanoTime() - start);
+1:             boolean timedOut;
+1: 
+1:             try
+1:             {
+1:                 timedOut = !condition.await(timeout, TimeUnit.NANOSECONDS);
+1:             }
+1:             catch (InterruptedException e)
+1:             {
+1:                 throw new AssertionError(e);
+1:             }
+1: 
+1:             return timedOut ? Outcome.TIMEOUT : outcome;
+1:         }
+1: 
+0:         public void onFailure(InetAddress from)
+1:         {
+1:             outcome = Outcome.FAILURE;
+1:             condition.signalAll();
+1:         }
+1: 
+1:         public void response(MessageIn msg)
+1:         {
+1:             outcome = Outcome.SUCCESS;
+1:             condition.signalAll();
+1:         }
+1: 
+1:         public boolean isLatencyForSnitch()
+1:         {
+1:             return false;
+1:         }
+1:     }
+1: }
+============================================================================

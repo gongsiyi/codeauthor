@@ -1,0 +1,1541 @@
+2:066ef58: /*
+1:066ef58:  * Licensed to the Apache Software Foundation (ASF) under one
+1:066ef58:  * or more contributor license agreements.  See the NOTICE file
+1:066ef58:  * distributed with this work for additional information
+1:066ef58:  * regarding copyright ownership.  The ASF licenses this file
+1:066ef58:  * to you under the Apache License, Version 2.0 (the
+1:066ef58:  * "License"); you may not use this file except in compliance
+1:066ef58:  * with the License.  You may obtain a copy of the License at
+1:6cb811b:  *
+1:066ef58:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:5e4c5ce:  *
+1:066ef58:  * Unless required by applicable law or agreed to in writing, software
+1:066ef58:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:066ef58:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:066ef58:  * See the License for the specific language governing permissions and
+1:066ef58:  * limitations under the License.
+2:6cb811b:  */
+1:066ef58: package org.apache.cassandra.utils;
+7:6cb811b: 
+1:20c2adc: import com.google.common.annotations.VisibleForTesting;
+1:20c2adc: 
+1:1e92ce4: import io.netty.util.concurrent.FastThreadLocal;
+1:1e92ce4: import net.nicoulaj.compilecommand.annotations.Inline;
+1:a7f4134: import org.apache.cassandra.utils.concurrent.Ref;
+1:61384c5: import org.apache.cassandra.utils.concurrent.WrappedSharedCloseable;
+1:dc37dea: import org.apache.cassandra.utils.obs.IBitSet;
+1:6cb811b: 
+1:18d8f26: public class BloomFilter extends WrappedSharedCloseable implements IFilter
+8:6cb811b: {
+1:1e92ce4:     private final static FastThreadLocal<long[]> reusableIndexes = new FastThreadLocal<long[]>()
+1:20c2adc:     {
+1:20c2adc:         protected long[] initialValue()
+1:20c2adc:         {
+1:20c2adc:             return new long[21];
+1:20c2adc:         }
+1:20c2adc:     };
+1:20c2adc: 
+1:dc37dea:     public final IBitSet bitset;
+1:a15500e:     public final int hashCount;
+1:23fd75f:     /**
+1:23fd75f:      * CASSANDRA-8413: 3.0 (inverted) bloom filters have no 'static' bits caused by using the same upper bits
+1:23fd75f:      * for both bloom filter and token distribution.
+1:23fd75f:      */
+1:23fd75f:     public final boolean oldBfHashOrder;
+1:dc37dea: 
+1:23fd75f:     BloomFilter(int hashCount, IBitSet bitset, boolean oldBfHashOrder)
+1:5dd1654:     {
+1:61384c5:         super(bitset);
+1:61384c5:         this.hashCount = hashCount;
+1:d765b24:         this.bitset = bitset;
+1:23fd75f:         this.oldBfHashOrder = oldBfHashOrder;
+8:6cb811b:     }
+1:61384c5: 
+1:23fd75f:     private BloomFilter(BloomFilter copy)
+1:61384c5:     {
+1:61384c5:         super(copy);
+1:61384c5:         this.hashCount = copy.hashCount;
+1:61384c5:         this.bitset = copy.bitset;
+1:23fd75f:         this.oldBfHashOrder = copy.oldBfHashOrder;
+1:61384c5:     }
+1:18d8f26: 
+1:18d8f26:     public long serializedSize()
+1:18d8f26:     {
+1:23fd75f:         return BloomFilterSerializer.serializedSize(this);
+1:18d8f26:     }
+1:18d8f26: 
+1:6cb811b:     // Murmur is faster than an SHA-based approach and provides as-good collision
+1:6cb811b:     // resistance.  The combinatorial generation approach described in
+1:6cb811b:     // http://www.eecs.harvard.edu/~kirsch/pubs/bbbf/esa06.pdf
+1:6cb811b:     // does prove to work in actual tests, and is obviously faster
+1:6cb811b:     // than performing further iterations of murmur.
+1:20c2adc: 
+1:20c2adc:     // tests ask for ridiculous numbers of hashes so here is a special case for them
+1:20c2adc:     // rather than using the threadLocal like we do in production
+1:20c2adc:     @VisibleForTesting
+1:18d8f26:     public long[] getHashBuckets(FilterKey key, int hashCount, long max)
+1:6cb811b:     {
+1:20c2adc:         long[] hash = new long[2];
+1:18d8f26:         key.filterHash(hash);
+1:20c2adc:         long[] indexes = new long[hashCount];
+1:23fd75f:         setIndexes(hash[1], hash[0], hashCount, max, indexes);
+1:20c2adc:         return indexes;
+1:20c2adc:     }
+1:20c2adc: 
+1:20c2adc:     // note that this method uses the threadLocal that may be longer than hashCount
+1:20c2adc:     // to avoid generating a lot of garbage since stack allocation currently does not support stores
+1:20c2adc:     // (CASSANDRA-6609).  it returns the array so that the caller does not need to perform
+1:20c2adc:     // a second threadlocal lookup.
+1:1e92ce4:     @Inline
+1:18d8f26:     private long[] indexes(FilterKey key)
+1:20c2adc:     {
+1:20c2adc:         // we use the same array both for storing the hash result, and for storing the indexes we return,
+1:20c2adc:         // so that we do not need to allocate two arrays.
+1:20c2adc:         long[] indexes = reusableIndexes.get();
+1:1e92ce4: 
+1:18d8f26:         key.filterHash(indexes);
+1:23fd75f:         setIndexes(indexes[1], indexes[0], hashCount, bitset.capacity(), indexes);
+1:20c2adc:         return indexes;
+1:20c2adc:     }
+1:20c2adc: 
+1:1e92ce4:     @Inline
+1:20c2adc:     private void setIndexes(long base, long inc, int count, long max, long[] results)
+1:20c2adc:     {
+1:23fd75f:         if (oldBfHashOrder)
+1:23fd75f:         {
+1:23fd75f:             long x = inc;
+1:23fd75f:             inc = base;
+1:23fd75f:             base = x;
+1:23fd75f:         }
+1:23fd75f: 
+1:20c2adc:         for (int i = 0; i < count; i++)
+1:6cb811b:         {
+1:20c2adc:             results[i] = FBUtilities.abs(base % max);
+1:20c2adc:             base += inc;
+1:5dd1654:         }
+1:6cb811b:     }
+1:5dd1654: 
+1:18d8f26:     public void add(FilterKey key)
+1:6cb811b:     {
+1:20c2adc:         long[] indexes = indexes(key);
+1:20c2adc:         for (int i = 0; i < hashCount; i++)
+1:6cb811b:         {
+1:20c2adc:             bitset.set(indexes[i]);
+1:6cb811b:         }
+1:6cb811b:     }
+1:6cb811b: 
+1:18d8f26:     public final boolean isPresent(FilterKey key)
+1:20c2adc:     {
+1:20c2adc:         long[] indexes = indexes(key);
+1:20c2adc:         for (int i = 0; i < hashCount; i++)
+1:6cb811b:         {
+1:20c2adc:             if (!bitset.get(indexes[i]))
+1:20c2adc:             {
+1:20c2adc:                 return false;
+1:20c2adc:             }
+1:20c2adc:         }
+1:20c2adc:         return true;
+1:6cb811b:     }
+1:6cb811b: 
+1:6cb811b:     public void clear()
+1:dc37dea:     {
+1:dc37dea:         bitset.clear();
+1:dc37dea:     }
+1:18d8f26: 
+1:18d8f26:     public IFilter sharedCopy()
+1:18d8f26:     {
+1:18d8f26:         return new BloomFilter(this);
+1:18d8f26:     }
+1:18d8f26: 
+1:18d8f26:     @Override
+1:18d8f26:     public long offHeapSize()
+1:18d8f26:     {
+1:18d8f26:         return bitset.offHeapSize();
+1:18d8f26:     }
+1:23fd75f: 
+1:23fd75f:     public String toString()
+1:23fd75f:     {
+1:23fd75f:         return "BloomFilter[hashCount=" + hashCount + ";oldBfHashOrder=" + oldBfHashOrder + ";capacity=" + bitset.capacity() + ']';
+1:23fd75f:     }
+1:a7f4134: 
+1:a7f4134:     public void addTo(Ref.IdentityCollection identities)
+1:a7f4134:     {
+1:a7f4134:         super.addTo(identities);
+1:a7f4134:         bitset.addTo(identities);
+1:a7f4134:     }
+1:6cb811b: }
+============================================================================
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:1e92ce4
+/////////////////////////////////////////////////////////////////////////
+1: import io.netty.util.concurrent.FastThreadLocal;
+1: import net.nicoulaj.compilecommand.annotations.Inline;
+1:     private final static FastThreadLocal<long[]> reusableIndexes = new FastThreadLocal<long[]>()
+/////////////////////////////////////////////////////////////////////////
+1:     @Inline
+1: 
+1:     @Inline
+commit:2ec8621
+commit:3787d6c
+/////////////////////////////////////////////////////////////////////////
+0:         long hash1 = MurmurHash.hash64(b, b.position(), b.remaining(), 0L);
+0:         long hash2 = MurmurHash.hash64(b, b.position(), b.remaining(), hash1);
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:a7f4134
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.concurrent.Ref;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     public void addTo(Ref.IdentityCollection identities)
+1:     {
+1:         super.addTo(identities);
+1:         bitset.addTo(identities);
+1:     }
+commit:18d8f26
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.TypeSizes;
+1: public class BloomFilter extends WrappedSharedCloseable implements IFilter
+/////////////////////////////////////////////////////////////////////////
+0:     public static final BloomFilterSerializer serializer = new BloomFilterSerializer();
+1: 
+1:     public long serializedSize()
+1:     {
+0:         return serializer.serializedSize(this, TypeSizes.NATIVE);
+1:     }
+1: 
+1:     public long[] getHashBuckets(FilterKey key, int hashCount, long max)
+1:         key.filterHash(hash);
+/////////////////////////////////////////////////////////////////////////
+1:     private long[] indexes(FilterKey key)
+1:         key.filterHash(indexes);
+/////////////////////////////////////////////////////////////////////////
+1:     public void add(FilterKey key)
+/////////////////////////////////////////////////////////////////////////
+1:     public final boolean isPresent(FilterKey key)
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     public IFilter sharedCopy()
+1:     {
+1:         return new BloomFilter(this);
+1:     }
+1: 
+1:     @Override
+1:     public long offHeapSize()
+1:     {
+1:         return bitset.offHeapSize();
+1:     }
+commit:61384c5
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.concurrent.WrappedSharedCloseable;
+0: public abstract class BloomFilter extends WrappedSharedCloseable implements IFilter
+/////////////////////////////////////////////////////////////////////////
+0:     BloomFilter(int hashCount, IBitSet bitset)
+1:         super(bitset);
+1:         this.hashCount = hashCount;
+0:     BloomFilter(BloomFilter copy)
+1:     {
+1:         super(copy);
+1:         this.hashCount = copy.hashCount;
+1:         this.bitset = copy.bitset;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:23fd75f
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * CASSANDRA-8413: 3.0 (inverted) bloom filters have no 'static' bits caused by using the same upper bits
+1:      * for both bloom filter and token distribution.
+1:      */
+1:     public final boolean oldBfHashOrder;
+1:     BloomFilter(int hashCount, IBitSet bitset, boolean oldBfHashOrder)
+1:         this.oldBfHashOrder = oldBfHashOrder;
+1:     private BloomFilter(BloomFilter copy)
+1:         this.oldBfHashOrder = copy.oldBfHashOrder;
+1:         return BloomFilterSerializer.serializedSize(this);
+/////////////////////////////////////////////////////////////////////////
+1:         setIndexes(hash[1], hash[0], hashCount, max, indexes);
+/////////////////////////////////////////////////////////////////////////
+1:         setIndexes(indexes[1], indexes[0], hashCount, bitset.capacity(), indexes);
+1:         if (oldBfHashOrder)
+1:         {
+1:             long x = inc;
+1:             inc = base;
+1:             base = x;
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     public String toString()
+1:     {
+1:         return "BloomFilter[hashCount=" + hashCount + ";oldBfHashOrder=" + oldBfHashOrder + ";capacity=" + bitset.capacity() + ']';
+1:     }
+author:Ariel Weisberg
+-------------------------------------------------------------------------------
+commit:03f72ac
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         return serializer.serializedSize(this);
+author:belliottsmith
+-------------------------------------------------------------------------------
+commit:5ebadc1
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     public void close()
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:20c2adc
+/////////////////////////////////////////////////////////////////////////
+1: import com.google.common.annotations.VisibleForTesting;
+1: 
+0:     private static final ThreadLocal<long[]> reusableIndexes = new ThreadLocal<long[]>()
+1:     {
+1:         protected long[] initialValue()
+1:         {
+1:             return new long[21];
+1:         }
+1:     };
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:     protected abstract void hash(ByteBuffer b, int position, int remaining, long seed, long[] result);
+1: 
+1:     // tests ask for ridiculous numbers of hashes so here is a special case for them
+1:     // rather than using the threadLocal like we do in production
+1:     @VisibleForTesting
+0:     public long[] getHashBuckets(ByteBuffer key, int hashCount, long max)
+1:         long[] hash = new long[2];
+0:         hash(key, key.position(), key.remaining(), 0L, hash);
+1:         long[] indexes = new long[hashCount];
+0:         setIndexes(hash[0], hash[1], hashCount, max, indexes);
+1:         return indexes;
+1:     }
+1: 
+1:     // note that this method uses the threadLocal that may be longer than hashCount
+1:     // to avoid generating a lot of garbage since stack allocation currently does not support stores
+1:     // (CASSANDRA-6609).  it returns the array so that the caller does not need to perform
+1:     // a second threadlocal lookup.
+0:     private long[] indexes(ByteBuffer key)
+1:     {
+1:         // we use the same array both for storing the hash result, and for storing the indexes we return,
+1:         // so that we do not need to allocate two arrays.
+1:         long[] indexes = reusableIndexes.get();
+0:         hash(key, key.position(), key.remaining(), 0L, indexes);
+0:         setIndexes(indexes[0], indexes[1], hashCount, bitset.capacity(), indexes);
+1:         return indexes;
+1:     }
+1: 
+1:     private void setIndexes(long base, long inc, int count, long max, long[] results)
+1:     {
+1:         for (int i = 0; i < count; i++)
+1:             results[i] = FBUtilities.abs(base % max);
+1:             base += inc;
+1:         long[] indexes = indexes(key);
+1:         for (int i = 0; i < hashCount; i++)
+1:             bitset.set(indexes[i]);
+0:     public final boolean isPresent(ByteBuffer key)
+1:         long[] indexes = indexes(key);
+1:         for (int i = 0; i < hashCount; i++)
+1:         {
+1:             if (!bitset.get(indexes[i]))
+1:             {
+1:                 return false;
+1:             }
+1:         }
+1:         return true;
+commit:a15500e
+/////////////////////////////////////////////////////////////////////////
+0: public abstract class BloomFilter implements IFilter
+1:     public final int hashCount;
+/////////////////////////////////////////////////////////////////////////
+commit:dc37dea
+/////////////////////////////////////////////////////////////////////////
+0: import java.io.IOException;
+1: import org.apache.cassandra.utils.obs.IBitSet;
+1:     public final IBitSet bitset;
+0:     BloomFilter(int hashes, IBitSet bitset)
+/////////////////////////////////////////////////////////////////////////
+0:         return getHashBuckets(key, hashCount, bitset.capacity());
+/////////////////////////////////////////////////////////////////////////
+1:         bitset.clear();
+1:     }
+1: 
+0:     @Override
+0:     public void close() throws IOException
+1:     {
+0:         bitset.close();
+commit:00436c0
+/////////////////////////////////////////////////////////////////////////
+0:             bitset.set(bucketIndex);
+/////////////////////////////////////////////////////////////////////////
+0:           if (!bitset.get(bucketIndex))
+commit:c7455fb
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         return BloomFilter.getHashBuckets(key, hashCount, bitset.size());
+/////////////////////////////////////////////////////////////////////////
+0:             bitset.fastSet(bucketIndex);
+/////////////////////////////////////////////////////////////////////////
+0:           if (!bitset.fastGet(bucketIndex))
+commit:84eeb28
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     static BloomFilterSerializer serializer_ = new BloomFilterSerializer();
+/////////////////////////////////////////////////////////////////////////
+0:     public static BloomFilterSerializer serializer()
+/////////////////////////////////////////////////////////////////////////
+0:     public long serializedSize()
+0:         return serializer_.serializedSize(this);
+commit:fa21273
+/////////////////////////////////////////////////////////////////////////
+0:         if (logger.isTraceEnabled())
+0:             logger.trace("Creating bloom filter for {} elements and spec {}", numElements, spec);
+commit:5dd1654
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:     public int serializedSize()
+1:     {
+0:         return BloomFilterSerializer.serializedSize(this);
+1:     }
+commit:70c0ed8
+commit:27cf0a9
+commit:9375995
+/////////////////////////////////////////////////////////////////////////
+0:         return new OpenBitSet(numElements * bucketsPer + EXCESS);
+/////////////////////////////////////////////////////////////////////////
+0:                                       numElements, bucketsPerElement, targetBucketsPerElem));
+commit:6a0df02
+/////////////////////////////////////////////////////////////////////////
+commit:6cb811b
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.utils.obs.OpenBitSet;
+1: 
+0:     private static final int EXCESS = 20;
+0:     public OpenBitSet bitset;
+1: 
+0:     BloomFilter(int hashes, OpenBitSet bs)
+1:     {
+0:         hashCount = hashes;
+0:         bitset = bs;
+1:     }
+0:     long emptyBuckets()
+0:         long n = 0;
+0:         for (long i = 0; i < buckets(); i++)
+0:             if (!bitset.get(i))
+1:     
+0:     private static OpenBitSet bucketsFor(long numElements, int bucketsPer)
+0:         long numBits = numElements * bucketsPer + EXCESS; //TODO overflow?
+0:         return new OpenBitSet((long)Math.min(Long.MAX_VALUE, numBits));
+0:     /**
+0:     * @return A BloomFilter with the lowest practical false positive probability
+0:     * for the given number of elements.
+1:     */
+0:     public static BloomFilter getFilter(long numElements, int targetBucketsPerElem)
+0:         int maxBucketsPerElement = Math.max(1, BloomCalculations.maxBucketsPerElement(numElements));
+0:         int bucketsPerElement = Math.min(targetBucketsPerElem, maxBucketsPerElement);
+0:         if (bucketsPerElement < targetBucketsPerElem)
+1:         {
+0:             logger.warn(String.format("Cannot provide an optimal BloomFilter for %d elements (%d/%d buckets per element).",
+0:                                     numElements, bucketsPerElement, targetBucketsPerElem));
+1:         }
+0:         BloomCalculations.BloomSpecification spec = BloomCalculations.computeBloomSpec(bucketsPerElement);
+0:         return new BloomFilter(spec.K, bucketsFor(numElements, spec.bucketsPerElement));
+1:     }
+1: 
+0:     /**
+0:     * @return The smallest BloomFilter that can provide the given false positive
+0:     * probability rate for the given number of elements.
+1:     *
+0:     * Asserts that the given probability can be satisfied using this filter.
+1:     */
+0:     public static BloomFilter getFilter(long numElements, double maxFalsePosProbability)
+1:     {
+0:         assert maxFalsePosProbability <= 1.0 : "Invalid probability";
+0:         int bucketsPerElement = BloomCalculations.maxBucketsPerElement(numElements);
+0:         BloomCalculations.BloomSpecification spec = BloomCalculations.computeBloomSpec(bucketsPerElement, maxFalsePosProbability);
+0:         return new BloomFilter(spec.K, bucketsFor(numElements, spec.bucketsPerElement));
+1:     }
+1: 
+0:     private long buckets()
+1:     {
+0:       return bitset.size();
+1:     }
+1: 
+0:     private long[] getHashBuckets(ByteBuffer key)
+1:     {
+0:         return BloomFilter.getHashBuckets(key, hashCount, buckets());
+1:     }
+1: 
+1:     // Murmur is faster than an SHA-based approach and provides as-good collision
+1:     // resistance.  The combinatorial generation approach described in
+1:     // http://www.eecs.harvard.edu/~kirsch/pubs/bbbf/esa06.pdf
+1:     // does prove to work in actual tests, and is obviously faster
+1:     // than performing further iterations of murmur.
+0:     static long[] getHashBuckets(ByteBuffer b, int hashCount, long max)
+1:     {
+0:         long[] result = new long[hashCount];
+0:         long hash1 = MurmurHash.hash64(b.array(), b.position()+b.arrayOffset(), b.remaining(), 0L);
+0:         long hash2 = MurmurHash.hash64(b.array(), b.position()+b.arrayOffset(), b.remaining(), hash1);
+0:         for (int i = 0; i < hashCount; ++i)
+1:         {
+0:             result[i] = Math.abs((hash1 + (long)i * hash2) % max);
+1:         }
+0:         return result;
+1:     }
+1: 
+0:     public void add(ByteBuffer key)
+1:     {
+0:         for (long bucketIndex : getHashBuckets(key))
+1:         {
+0:             bitset.set(bucketIndex);
+1:         }
+1:     }
+1: 
+0:     public boolean isPresent(ByteBuffer key)
+1:     {
+0:       for (long bucketIndex : getHashBuckets(key))
+1:       {
+0:           if (!bitset.get(bucketIndex))
+1:           {
+0:               return false;
+1:           }
+1:       }
+0:       return true;
+1:     }
+1: 
+1:     public void clear()
+1:     {
+0:         bitset.clear(0, bitset.size());
+commit:ef25537
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.ICompactSerializer;
+0: 
+commit:e7a385a
+/////////////////////////////////////////////////////////////////////////
+0: import java.nio.ByteBuffer;
+/////////////////////////////////////////////////////////////////////////
+0:     public boolean isPresent(ByteBuffer key)
+/////////////////////////////////////////////////////////////////////////
+0:     public void add(ByteBuffer key)
+commit:5e4c5ce
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.log4j.Logger;
+0: 
+0:     private static final Logger logger = Logger.getLogger(BloomFilter.class);
+0:     private static final int EXCESS = 20;
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:     private static BitSet bucketsFor(long numElements, int bucketsPer)
+0:     {
+0:         long numBits = numElements * bucketsPer + EXCESS;
+0:         return new BitSet((int)Math.min(Integer.MAX_VALUE, numBits));
+0:     }
+0: 
+0:     /**
+0:      * Calculates the maximum number of buckets per element that this implementation
+0:      * can support.  Crucially, it will lower the bucket count if necessary to meet
+0:      * BitSet's size restrictions.
+0:      */
+0:     private static int maxBucketsPerElement(long numElements)
+0:     {
+0:         numElements = Math.max(1, numElements);
+0:         double v = (Integer.MAX_VALUE - EXCESS) / (double)numElements;
+0:         if (v < 1.0)
+0:         {
+0:             throw new UnsupportedOperationException("Cannot compute probabilities for " + numElements + " elements.");
+0:         }
+0:         return Math.min(BloomCalculations.probs.length - 1, (int)v);
+0:     }
+0: 
+0:     /**
+0:      * @return A BloomFilter with the lowest practical false positive probability
+0:      * for the given number of elements.
+0:      */
+0:     public static BloomFilter getFilter(long numElements, int targetBucketsPerElem)
+0:     {
+0:         int maxBucketsPerElement = Math.max(1, maxBucketsPerElement(numElements));
+0:         int bucketsPerElement = Math.min(targetBucketsPerElem, maxBucketsPerElement);
+0:         if (bucketsPerElement < targetBucketsPerElem)
+0:         {
+0:             logger.warn(String.format("Cannot provide an optimal BloomFilter for %d elements (%d/%d buckets per element).",
+0:                                       numElements, bucketsPerElement, targetBucketsPerElem));
+0:         }
+0:         BloomCalculations.BloomSpecification spec = BloomCalculations.computeBloomSpec(bucketsPerElement);
+0:         return new BloomFilter(spec.K, bucketsFor(numElements, spec.bucketsPerElement));
+0:     }
+0: 
+0:     /**
+0:      * @return The smallest BloomFilter that can provide the given false positive
+0:      * probability rate for the given number of elements.
+1:      *
+0:      * Asserts that the given probability can be satisfied using this filter.
+0:      */
+0:     public static BloomFilter getFilter(long numElements, double maxFalsePosProbability)
+0:     {
+0:         assert maxFalsePosProbability <= 1.0 : "Invalid probability";
+0:         int bucketsPerElement = maxBucketsPerElement(numElements);
+0:         BloomCalculations.BloomSpecification spec = BloomCalculations.computeBloomSpec(bucketsPerElement, maxFalsePosProbability);
+0:         return new BloomFilter(spec.K, bucketsFor(numElements, spec.bucketsPerElement));
+0:     }
+0: 
+commit:5a31842
+/////////////////////////////////////////////////////////////////////////
+0:     public boolean isPresent(byte[] key)
+0:     {
+0:         for (int bucketIndex : getHashBuckets(key))
+0:         {
+0:             if (!filter_.get(bucketIndex))
+0:             {
+0:                 return false;
+0:             }
+0:         }
+0:         return true;
+0:     }
+0: 
+commit:066ef58
+/////////////////////////////////////////////////////////////////////////
+0: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+0:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+0:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+0:  */
+0: 
+1: package org.apache.cassandra.utils;
+0: 
+0: import java.io.DataInputStream;
+0: import java.io.DataOutputStream;
+0: import java.io.IOException;
+0: import java.util.BitSet;
+0: 
+0: import org.apache.cassandra.io.ICompactSerializer;
+0: 
+0: public class BloomFilter extends Filter
+0: {
+0:     static ICompactSerializer<BloomFilter> serializer_ = new BloomFilterSerializer();
+0: 
+0:     public static ICompactSerializer<BloomFilter> serializer()
+0:     {
+0:         return serializer_;
+0:     }
+0: 
+0:     private BitSet filter_;
+0: 
+0:     public BloomFilter(int numElements, int bucketsPerElement)
+0:     {
+0:         this(BloomCalculations.computeBestK(bucketsPerElement), new BitSet(numElements * bucketsPerElement + 20));
+0:     }
+0: 
+0:     public BloomFilter(int numElements, double maxFalsePosProbability)
+0:     {
+0:         BloomCalculations.BloomSpecification spec = BloomCalculations
+0:                 .computeBucketsAndK(maxFalsePosProbability);
+0:         filter_ = new BitSet(numElements * spec.bucketsPerElement + 20);
+0:         hashCount = spec.K;
+0:     }
+0: 
+1:     /*
+0:      * This version is only used by the deserializer.
+0:      */
+0:     BloomFilter(int hashes, BitSet filter)
+0:     {
+0:         hashCount = hashes;
+0:         filter_ = filter;
+0:     }
+0: 
+0:     public void clear()
+0:     {
+0:         filter_.clear();
+0:     }
+0: 
+0:     int buckets()
+0:     {
+0:         return filter_.size();
+0:     }
+0: 
+0:     BitSet filter()
+0:     {
+0:         return filter_;
+0:     }
+0: 
+0:     public boolean isPresent(String key)
+0:     {
+0:         for (int bucketIndex : getHashBuckets(key))
+0:         {
+0:             if (!filter_.get(bucketIndex))
+0:             {
+0:                 return false;
+0:             }
+0:         }
+0:         return true;
+0:     }
+0: 
+1:     /*
+0:      @param key -- value whose hash is used to fill
+0:      the filter_.
+0:      This is a general purpose API.
+0:      */
+0:     public void add(String key)
+0:     {
+0:         for (int bucketIndex : getHashBuckets(key))
+0:         {
+0:             filter_.set(bucketIndex);
+0:         }
+0:     }
+0: 
+0:     public void add(byte[] key)
+0:     {
+0:         for (int bucketIndex : getHashBuckets(key))
+0:         {
+0:             filter_.set(bucketIndex);
+0:         }
+0:     }
+0: 
+0:     public String toString()
+0:     {
+0:         return filter_.toString();
+0:     }
+0: 
+0:     ICompactSerializer tserializer()
+0:     {
+0:         return serializer_;
+0:     }
+0: 
+0:     int emptyBuckets()
+0:     {
+0:         int n = 0;
+0:         for (int i = 0; i < buckets(); i++)
+0:         {
+0:             if (!filter_.get(i))
+0:             {
+0:                 n++;
+0:             }
+0:         }
+0:         return n;
+0:     }
+0: 
+0:     /** @return a BloomFilter that always returns a positive match, for testing */
+0:     public static BloomFilter alwaysMatchingBloomFilter()
+0:     {
+0:         BitSet set = new BitSet(64);
+0:         set.set(0, 64);
+0:         return new BloomFilter(1, set);
+0:     }
+0: }
+0: 
+0: class BloomFilterSerializer implements ICompactSerializer<BloomFilter>
+0: {
+0:     public void serialize(BloomFilter bf, DataOutputStream dos)
+0:             throws IOException
+0:     {
+0:         dos.writeInt(bf.getHashCount());
+0:         BitSetSerializer.serialize(bf.filter(), dos);
+0:     }
+0: 
+0:     public BloomFilter deserialize(DataInputStream dis) throws IOException
+0:     {
+0:         int hashes = dis.readInt();
+0:         BitSet bs = BitSetSerializer.deserialize(dis);
+0:         return new BloomFilter(hashes, bs);
+0:     }
+0: }
+commit:986cee6
+/////////////////////////////////////////////////////////////////////////
+0:     public void add(byte[] key)
+0:     {
+0:         for (int bucketIndex : getHashBuckets(key))
+0:         {
+0:             filter_.set(bucketIndex);
+0:         }
+0:     }
+0: 
+commit:4e3a440
+/////////////////////////////////////////////////////////////////////////
+0:      @param key -- value whose hash is used to fill
+commit:72e6eea
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:     /** @return a BloomFilter that always returns a positive match, for testing */
+0:     public static BloomFilter alwaysMatchingBloomFilter()
+0:     {
+0:         BitSet set = new BitSet(64);
+0:         set.set(0, 64);
+0:         return new BloomFilter(1, set);
+0:     }
+commit:71739ef
+commit:7bb094f
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.BitSet;
+/////////////////////////////////////////////////////////////////////////
+0:         BitSetSerializer.serialize(bf.filter(), dos);
+0:         BitSet bs = BitSetSerializer.deserialize(dis);
+commit:0c0c6e5
+/////////////////////////////////////////////////////////////////////////
+0: import java.io.DataInputStream;
+0: import java.io.DataOutputStream;
+0: import java.io.IOException;
+0: public class BloomFilter extends Filter
+0: {
+0:     static ICompactSerializer<BloomFilter> serializer_ = new BloomFilterSerializer();
+/////////////////////////////////////////////////////////////////////////
+0:     public BloomFilter(int numElements, int bucketsPerElement)
+0:         this(BloomCalculations.computeBestK(bucketsPerElement), new BitSet(numElements * bucketsPerElement + 20));
+0:     }
+0: 
+0:     public BloomFilter(int numElements, double maxFalsePosProbability)
+0:     {
+0:         BloomCalculations.BloomSpecification spec = BloomCalculations
+0:                 .computeBucketsAndK(maxFalsePosProbability);
+0:         filter_ = new BitSet(numElements * spec.bucketsPerElement + 20);
+0:         hashCount = spec.K;
+0:      * This version is only used by the deserializer.
+0:     BloomFilter(int hashes, BitSet filter)
+0:         hashCount = hashes;
+0:     public void clear()
+0:         filter_.clear();
+0:     int buckets()
+0:         return filter_.size();
+/////////////////////////////////////////////////////////////////////////
+0:         for (int bucketIndex : getHashBuckets(key))
+0:             if (!filter_.get(bucketIndex))
+0:                 return false;
+0:         return true;
+/////////////////////////////////////////////////////////////////////////
+0:         for (int bucketIndex : getHashBuckets(key))
+0:             filter_.set(bucketIndex);
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:     ICompactSerializer tserializer()
+0:     {
+0:         return serializer_;
+0:     }
+0: 
+0:     int emptyBuckets()
+0:     {
+0:         int n = 0;
+0:         for (int i = 0; i < buckets(); i++)
+0:         {
+0:             if (!filter_.get(i))
+0:             {
+0:                 n++;
+0:             }
+0:         }
+0:         return n;
+0:     }
+0:     public void serialize(BloomFilter bf, DataOutputStream dos)
+0:             throws IOException
+0:         dos.writeInt(bf.getHashCount());
+0:         return new BloomFilter(hashes, bs);
+commit:674eaf5
+/////////////////////////////////////////////////////////////////////////
+0:     public void add(String key)
+commit:7f256c3
+/////////////////////////////////////////////////////////////////////////
+0: {    
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:d765b24
+/////////////////////////////////////////////////////////////////////////
+0: public abstract class BloomFilter extends Filter
+0:     BloomFilter(int hashes, long numElements, int bucketsPer)
+0:         bitset = new OpenBitSet(numElements * bucketsPer + EXCESS);
+0:     BloomFilter(int hashes, OpenBitSet bitset)
+0:         this.hashCount = hashes;
+1:         this.bitset = bitset;
+0:         return getHashBuckets(key, hashCount, bitset.size());
+0:     protected abstract long[] hash(ByteBuffer b, int position, int remaining, long seed);
+0: 
+0:     long[] getHashBuckets(ByteBuffer b, int hashCount, long max)
+0:         long[] hash = this.hash(b, b.position(), b.remaining(), 0L);
+0:             result[i] = Math.abs((hash[0] + (long)i * hash[1]) % max);
+/////////////////////////////////////////////////////////////////////////
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:5a6e2b0
+/////////////////////////////////////////////////////////////////////////
+0:     static final BloomFilterSerializer serializer = new BloomFilterSerializer();
+0:     public final OpenBitSet bitset;
+commit:07cf56f
+/////////////////////////////////////////////////////////////////////////
+0: /*
+/////////////////////////////////////////////////////////////////////////
+commit:910b663
+/////////////////////////////////////////////////////////////////////////
+0:     static BloomFilterSerializer serializer = new BloomFilterSerializer();
+/////////////////////////////////////////////////////////////////////////
+0:         return serializer;
+/////////////////////////////////////////////////////////////////////////
+0:         return serializer.serializedSize(this);
+author:Gary Dusbabek
+-------------------------------------------------------------------------------
+commit:1ecdd7f
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.ICompactSerializer2;
+/////////////////////////////////////////////////////////////////////////
+0:     static ICompactSerializer2<BloomFilter> serializer_ = new BloomFilterSerializer();
+/////////////////////////////////////////////////////////////////////////
+0:     public static ICompactSerializer2<BloomFilter> serializer()
+commit:790cca1
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+commit:0095f0c
+/////////////////////////////////////////////////////////////////////////
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+0:     private static final Logger logger = LoggerFactory.getLogger(BloomFilter.class);
+author:Prashant Malik
+-------------------------------------------------------------------------------
+commit:1f91e99
+/////////////////////////////////////////////////////////////////////////
+0: /**
+0:  * Licensed to the Apache Software Foundation (ASF) under one
+0:  * or more contributor license agreements.  See the NOTICE file
+0:  * distributed with this work for additional information
+0:  * regarding copyright ownership.  The ASF licenses this file
+0:  * to you under the Apache License, Version 2.0 (the
+0:  * "License"); you may not use this file except in compliance
+0:  * with the License.  You may obtain a copy of the License at
+0:  *
+0:  *     http://www.apache.org/licenses/LICENSE-2.0
+0:  *
+0:  * Unless required by applicable law or agreed to in writing, software
+0:  * distributed under the License is distributed on an "AS IS" BASIS,
+0:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+0:  * See the License for the specific language governing permissions and
+0:  * limitations under the License.
+0:  */
+0: 
+0: package org.apache.cassandra.utils;
+0: 
+0: import java.math.*;
+0: import java.nio.ByteBuffer;
+0: import java.nio.LongBuffer;
+0: import java.io.*;
+0: import java.security.*;
+0: import java.util.ArrayList;
+0: import java.util.List;
+0: import java.util.Random;
+0: import java.util.zip.*;
+0: 
+0: import javax.xml.bind.annotation.XmlElement;
+0: 
+0: import org.apache.cassandra.io.DataInputBuffer;
+0: import org.apache.cassandra.io.DataOutputBuffer;
+0: import org.apache.cassandra.io.ICompactSerializer;
+0: import org.apache.cassandra.io.SSTable;
+0: 
+0: 
+0: /**
+0:  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+0:  */
+0: 
+0: public class BloomFilter implements Serializable
+0: {
+0:     public static class CountingBloomFilter implements Serializable
+0:     {
+0:         private static ICompactSerializer<CountingBloomFilter> serializer_;
+0:         static
+0:         {
+0:             serializer_ = new CountingBloomFilterSerializer();
+0:         }
+0:         
+0:         public static ICompactSerializer<CountingBloomFilter> serializer()
+0:         {
+0:             return serializer_;
+0:         }
+0:         
+0:         @XmlElement(name="Filter")
+0:         private byte[] filter_ = new byte[0];
+0:         
+0:         @XmlElement(name="Size")
+0:         private int size_;
+0:         
+0:         @XmlElement(name="Hashes")
+0:         private int hashes_;
+0:         
+0:         /* Keeps count of number of keys added to CBF */
+0:         private transient int count_ = 0;                
+0:         private transient Random random_ = new Random(System.currentTimeMillis());
+0:         
+0:         /*
+0:          * This is just for JAXB. 
+0:         */
+0:         private CountingBloomFilter()
+0:         {
+0:         }
+0:         
+0:         public CountingBloomFilter(int numElements, int bitsPerElement)
+0:         {
+0:             // TODO -- think about the trivial cases more.
+0:             // Note that it should indeed be possible to send a bloom filter that
+0:             // encodes the empty set.
+0:             if (numElements < 0 || bitsPerElement < 1)
+0:                 throw new IllegalArgumentException("Number of elements and bits "
+0:                         + "must be non-negative.");
+0:             // Adding a small random number of bits so that even if the set
+0:             // of elements hasn't changed, we'll get different false positives.              
+0:             size_ = numElements * bitsPerElement + 20 + random_.nextInt(64);            
+0:             filter_ = new byte[size_];
+0:             hashes_ = BloomCalculations.computeBestK(bitsPerElement);
+0:         }
+0:         
+0:         CountingBloomFilter(int size, int hashes, byte[] filter)
+0:         {
+0:             size_ = size;
+0:             hashes_ = hashes;
+0:             filter_ = filter;
+0:         }
+0:         
+0:         public CountingBloomFilter cloneMe()
+0:         {
+0:             byte[] filter = new byte[filter_.length];
+0:             System.arraycopy(filter_, 0, filter, 0, filter_.length);
+0:             return new BloomFilter.CountingBloomFilter(size_, hashes_, filter);                        
+0:         }
+0:         
+0:         int size()
+0:         {
+0:             return size_;
+0:         }
+0:         
+0:         int hashes()
+0:         {
+0:             return hashes_;
+0:         }
+0:         
+0:         byte[] filter()
+0:         {
+0:             return filter_;
+0:         }
+0:         
+0:         public BloomFilter.CountingBloomFilter merge(BloomFilter.CountingBloomFilter cbf)
+0:         {
+0:             if ( cbf == null )
+0:                 return this;
+0:             
+0:             if ( size_ >= cbf.size_ )
+0:             {
+0:                 for ( int i = 0; i < cbf.filter_.length; ++i )
+0:                 {
+0:                     filter_[i] |= cbf.filter_[i];                    
+0:                 }
+0:                 return this;
+0:             }
+0:             else
+0:             {
+0:                 for ( int i = 0; i < filter_.length; ++i )
+0:                 {
+0:                     cbf.filter_[i] |= filter_[i];
+0:                 }
+0:                 return cbf;
+0:             }
+0:         }
+0:         
+0:         public boolean isPresent(String key)
+0:         {
+0:             boolean bVal = true;
+0:             for (int i = 0; i < hashes_; ++i)
+0:             {
+0:                 ISimpleHash hash = hashLibrary_.get(i);
+0:                 int hashValue = hash.hash(key);
+0:                 int index = Math.abs(hashValue % size_);
+0:                 if (filter_[index] == 0)
+0:                 {
+0:                     bVal = false;
+0:                     break;
+0:                 }
+0:             }
+0:             return bVal;
+0:         }
+0: 
+0:         /*
+0:          param@ key -- value whose hash is used to fill
+0:          the filter_.
+0:          This is a general purpose API.
+0:          */
+0:         public void add(String key)
+0:         {         
+0:             if ( !isPresent(key) )
+0:                 ++count_;
+0:             for (int i = 0; i < hashes_; ++i)
+0:             {
+0:                 ISimpleHash hash = hashLibrary_.get(i);
+0:                 int hashValue = hash.hash(key);
+0:                 int index = Math.abs(hashValue % size_);
+0:                 byte value = (filter_[index] == 0xFF) ? filter_[index] : (byte)( (++filter_[index]) & 0xFF );
+0:                 filter_[index] = value;
+0:             }
+0:         }
+0: 
+0:         public boolean delete(String key)
+0:         {
+0:             boolean bVal = isPresent(key);
+0:             if ( !bVal )
+0:             {
+0:                 --count_;
+0:                 return bVal;
+0:             }
+0:             
+0:             for (int i = 0; i < hashes_; ++i)
+0:             {
+0:                 ISimpleHash hash = hashLibrary_.get(i);
+0:                 int hashValue = hash.hash(key);
+0:                 int index = Math.abs(hashValue % size_);
+0:                 byte value = (filter_[index] == 0) ? filter_[index] : (byte)( (--filter_[index]) & 0xFF );
+0:                 filter_[index] = value;
+0:             }
+0:             
+0:             return bVal;
+0:         }
+0:         
+0:         public int count()
+0:         {
+0:            return count_;
+0:         }
+0:     }
+0:     
+0:     private static List<ISimpleHash> hashLibrary_ = new ArrayList<ISimpleHash>();
+0:     private static ICompactSerializer<BloomFilter> serializer_;
+0: 
+0:     static
+0:     {
+0:         serializer_ = new BloomFilterSerializer();
+0:         hashLibrary_.add(new RSHash());
+0:         hashLibrary_.add(new JSHash());
+0:         hashLibrary_.add(new PJWHash());
+0:         hashLibrary_.add(new ELFHash());
+0:         hashLibrary_.add(new BKDRHash());
+0:         hashLibrary_.add(new SDBMHash());
+0:         hashLibrary_.add(new DJBHash());
+0:         hashLibrary_.add(new DEKHash());
+0:         hashLibrary_.add(new BPHash());
+0:         hashLibrary_.add(new FNVHash());
+0:         hashLibrary_.add(new APHash());
+0:     }
+0: 
+0:     public static ICompactSerializer<BloomFilter> serializer()
+0:     {
+0:         return serializer_;
+0:     }
+0: 
+0:     private BitSet filter_;
+0:     private int count_;
+0:     private int size_;
+0:     private int hashes_;
+0:     private Random random_ = new Random(System.currentTimeMillis());
+0:     
+0:     public BloomFilter(int bitsPerElement)
+0:     {
+0:         if (bitsPerElement < 1)
+0:             throw new IllegalArgumentException("Number of bitsPerElement "
+0:                     + "must be non-negative.");
+0:         // Adding a small random number of bits so that even if the set
+0:         // of elements hasn't changed, we'll get different false positives.        
+0:         size_ = 20 + random_.nextInt(64);
+0:         filter_ = new BitSet(size_);
+0:         hashes_ = BloomCalculations.computeBestK(bitsPerElement);
+0:     }
+0: 
+0:     public BloomFilter(int numElements, int bitsPerElement)
+0:     {
+0:         // TODO -- think about the trivial cases more.
+0:         // Note that it should indeed be possible to send a bloom filter that
+0:         // encodes the empty set.
+0:         if (numElements < 0 || bitsPerElement < 1)
+0:             throw new IllegalArgumentException("Number of elements and bits "
+0:                     + "must be non-negative.");
+0:         // Adding a small random number of bits so that even if the set
+0:         // of elements hasn't changed, we'll get different false positives.
+0:         count_ = numElements;
+0:         size_ = numElements * bitsPerElement + 20 + random_.nextInt(64);
+0:         filter_ = new BitSet(size_);
+0:         //hashes_ = BloomCalculations.computeBestK(bitsPerElement);
+0:         hashes_ = 8;
+0:     }
+0: 
+0:     public BloomFilter(int numElements, double maxFalsePosProbability)
+0:     {
+0:         if (numElements < 0)
+0:             throw new IllegalArgumentException("Number of elements must be "
+0:                     + "non-negative.");
+0:         BloomCalculations.BloomSpecification spec = BloomCalculations
+0:                 .computeBitsAndK(maxFalsePosProbability);
+0:         // Add a small random number of bits so that even if the set
+0:         // of elements hasn't changed, we'll get different false positives.
+0:         count_ = numElements;
+0:         size_ = numElements * spec.bitsPerElement + 20 + random_.nextInt(64);
+0:         filter_ = new BitSet(size_);
+0:         hashes_ = spec.K;
+0:     }
+0: 
+0:     /*
+0:      * This version is only used by the deserializer. 
+0:      */
+0:     BloomFilter(int count, int hashes, int size, BitSet filter)
+0:     {
+0:         count_ = count;
+0:         hashes_ = hashes;
+0:         size_ = size;
+0:         filter_ = filter;
+0:     }
+0: 
+0:     int count()
+0:     {
+0:         return count_;
+0:     }
+0: 
+0:     int size()
+0:     {        
+0:         return size_;
+0:     }
+0: 
+0:     int hashes()
+0:     {
+0:         return hashes_;
+0:     }
+0: 
+0:     BitSet filter()
+0:     {
+0:         return filter_;
+0:     }
+0: 
+0:     public BloomFilter merge(BloomFilter bf)
+0:     {
+0:         BloomFilter mergedBf = null;
+0:         if ( filter_.size() >= bf.filter_.size() )
+0:         {
+0:             filter_.or(bf.filter_);
+0:             mergedBf = this;
+0:         }
+0:         else
+0:         {
+0:             bf.filter_.or(filter_);
+0:             mergedBf = bf;
+0:         }
+0:         return mergedBf;
+0:     }
+0: 
+0:     public boolean isPresent(String key)
+0:     {
+0:         boolean bVal = true;
+0:         for (int i = 0; i < hashes_; ++i)
+0:         {
+0:             ISimpleHash hash = hashLibrary_.get(i);
+0:             int hashValue = hash.hash(key);
+0:             int index = Math.abs(hashValue % size_);
+0:             if (!filter_.get(index))
+0:             {
+0:                 bVal = false;
+0:                 break;
+0:             }
+0:         }
+0:         return bVal;
+0:     }
+0: 
+0:     /*
+0:      param@ key -- value whose hash is used to fill
+0:      the filter_.
+0:      This is a general purpose API.
+0:      */
+0:     public void fill(String key)
+0:     {
+0:         for (int i = 0; i < hashes_; ++i)
+0:         {
+0:             ISimpleHash hash = hashLibrary_.get(i);
+0:             int hashValue = hash.hash(key);
+0:             int index = Math.abs(hashValue % size_);
+0:             filter_.set(index);
+0:         }
+0:     }
+0: 
+0:     public String toString()
+0:     {
+0:         return filter_.toString();
+0:     }
+0: 
+0:     public static void main(String[] args) throws Throwable
+0:     { 
+0:         BloomFilter bf = new BloomFilter(64*1024*1024, 15);        
+0:         for ( int i = 0; i < 64*1024*1024; ++i )
+0:         {
+0:             bf.fill(Integer.toString(i));
+0:         }
+0:         System.out.println("Done filling ...");
+0:         for ( int i = 0; i < 64*1024*1024; ++i )
+0:         {
+0:         	if ( !bf.isPresent(Integer.toString(i)) )
+0:         		System.out.println("Oops");
+0:         }
+0:     }
+0: }
+0: 
+0: class BloomFilterSerializer implements ICompactSerializer<BloomFilter>
+0: {
+0:     /* 
+0:      * The following methods are used for compact representation
+0:      * of BloomFilter. This is essential, since we want to determine
+0:      * the size of the serialized Bloom Filter blob before it is
+0:      * populated armed with the knowledge of how many elements are
+0:      * going to reside in it.
+0:      */
+0: 
+0:     public void serialize(BloomFilter bf, DataOutputStream dos) throws IOException
+0:     {
+0:         /* write out the count of the BloomFilter */
+0:         dos.writeInt(bf.count());
+0:         /* write the number of hash functions used */
+0:         dos.writeInt(bf.hashes());
+0:         /* write the size of the BloomFilter */
+0:         dos.writeInt(bf.size());
+0:         BitSet.serializer().serialize(bf.filter(), dos);
+0:     }
+0: 
+0:     public BloomFilter deserialize(DataInputStream dis) throws IOException
+0:     {
+0:         /* read the count of the BloomFilter */
+0:         int count = dis.readInt();
+0:         /* read the number of hash functions */
+0:         int hashes = dis.readInt();
+0:         /* read the size of the bloom filter */
+0:         int size = dis.readInt();
+0:         BitSet bs = BitSet.serializer().deserialize(dis);
+0:         return new BloomFilter(count, hashes, size, bs);
+0:     }
+0: }
+0: 
+0: class CountingBloomFilterSerializer implements ICompactSerializer<BloomFilter.CountingBloomFilter>
+0: {
+0:     /* 
+0:      * The following methods are used for compact representation
+0:      * of BloomFilter. This is essential, since we want to determine
+0:      * the size of the serialized Bloom Filter blob before it is
+0:      * populated armed with the knowledge of how many elements are
+0:      * going to reside in it.
+0:      */
+0: 
+0:     public void serialize(BloomFilter.CountingBloomFilter cbf, DataOutputStream dos)
+0:             throws IOException
+0:     {        
+0:         /* write the size of the BloomFilter */
+0:         dos.writeInt(cbf.size());
+0:         /* write the number of hash functions used */
+0:         dos.writeInt(cbf.hashes());
+0:         
+0:         byte[] filter = cbf.filter();
+0:         /* write length of the filter */
+0:         dos.writeInt(filter.length);
+0:         dos.write(filter);
+0:     }
+0: 
+0:     public BloomFilter.CountingBloomFilter deserialize(DataInputStream dis) throws IOException
+0:     {
+0:         /* read the size of the bloom filter */
+0:         int size = dis.readInt();
+0:         /* read the number of hash functions */
+0:         int hashes = dis.readInt();
+0:         /* read the length of the filter */
+0:         int length = dis.readInt();
+0:         byte[] filter = new byte[length];
+0:         dis.readFully(filter);
+0:         return new BloomFilter.CountingBloomFilter(size, hashes, filter);
+0:     }
+0: }
+0: 
+0: interface ISimpleHash
+0: {
+0:     public int hash(String str);
+0: }
+0: 
+0: class RSHash implements ISimpleHash
+0: {
+0:     public int hash(String str)
+0:     {
+0:         int b = 378551;
+0:         int a = 63689;
+0:         int hash = 0;
+0: 
+0:         for (int i = 0; i < str.length(); i++)
+0:         {
+0:             hash = hash * a + str.charAt(i);
+0:             a = a * b;
+0:         }
+0:         return hash;
+0:     }
+0: }
+0: 
+0: class JSHash implements ISimpleHash
+0: {
+0:     public int hash(String str)
+0:     {
+0:         int hash = 1315423911;
+0:         for (int i = 0; i < str.length(); i++)
+0:         {
+0:             hash ^= ((hash << 5) + str.charAt(i) + (hash >> 2));
+0:         }
+0:         return hash;
+0:     }
+0: }
+0: 
+0: class PJWHash implements ISimpleHash
+0: {
+0:     public int hash(String str)
+0:     {
+0:         int bitsInUnsignedInt = (4 * 8);
+0:         int threeQuarters = (bitsInUnsignedInt * 3) / 4;
+0:         int oneEighth = bitsInUnsignedInt / 8;
+0:         int highBits = (0xFFFFFFFF) << (bitsInUnsignedInt - oneEighth);
+0:         int hash = 0;
+0:         int test = 0;
+0: 
+0:         for (int i = 0; i < str.length(); i++)
+0:         {
+0:             hash = (hash << oneEighth) + str.charAt(i);
+0: 
+0:             if ((test = hash & highBits) != 0)
+0:             {
+0:                 hash = ((hash ^ (test >> threeQuarters)) & (~highBits));
+0:             }
+0:         }
+0:         return hash;
+0:     }
+0: }
+0: 
+0: class ELFHash implements ISimpleHash
+0: {
+0:     public int hash(String str)
+0:     {
+0:         int hash = 0;
+0:         int x = 0;
+0:         for (int i = 0; i < str.length(); i++)
+0:         {
+0:             hash = (hash << 4) + str.charAt(i);
+0: 
+0:             if ((x = hash & 0xF0000000) != 0)
+0:             {
+0:                 hash ^= (x >> 24);
+0:             }
+0:             hash &= ~x;
+0:         }
+0:         return hash;
+0:     }
+0: }
+0: 
+0: class BKDRHash implements ISimpleHash
+0: {
+0:     public int hash(String str)
+0:     {
+0:         int seed = 131; // 31 131 1313 13131 131313 etc..
+0:         int hash = 0;
+0:         for (int i = 0; i < str.length(); i++)
+0:         {
+0:             hash = (hash * seed) + str.charAt(i);
+0:         }
+0:         return hash;
+0:     }
+0: }
+0: 
+0: class SDBMHash implements ISimpleHash
+0: {
+0:     public int hash(String str)
+0:     {
+0:         int hash = 0;
+0:         for (int i = 0; i < str.length(); i++)
+0:         {
+0:             hash = str.charAt(i) + (hash << 6) + (hash << 16) - hash;
+0:         }
+0:         return hash;
+0:     }
+0: }
+0: 
+0: class DJBHash implements ISimpleHash
+0: {
+0:     public int hash(String str)
+0:     {
+0:         int hash = 5381;
+0:         for (int i = 0; i < str.length(); i++)
+0:         {
+0:             hash = ((hash << 5) + hash) + str.charAt(i);
+0:         }
+0:         return hash;
+0:     }
+0: }
+0: 
+0: class DEKHash implements ISimpleHash
+0: {
+0:     public int hash(String str)
+0:     {
+0:         int hash = str.length();
+0:         for (int i = 0; i < str.length(); i++)
+0:         {
+0:             hash = ((hash << 5) ^ (hash >> 27)) ^ str.charAt(i);
+0:         }
+0:         return hash;
+0:     }
+0: }
+0: 
+0: class BPHash implements ISimpleHash
+0: {
+0:     public int hash(String str)
+0:     {
+0:         int hash = 0;
+0:         for (int i = 0; i < str.length(); i++)
+0:         {
+0:             hash = hash << 7 ^ str.charAt(i);
+0:         }
+0:         return hash;
+0:     }
+0: }
+0: 
+0: class FNVHash implements ISimpleHash
+0: {
+0:     public int hash(String str)
+0:     {
+0:         int fnv_prime = 0x811C9DC5;
+0:         int hash = 0;
+0:         for (int i = 0; i < str.length(); i++)
+0:         {
+0:             hash *= fnv_prime;
+0:             hash ^= str.charAt(i);
+0:         }
+0:         return hash;
+0:     }
+0: }
+0: 
+0: class APHash implements ISimpleHash
+0: {
+0:     public int hash(String str)
+0:     {
+0:         int hash = 0xAAAAAAAA;
+0:         for (int i = 0; i < str.length(); i++)
+0:         {
+0:             if ((i & 1) == 0)
+0:             {
+0:                 hash ^= ((hash << 7) ^ str.charAt(i) ^ (hash >> 3));
+0:             }
+0:             else
+0:             {
+0:                 hash ^= (~((hash << 11) ^ str.charAt(i) ^ (hash >> 5)));
+0:             }
+0:         }
+0:         return hash;
+0:     }
+0: }
+============================================================================

@@ -1,0 +1,605 @@
+1:946e62d: /*
+1:946e62d:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:946e62d:  * contributor license agreements.  See the NOTICE file distributed with
+1:946e62d:  * this work for additional information regarding copyright ownership.
+1:946e62d:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:946e62d:  * (the "License"); you may not use this file except in compliance with
+1:946e62d:  * the License.  You may obtain a copy of the License at
+1:946e62d:  *
+1:946e62d:  *      http://www.apache.org/licenses/LICENSE-2.0
+1:946e62d:  *
+1:946e62d:  * Unless required by applicable law or agreed to in writing, software
+1:946e62d:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:946e62d:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:946e62d:  * See the License for the specific language governing permissions and
+1:946e62d:  * limitations under the License.
+1:946e62d:  */
+1:946e62d: package org.apache.activemq.store.kahadb.disk.journal;
+2:946e62d: 
+1:946e62d: import java.io.IOException;
+1:946e62d: import java.util.Map;
+1:946e62d: import java.util.concurrent.atomic.AtomicReference;
+1:946e62d: import java.util.zip.Adler32;
+1:946e62d: import java.util.zip.Checksum;
+1:946e62d: 
+1:946e62d: import org.apache.activemq.store.kahadb.disk.util.DataByteArrayOutputStream;
+1:946e62d: import org.apache.activemq.store.kahadb.disk.util.LinkedNodeList;
+1:946e62d: import org.apache.activemq.util.ByteSequence;
+1:946e62d: import org.apache.activemq.util.RecoverableRandomAccessFile;
+1:946e62d: import org.slf4j.Logger;
+1:946e62d: import org.slf4j.LoggerFactory;
+1:946e62d: 
+1:946e62d: /**
+1:946e62d:  * File Appender instance that performs batched writes in the thread where the write is
+1:946e62d:  * queued.  This appender does not honor the maxFileLength value in the journal as the
+1:946e62d:  * files created here are out-of-band logs used for other purposes such as journal level
+1:946e62d:  * compaction.
+1:946e62d:  */
+1:946e62d: public class TargetedDataFileAppender implements FileAppender {
+1:946e62d: 
+1:946e62d:     private static final Logger LOG = LoggerFactory.getLogger(TargetedDataFileAppender.class);
+1:946e62d: 
+1:946e62d:     private final Journal journal;
+1:946e62d:     private final DataFile target;
+1:946e62d:     private final Map<Journal.WriteKey, Journal.WriteCommand> inflightWrites;
+1:946e62d:     private final int maxWriteBatchSize;
+1:946e62d: 
+1:946e62d:     private boolean closed;
+1:946e62d:     private boolean preallocate;
+1:946e62d:     private WriteBatch nextWriteBatch;
+1:946e62d:     private int statIdx = 0;
+1:946e62d:     private int[] stats = new int[maxStat];
+1:946e62d: 
+1:946e62d:     public class WriteBatch {
+1:946e62d: 
+1:946e62d:         protected final int offset;
+1:946e62d: 
+1:946e62d:         public final DataFile dataFile;
+1:946e62d:         public final LinkedNodeList<Journal.WriteCommand> writes = new LinkedNodeList<Journal.WriteCommand>();
+1:946e62d:         public int size = Journal.BATCH_CONTROL_RECORD_SIZE;
+1:946e62d:         public AtomicReference<IOException> exception = new AtomicReference<IOException>();
+1:946e62d: 
+1:946e62d:         public WriteBatch(DataFile dataFile, int offset) {
+1:946e62d:             this.dataFile = dataFile;
+1:946e62d:             this.offset = offset;
+1:946e62d:             this.dataFile.incrementLength(Journal.BATCH_CONTROL_RECORD_SIZE);
+1:946e62d:             this.size = Journal.BATCH_CONTROL_RECORD_SIZE;
+1:946e62d:             journal.addToTotalLength(Journal.BATCH_CONTROL_RECORD_SIZE);
+1:946e62d:         }
+1:946e62d: 
+1:946e62d:         public WriteBatch(DataFile dataFile, int offset, Journal.WriteCommand write) throws IOException {
+1:946e62d:             this(dataFile, offset);
+1:946e62d:             append(write);
+1:946e62d:         }
+1:946e62d: 
+1:946e62d:         public boolean canAppend(Journal.WriteCommand write) {
+1:946e62d:             int newSize = size + write.location.getSize();
+1:946e62d:             if (newSize >= maxWriteBatchSize) {
+1:946e62d:                 return false;
+1:946e62d:             }
+1:946e62d:             return true;
+1:946e62d:         }
+1:946e62d: 
+1:946e62d:         public void append(Journal.WriteCommand write) throws IOException {
+1:946e62d:             this.writes.addLast(write);
+1:946e62d:             write.location.setDataFileId(dataFile.getDataFileId());
+1:946e62d:             write.location.setOffset(offset + size);
+1:946e62d:             int s = write.location.getSize();
+1:946e62d:             size += s;
+1:946e62d:             dataFile.incrementLength(s);
+1:946e62d:             journal.addToTotalLength(s);
+1:946e62d:         }
+1:946e62d:     }
+1:946e62d: 
+1:946e62d:     /**
+1:946e62d:      * Construct a Store writer
+1:946e62d:      */
+1:946e62d:     public TargetedDataFileAppender(Journal journal, DataFile target) {
+1:946e62d:         this.journal = journal;
+1:946e62d:         this.target = target;
+1:946e62d:         this.inflightWrites = this.journal.getInflightWrites();
+1:946e62d:         this.maxWriteBatchSize = this.journal.getWriteBatchSize();
+1:946e62d:     }
+1:946e62d: 
+1:946e62d:     @Override
+1:946e62d:     public Location storeItem(ByteSequence data, byte type, boolean sync) throws IOException {
+1:946e62d:         checkClosed();
+1:946e62d: 
+1:946e62d:         // Write the packet our internal buffer.
+1:946e62d:         int size = data.getLength() + Journal.RECORD_HEAD_SPACE;
+1:946e62d: 
+1:946e62d:         final Location location = new Location();
+1:946e62d:         location.setSize(size);
+1:946e62d:         location.setType(type);
+1:946e62d: 
+1:946e62d:         Journal.WriteCommand write = new Journal.WriteCommand(location, data, sync);
+1:946e62d: 
+1:946e62d:         enqueueWrite(write);
+1:946e62d: 
+1:946e62d:         if (sync) {
+1:946e62d:             writePendingBatch();
+1:946e62d:         }
+1:946e62d: 
+1:946e62d:         return location;
+1:946e62d:     }
+1:946e62d: 
+1:946e62d:     @Override
+1:946e62d:     public Location storeItem(ByteSequence data, byte type, Runnable onComplete) throws IOException {
+1:946e62d:         checkClosed();
+1:946e62d: 
+1:946e62d:         // Write the packet our internal buffer.
+1:946e62d:         int size = data.getLength() + Journal.RECORD_HEAD_SPACE;
+1:946e62d: 
+1:946e62d:         final Location location = new Location();
+1:946e62d:         location.setSize(size);
+1:946e62d:         location.setType(type);
+1:946e62d: 
+1:946e62d:         Journal.WriteCommand write = new Journal.WriteCommand(location, data, onComplete);
+1:946e62d: 
+1:946e62d:         enqueueWrite(write);
+1:946e62d: 
+1:946e62d:         return location;
+1:946e62d:     }
+1:946e62d: 
+1:946e62d:     @Override
+1:946e62d:     public void close() throws IOException {
+1:946e62d:         if (!closed) {
+1:946e62d:             if (nextWriteBatch != null) {
+1:946e62d:                 // force sync of current in-progress batched write.
+1:946e62d:                 LOG.debug("Close of targeted appender flushing last batch.");
+1:946e62d:                 writePendingBatch();
+1:946e62d:             }
+1:946e62d: 
+1:946e62d:             closed = true;
+1:946e62d:         }
+1:946e62d:     }
+1:946e62d: 
+1:946e62d:     //----- Appender Configuration -------------------------------------------//
+1:946e62d: 
+1:946e62d:     public boolean isPreallocate() {
+1:946e62d:         return preallocate;
+1:946e62d:     }
+1:946e62d: 
+1:946e62d:     public void setPreallocate(boolean preallocate) {
+1:946e62d:         this.preallocate = preallocate;
+1:946e62d:     }
+1:946e62d: 
+1:946e62d:     //----- Internal Implementation ------------------------------------------//
+1:946e62d: 
+1:946e62d:     private void checkClosed() throws IOException {
+1:946e62d:         if (closed) {
+1:946e62d:             throw new IOException("The appender is clsoed");
+1:946e62d:         }
+1:946e62d:     }
+1:946e62d: 
+1:946e62d:     private WriteBatch enqueueWrite(Journal.WriteCommand write) throws IOException {
+1:946e62d:         while (true) {
+1:946e62d:             if (nextWriteBatch == null) {
+1:946e62d:                 nextWriteBatch = new WriteBatch(target, target.getLength(), write);
+1:946e62d:                 break;
+1:946e62d:             } else {
+1:946e62d:                 // Append to current batch if possible..
+1:946e62d:                 if (nextWriteBatch.canAppend(write)) {
+1:946e62d:                     nextWriteBatch.append(write);
+1:946e62d:                     break;
+1:946e62d:                 } else {
+1:946e62d:                     // Flush current batch and start a new one.
+1:946e62d:                     writePendingBatch();
+1:946e62d:                     nextWriteBatch = null;
+1:946e62d:                 }
+1:946e62d:             }
+1:946e62d:         }
+1:946e62d: 
+1:946e62d:         if (!write.sync) {
+1:946e62d:             inflightWrites.put(new Journal.WriteKey(write.location), write);
+1:946e62d:         }
+1:946e62d: 
+1:946e62d:         return nextWriteBatch;
+1:946e62d:     }
+1:946e62d: 
+1:946e62d:     private void writePendingBatch() throws IOException {
+1:946e62d:         DataFile dataFile = nextWriteBatch.dataFile;
+1:946e62d: 
+1:946e62d:         try (RecoverableRandomAccessFile file = dataFile.openRandomAccessFile();
+1:946e62d:              DataByteArrayOutputStream buff = new DataByteArrayOutputStream(maxWriteBatchSize);) {
+1:946e62d: 
+1:946e62d:             // preallocate on first open of new file (length == 0) if configured to do so.
+1:946e62d:             // NOTE: dataFile.length cannot be used because it is updated in enqueue
+1:946e62d:             if (file.length() == 0L && isPreallocate()) {
+1:946e62d:                 journal.preallocateEntireJournalDataFile(file);
+1:946e62d:             }
+1:946e62d: 
+1:946e62d:             Journal.WriteCommand write = nextWriteBatch.writes.getHead();
+1:946e62d: 
+1:946e62d:             // Write an empty batch control record.
+1:946e62d:             buff.reset();
+1:946e62d:             buff.writeInt(Journal.BATCH_CONTROL_RECORD_SIZE);
+1:946e62d:             buff.writeByte(Journal.BATCH_CONTROL_RECORD_TYPE);
+1:946e62d:             buff.write(Journal.BATCH_CONTROL_RECORD_MAGIC);
+2:946e62d:             buff.writeInt(0);
+1:946e62d:             buff.writeLong(0);
+1:946e62d: 
+1:946e62d:             while (write != null) {
+1:946e62d:                 buff.writeInt(write.location.getSize());
+1:946e62d:                 buff.writeByte(write.location.getType());
+1:946e62d:                 buff.write(write.data.getData(), write.data.getOffset(), write.data.getLength());
+1:946e62d:                 write = write.getNext();
+1:946e62d:             }
+1:946e62d: 
+1:946e62d:             // append 'unset' next batch (5 bytes) so read can always find eof
+1:62bdbb0:             buff.write(Journal.EOF_RECORD);
+1:946e62d:             ByteSequence sequence = buff.toByteSequence();
+1:946e62d: 
+1:946e62d:             // Now we can fill in the batch control record properly.
+1:946e62d:             buff.reset();
+1:946e62d:             buff.skip(5 + Journal.BATCH_CONTROL_RECORD_MAGIC.length);
+1:62bdbb0:             buff.writeInt(sequence.getLength() - Journal.BATCH_CONTROL_RECORD_SIZE - Journal.EOF_RECORD.length);
+1:946e62d:             if (journal.isChecksum()) {
+1:946e62d:                 Checksum checksum = new Adler32();
+1:946e62d:                 checksum.update(sequence.getData(),
+1:946e62d:                                 sequence.getOffset() + Journal.BATCH_CONTROL_RECORD_SIZE,
+1:62bdbb0:                                 sequence.getLength() - Journal.BATCH_CONTROL_RECORD_SIZE - Journal.EOF_RECORD.length);
+1:946e62d:                 buff.writeLong(checksum.getValue());
+1:946e62d:             }
+1:946e62d: 
+1:946e62d:             // Now do the 1 big write.
+1:946e62d:             file.seek(nextWriteBatch.offset);
+1:946e62d:             if (maxStat > 0) {
+1:946e62d:                 if (statIdx < maxStat) {
+1:946e62d:                     stats[statIdx++] = sequence.getLength();
+1:946e62d:                 } else {
+1:946e62d:                     long all = 0;
+1:946e62d:                     for (; statIdx > 0;) {
+1:946e62d:                         all += stats[--statIdx];
+1:946e62d:                     }
+1:946e62d:                     LOG.trace("Ave writeSize: {}", all / maxStat);
+1:946e62d:                 }
+1:946e62d:             }
+1:946e62d: 
+1:946e62d:             file.write(sequence.getData(), sequence.getOffset(), sequence.getLength());
+1:946e62d: 
+1:946e62d:             ReplicationTarget replicationTarget = journal.getReplicationTarget();
+1:946e62d:             if (replicationTarget != null) {
+1:946e62d:                 replicationTarget.replicate(nextWriteBatch.writes.getHead().location, sequence, true);
+1:946e62d:             }
+1:946e62d: 
+1:946e62d:             file.sync();
+1:946e62d: 
+1:946e62d:             signalDone(nextWriteBatch);
+1:946e62d:         } catch (IOException e) {
+1:946e62d:             LOG.info("Journal failed while writing at: {}", nextWriteBatch.offset);
+1:946e62d:             throw e;
+1:946e62d:         }
+1:946e62d:     }
+1:946e62d: 
+1:946e62d:     private void signalDone(WriteBatch writeBatch) {
+1:946e62d:         // Now that the data is on disk, remove the writes from the in
+1:946e62d:         // flight cache and signal any onComplete requests.
+1:946e62d:         Journal.WriteCommand write = writeBatch.writes.getHead();
+1:946e62d:         while (write != null) {
+1:946e62d:             if (!write.sync) {
+1:946e62d:                 inflightWrites.remove(new Journal.WriteKey(write.location));
+1:946e62d:             }
+1:946e62d: 
+1:946e62d:             if (write.onComplete != null) {
+1:946e62d:                 try {
+1:946e62d:                     write.onComplete.run();
+1:946e62d:                 } catch (Throwable e) {
+1:946e62d:                     LOG.info("Add exception was raised while executing the run command for onComplete", e);
+1:946e62d:                 }
+1:946e62d:             }
+1:946e62d: 
+1:946e62d:             write = write.getNext();
+1:946e62d:         }
+1:946e62d:     }
+1:946e62d: }
+============================================================================
+author:gtully
+-------------------------------------------------------------------------------
+commit:62bdbb0
+/////////////////////////////////////////////////////////////////////////
+1:             buff.write(Journal.EOF_RECORD);
+1:             buff.writeInt(sequence.getLength() - Journal.BATCH_CONTROL_RECORD_SIZE - Journal.EOF_RECORD.length);
+1:                                 sequence.getLength() - Journal.BATCH_CONTROL_RECORD_SIZE - Journal.EOF_RECORD.length);
+author:Timothy Bish
+-------------------------------------------------------------------------------
+commit:946e62d
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *      http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.activemq.store.kahadb.disk.journal;
+1: 
+1: import java.io.IOException;
+1: import java.util.Map;
+1: import java.util.concurrent.atomic.AtomicReference;
+1: import java.util.zip.Adler32;
+1: import java.util.zip.Checksum;
+1: 
+1: import org.apache.activemq.store.kahadb.disk.util.DataByteArrayOutputStream;
+1: import org.apache.activemq.store.kahadb.disk.util.LinkedNodeList;
+1: import org.apache.activemq.util.ByteSequence;
+1: import org.apache.activemq.util.RecoverableRandomAccessFile;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: /**
+1:  * File Appender instance that performs batched writes in the thread where the write is
+1:  * queued.  This appender does not honor the maxFileLength value in the journal as the
+1:  * files created here are out-of-band logs used for other purposes such as journal level
+1:  * compaction.
+1:  */
+1: public class TargetedDataFileAppender implements FileAppender {
+1: 
+1:     private static final Logger LOG = LoggerFactory.getLogger(TargetedDataFileAppender.class);
+1: 
+1:     private final Journal journal;
+1:     private final DataFile target;
+1:     private final Map<Journal.WriteKey, Journal.WriteCommand> inflightWrites;
+1:     private final int maxWriteBatchSize;
+1: 
+1:     private boolean closed;
+1:     private boolean preallocate;
+1:     private WriteBatch nextWriteBatch;
+1:     private int statIdx = 0;
+1:     private int[] stats = new int[maxStat];
+1: 
+1:     public class WriteBatch {
+1: 
+1:         protected final int offset;
+1: 
+1:         public final DataFile dataFile;
+1:         public final LinkedNodeList<Journal.WriteCommand> writes = new LinkedNodeList<Journal.WriteCommand>();
+1:         public int size = Journal.BATCH_CONTROL_RECORD_SIZE;
+1:         public AtomicReference<IOException> exception = new AtomicReference<IOException>();
+1: 
+1:         public WriteBatch(DataFile dataFile, int offset) {
+1:             this.dataFile = dataFile;
+1:             this.offset = offset;
+1:             this.dataFile.incrementLength(Journal.BATCH_CONTROL_RECORD_SIZE);
+1:             this.size = Journal.BATCH_CONTROL_RECORD_SIZE;
+1:             journal.addToTotalLength(Journal.BATCH_CONTROL_RECORD_SIZE);
+1:         }
+1: 
+1:         public WriteBatch(DataFile dataFile, int offset, Journal.WriteCommand write) throws IOException {
+1:             this(dataFile, offset);
+1:             append(write);
+1:         }
+1: 
+1:         public boolean canAppend(Journal.WriteCommand write) {
+1:             int newSize = size + write.location.getSize();
+1:             if (newSize >= maxWriteBatchSize) {
+1:                 return false;
+1:             }
+1:             return true;
+1:         }
+1: 
+1:         public void append(Journal.WriteCommand write) throws IOException {
+1:             this.writes.addLast(write);
+1:             write.location.setDataFileId(dataFile.getDataFileId());
+1:             write.location.setOffset(offset + size);
+1:             int s = write.location.getSize();
+1:             size += s;
+1:             dataFile.incrementLength(s);
+1:             journal.addToTotalLength(s);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Construct a Store writer
+1:      */
+1:     public TargetedDataFileAppender(Journal journal, DataFile target) {
+1:         this.journal = journal;
+1:         this.target = target;
+1:         this.inflightWrites = this.journal.getInflightWrites();
+1:         this.maxWriteBatchSize = this.journal.getWriteBatchSize();
+1:     }
+1: 
+1:     @Override
+1:     public Location storeItem(ByteSequence data, byte type, boolean sync) throws IOException {
+1:         checkClosed();
+1: 
+1:         // Write the packet our internal buffer.
+1:         int size = data.getLength() + Journal.RECORD_HEAD_SPACE;
+1: 
+1:         final Location location = new Location();
+1:         location.setSize(size);
+1:         location.setType(type);
+1: 
+1:         Journal.WriteCommand write = new Journal.WriteCommand(location, data, sync);
+1: 
+1:         enqueueWrite(write);
+1: 
+1:         if (sync) {
+1:             writePendingBatch();
+1:         }
+1: 
+1:         return location;
+1:     }
+1: 
+1:     @Override
+1:     public Location storeItem(ByteSequence data, byte type, Runnable onComplete) throws IOException {
+1:         checkClosed();
+1: 
+1:         // Write the packet our internal buffer.
+1:         int size = data.getLength() + Journal.RECORD_HEAD_SPACE;
+1: 
+1:         final Location location = new Location();
+1:         location.setSize(size);
+1:         location.setType(type);
+1: 
+1:         Journal.WriteCommand write = new Journal.WriteCommand(location, data, onComplete);
+1: 
+1:         enqueueWrite(write);
+1: 
+1:         return location;
+1:     }
+1: 
+1:     @Override
+1:     public void close() throws IOException {
+1:         if (!closed) {
+1:             if (nextWriteBatch != null) {
+1:                 // force sync of current in-progress batched write.
+1:                 LOG.debug("Close of targeted appender flushing last batch.");
+1:                 writePendingBatch();
+1:             }
+1: 
+1:             closed = true;
+1:         }
+1:     }
+1: 
+1:     //----- Appender Configuration -------------------------------------------//
+1: 
+1:     public boolean isPreallocate() {
+1:         return preallocate;
+1:     }
+1: 
+1:     public void setPreallocate(boolean preallocate) {
+1:         this.preallocate = preallocate;
+1:     }
+1: 
+1:     //----- Internal Implementation ------------------------------------------//
+1: 
+1:     private void checkClosed() throws IOException {
+1:         if (closed) {
+1:             throw new IOException("The appender is clsoed");
+1:         }
+1:     }
+1: 
+1:     private WriteBatch enqueueWrite(Journal.WriteCommand write) throws IOException {
+1:         while (true) {
+1:             if (nextWriteBatch == null) {
+1:                 nextWriteBatch = new WriteBatch(target, target.getLength(), write);
+1:                 break;
+1:             } else {
+1:                 // Append to current batch if possible..
+1:                 if (nextWriteBatch.canAppend(write)) {
+1:                     nextWriteBatch.append(write);
+1:                     break;
+1:                 } else {
+1:                     // Flush current batch and start a new one.
+1:                     writePendingBatch();
+1:                     nextWriteBatch = null;
+1:                 }
+1:             }
+1:         }
+1: 
+1:         if (!write.sync) {
+1:             inflightWrites.put(new Journal.WriteKey(write.location), write);
+1:         }
+1: 
+1:         return nextWriteBatch;
+1:     }
+1: 
+1:     private void writePendingBatch() throws IOException {
+1:         DataFile dataFile = nextWriteBatch.dataFile;
+1: 
+1:         try (RecoverableRandomAccessFile file = dataFile.openRandomAccessFile();
+1:              DataByteArrayOutputStream buff = new DataByteArrayOutputStream(maxWriteBatchSize);) {
+1: 
+1:             // preallocate on first open of new file (length == 0) if configured to do so.
+1:             // NOTE: dataFile.length cannot be used because it is updated in enqueue
+1:             if (file.length() == 0L && isPreallocate()) {
+1:                 journal.preallocateEntireJournalDataFile(file);
+1:             }
+1: 
+1:             Journal.WriteCommand write = nextWriteBatch.writes.getHead();
+1: 
+1:             // Write an empty batch control record.
+1:             buff.reset();
+1:             buff.writeInt(Journal.BATCH_CONTROL_RECORD_SIZE);
+1:             buff.writeByte(Journal.BATCH_CONTROL_RECORD_TYPE);
+1:             buff.write(Journal.BATCH_CONTROL_RECORD_MAGIC);
+1:             buff.writeInt(0);
+1:             buff.writeLong(0);
+1: 
+1:             while (write != null) {
+1:                 buff.writeInt(write.location.getSize());
+1:                 buff.writeByte(write.location.getType());
+1:                 buff.write(write.data.getData(), write.data.getOffset(), write.data.getLength());
+1:                 write = write.getNext();
+1:             }
+1: 
+1:             // append 'unset' next batch (5 bytes) so read can always find eof
+1:             buff.writeInt(0);
+0:             buff.writeByte(0);
+1: 
+1:             ByteSequence sequence = buff.toByteSequence();
+1: 
+1:             // Now we can fill in the batch control record properly.
+1:             buff.reset();
+1:             buff.skip(5 + Journal.BATCH_CONTROL_RECORD_MAGIC.length);
+0:             buff.writeInt(sequence.getLength() - Journal.BATCH_CONTROL_RECORD_SIZE - 5);
+1:             if (journal.isChecksum()) {
+1:                 Checksum checksum = new Adler32();
+1:                 checksum.update(sequence.getData(),
+1:                                 sequence.getOffset() + Journal.BATCH_CONTROL_RECORD_SIZE,
+0:                                 sequence.getLength() - Journal.BATCH_CONTROL_RECORD_SIZE - 5);
+1:                 buff.writeLong(checksum.getValue());
+1:             }
+1: 
+1:             // Now do the 1 big write.
+1:             file.seek(nextWriteBatch.offset);
+1:             if (maxStat > 0) {
+1:                 if (statIdx < maxStat) {
+1:                     stats[statIdx++] = sequence.getLength();
+1:                 } else {
+1:                     long all = 0;
+1:                     for (; statIdx > 0;) {
+1:                         all += stats[--statIdx];
+1:                     }
+1:                     LOG.trace("Ave writeSize: {}", all / maxStat);
+1:                 }
+1:             }
+1: 
+1:             file.write(sequence.getData(), sequence.getOffset(), sequence.getLength());
+1: 
+1:             ReplicationTarget replicationTarget = journal.getReplicationTarget();
+1:             if (replicationTarget != null) {
+1:                 replicationTarget.replicate(nextWriteBatch.writes.getHead().location, sequence, true);
+1:             }
+1: 
+1:             file.sync();
+1: 
+1:             signalDone(nextWriteBatch);
+1:         } catch (IOException e) {
+1:             LOG.info("Journal failed while writing at: {}", nextWriteBatch.offset);
+1:             throw e;
+1:         }
+1:     }
+1: 
+1:     private void signalDone(WriteBatch writeBatch) {
+1:         // Now that the data is on disk, remove the writes from the in
+1:         // flight cache and signal any onComplete requests.
+1:         Journal.WriteCommand write = writeBatch.writes.getHead();
+1:         while (write != null) {
+1:             if (!write.sync) {
+1:                 inflightWrites.remove(new Journal.WriteKey(write.location));
+1:             }
+1: 
+1:             if (write.onComplete != null) {
+1:                 try {
+1:                     write.onComplete.run();
+1:                 } catch (Throwable e) {
+1:                     LOG.info("Add exception was raised while executing the run command for onComplete", e);
+1:                 }
+1:             }
+1: 
+1:             write = write.getNext();
+1:         }
+1:     }
+1: }
+============================================================================

@@ -1,0 +1,1079 @@
+1:a991b64: /*
+1:a991b64:  * Licensed to the Apache Software Foundation (ASF) under one
+1:a991b64:  * or more contributor license agreements.  See the NOTICE file
+1:a991b64:  * distributed with this work for additional information
+1:a991b64:  * regarding copyright ownership.  The ASF licenses this file
+1:a991b64:  * to you under the Apache License, Version 2.0 (the
+1:a991b64:  * "License"); you may not use this file except in compliance
+1:a991b64:  * with the License.  You may obtain a copy of the License at
+2:a991b64:  *
+1:a991b64:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:a991b64:  *
+1:a991b64:  * Unless required by applicable law or agreed to in writing, software
+1:a991b64:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:a991b64:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:a991b64:  * See the License for the specific language governing permissions and
+1:a991b64:  * limitations under the License.
+2:a991b64:  */
+1:a991b64: package org.apache.cassandra.db.partitions;
+26:a991b64: 
+1:a991b64: import java.io.IOError;
+1:a991b64: import java.io.IOException;
+1:a991b64: import java.security.MessageDigest;
+1:a991b64: import java.util.*;
+1:a991b64: 
+1:a991b64: import org.apache.cassandra.config.CFMetaData;
+1:a991b64: import org.apache.cassandra.db.*;
+1:8c64cef: import org.apache.cassandra.db.filter.ColumnFilter;
+1:a991b64: import org.apache.cassandra.db.rows.*;
+1:6094974: import org.apache.cassandra.db.transform.FilteredPartitions;
+1:f2d5cd0: import org.apache.cassandra.db.transform.MorePartitions;
+1:6094974: import org.apache.cassandra.db.transform.Transformation;
+1:6249a3b: import org.apache.cassandra.io.util.DataInputPlus;
+1:a991b64: import org.apache.cassandra.io.util.DataOutputPlus;
+1:a991b64: import org.apache.cassandra.net.MessagingService;
+1:a991b64: import org.apache.cassandra.utils.MergeIterator;
+1:a991b64: 
+2:a991b64: /**
+1:a991b64:  * Static methods to work with partition iterators.
+1:a991b64:  */
+1:a991b64: public abstract class UnfilteredPartitionIterators
+36:a991b64: {
+1:a991b64:     private static final Serializer serializer = new Serializer();
+1:a991b64: 
+1:2457599:     private static final Comparator<UnfilteredRowIterator> partitionComparator = (p1, p2) -> p1.partitionKey().compareTo(p2.partitionKey());
+1:a991b64: 
+1:a991b64:     private UnfilteredPartitionIterators() {}
+1:a991b64: 
+1:a991b64:     public interface MergeListener
+1:a991b64:     {
+1:a991b64:         public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List<UnfilteredRowIterator> versions);
+1:a991b64:         public void close();
+27:a991b64:     }
+1:8a97969: 
+1:a991b64:     @SuppressWarnings("resource") // The created resources are returned right away
+1:4beb54d:     public static UnfilteredRowIterator getOnlyElement(final UnfilteredPartitionIterator iter, SinglePartitionReadCommand command)
+1:8a97969:     {
+1:a991b64:         // If the query has no results, we'll get an empty iterator, but we still
+1:a991b64:         // want a RowIterator out of this method, so we return an empty one.
+1:a991b64:         UnfilteredRowIterator toReturn = iter.hasNext()
+1:a991b64:                               ? iter.next()
+1:6094974:                               : EmptyIterators.unfilteredRow(command.metadata(),
+1:a991b64:                                                              command.partitionKey(),
+1:a991b64:                                                              command.clusteringIndexFilter().isReversed());
+1:a991b64: 
+1:a991b64:         // Note that in general, we should wrap the result so that it's close method actually
+1:a991b64:         // close the whole UnfilteredPartitionIterator.
+1:6094974:         class Close extends Transformation
+1:a991b64:         {
+1:6094974:             public void onPartitionClose()
+1:a991b64:             {
+1:a991b64:                 // asserting this only now because it bothers Serializer if hasNext() is called before
+1:a991b64:                 // the previously returned iterator hasn't been fully consumed.
+1:6094974:                 boolean hadNext = iter.hasNext();
+1:a991b64:                 iter.close();
+1:6094974:                 assert !hadNext;
+1:a991b64:             }
+1:a991b64:         }
+1:6094974:         return Transformation.apply(toReturn, new Close());
+1:a991b64:     }
+1:a991b64: 
+1:f2d5cd0:     public static UnfilteredPartitionIterator concat(final List<UnfilteredPartitionIterator> iterators)
+1:f2d5cd0:     {
+1:f2d5cd0:         if (iterators.size() == 1)
+1:f2d5cd0:             return iterators.get(0);
+1:f2d5cd0: 
+1:f2d5cd0:         class Extend implements MorePartitions<UnfilteredPartitionIterator>
+1:f2d5cd0:         {
+1:f2d5cd0:             int i = 1;
+1:f2d5cd0:             public UnfilteredPartitionIterator moreContents()
+1:f2d5cd0:             {
+1:f2d5cd0:                 if (i >= iterators.size())
+1:f2d5cd0:                     return null;
+1:f2d5cd0:                 return iterators.get(i++);
+1:f2d5cd0:             }
+1:f2d5cd0:         }
+1:f2d5cd0:         return MorePartitions.extend(iterators.get(0), new Extend());
+1:f2d5cd0:     }
+1:f2d5cd0: 
+1:f2d5cd0: 
+1:a991b64:     public static PartitionIterator mergeAndFilter(List<UnfilteredPartitionIterator> iterators, int nowInSec, MergeListener listener)
+1:a991b64:     {
+1:a991b64:         // TODO: we could have a somewhat faster version if we were to merge the UnfilteredRowIterators directly as RowIterators
+1:a991b64:         return filter(merge(iterators, nowInSec, listener), nowInSec);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public static PartitionIterator filter(final UnfilteredPartitionIterator iterator, final int nowInSec)
+1:a991b64:     {
+1:6094974:         return FilteredPartitions.filter(iterator, nowInSec);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public static UnfilteredPartitionIterator merge(final List<? extends UnfilteredPartitionIterator> iterators, final int nowInSec, final MergeListener listener)
+1:a991b64:     {
+1:a991b64:         assert listener != null;
+1:a991b64:         assert !iterators.isEmpty();
+1:a991b64: 
+1:a991b64:         final boolean isForThrift = iterators.get(0).isForThrift();
+1:8a97969:         final CFMetaData metadata = iterators.get(0).metadata();
+1:a991b64: 
+1:a991b64:         final MergeIterator<UnfilteredRowIterator, UnfilteredRowIterator> merged = MergeIterator.get(iterators, partitionComparator, new MergeIterator.Reducer<UnfilteredRowIterator, UnfilteredRowIterator>()
+1:a991b64:         {
+1:a991b64:             private final List<UnfilteredRowIterator> toMerge = new ArrayList<>(iterators.size());
+1:a991b64: 
+1:a991b64:             private DecoratedKey partitionKey;
+1:a991b64:             private boolean isReverseOrder;
+1:a991b64: 
+1:a991b64:             public void reduce(int idx, UnfilteredRowIterator current)
+1:a991b64:             {
+1:a991b64:                 partitionKey = current.partitionKey();
+1:a991b64:                 isReverseOrder = current.isReverseOrder();
+1:a991b64: 
+1:a991b64:                 // Note that because the MergeListener cares about it, we want to preserve the index of the iterator.
+1:a991b64:                 // Non-present iterator will thus be set to empty in getReduced.
+1:a991b64:                 toMerge.set(idx, current);
+1:a991b64:             }
+1:a991b64: 
+1:a991b64:             protected UnfilteredRowIterator getReduced()
+1:a991b64:             {
+1:a991b64:                 UnfilteredRowIterators.MergeListener rowListener = listener.getRowMergeListener(partitionKey, toMerge);
+1:a991b64: 
+1:a991b64:                 // Replace nulls by empty iterators
+1:a991b64:                 for (int i = 0; i < toMerge.size(); i++)
+1:a991b64:                     if (toMerge.get(i) == null)
+1:6094974:                         toMerge.set(i, EmptyIterators.unfilteredRow(metadata, partitionKey, isReverseOrder));
+1:a991b64: 
+1:a991b64:                 return UnfilteredRowIterators.merge(toMerge, nowInSec, rowListener);
+1:a991b64:             }
+1:a991b64: 
+1:a991b64:             protected void onKeyChange()
+1:a991b64:             {
+1:a991b64:                 toMerge.clear();
+1:a991b64:                 for (int i = 0; i < iterators.size(); i++)
+1:a991b64:                     toMerge.add(null);
+1:a991b64:             }
+1:a991b64:         });
+1:a991b64: 
+1:8a97969:         return new AbstractUnfilteredPartitionIterator()
+1:8a97969:         {
+1:8a97969:             public boolean isForThrift()
+1:8a97969:             {
+1:a991b64:                 return isForThrift;
+1:8a97969:             }
+1:8a97969: 
+1:8a97969:             public CFMetaData metadata()
+1:8a97969:             {
+1:8a97969:                 return metadata;
+1:8a97969:             }
+1:8a97969: 
+1:8a97969:             public boolean hasNext()
+1:8a97969:             {
+1:a991b64:                 return merged.hasNext();
+1:8a97969:             }
+1:8a97969: 
+1:8a97969:             public UnfilteredRowIterator next()
+1:8a97969:             {
+1:a991b64:                 return merged.next();
+1:8a97969:             }
+1:8a97969: 
+7:a991b64:             @Override
+3:a991b64:             public void close()
+1:8a97969:             {
+1:a991b64:                 merged.close();
+1:8a97969:             }
+1:8a97969:         };
+1:8a97969:     }
+1:8a97969: 
+1:a991b64:     public static UnfilteredPartitionIterator mergeLazily(final List<? extends UnfilteredPartitionIterator> iterators, final int nowInSec)
+1:8a97969:     {
+1:a991b64:         assert !iterators.isEmpty();
+1:8a97969: 
+1:a991b64:         if (iterators.size() == 1)
+1:a991b64:             return iterators.get(0);
+1:a991b64: 
+1:a991b64:         final boolean isForThrift = iterators.get(0).isForThrift();
+1:8a97969:         final CFMetaData metadata = iterators.get(0).metadata();
+1:a991b64: 
+1:a991b64:         final MergeIterator<UnfilteredRowIterator, UnfilteredRowIterator> merged = MergeIterator.get(iterators, partitionComparator, new MergeIterator.Reducer<UnfilteredRowIterator, UnfilteredRowIterator>()
+1:8a97969:         {
+1:a991b64:             private final List<UnfilteredRowIterator> toMerge = new ArrayList<>(iterators.size());
+1:a991b64: 
+1:a991b64:             public void reduce(int idx, UnfilteredRowIterator current)
+1:a991b64:             {
+1:a991b64:                 toMerge.add(current);
+1:a991b64:             }
+1:a991b64: 
+1:a991b64:             protected UnfilteredRowIterator getReduced()
+1:a991b64:             {
+1:a991b64:                 return new LazilyInitializedUnfilteredRowIterator(toMerge.get(0).partitionKey())
+1:a991b64:                 {
+1:a991b64:                     protected UnfilteredRowIterator initializeIterator()
+1:a991b64:                     {
+1:a991b64:                         return UnfilteredRowIterators.merge(toMerge, nowInSec);
+1:a991b64:                     }
+10:a991b64:                 };
+1:a991b64:             }
+1:a991b64: 
+1:a991b64:             protected void onKeyChange()
+1:a991b64:             {
+1:a991b64:                 toMerge.clear();
+1:a991b64:             }
+1:a991b64:         });
+1:a991b64: 
+2:a991b64:         return new AbstractUnfilteredPartitionIterator()
+1:a991b64:         {
+3:a991b64:             public boolean isForThrift()
+1:a991b64:             {
+1:a991b64:                 return isForThrift;
+1:a991b64:             }
+1:a991b64: 
+1:8a97969:             public CFMetaData metadata()
+1:a991b64:             {
+1:8a97969:                 return metadata;
+1:a991b64:             }
+1:a991b64: 
+4:a991b64:             public boolean hasNext()
+1:a991b64:             {
+1:a991b64:                 return merged.hasNext();
+1:a991b64:             }
+1:a991b64: 
+4:a991b64:             public UnfilteredRowIterator next()
+1:a991b64:             {
+1:a991b64:                 return merged.next();
+1:a991b64:             }
+1:a991b64: 
+1:a991b64:             @Override
+1:a991b64:             public void close()
+1:a991b64:             {
+1:a991b64:                 merged.close();
+1:a991b64:             }
+1:a991b64:         };
+1:a991b64:     }
+1:a991b64: 
+1:782a1c3:     /**
+1:782a1c3:      * Digests the the provided iterator.
+1:782a1c3:      *
+1:3e37b4a:      * @param command the command that has yield {@code iterator}. This can be null if {@code version >= MessagingService.VERSION_30}
+1:3e37b4a:      * as this is only used when producing digest to be sent to legacy nodes.
+1:782a1c3:      * @param iterator the iterator to digest.
+1:782a1c3:      * @param digest the {@code MessageDigest} to use for the digest.
+1:782a1c3:      * @param version the messaging protocol to use when producing the digest.
+1:782a1c3:      */
+1:3e37b4a:     public static void digest(ReadCommand command, UnfilteredPartitionIterator iterator, MessageDigest digest, int version)
+1:a991b64:     {
+1:a991b64:         try (UnfilteredPartitionIterator iter = iterator)
+1:a991b64:         {
+1:a991b64:             while (iter.hasNext())
+1:a991b64:             {
+1:a991b64:                 try (UnfilteredRowIterator partition = iter.next())
+1:a991b64:                 {
+1:3e37b4a:                     UnfilteredRowIterators.digest(command, partition, digest, version);
+1:a991b64:                 }
+1:a991b64:             }
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public static Serializer serializerForIntraNode()
+1:a991b64:     {
+1:a991b64:         return serializer;
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:a991b64:      * Wraps the provided iterator so it logs the returned rows/RT for debugging purposes.
+2:a991b64:      * <p>
+1:a991b64:      * Note that this is only meant for debugging as this can log a very large amount of
+1:a991b64:      * logging at INFO.
+1:a991b64:      */
+1:a991b64:     public static UnfilteredPartitionIterator loggingIterator(UnfilteredPartitionIterator iterator, final String id, final boolean fullDetails)
+1:a991b64:     {
+1:6094974:         class Logging extends Transformation<UnfilteredRowIterator>
+1:a991b64:         {
+1:6094974:             public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+1:a991b64:             {
+1:6094974:                 return UnfilteredRowIterators.loggingIterator(partition, id, fullDetails);
+1:a991b64:             }
+1:a991b64:         }
+1:6094974:         return Transformation.apply(iterator, new Logging());
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:a991b64:      * Serialize each UnfilteredSerializer one after the other, with an initial byte that indicates whether
+1:a991b64:      * we're done or not.
+1:a991b64:      */
+1:a991b64:     public static class Serializer
+1:a991b64:     {
+1:fe388d4:         public void serialize(UnfilteredPartitionIterator iter, ColumnFilter selection, DataOutputPlus out, int version) throws IOException
+1:a991b64:         {
+1:8c64cef:             assert version >= MessagingService.VERSION_30; // We handle backward compatibility directy in ReadResponse.LegacyRangeSliceReplySerializer
+1:a991b64: 
+1:a991b64:             out.writeBoolean(iter.isForThrift());
+1:a991b64:             while (iter.hasNext())
+1:a991b64:             {
+1:a991b64:                 out.writeBoolean(true);
+1:a991b64:                 try (UnfilteredRowIterator partition = iter.next())
+1:a991b64:                 {
+1:fe388d4:                     UnfilteredRowIteratorSerializer.serializer.serialize(partition, selection, out, version);
+1:a991b64:                 }
+1:a991b64:             }
+1:a991b64:             out.writeBoolean(false);
+1:a991b64:         }
+1:a991b64: 
+1:fe388d4:         public UnfilteredPartitionIterator deserialize(final DataInputPlus in, final int version, final CFMetaData metadata, final ColumnFilter selection, final SerializationHelper.Flag flag) throws IOException
+1:a991b64:         {
+1:8c64cef:             assert version >= MessagingService.VERSION_30; // We handle backward compatibility directy in ReadResponse.LegacyRangeSliceReplySerializer
+1:a991b64:             final boolean isForThrift = in.readBoolean();
+1:a991b64: 
+1:a991b64:             return new AbstractUnfilteredPartitionIterator()
+1:a991b64:             {
+1:a991b64:                 private UnfilteredRowIterator next;
+1:a991b64:                 private boolean hasNext;
+1:a991b64:                 private boolean nextReturned = true;
+1:a991b64: 
+1:a991b64:                 public boolean isForThrift()
+1:a991b64:                 {
+1:a991b64:                     return isForThrift;
+1:a991b64:                 }
+1:a991b64: 
+1:8a97969:                 public CFMetaData metadata()
+1:a991b64:                 {
+1:8a97969:                     return metadata;
+1:a991b64:                 }
+1:a991b64: 
+1:a991b64:                 public boolean hasNext()
+1:a991b64:                 {
+1:a991b64:                     if (!nextReturned)
+1:a991b64:                         return hasNext;
+1:a991b64: 
+1:a991b64:                     // We can't answer this until the previously returned iterator has been fully consumed,
+1:a991b64:                     // so complain if that's not the case.
+1:a991b64:                     if (next != null && next.hasNext())
+1:a991b64:                         throw new IllegalStateException("Cannot call hasNext() until the previous iterator has been fully consumed");
+1:a991b64: 
+3:a991b64:                     try
+1:a991b64:                     {
+1:a991b64:                         hasNext = in.readBoolean();
+1:a991b64:                         nextReturned = false;
+1:a991b64:                         return hasNext;
+1:a991b64:                     }
+1:a991b64:                     catch (IOException e)
+1:a991b64:                     {
+1:a991b64:                         throw new IOError(e);
+1:a991b64:                     }
+1:a991b64:                 }
+1:a991b64: 
+1:a991b64:                 public UnfilteredRowIterator next()
+1:a991b64:                 {
+1:a991b64:                     if (nextReturned && !hasNext())
+1:8a97969:                         throw new NoSuchElementException();
+1:8a97969: 
+1:a991b64:                     try
+1:a991b64:                     {
+1:a991b64:                         nextReturned = true;
+1:fe388d4:                         next = UnfilteredRowIteratorSerializer.serializer.deserialize(in, version, metadata, selection, flag);
+1:a991b64:                         return next;
+1:8a97969:                     }
+1:a991b64:                     catch (IOException e)
+1:a991b64:                     {
+1:a991b64:                         throw new IOError(e);
+1:8a97969:                     }
+1:a991b64:                 }
+1:a991b64: 
+1:a991b64:                 @Override
+1:a991b64:                 public void close()
+1:a991b64:                 {
+2:a991b64:                     if (next != null)
+2:a991b64:                         next.close();
+1:a991b64:                 }
+1:a991b64:             };
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: }
+============================================================================
+author:Stefania Alborghetti
+-------------------------------------------------------------------------------
+commit:f2d5cd0
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.transform.MorePartitions;
+/////////////////////////////////////////////////////////////////////////
+1:     public static UnfilteredPartitionIterator concat(final List<UnfilteredPartitionIterator> iterators)
+1:     {
+1:         if (iterators.size() == 1)
+1:             return iterators.get(0);
+1: 
+1:         class Extend implements MorePartitions<UnfilteredPartitionIterator>
+1:         {
+1:             int i = 1;
+1:             public UnfilteredPartitionIterator moreContents()
+1:             {
+1:                 if (i >= iterators.size())
+1:                     return null;
+1:                 return iterators.get(i++);
+1:             }
+1:         }
+1:         return MorePartitions.extend(iterators.get(0), new Extend());
+1:     }
+1: 
+1: 
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:5956000
+commit:3e37b4a
+/////////////////////////////////////////////////////////////////////////
+1:      * @param command the command that has yield {@code iterator}. This can be null if {@code version >= MessagingService.VERSION_30}
+1:      * as this is only used when producing digest to be sent to legacy nodes.
+1:     public static void digest(ReadCommand command, UnfilteredPartitionIterator iterator, MessageDigest digest, int version)
+/////////////////////////////////////////////////////////////////////////
+1:                     UnfilteredRowIterators.digest(command, partition, digest, version);
+commit:4beb54d
+/////////////////////////////////////////////////////////////////////////
+1:     public static UnfilteredRowIterator getOnlyElement(final UnfilteredPartitionIterator iter, SinglePartitionReadCommand command)
+commit:782a1c3
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Digests the the provided iterator.
+1:      *
+1:      * @param iterator the iterator to digest.
+1:      * @param digest the {@code MessageDigest} to use for the digest.
+1:      * @param version the messaging protocol to use when producing the digest.
+1:      */
+0:     public static void digest(UnfilteredPartitionIterator iterator, MessageDigest digest, int version)
+/////////////////////////////////////////////////////////////////////////
+0:                     UnfilteredRowIterators.digest(partition, digest, version);
+commit:8a97969
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:     public static UnfilteredPartitionIterator empty(final CFMetaData metadata)
+1:     {
+1:         return new AbstractUnfilteredPartitionIterator()
+1:         {
+1:             public boolean isForThrift()
+1:             {
+0:                 return false;
+1:             }
+1: 
+1:             public CFMetaData metadata()
+1:             {
+1:                 return metadata;
+1:             }
+1: 
+1:             public boolean hasNext()
+1:             {
+0:                 return false;
+1:             }
+1: 
+1:             public UnfilteredRowIterator next()
+1:             {
+1:                 throw new NoSuchElementException();
+1:             }
+1:         };
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         final CFMetaData metadata = iterators.get(0).metadata();
+/////////////////////////////////////////////////////////////////////////
+1:             public CFMetaData metadata()
+1:             {
+1:                 return metadata;
+1:             }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         final CFMetaData metadata = iterators.get(0).metadata();
+/////////////////////////////////////////////////////////////////////////
+1:             public CFMetaData metadata()
+1:             {
+1:                 return metadata;
+1:             }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         public UnfilteredPartitionIterator deserialize(final DataInputPlus in, final int version, final CFMetaData metadata, final SerializationHelper.Flag flag) throws IOException
+/////////////////////////////////////////////////////////////////////////
+0:                 public CFMetaData metadata()
+1:                 {
+0:                     return metadata;
+1:                 }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:                         next = UnfilteredRowIteratorSerializer.serializer.deserialize(in, version, metadata, flag);
+commit:2457599
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private static final Comparator<UnfilteredRowIterator> partitionComparator = (p1, p2) -> p1.partitionKey().compareTo(p2.partitionKey());
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+commit:6249a3b
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.io.util.DataInputPlus;
+/////////////////////////////////////////////////////////////////////////
+0:         public UnfilteredPartitionIterator deserialize(final DataInputPlus in, final int version, final SerializationHelper.Flag flag) throws IOException
+commit:4c12f19
+/////////////////////////////////////////////////////////////////////////
+0: import java.nio.ByteBuffer;
+/////////////////////////////////////////////////////////////////////////
+0:     public static UnfilteredPartitionIterator removeDroppedColumns(UnfilteredPartitionIterator iterator, final Map<ByteBuffer, CFMetaData.DroppedColumn> droppedColumns)
+/////////////////////////////////////////////////////////////////////////
+0:                         CFMetaData.DroppedColumn dropped = droppedColumns.get(column.name.bytes);
+/////////////////////////////////////////////////////////////////////////
+0:                     if (droppedColumns.containsKey(c.name.bytes))
+commit:a991b64
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.db.partitions;
+1: 
+0: import java.io.DataInput;
+1: import java.io.IOError;
+1: import java.io.IOException;
+1: import java.security.MessageDigest;
+1: import java.util.*;
+1: 
+1: import org.apache.cassandra.config.CFMetaData;
+0: import org.apache.cassandra.config.ColumnDefinition;
+0: import org.apache.cassandra.cql3.ColumnIdentifier;
+1: import org.apache.cassandra.db.*;
+1: import org.apache.cassandra.db.rows.*;
+1: import org.apache.cassandra.io.util.DataOutputPlus;
+1: import org.apache.cassandra.net.MessagingService;
+1: import org.apache.cassandra.utils.MergeIterator;
+1: 
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+1: 
+1: /**
+1:  * Static methods to work with partition iterators.
+1:  */
+1: public abstract class UnfilteredPartitionIterators
+1: {
+0:     private static final Logger logger = LoggerFactory.getLogger(UnfilteredPartitionIterators.class);
+1: 
+1:     private static final Serializer serializer = new Serializer();
+1: 
+0:     private static final Comparator<UnfilteredRowIterator> partitionComparator = new Comparator<UnfilteredRowIterator>()
+1:     {
+0:         public int compare(UnfilteredRowIterator p1, UnfilteredRowIterator p2)
+1:         {
+0:             return p1.partitionKey().compareTo(p2.partitionKey());
+1:         }
+1:     };
+1: 
+0:     public static final UnfilteredPartitionIterator EMPTY = new AbstractUnfilteredPartitionIterator()
+1:     {
+1:         public boolean isForThrift()
+1:         {
+0:             return false;
+1:         }
+1: 
+1:         public boolean hasNext()
+1:         {
+0:             return false;
+1:         }
+1: 
+1:         public UnfilteredRowIterator next()
+1:         {
+0:             throw new NoSuchElementException();
+1:         }
+1:     };
+1: 
+1:     private UnfilteredPartitionIterators() {}
+1: 
+1:     public interface MergeListener
+1:     {
+1:         public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List<UnfilteredRowIterator> versions);
+1:         public void close();
+1:     }
+1: 
+1:     @SuppressWarnings("resource") // The created resources are returned right away
+0:     public static UnfilteredRowIterator getOnlyElement(final UnfilteredPartitionIterator iter, SinglePartitionReadCommand<?> command)
+1:     {
+1:         // If the query has no results, we'll get an empty iterator, but we still
+1:         // want a RowIterator out of this method, so we return an empty one.
+1:         UnfilteredRowIterator toReturn = iter.hasNext()
+1:                               ? iter.next()
+0:                               : UnfilteredRowIterators.emptyIterator(command.metadata(),
+1:                                                                      command.partitionKey(),
+1:                                                                      command.clusteringIndexFilter().isReversed());
+1: 
+1:         // Note that in general, we should wrap the result so that it's close method actually
+1:         // close the whole UnfilteredPartitionIterator.
+0:         return new WrappingUnfilteredRowIterator(toReturn)
+1:         {
+1:             public void close()
+1:             {
+1:                 try
+1:                 {
+0:                     super.close();
+1:                 }
+0:                 finally
+1:                 {
+1:                     // asserting this only now because it bothers Serializer if hasNext() is called before
+1:                     // the previously returned iterator hasn't been fully consumed.
+0:                     assert !iter.hasNext();
+1: 
+1:                     iter.close();
+1:                 }
+1:             }
+1:         };
+1:     }
+1: 
+1:     public static PartitionIterator mergeAndFilter(List<UnfilteredPartitionIterator> iterators, int nowInSec, MergeListener listener)
+1:     {
+1:         // TODO: we could have a somewhat faster version if we were to merge the UnfilteredRowIterators directly as RowIterators
+1:         return filter(merge(iterators, nowInSec, listener), nowInSec);
+1:     }
+1: 
+1:     public static PartitionIterator filter(final UnfilteredPartitionIterator iterator, final int nowInSec)
+1:     {
+0:         return new PartitionIterator()
+1:         {
+0:             private RowIterator next;
+1: 
+1:             public boolean hasNext()
+1:             {
+0:                 while (next == null && iterator.hasNext())
+1:                 {
+0:                     @SuppressWarnings("resource") // closed either directly if empty, or, if assigned to next, by either
+0:                                                   // the caller of next() or close()
+0:                     UnfilteredRowIterator rowIterator = iterator.next();
+0:                     next = UnfilteredRowIterators.filter(rowIterator, nowInSec);
+0:                     if (!iterator.isForThrift() && next.isEmpty())
+1:                     {
+0:                         rowIterator.close();
+0:                         next = null;
+1:                     }
+1:                 }
+0:                 return next != null;
+1:             }
+1: 
+0:             public RowIterator next()
+1:             {
+0:                 if (next == null && !hasNext())
+0:                     throw new NoSuchElementException();
+1: 
+0:                 RowIterator toReturn = next;
+0:                 next = null;
+0:                 return toReturn;
+1:             }
+1: 
+0:             public void remove()
+1:             {
+0:                 throw new UnsupportedOperationException();
+1:             }
+1: 
+1:             public void close()
+1:             {
+1:                 try
+1:                 {
+0:                     iterator.close();
+1:                 }
+0:                 finally
+1:                 {
+1:                     if (next != null)
+1:                         next.close();
+1:                 }
+1:             }
+1:         };
+1:     }
+1: 
+1:     public static UnfilteredPartitionIterator merge(final List<? extends UnfilteredPartitionIterator> iterators, final int nowInSec, final MergeListener listener)
+1:     {
+1:         assert listener != null;
+1:         assert !iterators.isEmpty();
+1: 
+1:         final boolean isForThrift = iterators.get(0).isForThrift();
+1: 
+1:         final MergeIterator<UnfilteredRowIterator, UnfilteredRowIterator> merged = MergeIterator.get(iterators, partitionComparator, new MergeIterator.Reducer<UnfilteredRowIterator, UnfilteredRowIterator>()
+1:         {
+1:             private final List<UnfilteredRowIterator> toMerge = new ArrayList<>(iterators.size());
+1: 
+0:             private CFMetaData metadata;
+1:             private DecoratedKey partitionKey;
+1:             private boolean isReverseOrder;
+1: 
+1:             public void reduce(int idx, UnfilteredRowIterator current)
+1:             {
+0:                 metadata = current.metadata();
+1:                 partitionKey = current.partitionKey();
+1:                 isReverseOrder = current.isReverseOrder();
+1: 
+1:                 // Note that because the MergeListener cares about it, we want to preserve the index of the iterator.
+1:                 // Non-present iterator will thus be set to empty in getReduced.
+1:                 toMerge.set(idx, current);
+1:             }
+1: 
+1:             protected UnfilteredRowIterator getReduced()
+1:             {
+1:                 UnfilteredRowIterators.MergeListener rowListener = listener.getRowMergeListener(partitionKey, toMerge);
+1: 
+1:                 // Replace nulls by empty iterators
+1:                 for (int i = 0; i < toMerge.size(); i++)
+1:                     if (toMerge.get(i) == null)
+0:                         toMerge.set(i, UnfilteredRowIterators.emptyIterator(metadata, partitionKey, isReverseOrder));
+1: 
+1:                 return UnfilteredRowIterators.merge(toMerge, nowInSec, rowListener);
+1:             }
+1: 
+1:             protected void onKeyChange()
+1:             {
+1:                 toMerge.clear();
+1:                 for (int i = 0; i < iterators.size(); i++)
+1:                     toMerge.add(null);
+1:             }
+1:         });
+1: 
+1:         return new AbstractUnfilteredPartitionIterator()
+1:         {
+1:             public boolean isForThrift()
+1:             {
+1:                 return isForThrift;
+1:             }
+1: 
+1:             public boolean hasNext()
+1:             {
+1:                 return merged.hasNext();
+1:             }
+1: 
+1:             public UnfilteredRowIterator next()
+1:             {
+1:                 return merged.next();
+1:             }
+1: 
+1:             @Override
+1:             public void close()
+1:             {
+1:                 merged.close();
+1:             }
+1:         };
+1:     }
+1: 
+1:     /**
+0:      * Convert all expired cells to equivalent tombstones.
+1:      * <p>
+0:      * See {@link UnfilteredRowIterators#convertExpiredCellsToTombstones} for details.
+1:      *
+0:      * @param iterator the iterator in which to conver expired cells.
+0:      * @param nowInSec the current time to use to decide if a cell is expired.
+0:      * @return an iterator that returns the same data than {@code iterator} but with all expired cells converted
+0:      * to equivalent tombstones.
+1:      */
+0:     public static UnfilteredPartitionIterator convertExpiredCellsToTombstones(UnfilteredPartitionIterator iterator, final int nowInSec)
+1:     {
+0:         return new WrappingUnfilteredPartitionIterator(iterator)
+1:         {
+1:             @Override
+0:             protected UnfilteredRowIterator computeNext(UnfilteredRowIterator iter)
+1:             {
+0:                 return UnfilteredRowIterators.convertExpiredCellsToTombstones(iter, nowInSec);
+1:             }
+1:         };
+1:     }
+1: 
+1:     public static UnfilteredPartitionIterator mergeLazily(final List<? extends UnfilteredPartitionIterator> iterators, final int nowInSec)
+1:     {
+1:         assert !iterators.isEmpty();
+1: 
+1:         if (iterators.size() == 1)
+1:             return iterators.get(0);
+1: 
+1:         final boolean isForThrift = iterators.get(0).isForThrift();
+1: 
+1:         final MergeIterator<UnfilteredRowIterator, UnfilteredRowIterator> merged = MergeIterator.get(iterators, partitionComparator, new MergeIterator.Reducer<UnfilteredRowIterator, UnfilteredRowIterator>()
+1:         {
+1:             private final List<UnfilteredRowIterator> toMerge = new ArrayList<>(iterators.size());
+1: 
+1:             @Override
+0:             public boolean trivialReduceIsTrivial()
+1:             {
+0:                 return false;
+1:             }
+1: 
+1:             public void reduce(int idx, UnfilteredRowIterator current)
+1:             {
+1:                 toMerge.add(current);
+1:             }
+1: 
+1:             protected UnfilteredRowIterator getReduced()
+1:             {
+1:                 return new LazilyInitializedUnfilteredRowIterator(toMerge.get(0).partitionKey())
+1:                 {
+1:                     protected UnfilteredRowIterator initializeIterator()
+1:                     {
+1:                         return UnfilteredRowIterators.merge(toMerge, nowInSec);
+1:                     }
+1:                 };
+1:             }
+1: 
+1:             protected void onKeyChange()
+1:             {
+1:                 toMerge.clear();
+1:             }
+1:         });
+1: 
+1:         return new AbstractUnfilteredPartitionIterator()
+1:         {
+1:             public boolean isForThrift()
+1:             {
+1:                 return isForThrift;
+1:             }
+1: 
+1:             public boolean hasNext()
+1:             {
+1:                 return merged.hasNext();
+1:             }
+1: 
+1:             public UnfilteredRowIterator next()
+1:             {
+1:                 return merged.next();
+1:             }
+1: 
+1:             @Override
+1:             public void close()
+1:             {
+1:                 merged.close();
+1:             }
+1:         };
+1:     }
+1: 
+0:     public static UnfilteredPartitionIterator removeDroppedColumns(UnfilteredPartitionIterator iterator, final Map<ColumnIdentifier, CFMetaData.DroppedColumn> droppedColumns)
+1:     {
+0:         return new FilteringPartitionIterator(iterator)
+1:         {
+1:             @Override
+0:             protected FilteringRow makeRowFilter()
+1:             {
+0:                 return new FilteringRow()
+1:                 {
+1:                     @Override
+0:                     protected boolean include(Cell cell)
+1:                     {
+0:                         return include(cell.column(), cell.livenessInfo().timestamp());
+1:                     }
+1: 
+1:                     @Override
+0:                     protected boolean include(ColumnDefinition c, DeletionTime dt)
+1:                     {
+0:                         return include(c, dt.markedForDeleteAt());
+1:                     }
+1: 
+0:                     private boolean include(ColumnDefinition column, long timestamp)
+1:                     {
+0:                         CFMetaData.DroppedColumn dropped = droppedColumns.get(column.name);
+0:                         return dropped == null || timestamp > dropped.droppedTime;
+1:                     }
+1:                 };
+1:             }
+1: 
+1:             @Override
+0:             protected boolean shouldFilter(UnfilteredRowIterator iterator)
+1:             {
+0:                 // TODO: We could have row iterators return the smallest timestamp they might return
+0:                 // (which we can get from sstable stats), and ignore any dropping if that smallest
+0:                 // timestamp is bigger that the biggest droppedColumns timestamp.
+1: 
+0:                 // If none of the dropped columns is part of the columns that the iterator actually returns, there is nothing to do;
+0:                 for (ColumnDefinition c : iterator.columns())
+0:                     if (droppedColumns.containsKey(c.name))
+0:                         return true;
+1: 
+0:                 return false;
+1:             }
+1:         };
+1:     }
+1: 
+0:     public static void digest(UnfilteredPartitionIterator iterator, MessageDigest digest)
+1:     {
+1:         try (UnfilteredPartitionIterator iter = iterator)
+1:         {
+1:             while (iter.hasNext())
+1:             {
+1:                 try (UnfilteredRowIterator partition = iter.next())
+1:                 {
+0:                     UnfilteredRowIterators.digest(partition, digest);
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+1:     public static Serializer serializerForIntraNode()
+1:     {
+1:         return serializer;
+1:     }
+1: 
+1:     /**
+1:      * Wraps the provided iterator so it logs the returned rows/RT for debugging purposes.
+1:      * <p>
+1:      * Note that this is only meant for debugging as this can log a very large amount of
+1:      * logging at INFO.
+1:      */
+1:     public static UnfilteredPartitionIterator loggingIterator(UnfilteredPartitionIterator iterator, final String id, final boolean fullDetails)
+1:     {
+0:         return new WrappingUnfilteredPartitionIterator(iterator)
+1:         {
+1:             public UnfilteredRowIterator next()
+1:             {
+0:                 return UnfilteredRowIterators.loggingIterator(super.next(), id, fullDetails);
+1:             }
+1:         };
+1:     }
+1: 
+1:     /**
+1:      * Serialize each UnfilteredSerializer one after the other, with an initial byte that indicates whether
+1:      * we're done or not.
+1:      */
+1:     public static class Serializer
+1:     {
+0:         public void serialize(UnfilteredPartitionIterator iter, DataOutputPlus out, int version) throws IOException
+1:         {
+0:             if (version < MessagingService.VERSION_30)
+0:                 throw new UnsupportedOperationException();
+1: 
+1:             out.writeBoolean(iter.isForThrift());
+1:             while (iter.hasNext())
+1:             {
+1:                 out.writeBoolean(true);
+1:                 try (UnfilteredRowIterator partition = iter.next())
+1:                 {
+0:                     UnfilteredRowIteratorSerializer.serializer.serialize(partition, out, version);
+1:                 }
+1:             }
+1:             out.writeBoolean(false);
+1:         }
+1: 
+0:         public UnfilteredPartitionIterator deserialize(final DataInput in, final int version, final SerializationHelper.Flag flag) throws IOException
+1:         {
+0:             if (version < MessagingService.VERSION_30)
+0:                 throw new UnsupportedOperationException();
+1: 
+1:             final boolean isForThrift = in.readBoolean();
+1: 
+1:             return new AbstractUnfilteredPartitionIterator()
+1:             {
+1:                 private UnfilteredRowIterator next;
+1:                 private boolean hasNext;
+1:                 private boolean nextReturned = true;
+1: 
+1:                 public boolean isForThrift()
+1:                 {
+1:                     return isForThrift;
+1:                 }
+1: 
+1:                 public boolean hasNext()
+1:                 {
+1:                     if (!nextReturned)
+1:                         return hasNext;
+1: 
+1:                     // We can't answer this until the previously returned iterator has been fully consumed,
+1:                     // so complain if that's not the case.
+1:                     if (next != null && next.hasNext())
+1:                         throw new IllegalStateException("Cannot call hasNext() until the previous iterator has been fully consumed");
+1: 
+1:                     try
+1:                     {
+1:                         hasNext = in.readBoolean();
+1:                         nextReturned = false;
+1:                         return hasNext;
+1:                     }
+1:                     catch (IOException e)
+1:                     {
+1:                         throw new IOError(e);
+1:                     }
+1:                 }
+1: 
+1:                 public UnfilteredRowIterator next()
+1:                 {
+1:                     if (nextReturned && !hasNext())
+0:                         throw new NoSuchElementException();
+1: 
+1:                     try
+1:                     {
+1:                         nextReturned = true;
+0:                         next = UnfilteredRowIteratorSerializer.serializer.deserialize(in, version, flag);
+1:                         return next;
+1:                     }
+1:                     catch (IOException e)
+1:                     {
+1:                         throw new IOError(e);
+1:                     }
+1:                 }
+1: 
+1:                 @Override
+1:                 public void close()
+1:                 {
+1:                     if (next != null)
+1:                         next.close();
+1:                 }
+1:             };
+1:         }
+1:     }
+1: }
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:0f5e780
+/////////////////////////////////////////////////////////////////////////
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:6094974
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.transform.FilteredPartitions;
+1: import org.apache.cassandra.db.transform.Transformation;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:                               : EmptyIterators.unfilteredRow(command.metadata(),
+0:                                                              command.partitionKey(),
+0:                                                              command.clusteringIndexFilter().isReversed());
+1:         class Close extends Transformation
+1:             public void onPartitionClose()
+0:                 // asserting this only now because it bothers Serializer if hasNext() is called before
+0:                 // the previously returned iterator hasn't been fully consumed.
+1:                 boolean hadNext = iter.hasNext();
+0:                 iter.close();
+1:                 assert !hadNext;
+0:         }
+1:         return Transformation.apply(toReturn, new Close());
+/////////////////////////////////////////////////////////////////////////
+1:         return FilteredPartitions.filter(iterator, nowInSec);
+/////////////////////////////////////////////////////////////////////////
+1:                         toMerge.set(i, EmptyIterators.unfilteredRow(metadata, partitionKey, isReverseOrder));
+/////////////////////////////////////////////////////////////////////////
+1:         class Logging extends Transformation<UnfilteredRowIterator>
+1:             public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+1:                 return UnfilteredRowIterators.loggingIterator(partition, id, fullDetails);
+0:         }
+1:         return Transformation.apply(iterator, new Logging());
+commit:fe388d4
+/////////////////////////////////////////////////////////////////////////
+1:         public void serialize(UnfilteredPartitionIterator iter, ColumnFilter selection, DataOutputPlus out, int version) throws IOException
+/////////////////////////////////////////////////////////////////////////
+1:                     UnfilteredRowIteratorSerializer.serializer.serialize(partition, selection, out, version);
+1:         public UnfilteredPartitionIterator deserialize(final DataInputPlus in, final int version, final CFMetaData metadata, final ColumnFilter selection, final SerializationHelper.Flag flag) throws IOException
+/////////////////////////////////////////////////////////////////////////
+1:                         next = UnfilteredRowIteratorSerializer.serializer.deserialize(in, version, metadata, selection, flag);
+author:Tyler Hobbs
+-------------------------------------------------------------------------------
+commit:8c64cef
+/////////////////////////////////////////////////////////////////////////
+0: import com.google.common.collect.AbstractIterator;
+0: import com.google.common.collect.Lists;
+0: 
+1: import org.apache.cassandra.db.filter.ColumnFilter;
+0: import org.apache.cassandra.service.StorageService;
+0: import org.apache.cassandra.utils.*;
+/////////////////////////////////////////////////////////////////////////
+1:             assert version >= MessagingService.VERSION_30; // We handle backward compatibility directy in ReadResponse.LegacyRangeSliceReplySerializer
+/////////////////////////////////////////////////////////////////////////
+1:             assert version >= MessagingService.VERSION_30; // We handle backward compatibility directy in ReadResponse.LegacyRangeSliceReplySerializer
+============================================================================

@@ -1,0 +1,1733 @@
+1:eac0369: /*
+1:345de35: 
+1:345de35:    Derby - Class org.apache.derby.impl.services.locks.Deadlock
+1:345de35: 
+1:93fea34:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:93fea34:    contributor license agreements.  See the NOTICE file distributed with
+1:93fea34:    this work for additional information regarding copyright ownership.
+1:93fea34:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:93fea34:    (the "License"); you may not use this file except in compliance with
+1:93fea34:    the License.  You may obtain a copy of the License at
+1:345de35: 
+1:345de35:       http://www.apache.org/licenses/LICENSE-2.0
+1:345de35: 
+1:345de35:    Unless required by applicable law or agreed to in writing, software
+1:345de35:    distributed under the License is distributed on an "AS IS" BASIS,
+1:345de35:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:345de35:    See the License for the specific language governing permissions and
+1:345de35:    limitations under the License.
+11:eac0369: 
+3:eac0369:  */
+1:eac0369: 
+1:eac0369: package org.apache.derby.impl.services.locks;
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.services.locks.VirtualLockTable;
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.error.StandardException;
+1:eac0369: import org.apache.derby.iapi.reference.SQLState;
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
+1:a0dbbd7: import org.apache.derby.iapi.services.context.Context;
+1:eac0369: import org.apache.derby.iapi.services.context.ContextService;
+1:eac0369: import org.apache.derby.iapi.store.access.TransactionController;
+1:eac0369: import org.apache.derby.iapi.store.access.TransactionInfo;
+1:eac0369: 
+1:a0dbbd7: import java.security.AccessController;
+1:a0dbbd7: import java.security.PrivilegedAction;
+1:eac0369: import java.util.Hashtable;
+1:eac0369: import java.util.Dictionary;
+1:eac0369: import java.util.Stack;
+1:eac0369: 
+1:eac0369: import java.util.List;
+1:eac0369: 
+2:eac0369: /**
+1:e0699ea:  * <p>
+1:e0699ea:  * Code to support deadlock detection.
+1:e0699ea:  * </p>
+1:e0699ea:  *
+1:e0699ea:  * <p>
+1:e0699ea:  * This class implements deadlock detection by searching for cycles in the
+1:e0699ea:  * wait graph. If a cycle is found, it means that (at least) two transactions
+1:e0699ea:  * are blocked by each other, and one of them must be aborted to allow the
+1:e0699ea:  * other one to continue.
+1:e0699ea:  * </p>
+1:e0699ea:  *
+1:e0699ea:  * <p>
+1:e0699ea:  * The wait graph is obtained by asking the {@code LockSet} instance to
+1:e0699ea:  * provide a map representing all wait relations, see {@link #getWaiters}.
+1:e0699ea:  * The map consists of two distinct sets of (key, value) pairs:
+1:e0699ea:  * </p>
+1:e0699ea:  *
+1:e0699ea:  * <ol>
+1:e0699ea:  * <li>(space, lock) pairs, where {@code space} is the compatibility space
+1:e0699ea:  * of a waiting transaction and {@code lock} is the {@code ActiveLock}
+1:e0699ea:  * instance on which the transaction is waiting</li>
+1:e0699ea:  * <li>(lock, prevLock) pairs, where {@code lock} is an {@code ActiveLock} and
+1:e0699ea:  * {@code prevLock} is the {@code ActiveLock} or {@code LockControl} for the
+1:e0699ea:  * first waiter in the queue behind {@code lock}</li>
+1:e0699ea:  * </ol>
+1:e0699ea:  *
+1:e0699ea:  * <p>
+1:e0699ea:  * The search is performed as a depth-first search starting from the lock
+1:e0699ea:  * request of a waiter that has been awoken for deadlock detection (either
+1:e0699ea:  * because {@code derby.locks.deadlockTimeout} has expired or because some
+1:e0699ea:  * other waiter had picked it as a victim in order to break a deadlock).
+1:e0699ea:  * From this lock request, the wait graph is traversed by checking which
+1:e0699ea:  * transactions have already been granted a lock on the object, and who they
+1:e0699ea:  * are waiting for.
+1:e0699ea:  * </p>
+1:e0699ea:  *
+1:e0699ea:  * <p>
+1:e0699ea:  * The state of the search is maintained by pushing compatibility spaces
+1:e0699ea:  * (representing waiting transactions) and granted locks onto a stack. When a
+1:e0699ea:  * dead end is found (that is, a transaction that holds locks without waiting
+1:e0699ea:  * for any other transaction), the stack is popped and the search continues
+1:e0699ea:  * down a different path. This continues until a cycle is found or the stack is
+1:e0699ea:  * empty. Detection of cycles happens when pushing a new compatibility space
+1:e0699ea:  * onto the stack. If the same space already exists on the stack, it means the
+1:e0699ea:  * graph has a cycle and we have a deadlock.
+1:e0699ea:  * </p>
+1:e0699ea:  *
+1:e0699ea:  * <p>
+1:e0699ea:  * When a deadlock is found, one of the waiters in the deadlock cycle is awoken
+1:e0699ea:  * and it will terminate itself, unless it finds that the deadlock has been
+1:e0699ea:  * broken in the meantime, for example because one of the involved waiters
+1:e0699ea:  * has timed out.
+1:e0699ea:  * </p>
+1:e0699ea:  */
+1:eac0369: 
+1:eac0369: class Deadlock  {
+1:eac0369: 
+1:eac0369: 	private Deadlock() {}
+1:eac0369: 
+1:fa8c910: 	/**
+1:e0699ea:      * <p>
+1:fa8c910: 	 * Look for a deadlock.
+1:e0699ea:      * </p>
+1:e0699ea: 	 *
+1:e0699ea:      * <p>
+1:11850ac: 	 * Walk through the graph of all locks and search for cycles among
+1:11850ac: 	 * the waiting lock requests which would indicate a deadlock. A simple
+1:11850ac: 	 * deadlock cycle is where the granted locks of waiting compatibility
+1:11850ac: 	 * space A is blocking compatibility space B and space B holds locks causing
+1:11850ac: 	 * space A to wait.
+1:e0699ea:      * </p>
+1:e0699ea:      *
+2:11850ac: 	 * <p> 
+1:41d69da: 	 * MT - if the <code>LockTable</code> is a <code>LockSet</code> object, the
+1:41d69da: 	 * callers must be synchronized on the <code>LockSet</code> object in order
+1:e0699ea: 	 * to satisfy the synchronization requirements of
+1:41d69da: 	 * <code>LockSet.addWaiters()</code>. If it is a
+1:41d69da: 	 * <code>ConcurrentLockSet</code> object, the callers must not hold any of
+1:41d69da: 	 * the <code>ReentrantLock</code>s guarding the entries in the lock table,
+1:41d69da: 	 * and the callers must make sure that only a single thread calls
+1:41d69da: 	 * <code>look()</code> at a time.
+1:e0699ea:      * </p>
+1:11850ac: 	 *
+1:11850ac: 	 *
+1:11850ac: 	 * @param factory The locking system factory
+1:11850ac: 	 * @param set The complete lock table. A lock table is a hash
+1:11850ac: 	 * table keyed by a Lockable and with a LockControl as
+1:11850ac: 	 * the data element.
+1:11850ac: 	 * @param control A LockControl contains a reference to the item being
+1:11850ac: 	 * locked and doubly linked lists for the granted locks
+1:11850ac: 	 * and the waiting locks. The passed in value is the
+1:11850ac: 	 * lock that the caller was waiting on when woken up
+1:11850ac: 	 * to do the deadlock check.
+1:11850ac: 	 * @param startingLock represents the specific waiting lock request that
+1:11850ac: 	 * the caller has been waiting on, before just being
+1:11850ac: 	 * woken up to do this search.
+1:11850ac: 	 * @param deadlockWake Either Constants.WAITING_LOCK_IN_WAIT, or
+1:11850ac: 	 * Constants.WAITING_LOCK_DEADLOCK. 
+1:11850ac: 	 *
+1:11850ac: 	 * @return The identifier to be used to open the conglomerate later.
+1:11850ac: 	 *
+1:11850ac: 	 * @exception StandardException Standard exception policy.
+1:fa8c910: 	 */
+1:3ba8a9a: 	static Object[] look(AbstractPool factory, LockTable set,
+1:b3eb01a: 						 LockControl control, ActiveLock startingLock,
+1:b3eb01a: 						 byte deadlockWake) {
+1:eac0369: 
+1:eac0369: 		// step one, get a list of all waiters
+1:eac0369: 		Dictionary waiters = Deadlock.getWaiters(set);
+1:eac0369: 
+1:eac0369: 		// This stack will track the potential deadlock chain
+1:eac0369: 		// The Stack consists of
+1:eac0369: 
+1:eac0369: 		// start (Vector element 0)
+1:eac0369: 		// - Compatibility space of waiter A
+1:eac0369: 		// - Stack of compatibility spaces with granted lock for waiter A
+1:eac0369: 
+1:a15a470: 		Stack<Object> chain = new Stack<Object>();
+1:eac0369: 
+1:eac0369: 		chain.push(startingLock.getCompatabilitySpace());
+1:eac0369: 		chain.push(control.getGrants());
+1:eac0369: outer:	for (;;) {
+1:eac0369: 
+1:eac0369: 			if (chain.isEmpty()) {
+1:e0699ea:                 // All paths from the initial waiting lock request have been
+1:e0699ea:                 // examined without finding a deadlock. We're done.
+1:eac0369: 				break outer;
+7:eac0369: 			}
+1:eac0369: 
+1:a784994: 			List grants = (List) chain.peek();
+1:eac0369: 			if (grants.isEmpty()) {
+1:e0699ea:                 // All granted locks in this lock control have been examined.
+1:eac0369: 				// pop this list of granted locks and back to the previous one
+3:eac0369: 				rollback(chain);
+4:eac0369: 				continue outer;
+1:eac0369: 			}
+1:e0699ea: 
+1:e0699ea:             // Pick one of the granted lock for examination. rollback()
+1:e0699ea:             // expects us to have examined the last one in the list, so
+1:e0699ea:             // always pick that one.
+1:eac0369: 			int endStack = grants.size() - 1;
+1:eac0369: 			Object space = ((Lock) grants.get(endStack)).getCompatabilitySpace();
+1:eac0369: 
+1:eac0369: 			// this stack of granted locks can contain multiple entries
+1:eac0369: 			// for a single space. We don't want to do deadlock detection
+1:eac0369: 			// twice so check to see if we have seen this space already.
+1:eac0369: 			for (int gs = 0; gs < endStack; gs++) {
+1:eac0369: 				if (space.equals(((Lock) grants.get(gs)).getCompatabilitySpace())) {
+1:eac0369: 					chain.push(space); // set up as rollback() expects.
+1:eac0369: 					rollback(chain);
+1:eac0369: 					continue outer;
+1:eac0369: 				}
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369: 			// find if this space is waiting on anyone
+1:eac0369: inner:		for (;;) {
+1:eac0369: 				int index = chain.indexOf(space);
+1:eac0369: 				if (index != -1) {
+1:e0699ea:                     // Oops... The space has been examined once before, so
+1:e0699ea:                     // we have what appears to be a cycle in the wait graph.
+1:e0699ea:                     // In most cases this means we have a deadlock.
+1:e0699ea:                     //
+1:e0699ea:                     // However, in some cases, the cycle in the graph may be
+1:e0699ea:                     // an illusion. For example, we could have a situation
+1:e0699ea:                     // here like this:
+1:e0699ea:                     //
+1:eac0369: 					// Granted T1{S}, T2{S}
+1:eac0369: 					// Waiting T1{X} - deadlock checking on this
+2:eac0369: 					//
+1:e0699ea:                     // In this case it's not necessarily a deadlock. If the
+1:e0699ea:                     // Lockable returns true from its lockerAlwaysCompatible()
+1:e0699ea:                     // method, which means that lock requests within the same
+1:e0699ea:                     // compatibility space never conflict with each other,
+1:e0699ea:                     // T1 is only waiting for T2 to release its shared lock.
+1:e0699ea:                     // T2 isn't waiting for anyone, so there is no deadlock.
+1:e0699ea:                     //
+1:e0699ea:                     // This is only true if T1 is the first one waiting for
+1:e0699ea:                     // a lock on the object. If there are other waiters in
+1:e0699ea:                     // between, we have a deadlock regardless of what
+1:e0699ea:                     // lockerAlwaysCompatible() returns. Take for example this
+1:e0699ea:                     // similar scenario, where T3 is also waiting:
+1:e0699ea:                     //
+1:e0699ea:                     // Granted T1{S}, T2{S}
+1:e0699ea:                     // Waiting T3{X}
+1:e0699ea:                     // Waiting T1{X} - deadlock checking on this
+1:e0699ea:                     //
+1:e0699ea:                     // Here, T1 is stuck behind T3, and T3 is waiting for T1,
+1:e0699ea:                     // so we have a deadlock.
+1:eac0369: 
+1:eac0369: 					if ((index == (chain.size() - 1)) ||
+1:eac0369: 						((index == (chain.size() - 2))
+1:eac0369: 						&& (index == (chain.indexOf(grants) - 1)))) {
+1:eac0369: 
+1:e0699ea:                         // The two identical compatibility spaces were right
+1:e0699ea:                         // next to each other on the stack. This means we have
+1:e0699ea:                         // the first scenario described above, with the first
+1:e0699ea:                         // waiter already having a lock on the object. It is a
+1:eac0369: 						// potential self deadlock, but probably not!
+1:eac0369: 						ActiveLock lock = (ActiveLock) waiters.get(space);
+1:eac0369: 
+1:eac0369: 						if (lock.canSkip) {
+1:eac0369: 							// not a deadlock ...
+1:eac0369: 							chain.push(space); // set up as rollback() expects.
+1:eac0369: 
+1:eac0369: 							rollback(chain);
+1:eac0369: 							continue outer;
+1:eac0369: 						}
+1:eac0369: 					}
+1:eac0369: 
+1:e0699ea:                     // So it wasn't an illusion after all. Pick a victim.
+1:eac0369: 					return Deadlock.handle(factory, chain, index, waiters, deadlockWake);
+1:eac0369: 				}
+1:e0699ea: 
+1:e0699ea:                 // Otherwise... The space hasn't been examined yet, so put it
+1:e0699ea:                 // on the stack and start examining it.
+1:eac0369: 				chain.push(space);
+1:eac0369: 
+1:2483560:                 skip_space: while (true) {
+1:eac0369: 
+1:e0699ea:                     // Who is this space waiting for?
+1:2483560:                     Lock waitingLock = (Lock) waiters.get(space);
+1:2483560:                     if (waitingLock == null) {
+1:e0699ea:                         // The space isn't waiting for anyone, so we're at the
+1:2483560:                         // end of the road, no deadlock in this path
+1:2483560:                         // pop items until the previous Stack
+1:2483560:                         rollback(chain);
+1:2483560:                         continue outer;
+1:2483560:                     }
+1:eac0369: 
+1:2483560:                     // Is a LockControl or another ActiveLock
+1:2483560:                     Object waitOn = waiters.get(waitingLock);
+1:2483560:                     if (waitOn instanceof LockControl) {
+1:eac0369: 
+1:2483560:                         LockControl waitOnControl = (LockControl) waitOn;
+1:eac0369: 
+1:2483560:                         // This lock control may have waiters but no
+1:2483560:                         // one holding the lock. This is true if lock
+1:2483560:                         // has just been released but the waiters haven't
+1:2483560:                         // woken up, or they are trying to get the
+1:2483560:                         // synchronization we hold.
+1:eac0369: 
+1:2483560:                         if (waitOnControl.isUnlocked()) {
+1:2483560:                             // end of the road, no deadlock in this path
+1:2483560:                             // pop items until the previous Stack
+1:2483560:                             rollback(chain);
+1:2483560:                             continue outer;
+1:2483560:                         }
+1:2483560: 
+1:e0699ea:                         // Push all the granted locks on this object onto the
+1:e0699ea:                         // stack, and go ahead examining them one by one.
+1:2483560:                         chain.push(waitOnControl.getGrants());
+1:2483560:                         continue outer;
+1:2483560:                     } else {
+1:2483560:                         // simply waiting on another waiter
+1:2483560:                         ActiveLock waitOnLock = (ActiveLock) waitOn;
+1:2483560: 
+1:e0699ea:                         // Set up the next space for examination.
+1:2483560:                         space = waitOnLock.getCompatabilitySpace();
+1:2483560: 
+1:e0699ea:                         // Now, there is a possibility that we're not actually
+1:e0699ea:                         // waiting behind the other other waiter. Take for
+1:e0699ea:                         // example this scenario:
+1:e0699ea:                         //
+1:e0699ea:                         // Granted T1{X}
+1:e0699ea:                         // Waiting T2{S}
+1:e0699ea:                         // Waiting T3{S} - deadlock checking on this
+1:e0699ea:                         //
+1:e0699ea:                         // Here, T3 isn't blocked by T2. As soon as T1 releases
+1:e0699ea:                         // its X lock on the object, both T2 and T3 will be
+1:e0699ea:                         // granted an S lock. And if T1 also turns out to be
+1:e0699ea:                         // blocked by T3 and we have a deadlock, aborting T2
+1:e0699ea:                         // won't resolve the deadlock, so it's not actually
+1:e0699ea:                         // part of the deadlock. If we have this scenario, we
+1:e0699ea:                         // just skip past T2's space and consider T3 to be
+1:e0699ea:                         // waiting on T1 directly.
+1:e0699ea: 
+1:2483560:                         if (waitingLock.getLockable().requestCompatible(
+1:2483560:                                 waitingLock.getQualifier(),
+1:2483560:                                 waitOnLock.getQualifier())) {
+1:e0699ea:                             // We're behind another waiter with a compatible
+1:e0699ea:                             // lock request. Skip it since we're not really
+1:e0699ea:                             // blocked by it.
+1:2483560:                             continue skip_space;
+1:2483560:                         } else {
+1:e0699ea:                             // We are really blocked by the other waiter. Go
+1:e0699ea:                             // ahead and investigate its compatibility space.
+1:2483560:                             continue inner;
+1:2483560:                         }
+1:2483560:                     }
+1:2483560:                 }
+1:2483560:             }
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		return null;
+1:eac0369: 	}
+1:eac0369: 
+1:e0699ea:     /**
+1:e0699ea:      * Backtrack in the depth-first search through the wait graph. Expect
+1:e0699ea:      * the top of the stack to hold the compatibility space we've just
+1:e0699ea:      * investigated. Pop the stack until the most recently examined granted
+1:e0699ea:      * lock has been removed.
+1:e0699ea:      *
+1:e0699ea:      * @param chain the stack representing the state of the search
+1:e0699ea:      */
+1:eac0369: 	private static void rollback(Stack chain) {
+1:eac0369: 		do {
+1:eac0369: 			chain.pop();
+1:eac0369: 			if (chain.isEmpty())
+1:eac0369: 				return;
+1:eac0369: 		} while (!(chain.peek() instanceof List));
+1:eac0369: 
+1:eac0369: 		// remove the last element, the one we were looking at
+2:eac0369: 		List grants = (List) chain.peek();
+1:eac0369: 		grants.remove(grants.size() - 1);
+1:eac0369: 	}
+1:eac0369: 
+1:e0699ea:     /**
+1:e0699ea:      * Get all the waiters in a {@code LockTable}. The waiters are returned
+1:e0699ea:      * as pairs (space, lock) mapping waiting compatibility spaces to the
+1:e0699ea:      * lock request in which they are blocked, and (lock, prevLock) linking
+1:e0699ea:      * a lock request with the lock request that's behind it in the queue of
+1:e0699ea:      * waiters.
+1:e0699ea:      *
+1:e0699ea:      * @param set the lock table
+1:e0699ea:      * @return all waiters in the lock table
+1:e0699ea:      * @see LockControl#addWaiters(java.util.Map)
+1:e0699ea:      */
+1:b3eb01a: 	private static Hashtable getWaiters(LockTable set) {
+1:a15a470: 		Hashtable<Object,Object> waiters = new Hashtable<Object,Object>();
+1:fa8c910: 		set.addWaiters(waiters);
+1:eac0369: 		return waiters;
+1:eac0369: 	}
+1:eac0369: 
+1:e0699ea:     /**
+1:e0699ea:      * Handle a deadlock when it has been detected. Find out if the waiter
+1:e0699ea:      * that started looking for the deadlock is involved in it. If it isn't,
+1:e0699ea:      * pick a victim among the waiters that are involved.
+1:e0699ea:      *
+1:e0699ea:      * @return {@code null} if the waiter that started looking for the deadlock
+1:e0699ea:      * isn't involved in the deadlock (in which case another victim will have
+1:e0699ea:      * been picked and awoken), or an array describing the deadlock otherwise
+1:e0699ea:      */
+1:3ba8a9a: 	private static Object[] handle(AbstractPool factory, Stack chain, int start,
+1:3ba8a9a: 								   Dictionary waiters, byte deadlockWake) {
+1:eac0369: 
+1:eac0369: 		// If start is zero then the space that started looking for the
+1:eac0369: 		// deadlock is activly involved in the deadlock.
+1:eac0369: 
+1:eac0369: 		Object checker = chain.elementAt(0);
+1:eac0369: 
+1:eac0369: 		int minLockCount = Integer.MAX_VALUE;
+1:eac0369: 		Object victim = null;
+1:eac0369: 		for (int i = start; i < chain.size(); i++) {
+1:eac0369: 			Object space = chain.elementAt(i);
+1:eac0369: 			if (space instanceof List) {
+1:eac0369: 				continue;
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369: 			// See if the checker is in the deadlock and we
+1:eac0369: 			// already picked as a victim
+1:eac0369: 			if ((checker.equals(space)) && (deadlockWake == Constants.WAITING_LOCK_DEADLOCK)) {
+1:eac0369: 				victim = checker;
+2:eac0369: 				break;
+1:eac0369: 			}
+1:eac0369: 
+1:3c1f634: 			LockSpace ls = (LockSpace) space;
+1:eac0369: 			int spaceCount = ls.deadlockCount(minLockCount);
+1:eac0369: 
+1:eac0369: 			if (spaceCount <= minLockCount) {
+2:eac0369: 				victim = space;
+1:eac0369: 				minLockCount = spaceCount;
+1:eac0369: 			}
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		// See if the vitim is the one doing the checking
+1:eac0369: 		if (checker.equals(victim)) {
+1:eac0369: 			Object[] data = new Object[2];
+1:eac0369: 			data[0] = chain;
+1:eac0369: 			data[1] = waiters;
+1:eac0369: 			return data;
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		ActiveLock victimLock = (ActiveLock) waiters.get(victim);
+1:eac0369: 
+1:eac0369: 		victimLock.wakeUp(Constants.WAITING_LOCK_DEADLOCK);
+1:eac0369: 
+1:eac0369: 		return null;
+1:eac0369: 
+1:eac0369: 	}
+1:eac0369: 
+1:e0699ea:     /**
+1:e0699ea:      * Build an exception that describes a deadlock.
+1:e0699ea:      *
+1:e0699ea:      * @param factory the lock factory requesting the exception
+1:e0699ea:      * @param data an array with information about who's involved in
+1:e0699ea:      * a deadlock (as returned by {@link #handle})
+1:e0699ea:      * @return a deadlock exception
+1:e0699ea:      */
+1:3ba8a9a: 	static StandardException buildException(AbstractPool factory,
+1:3ba8a9a: 											Object[] data) {
+1:eac0369: 
+1:eac0369: 		Stack chain = (Stack) data[0];
+1:eac0369: 		Dictionary waiters = (Dictionary) data[1];
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 		LanguageConnectionContext lcc = (LanguageConnectionContext)
+1:a0dbbd7: 			getContext(LanguageConnectionContext.CONTEXT_ID);
+1:eac0369: 
+1:eac0369: 		TableNameInfo tabInfo = null;
+1:eac0369: 		TransactionInfo[] tt = null;
+1:eac0369: 		TransactionController tc = null;
+1:eac0369: 
+1:eac0369: 		if (lcc != null) {
+1:eac0369: 
+1:eac0369: 			try {
+1:eac0369: 				tc = lcc.getTransactionExecute();
+1:eac0369: 				tabInfo = new TableNameInfo(lcc, false);
+1:eac0369: 
+1:1985a18: 				tt = tc.getAccessManager().getTransactionInfo();
+1:eac0369: 
+1:eac0369: 			} catch (StandardException se) {
+1:eac0369: 				// just don't get any table info.
+1:eac0369: 			}
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 		StringBuffer sb = new StringBuffer(200);
+1:eac0369: 
+1:a15a470: 		Hashtable<String,Object> attributes = new Hashtable<String,Object>(17);
+1:eac0369: 
+1:eac0369: 		String victimXID = null;
+1:eac0369: 
+1:eac0369: 		for (int i = 0; i < chain.size(); i++) {
+1:eac0369: 			Object space = chain.elementAt(i);
+1:eac0369: 			if (space instanceof List) {
+1:eac0369: 				List grants = (List) space;
+1:eac0369: 
+1:eac0369: 				if (grants.size() != 0) {
+1:eac0369: 
+1:eac0369: 					sb.append("  Granted XID : ");
+1:eac0369: 
+1:eac0369: 					for (int j = 0; j < grants.size(); j ++) {
+1:eac0369: 
+1:eac0369: 						if (j != 0)
+1:eac0369: 							sb.append(", ");
+1:eac0369: 
+1:eac0369: 						Lock gl = (Lock) grants.get(j);
+1:eac0369: 
+1:eac0369: 						sb.append("{");
+1:a412791: 						sb.append(gl.getCompatabilitySpace().getOwner());
+1:eac0369: 						sb.append(", ");
+1:eac0369: 						sb.append(gl.getQualifier());
+1:eac0369: 						sb.append("} ");
+1:eac0369: 					}
+1:eac0369: 					sb.append('\n');
+1:eac0369: 				}
+1:eac0369: 				continue;
+1:eac0369: 			}
+1:eac0369: 			// Information about the lock we are waiting on
+1:eac0369: 			// TYPE |TABLENAME                     |LOCKNAME 
+1:eac0369: 			Lock lock = ((Lock) waiters.get(space));
+1:eac0369: 			
+1:eac0369: 			// see if this lockable object wants to participate
+1:eac0369: 			lock.getLockable().lockAttributes(VirtualLockTable.ALL, attributes);
+1:eac0369: 
+1:eac0369: 			addInfo(sb, "Lock : ", attributes.get(VirtualLockTable.LOCKTYPE));
+1:eac0369: 			if (tabInfo != null) {
+1:eac0369: 				Long conglomId = (Long) attributes.get(VirtualLockTable.CONGLOMID);
+1:eac0369: 				if (conglomId == null) {
+1:eac0369: 					Long containerId = (Long) attributes.get(VirtualLockTable.CONTAINERID);
+1:eac0369: 					try {
+1:ce40a31: 						conglomId = tc.findConglomid(containerId.longValue());
+1:eac0369: 					} catch (StandardException se) {
+1:eac0369: 					}
+1:eac0369: 				}
+1:eac0369: 				addInfo(sb, ", ", tabInfo.getTableName(conglomId));
+1:eac0369: 			}
+1:eac0369: 			addInfo(sb, ", ", attributes.get(VirtualLockTable.LOCKNAME));
+1:eac0369: 			sb.append('\n');
+1:eac0369: 
+1:a412791: 			String xid =
+1:a412791: 				String.valueOf(lock.getCompatabilitySpace().getOwner());
+1:eac0369: 			if (i == 0)
+1:eac0369: 				victimXID = xid;
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 			addInfo(sb, "  Waiting XID : {", xid);
+1:eac0369: 			addInfo(sb, ", ", lock.getQualifier());
+1:eac0369: 			sb.append("} ");
+1:eac0369: 			if (tt != null) {
+1:eac0369: 				for (int tti = tt.length - 1; tti >= 0; tti--) {
+1:eac0369: 					TransactionInfo ti = tt[tti];
+1:eac0369: 
+1:eac0369:                     // RESOLVE (track 2771) - not sure why 
+1:eac0369:                     // ti.getTransactionIdString() or ti can return null.
+1:eac0369:                     if (ti != null)
+1:eac0369:                     {
+1:eac0369:                         String idString = ti.getTransactionIdString();
+1:eac0369: 
+1:eac0369:                         if (idString != null && idString.equals(xid)) {
+1:eac0369: 
+1:eac0369:                             addInfo(sb, ", ", ti.getUsernameString());
+1:eac0369:                             addInfo(sb, ", ", ti.getStatementTextString());
+1:eac0369:                             break;
+1:eac0369:                         }
+1:eac0369:                     }
+1:eac0369: 				}
+1:eac0369: 			}
+1:eac0369: 			sb.append('\n');
+1:eac0369: 
+1:eac0369: 			attributes.clear();
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		StandardException se = StandardException.newException(SQLState.DEADLOCK, sb.toString(), victimXID);
+1:eac0369: 		se.setReport(factory.deadlockMonitor);
+1:eac0369: 		return se;
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 	private static void addInfo(StringBuffer sb, String desc, Object data) {
+1:eac0369: 		sb.append(desc);
+1:eac0369: 		if (data == null)
+1:eac0369: 			data = "?";
+1:eac0369: 		sb.append(data);
+1:eac0369: 	}
+1:eac0369: 
+1:a0dbbd7:     /**
+1:a0dbbd7:      * Privileged lookup of a Context. Must be package protected so that user code
+1:a0dbbd7:      * can't call this entry point.
+1:a0dbbd7:      */
+1:a0dbbd7:     static  Context    getContext( final String contextID )
+1:a0dbbd7:     {
+1:a0dbbd7:         if ( System.getSecurityManager() == null )
+1:a0dbbd7:         {
+1:a0dbbd7:             return ContextService.getContext( contextID );
+1:a0dbbd7:         }
+1:a0dbbd7:         else
+1:a0dbbd7:         {
+1:a0dbbd7:             return AccessController.doPrivileged
+1:a0dbbd7:                 (
+1:a0dbbd7:                  new PrivilegedAction<Context>()
+1:a0dbbd7:                  {
+1:a0dbbd7:                      public Context run()
+1:a0dbbd7:                      {
+1:a0dbbd7:                          return ContextService.getContext( contextID );
+1:a0dbbd7:                      }
+1:a0dbbd7:                  }
+1:a0dbbd7:                  );
+1:a0dbbd7:         }
+1:a0dbbd7:     }
+1:a0dbbd7: 
+1:eac0369: } 
+============================================================================
+author:Richard N. Hillegas
+-------------------------------------------------------------------------------
+commit:ce40a31
+/////////////////////////////////////////////////////////////////////////
+1: 						conglomId = tc.findConglomid(containerId.longValue());
+commit:a0dbbd7
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.services.context.Context;
+1: import java.security.AccessController;
+1: import java.security.PrivilegedAction;
+/////////////////////////////////////////////////////////////////////////
+1: 			getContext(LanguageConnectionContext.CONTEXT_ID);
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Privileged lookup of a Context. Must be package protected so that user code
+1:      * can't call this entry point.
+1:      */
+1:     static  Context    getContext( final String contextID )
+1:     {
+1:         if ( System.getSecurityManager() == null )
+1:         {
+1:             return ContextService.getContext( contextID );
+1:         }
+1:         else
+1:         {
+1:             return AccessController.doPrivileged
+1:                 (
+1:                  new PrivilegedAction<Context>()
+1:                  {
+1:                      public Context run()
+1:                      {
+1:                          return ContextService.getContext( contextID );
+1:                      }
+1:                  }
+1:                  );
+1:         }
+1:     }
+1: 
+commit:a15a470
+/////////////////////////////////////////////////////////////////////////
+1: 		Stack<Object> chain = new Stack<Object>();
+/////////////////////////////////////////////////////////////////////////
+0:             @SuppressWarnings("unchecked")
+0: 			List<Object> grants = (List<Object>) chain.peek();
+/////////////////////////////////////////////////////////////////////////
+1: 		Hashtable<Object,Object> waiters = new Hashtable<Object,Object>();
+/////////////////////////////////////////////////////////////////////////
+1: 		Hashtable<String,Object> attributes = new Hashtable<String,Object>(17);
+commit:93fea34
+/////////////////////////////////////////////////////////////////////////
+1:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:    contributor license agreements.  See the NOTICE file distributed with
+1:    this work for additional information regarding copyright ownership.
+1:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:    (the "License"); you may not use this file except in compliance with
+1:    the License.  You may obtain a copy of the License at
+author:Knut Anders Hatlen
+-------------------------------------------------------------------------------
+commit:a784994
+/////////////////////////////////////////////////////////////////////////
+1: 			List grants = (List) chain.peek();
+commit:e0699ea
+/////////////////////////////////////////////////////////////////////////
+1:  * <p>
+1:  * Code to support deadlock detection.
+1:  * </p>
+1:  *
+1:  * <p>
+1:  * This class implements deadlock detection by searching for cycles in the
+1:  * wait graph. If a cycle is found, it means that (at least) two transactions
+1:  * are blocked by each other, and one of them must be aborted to allow the
+1:  * other one to continue.
+1:  * </p>
+1:  *
+1:  * <p>
+1:  * The wait graph is obtained by asking the {@code LockSet} instance to
+1:  * provide a map representing all wait relations, see {@link #getWaiters}.
+1:  * The map consists of two distinct sets of (key, value) pairs:
+1:  * </p>
+1:  *
+1:  * <ol>
+1:  * <li>(space, lock) pairs, where {@code space} is the compatibility space
+1:  * of a waiting transaction and {@code lock} is the {@code ActiveLock}
+1:  * instance on which the transaction is waiting</li>
+1:  * <li>(lock, prevLock) pairs, where {@code lock} is an {@code ActiveLock} and
+1:  * {@code prevLock} is the {@code ActiveLock} or {@code LockControl} for the
+1:  * first waiter in the queue behind {@code lock}</li>
+1:  * </ol>
+1:  *
+1:  * <p>
+1:  * The search is performed as a depth-first search starting from the lock
+1:  * request of a waiter that has been awoken for deadlock detection (either
+1:  * because {@code derby.locks.deadlockTimeout} has expired or because some
+1:  * other waiter had picked it as a victim in order to break a deadlock).
+1:  * From this lock request, the wait graph is traversed by checking which
+1:  * transactions have already been granted a lock on the object, and who they
+1:  * are waiting for.
+1:  * </p>
+1:  *
+1:  * <p>
+1:  * The state of the search is maintained by pushing compatibility spaces
+1:  * (representing waiting transactions) and granted locks onto a stack. When a
+1:  * dead end is found (that is, a transaction that holds locks without waiting
+1:  * for any other transaction), the stack is popped and the search continues
+1:  * down a different path. This continues until a cycle is found or the stack is
+1:  * empty. Detection of cycles happens when pushing a new compatibility space
+1:  * onto the stack. If the same space already exists on the stack, it means the
+1:  * graph has a cycle and we have a deadlock.
+1:  * </p>
+1:  *
+1:  * <p>
+1:  * When a deadlock is found, one of the waiters in the deadlock cycle is awoken
+1:  * and it will terminate itself, unless it finds that the deadlock has been
+1:  * broken in the meantime, for example because one of the involved waiters
+1:  * has timed out.
+1:  * </p>
+1:  */
+1:      * <p>
+1:      * </p>
+1: 	 *
+1:      * <p>
+1:      * </p>
+1:      *
+1: 	 * to satisfy the synchronization requirements of
+1:      * </p>
+/////////////////////////////////////////////////////////////////////////
+1:                 // All paths from the initial waiting lock request have been
+1:                 // examined without finding a deadlock. We're done.
+1:                 // All granted locks in this lock control have been examined.
+1: 
+1:             // Pick one of the granted lock for examination. rollback()
+1:             // expects us to have examined the last one in the list, so
+1:             // always pick that one.
+/////////////////////////////////////////////////////////////////////////
+1:                     // Oops... The space has been examined once before, so
+1:                     // we have what appears to be a cycle in the wait graph.
+1:                     // In most cases this means we have a deadlock.
+1:                     //
+1:                     // However, in some cases, the cycle in the graph may be
+1:                     // an illusion. For example, we could have a situation
+1:                     // here like this:
+1:                     //
+1:                     // In this case it's not necessarily a deadlock. If the
+1:                     // Lockable returns true from its lockerAlwaysCompatible()
+1:                     // method, which means that lock requests within the same
+1:                     // compatibility space never conflict with each other,
+1:                     // T1 is only waiting for T2 to release its shared lock.
+1:                     // T2 isn't waiting for anyone, so there is no deadlock.
+1:                     //
+1:                     // This is only true if T1 is the first one waiting for
+1:                     // a lock on the object. If there are other waiters in
+1:                     // between, we have a deadlock regardless of what
+1:                     // lockerAlwaysCompatible() returns. Take for example this
+1:                     // similar scenario, where T3 is also waiting:
+1:                     //
+1:                     // Granted T1{S}, T2{S}
+1:                     // Waiting T3{X}
+1:                     // Waiting T1{X} - deadlock checking on this
+1:                     //
+1:                     // Here, T1 is stuck behind T3, and T3 is waiting for T1,
+1:                     // so we have a deadlock.
+1:                         // The two identical compatibility spaces were right
+1:                         // next to each other on the stack. This means we have
+1:                         // the first scenario described above, with the first
+1:                         // waiter already having a lock on the object. It is a
+/////////////////////////////////////////////////////////////////////////
+1:                     // So it wasn't an illusion after all. Pick a victim.
+1: 
+1:                 // Otherwise... The space hasn't been examined yet, so put it
+1:                 // on the stack and start examining it.
+1:                     // Who is this space waiting for?
+1:                         // The space isn't waiting for anyone, so we're at the
+/////////////////////////////////////////////////////////////////////////
+1:                         // Push all the granted locks on this object onto the
+1:                         // stack, and go ahead examining them one by one.
+1:                         // Set up the next space for examination.
+1:                         // Now, there is a possibility that we're not actually
+1:                         // waiting behind the other other waiter. Take for
+1:                         // example this scenario:
+1:                         //
+1:                         // Granted T1{X}
+1:                         // Waiting T2{S}
+1:                         // Waiting T3{S} - deadlock checking on this
+1:                         //
+1:                         // Here, T3 isn't blocked by T2. As soon as T1 releases
+1:                         // its X lock on the object, both T2 and T3 will be
+1:                         // granted an S lock. And if T1 also turns out to be
+1:                         // blocked by T3 and we have a deadlock, aborting T2
+1:                         // won't resolve the deadlock, so it's not actually
+1:                         // part of the deadlock. If we have this scenario, we
+1:                         // just skip past T2's space and consider T3 to be
+1:                         // waiting on T1 directly.
+1: 
+1:                             // We're behind another waiter with a compatible
+1:                             // lock request. Skip it since we're not really
+1:                             // blocked by it.
+1:                             // We are really blocked by the other waiter. Go
+1:                             // ahead and investigate its compatibility space.
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Backtrack in the depth-first search through the wait graph. Expect
+1:      * the top of the stack to hold the compatibility space we've just
+1:      * investigated. Pop the stack until the most recently examined granted
+1:      * lock has been removed.
+1:      *
+1:      * @param chain the stack representing the state of the search
+1:      */
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Get all the waiters in a {@code LockTable}. The waiters are returned
+1:      * as pairs (space, lock) mapping waiting compatibility spaces to the
+1:      * lock request in which they are blocked, and (lock, prevLock) linking
+1:      * a lock request with the lock request that's behind it in the queue of
+1:      * waiters.
+1:      *
+1:      * @param set the lock table
+1:      * @return all waiters in the lock table
+1:      * @see LockControl#addWaiters(java.util.Map)
+1:      */
+1:     /**
+1:      * Handle a deadlock when it has been detected. Find out if the waiter
+1:      * that started looking for the deadlock is involved in it. If it isn't,
+1:      * pick a victim among the waiters that are involved.
+1:      *
+1:      * @return {@code null} if the waiter that started looking for the deadlock
+1:      * isn't involved in the deadlock (in which case another victim will have
+1:      * been picked and awoken), or an array describing the deadlock otherwise
+1:      */
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Build an exception that describes a deadlock.
+1:      *
+1:      * @param factory the lock factory requesting the exception
+1:      * @param data an array with information about who's involved in
+1:      * a deadlock (as returned by {@link #handle})
+1:      * @return a deadlock exception
+1:      */
+commit:2483560
+/////////////////////////////////////////////////////////////////////////
+1:                 skip_space: while (true) {
+1:                     Lock waitingLock = (Lock) waiters.get(space);
+1:                     if (waitingLock == null) {
+1:                         // end of the road, no deadlock in this path
+1:                         // pop items until the previous Stack
+1:                         rollback(chain);
+1:                         continue outer;
+1:                     }
+1:                     // Is a LockControl or another ActiveLock
+1:                     Object waitOn = waiters.get(waitingLock);
+1:                     if (waitOn instanceof LockControl) {
+1:                         LockControl waitOnControl = (LockControl) waitOn;
+1:                         // This lock control may have waiters but no
+1:                         // one holding the lock. This is true if lock
+1:                         // has just been released but the waiters haven't
+1:                         // woken up, or they are trying to get the
+1:                         // synchronization we hold.
+1:                         if (waitOnControl.isUnlocked()) {
+1:                             // end of the road, no deadlock in this path
+1:                             // pop items until the previous Stack
+1:                             rollback(chain);
+1:                             continue outer;
+1:                         }
+1:                         chain.push(waitOnControl.getGrants());
+1: 
+1:                         continue outer;
+1:                     } else {
+1:                         // simply waiting on another waiter
+1:                         ActiveLock waitOnLock = (ActiveLock) waitOn;
+1: 
+1:                         space = waitOnLock.getCompatabilitySpace();
+1: 
+1:                         if (waitingLock.getLockable().requestCompatible(
+1:                                 waitingLock.getQualifier(),
+1:                                 waitOnLock.getQualifier())) {
+0:                             // We're behind another waiter in the queue, but we
+0:                             // request compatible locks, so we'll get the lock
+0:                             // too once it gets it. Since we're not actually
+0:                             // blocked by the waiter, skip it and see what's
+0:                             // blocking it instead.
+1:                             continue skip_space;
+1:                         } else {
+1:                             continue inner;
+1:                         }
+1:                     }
+1:                 }
+1:             }
+commit:a412791
+/////////////////////////////////////////////////////////////////////////
+1: 						sb.append(gl.getCompatabilitySpace().getOwner());
+/////////////////////////////////////////////////////////////////////////
+1: 			String xid =
+1: 				String.valueOf(lock.getCompatabilitySpace().getOwner());
+commit:41d69da
+/////////////////////////////////////////////////////////////////////////
+1: 	 * MT - if the <code>LockTable</code> is a <code>LockSet</code> object, the
+1: 	 * callers must be synchronized on the <code>LockSet</code> object in order
+0: 	 * to satisfy the syncronization requirements of
+1: 	 * <code>LockSet.addWaiters()</code>. If it is a
+1: 	 * <code>ConcurrentLockSet</code> object, the callers must not hold any of
+1: 	 * the <code>ReentrantLock</code>s guarding the entries in the lock table,
+1: 	 * and the callers must make sure that only a single thread calls
+1: 	 * <code>look()</code> at a time.
+commit:3ba8a9a
+/////////////////////////////////////////////////////////////////////////
+1: 	static Object[] look(AbstractPool factory, LockTable set,
+/////////////////////////////////////////////////////////////////////////
+1: 	private static Object[] handle(AbstractPool factory, Stack chain, int start,
+1: 								   Dictionary waiters, byte deadlockWake) {
+/////////////////////////////////////////////////////////////////////////
+1: 	static StandardException buildException(AbstractPool factory,
+1: 											Object[] data) {
+commit:b3eb01a
+/////////////////////////////////////////////////////////////////////////
+0: 	static Object[] look(SinglePool factory, LockTable set,
+1: 						 LockControl control, ActiveLock startingLock,
+1: 						 byte deadlockWake) {
+/////////////////////////////////////////////////////////////////////////
+1: 	private static Hashtable getWaiters(LockTable set) {
+commit:3c1f634
+/////////////////////////////////////////////////////////////////////////
+1: 			LockSpace ls = (LockSpace) space;
+commit:0f57d0e
+/////////////////////////////////////////////////////////////////////////
+commit:fa8c910
+/////////////////////////////////////////////////////////////////////////
+1: 	/**
+1: 	 * Look for a deadlock.
+0: 	 * <BR>
+0: 	 * MT - must be synchronized on the <code>LockSet</code> object.
+1: 	 */
+/////////////////////////////////////////////////////////////////////////
+0: 		Hashtable waiters = new Hashtable();
+1: 		set.addWaiters(waiters);
+author:Katherine Marsden
+-------------------------------------------------------------------------------
+commit:11850ac
+/////////////////////////////////////////////////////////////////////////
+1: 	 * Walk through the graph of all locks and search for cycles among
+1: 	 * the waiting lock requests which would indicate a deadlock. A simple
+1: 	 * deadlock cycle is where the granted locks of waiting compatibility
+1: 	 * space A is blocking compatibility space B and space B holds locks causing
+1: 	 * space A to wait.
+1: 	 * <p>
+0: 	 * Would be nice to get a better high level description of deadlock
+0: 	 * search.
+1: 	 * <p> 
+/////////////////////////////////////////////////////////////////////////
+1: 	 *
+1: 	 *
+1: 	 * @param factory The locking system factory
+1: 	 * @param set The complete lock table. A lock table is a hash
+1: 	 * table keyed by a Lockable and with a LockControl as
+1: 	 * the data element.
+1: 	 * @param control A LockControl contains a reference to the item being
+1: 	 * locked and doubly linked lists for the granted locks
+1: 	 * and the waiting locks. The passed in value is the
+1: 	 * lock that the caller was waiting on when woken up
+1: 	 * to do the deadlock check.
+1: 	 * @param startingLock represents the specific waiting lock request that
+1: 	 * the caller has been waiting on, before just being
+1: 	 * woken up to do this search.
+1: 	 * @param deadlockWake Either Constants.WAITING_LOCK_IN_WAIT, or
+1: 	 * Constants.WAITING_LOCK_DEADLOCK. 
+1: 	 *
+1: 	 * @return The identifier to be used to open the conglomerate later.
+1: 	 *
+1: 	 * @exception StandardException Standard exception policy.
+author:Daniel John Debrunner
+-------------------------------------------------------------------------------
+commit:1985a18
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: 				tt = tc.getAccessManager().getTransactionInfo();
+commit:345de35
+/////////////////////////////////////////////////////////////////////////
+1:    Derby - Class org.apache.derby.impl.services.locks.Deadlock
+1: 
+0:    Copyright 1999, 2004 The Apache Software Foundation or its licensors, as applicable.
+1: 
+0:    Licensed under the Apache License, Version 2.0 (the "License");
+0:    you may not use this file except in compliance with the License.
+0:    You may obtain a copy of the License at
+1: 
+1:       http://www.apache.org/licenses/LICENSE-2.0
+1: 
+1:    Unless required by applicable law or agreed to in writing, software
+1:    distributed under the License is distributed on an "AS IS" BASIS,
+1:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:    See the License for the specific language governing permissions and
+1:    limitations under the License.
+commit:1f9b9c4
+/////////////////////////////////////////////////////////////////////////
+commit:eac0369
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1: 
+0:    Licensed Materials - Property of IBM
+0:    Cloudscape - Package org.apache.derby.impl.services.locks
+0:    (C) Copyright IBM Corp. 1999, 2004. All Rights Reserved.
+0:    US Government Users Restricted Rights - Use, duplication or
+0:    disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+1: 
+1:  */
+1: 
+1: package org.apache.derby.impl.services.locks;
+1: 
+0: import org.apache.derby.iapi.services.locks.Lockable;
+1: import org.apache.derby.iapi.services.locks.VirtualLockTable;
+1: 
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+1: 
+1: import org.apache.derby.iapi.error.StandardException;
+1: import org.apache.derby.iapi.reference.SQLState;
+1: 
+0: import org.apache.derby.iapi.sql.conn.LanguageConnectionFactory;
+1: import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
+1: import org.apache.derby.iapi.services.context.ContextService;
+1: import org.apache.derby.iapi.store.access.TransactionController;
+1: import org.apache.derby.iapi.store.access.TransactionInfo;
+1: 
+1: import java.util.Hashtable;
+0: import java.util.Enumeration;
+1: import java.util.Dictionary;
+1: import java.util.Stack;
+1: 
+1: import java.util.List;
+1: 
+1: /**
+0: 	Code to support deadlock detection.
+1: */
+1: 
+1: class Deadlock  {
+1: 	/**
+0: 		IBM Copyright &copy notice.
+1: 	*/
+0: 	public static final String copyrightNotice = org.apache.derby.iapi.reference.Copyright.SHORT_1999_2004;
+1: 
+1: 	private Deadlock() {}
+1: 
+0: 	static Object[] look(SinglePool factory, LockSet set, LockControl control, ActiveLock startingLock, byte deadlockWake) {
+1: 
+1: 		// step one, get a list of all waiters
+1: 		Dictionary waiters = Deadlock.getWaiters(set);
+1: 
+1: 		// This stack will track the potential deadlock chain
+1: 		// The Stack consists of
+1: 
+1: 		// start (Vector element 0)
+1: 		// - Compatibility space of waiter A
+1: 		// - Stack of compatibility spaces with granted lock for waiter A
+1: 
+0: 		Stack chain = new Stack();
+1: 
+1: 		chain.push(startingLock.getCompatabilitySpace());
+1: 		chain.push(control.getGrants());
+1: outer:	for (;;) {
+1: 
+1: 			if (chain.isEmpty()) {
+0: 				// all done
+1: 				break outer;
+1: 			}
+1: 
+1: 			List grants = (List) chain.peek();
+1: 			if (grants.isEmpty()) {
+1: 				// pop this list of granted locks and back to the previous one
+1: 				rollback(chain);
+1: 				continue outer;
+1: 			}
+1: 			int endStack = grants.size() - 1;
+1: 			Object space = ((Lock) grants.get(endStack)).getCompatabilitySpace();
+1: 
+1: 			// this stack of granted locks can contain multiple entries
+1: 			// for a single space. We don't want to do deadlock detection
+1: 			// twice so check to see if we have seen this space already.
+1: 			for (int gs = 0; gs < endStack; gs++) {
+1: 				if (space.equals(((Lock) grants.get(gs)).getCompatabilitySpace())) {
+1: 					chain.push(space); // set up as rollback() expects.
+1: 					rollback(chain);
+1: 					continue outer;
+1: 				}
+1: 			}
+1: 
+1: 			// find if this space is waiting on anyone
+1: inner:		for (;;) {
+1: 				int index = chain.indexOf(space);
+1: 				if (index != -1) {
+1: 
+0: 					// We could be seeing a situation here like
+1: 					// Granted T1{S}, T2{S}
+1: 					// Waiting T1{X} - deadlock checking on this
+1: 					//
+0: 					// In this case it's not a deadlock, although it
+0: 					// depends on the locking policy of the Lockable. E.g.
+0: 					// Granted T1(latch)
+0: 					// Waiting T1(latch)
+0: 					//  is a deadlock.
+1: 					//
+1: 
+1: 					if ((index == (chain.size() - 1)) ||
+1: 						((index == (chain.size() - 2))
+1: 						&& (index == (chain.indexOf(grants) - 1)))) {
+1: 
+1: 						// potential self deadlock, but probably not!
+1: 						ActiveLock lock = (ActiveLock) waiters.get(space);
+1: 
+1: 						if (lock.canSkip) {
+1: 							// not a deadlock ...
+1: 							chain.push(space); // set up as rollback() expects.
+1: 
+1: 							rollback(chain);
+1: 							continue outer;
+1: 						}
+1: 					}
+1: 
+1: 					return Deadlock.handle(factory, chain, index, waiters, deadlockWake);
+1: 				}
+1: 				chain.push(space);
+1: 
+0: 				Lock waitingLock = (Lock) waiters.get(space);
+0: 				if (waitingLock == null) {
+0: 					// end of the road, no deadlock in this path
+0: 					// pop items until the previous Stack
+1: 					rollback(chain);
+1: 					continue outer;
+1: 				}
+1: 
+0: 				// Is a LockControl or another ActiveLock
+0: 				Object waitOn = waiters.get(waitingLock); 
+0: 				if (waitOn instanceof LockControl) {
+1: 
+0: 					LockControl waitOnControl = (LockControl) waitOn;
+1: 
+0: 					// This lock control may have waiters but no
+0: 					// one holding the lock. This is true if lock
+0: 					// has just been released but the waiters haven't
+0: 					// woken up, or they are trying to get the synchronization we hold.
+1: 
+0: 					if (waitOnControl.isUnlocked()) {
+0: 						// end of the road, no deadlock in this path
+0: 						// pop items until the previous Stack
+1: 						rollback(chain);
+1: 						continue outer;
+1: 					}
+1: 
+0: 					chain.push(waitOnControl.getGrants());
+1: 
+1: 					continue outer;
+0: 				} else {
+0: 					// simply waiting on another waiter
+0: 					space = waitingLock.getCompatabilitySpace();
+1: 				}
+1: 		}
+1: 		}
+1: 
+1: 		return null;
+1: 	}
+1: 
+1: 	private static void rollback(Stack chain) {
+1: 		do {
+1: 			chain.pop();
+1: 			if (chain.isEmpty())
+1: 				return;
+1: 		} while (!(chain.peek() instanceof List));
+1: 
+1: 		// remove the last element, the one we were looking at
+1: 		List grants = (List) chain.peek();
+1: 		grants.remove(grants.size() - 1);
+1: 	}
+1: 
+0: 	private static Hashtable getWaiters(LockSet set) {
+1: 
+0: 		Hashtable waiters = new Hashtable(set.size() * 2);
+1: 
+0: 		for (Enumeration e = set.elements(); e.hasMoreElements(); ) {
+1: 
+0: 			Control control = (Control) e.nextElement();
+1: 
+0: 			control.addWaiters(waiters);
+1: 		}
+1: 
+1: 		return waiters;
+1: 	}
+1: 
+0: 	private static Object[] handle(SinglePool factory, Stack chain, int start, Dictionary waiters, byte deadlockWake) {
+1: 
+1: 		// If start is zero then the space that started looking for the
+1: 		// deadlock is activly involved in the deadlock.
+1: 
+1: 		Object checker = chain.elementAt(0);
+1: 
+1: 		int minLockCount = Integer.MAX_VALUE;
+1: 		Object victim = null;
+1: 		for (int i = start; i < chain.size(); i++) {
+1: 			Object space = chain.elementAt(i);
+1: 			if (space instanceof List) {
+1: 				continue;
+1: 			}
+1: 
+1: 			// See if the checker is in the deadlock and we
+1: 			// already picked as a victim
+1: 			if ((checker.equals(space)) && (deadlockWake == Constants.WAITING_LOCK_DEADLOCK)) {
+1: 				victim = checker;
+1: 				break;
+1: 			}
+1: 
+0: 			LockSpace ls = (LockSpace) factory.get(space);
+0: 			if (ls == null) {
+0: 				// space only holds latches, pick as victim
+1: 				victim = space;
+1: 				break;
+1: 			}
+1: 
+1: 			int spaceCount = ls.deadlockCount(minLockCount);
+1: 
+1: 			if (spaceCount <= minLockCount) {
+1: 				victim = space;
+1: 				minLockCount = spaceCount;
+1: 			}
+1: 		}
+1: 
+1: 		// See if the vitim is the one doing the checking
+1: 		if (checker.equals(victim)) {
+1: 			Object[] data = new Object[2];
+1: 			data[0] = chain;
+1: 			data[1] = waiters;
+1: 			return data;
+1: 		}
+1: 
+1: 		ActiveLock victimLock = (ActiveLock) waiters.get(victim);
+1: 
+1: 		victimLock.wakeUp(Constants.WAITING_LOCK_DEADLOCK);
+1: 
+1: 		return null;
+1: 
+1: 	}
+1: 
+0: 	static StandardException buildException(SinglePool factory, Object[] data) {
+1: 
+1: 		Stack chain = (Stack) data[0];
+1: 		Dictionary waiters = (Dictionary) data[1];
+1: 
+1: 
+1: 		LanguageConnectionContext lcc = (LanguageConnectionContext)
+0: 			ContextService.getContext(LanguageConnectionContext.CONTEXT_ID);
+1: 
+1: 		TableNameInfo tabInfo = null;
+1: 		TransactionInfo[] tt = null;
+1: 		TransactionController tc = null;
+1: 
+1: 		if (lcc != null) {
+1: 
+1: 			try {
+1: 				tc = lcc.getTransactionExecute();
+1: 				tabInfo = new TableNameInfo(lcc, false);
+1: 
+0: 				tt = lcc.getLanguageConnectionFactory().getAccessFactory().getTransactionInfo();
+1: 
+1: 			} catch (StandardException se) {
+1: 				// just don't get any table info.
+1: 			}
+1: 		}
+1: 
+1: 
+1: 		StringBuffer sb = new StringBuffer(200);
+1: 
+0: 		Hashtable attributes = new Hashtable(17);
+1: 
+1: 		String victimXID = null;
+1: 
+1: 		for (int i = 0; i < chain.size(); i++) {
+1: 			Object space = chain.elementAt(i);
+1: 			if (space instanceof List) {
+1: 				List grants = (List) space;
+1: 
+1: 				if (grants.size() != 0) {
+1: 
+1: 					sb.append("  Granted XID : ");
+1: 
+1: 					for (int j = 0; j < grants.size(); j ++) {
+1: 
+1: 						if (j != 0)
+1: 							sb.append(", ");
+1: 
+1: 						Lock gl = (Lock) grants.get(j);
+1: 
+1: 						sb.append("{");
+0: 						sb.append(gl.getCompatabilitySpace());
+1: 						sb.append(", ");
+1: 						sb.append(gl.getQualifier());
+1: 						sb.append("} ");
+1: 					}
+1: 					sb.append('\n');
+1: 				}
+1: 				continue;
+1: 			}
+1: 			// Information about the lock we are waiting on
+1: 			// TYPE |TABLENAME                     |LOCKNAME 
+1: 			Lock lock = ((Lock) waiters.get(space));
+1: 			
+1: 			// see if this lockable object wants to participate
+1: 			lock.getLockable().lockAttributes(VirtualLockTable.ALL, attributes);
+1: 
+1: 			addInfo(sb, "Lock : ", attributes.get(VirtualLockTable.LOCKTYPE));
+1: 			if (tabInfo != null) {
+1: 				Long conglomId = (Long) attributes.get(VirtualLockTable.CONGLOMID);
+1: 				if (conglomId == null) {
+1: 					Long containerId = (Long) attributes.get(VirtualLockTable.CONTAINERID);
+1: 					try {
+0: 						conglomId = new Long(tc.findConglomid(containerId.longValue()));
+1: 					} catch (StandardException se) {
+1: 					}
+1: 				}
+1: 				addInfo(sb, ", ", tabInfo.getTableName(conglomId));
+1: 			}
+1: 			addInfo(sb, ", ", attributes.get(VirtualLockTable.LOCKNAME));
+1: 			sb.append('\n');
+1: 
+0: 			String xid = space.toString();
+1: 			if (i == 0)
+1: 				victimXID = xid;
+1: 
+1: 
+1: 			addInfo(sb, "  Waiting XID : {", xid);
+1: 			addInfo(sb, ", ", lock.getQualifier());
+1: 			sb.append("} ");
+1: 			if (tt != null) {
+1: 				for (int tti = tt.length - 1; tti >= 0; tti--) {
+1: 					TransactionInfo ti = tt[tti];
+1: 
+1:                     // RESOLVE (track 2771) - not sure why 
+1:                     // ti.getTransactionIdString() or ti can return null.
+1:                     if (ti != null)
+1:                     {
+1:                         String idString = ti.getTransactionIdString();
+1: 
+1:                         if (idString != null && idString.equals(xid)) {
+1: 
+1:                             addInfo(sb, ", ", ti.getUsernameString());
+1:                             addInfo(sb, ", ", ti.getStatementTextString());
+1:                             break;
+1:                         }
+1:                     }
+1: 				}
+1: 			}
+1: 			sb.append('\n');
+1: 
+1: 			attributes.clear();
+1: 		}
+1: 
+1: 		StandardException se = StandardException.newException(SQLState.DEADLOCK, sb.toString(), victimXID);
+1: 		se.setReport(factory.deadlockMonitor);
+1: 		return se;
+1: 	}
+1: 
+1: 	private static void addInfo(StringBuffer sb, String desc, Object data) {
+1: 		sb.append(desc);
+1: 		if (data == null)
+1: 			data = "?";
+1: 		sb.append(data);
+1: 	}
+1: 
+1: } 
+author:Oyvind Bakksjo
+-------------------------------------------------------------------------------
+commit:aaea357
+author:Ken Coar
+-------------------------------------------------------------------------------
+commit:95e7b46
+/////////////////////////////////////////////////////////////////////////
+0: /*
+0: 
+0:    Licensed Materials - Property of IBM
+0:    Cloudscape - Package org.apache.derby.impl.services.locks
+0:    (C) Copyright IBM Corp. 1999, 2004. All Rights Reserved.
+0:    US Government Users Restricted Rights - Use, duplication or
+0:    disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+0: 
+0:  */
+0: 
+0: package org.apache.derby.impl.services.locks;
+0: 
+0: import org.apache.derby.iapi.services.locks.Lockable;
+0: import org.apache.derby.iapi.services.locks.VirtualLockTable;
+0: 
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+0: 
+0: import org.apache.derby.iapi.error.StandardException;
+0: import org.apache.derby.iapi.reference.SQLState;
+0: 
+0: import org.apache.derby.iapi.sql.conn.LanguageConnectionFactory;
+0: import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
+0: import org.apache.derby.iapi.services.context.ContextService;
+0: import org.apache.derby.iapi.store.access.TransactionController;
+0: import org.apache.derby.iapi.store.access.TransactionInfo;
+0: 
+0: import java.util.Hashtable;
+0: import java.util.Enumeration;
+0: import java.util.Dictionary;
+0: import java.util.Stack;
+0: 
+0: import java.util.List;
+0: 
+0: /**
+0: 	Code to support deadlock detection.
+0: */
+0: 
+0: class Deadlock  {
+0: 	/**
+0: 		IBM Copyright &copy notice.
+0: 	*/
+0: 	public static final String copyrightNotice = org.apache.derby.iapi.reference.Copyright.SHORT_1999_2004;
+0: 
+0: 	private Deadlock() {}
+0: 
+0: 	static Object[] look(SinglePool factory, LockSet set, LockControl control, ActiveLock startingLock, byte deadlockWake) {
+0: 
+0: 		// step one, get a list of all waiters
+0: 		Dictionary waiters = Deadlock.getWaiters(set);
+0: 
+0: 		// This stack will track the potential deadlock chain
+0: 		// The Stack consists of
+0: 
+0: 		// start (Vector element 0)
+0: 		// - Compatibility space of waiter A
+0: 		// - Stack of compatibility spaces with granted lock for waiter A
+0: 
+0: 		Stack chain = new Stack();
+0: 
+0: 		chain.push(startingLock.getCompatabilitySpace());
+0: 		chain.push(control.getGrants());
+0: outer:	for (;;) {
+0: 
+0: 			if (chain.isEmpty()) {
+0: 				// all done
+0: 				break outer;
+0: 			}
+0: 
+0: 			List grants = (List) chain.peek();
+0: 			if (grants.isEmpty()) {
+0: 				// pop this list of granted locks and back to the previous one
+0: 				rollback(chain);
+0: 				continue outer;
+0: 			}
+0: 			int endStack = grants.size() - 1;
+0: 			Object space = ((Lock) grants.get(endStack)).getCompatabilitySpace();
+0: 
+0: 			// this stack of granted locks can contain multiple entries
+0: 			// for a single space. We don't want to do deadlock detection
+0: 			// twice so check to see if we have seen this space already.
+0: 			for (int gs = 0; gs < endStack; gs++) {
+0: 				if (space.equals(((Lock) grants.get(gs)).getCompatabilitySpace())) {
+0: 					chain.push(space); // set up as rollback() expects.
+0: 					rollback(chain);
+0: 					continue outer;
+0: 				}
+0: 			}
+0: 
+0: 			// find if this space is waiting on anyone
+0: inner:		for (;;) {
+0: 				int index = chain.indexOf(space);
+0: 				if (index != -1) {
+0: 
+0: 					// We could be seeing a situation here like
+0: 					// Granted T1{S}, T2{S}
+0: 					// Waiting T1{X} - deadlock checking on this
+0: 					//
+0: 					// In this case it's not a deadlock, although it
+0: 					// depends on the locking policy of the Lockable. E.g.
+0: 					// Granted T1(latch)
+0: 					// Waiting T1(latch)
+0: 					//  is a deadlock.
+0: 					//
+0: 
+0: 					if ((index == (chain.size() - 1)) ||
+0: 						((index == (chain.size() - 2))
+0: 						&& (index == (chain.indexOf(grants) - 1)))) {
+0: 
+0: 						// potential self deadlock, but probably not!
+0: 						ActiveLock lock = (ActiveLock) waiters.get(space);
+0: 
+0: 						if (lock.canSkip) {
+0: 							// not a deadlock ...
+0: 							chain.push(space); // set up as rollback() expects.
+0: 
+0: 							rollback(chain);
+0: 							continue outer;
+0: 						}
+0: 					}
+0: 
+0: 					return Deadlock.handle(factory, chain, index, waiters, deadlockWake);
+0: 				}
+0: 				chain.push(space);
+0: 
+0: 				Lock waitingLock = (Lock) waiters.get(space);
+0: 				if (waitingLock == null) {
+0: 					// end of the road, no deadlock in this path
+0: 					// pop items until the previous Stack
+0: 					rollback(chain);
+0: 					continue outer;
+0: 				}
+0: 
+0: 				// Is a LockControl or another ActiveLock
+0: 				Object waitOn = waiters.get(waitingLock); 
+0: 				if (waitOn instanceof LockControl) {
+0: 
+0: 					LockControl waitOnControl = (LockControl) waitOn;
+0: 
+0: 					// This lock control may have waiters but no
+0: 					// one holding the lock. This is true if lock
+0: 					// has just been released but the waiters haven't
+0: 					// woken up, or they are trying to get the synchronization we hold.
+0: 
+0: 					if (waitOnControl.isUnlocked()) {
+0: 						// end of the road, no deadlock in this path
+0: 						// pop items until the previous Stack
+0: 						rollback(chain);
+0: 						continue outer;
+0: 					}
+0: 
+0: 					chain.push(waitOnControl.getGrants());
+0: 
+0: 					continue outer;
+0: 				} else {
+0: 					// simply waiting on another waiter
+0: 					space = waitingLock.getCompatabilitySpace();
+0: 				}
+0: 		}
+0: 		}
+0: 
+0: 		return null;
+0: 	}
+0: 
+0: 	private static void rollback(Stack chain) {
+0: 		do {
+0: 			chain.pop();
+0: 			if (chain.isEmpty())
+0: 				return;
+0: 		} while (!(chain.peek() instanceof List));
+0: 
+0: 		// remove the last element, the one we were looking at
+0: 		List grants = (List) chain.peek();
+0: 		grants.remove(grants.size() - 1);
+0: 	}
+0: 
+0: 	private static Hashtable getWaiters(LockSet set) {
+0: 
+0: 		Hashtable waiters = new Hashtable(set.size() * 2);
+0: 
+0: 		for (Enumeration e = set.elements(); e.hasMoreElements(); ) {
+0: 
+0: 			Control control = (Control) e.nextElement();
+0: 
+0: 			control.addWaiters(waiters);
+0: 		}
+0: 
+0: 		return waiters;
+0: 	}
+0: 
+0: 	private static Object[] handle(SinglePool factory, Stack chain, int start, Dictionary waiters, byte deadlockWake) {
+0: 
+0: 		// If start is zero then the space that started looking for the
+0: 		// deadlock is activly involved in the deadlock.
+0: 
+0: 		Object checker = chain.elementAt(0);
+0: 
+0: 		int minLockCount = Integer.MAX_VALUE;
+0: 		Object victim = null;
+0: 		for (int i = start; i < chain.size(); i++) {
+0: 			Object space = chain.elementAt(i);
+0: 			if (space instanceof List) {
+0: 				continue;
+0: 			}
+0: 
+0: 			// See if the checker is in the deadlock and we
+0: 			// already picked as a victim
+0: 			if ((checker.equals(space)) && (deadlockWake == Constants.WAITING_LOCK_DEADLOCK)) {
+0: 				victim = checker;
+0: 				break;
+0: 			}
+0: 
+0: 			LockSpace ls = (LockSpace) factory.get(space);
+0: 			if (ls == null) {
+0: 				// space only holds latches, pick as victim
+0: 				victim = space;
+0: 				break;
+0: 			}
+0: 
+0: 			int spaceCount = ls.deadlockCount(minLockCount);
+0: 
+0: 			if (spaceCount <= minLockCount) {
+0: 				victim = space;
+0: 				minLockCount = spaceCount;
+0: 			}
+0: 		}
+0: 
+0: 		// See if the vitim is the one doing the checking
+0: 		if (checker.equals(victim)) {
+0: 			Object[] data = new Object[2];
+0: 			data[0] = chain;
+0: 			data[1] = waiters;
+0: 			return data;
+0: 		}
+0: 
+0: 		ActiveLock victimLock = (ActiveLock) waiters.get(victim);
+0: 
+0: 		victimLock.wakeUp(Constants.WAITING_LOCK_DEADLOCK);
+0: 
+0: 		return null;
+0: 
+0: 	}
+0: 
+0: 	static StandardException buildException(SinglePool factory, Object[] data) {
+0: 
+0: 		Stack chain = (Stack) data[0];
+0: 		Dictionary waiters = (Dictionary) data[1];
+0: 
+0: 
+0: 		LanguageConnectionContext lcc = (LanguageConnectionContext)
+0: 			ContextService.getContext(LanguageConnectionContext.CONTEXT_ID);
+0: 
+0: 		TableNameInfo tabInfo = null;
+0: 		TransactionInfo[] tt = null;
+0: 		TransactionController tc = null;
+0: 
+0: 		if (lcc != null) {
+0: 
+0: 			try {
+0: 				tc = lcc.getTransactionExecute();
+0: 				tabInfo = new TableNameInfo(lcc, false);
+0: 
+0: 				tt = lcc.getLanguageConnectionFactory().getAccessFactory().getTransactionInfo();
+0: 
+0: 			} catch (StandardException se) {
+0: 				// just don't get any table info.
+0: 			}
+0: 		}
+0: 
+0: 
+0: 		StringBuffer sb = new StringBuffer(200);
+0: 
+0: 		Hashtable attributes = new Hashtable(17);
+0: 
+0: 		String victimXID = null;
+0: 
+0: 		for (int i = 0; i < chain.size(); i++) {
+0: 			Object space = chain.elementAt(i);
+0: 			if (space instanceof List) {
+0: 				List grants = (List) space;
+0: 
+0: 				if (grants.size() != 0) {
+0: 
+0: 					sb.append("  Granted XID : ");
+0: 
+0: 					for (int j = 0; j < grants.size(); j ++) {
+0: 
+0: 						if (j != 0)
+0: 							sb.append(", ");
+0: 
+0: 						Lock gl = (Lock) grants.get(j);
+0: 
+0: 						sb.append("{");
+0: 						sb.append(gl.getCompatabilitySpace());
+0: 						sb.append(", ");
+0: 						sb.append(gl.getQualifier());
+0: 						sb.append("} ");
+0: 					}
+0: 					sb.append('\n');
+0: 				}
+0: 				continue;
+0: 			}
+0: 			// Information about the lock we are waiting on
+0: 			// TYPE |TABLENAME                     |LOCKNAME 
+0: 			Lock lock = ((Lock) waiters.get(space));
+0: 			
+0: 			// see if this lockable object wants to participate
+0: 			lock.getLockable().lockAttributes(VirtualLockTable.ALL, attributes);
+0: 
+0: 			addInfo(sb, "Lock : ", attributes.get(VirtualLockTable.LOCKTYPE));
+0: 			if (tabInfo != null) {
+0: 				Long conglomId = (Long) attributes.get(VirtualLockTable.CONGLOMID);
+0: 				if (conglomId == null) {
+0: 					Long containerId = (Long) attributes.get(VirtualLockTable.CONTAINERID);
+0: 					try {
+0: 						conglomId = new Long(tc.findConglomid(containerId.longValue()));
+0: 					} catch (StandardException se) {
+0: 					}
+0: 				}
+0: 				addInfo(sb, ", ", tabInfo.getTableName(conglomId));
+0: 			}
+0: 			addInfo(sb, ", ", attributes.get(VirtualLockTable.LOCKNAME));
+0: 			sb.append('\n');
+0: 
+0: 			String xid = space.toString();
+0: 			if (i == 0)
+0: 				victimXID = xid;
+0: 
+0: 
+0: 			addInfo(sb, "  Waiting XID : {", xid);
+0: 			addInfo(sb, ", ", lock.getQualifier());
+0: 			sb.append("} ");
+0: 			if (tt != null) {
+0: 				for (int tti = tt.length - 1; tti >= 0; tti--) {
+0: 					TransactionInfo ti = tt[tti];
+0: 
+0:                     // RESOLVE (track 2771) - not sure why 
+0:                     // ti.getTransactionIdString() or ti can return null.
+0:                     if (ti != null)
+0:                     {
+0:                         String idString = ti.getTransactionIdString();
+0: 
+0:                         if (idString != null && idString.equals(xid)) {
+0: 
+0:                             addInfo(sb, ", ", ti.getUsernameString());
+0:                             addInfo(sb, ", ", ti.getStatementTextString());
+0:                             break;
+0:                         }
+0:                     }
+0: 				}
+0: 			}
+0: 			sb.append('\n');
+0: 
+0: 			attributes.clear();
+0: 		}
+0: 
+0: 		StandardException se = StandardException.newException(SQLState.DEADLOCK, sb.toString(), victimXID);
+0: 		se.setReport(factory.deadlockMonitor);
+0: 		return se;
+0: 	}
+0: 
+0: 	private static void addInfo(StringBuffer sb, String desc, Object data) {
+0: 		sb.append(desc);
+0: 		if (data == null)
+0: 			data = "?";
+0: 		sb.append(data);
+0: 	}
+0: 
+0: } 
+============================================================================

@@ -1,0 +1,681 @@
+1:ffc7fab: /**
+1:ffc7fab:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:ffc7fab:  * contributor license agreements.  See the NOTICE file distributed with
+1:ffc7fab:  * this work for additional information regarding copyright ownership.
+1:ffc7fab:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:ffc7fab:  * (the "License"); you may not use this file except in compliance with
+1:ffc7fab:  * the License.  You may obtain a copy of the License at
+1:ffc7fab:  *
+1:ffc7fab:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:ffc7fab:  *
+1:ffc7fab:  * Unless required by applicable law or agreed to in writing, software
+1:ffc7fab:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:ffc7fab:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:ffc7fab:  * See the License for the specific language governing permissions and
+1:ffc7fab:  * limitations under the License.
+1:ffc7fab:  */
+1:ffc7fab: package org.apache.mahout.math.hadoop.stochasticsvd.qr;
+1:ffc7fab: 
+1:ffc7fab: import java.io.Closeable;
+1:ffc7fab: import java.io.File;
+1:ffc7fab: import java.io.IOException;
+1:ffc7fab: import java.util.Arrays;
+1:ffc7fab: import java.util.Deque;
+1:ffc7fab: import java.util.List;
+1:ffc7fab: 
+1:ffc7fab: import org.apache.hadoop.conf.Configuration;
+1:ffc7fab: import org.apache.hadoop.fs.FileSystem;
+1:ffc7fab: import org.apache.hadoop.fs.Path;
+1:ffc7fab: import org.apache.hadoop.io.IntWritable;
+1:ffc7fab: import org.apache.hadoop.io.NullWritable;
+1:ffc7fab: import org.apache.hadoop.io.SequenceFile;
+1:ffc7fab: import org.apache.hadoop.io.SequenceFile.CompressionType;
+1:ffc7fab: import org.apache.hadoop.io.Writable;
+1:ffc7fab: import org.apache.hadoop.mapred.JobConf;
+1:ffc7fab: import org.apache.hadoop.mapred.OutputCollector;
+1:ffc7fab: import org.apache.hadoop.mapred.lib.MultipleOutputs;
+1:ffc7fab: import org.apache.mahout.common.IOUtils;
+1:ffc7fab: import org.apache.mahout.common.iterator.CopyConstructorIterator;
+1:ffc7fab: import org.apache.mahout.math.DenseVector;
+1:ffc7fab: import org.apache.mahout.math.Vector;
+1:dc62944: import org.apache.mahout.math.Vector.Element;
+1:ffc7fab: import org.apache.mahout.math.VectorWritable;
+1:ffc7fab: import org.apache.mahout.math.hadoop.stochasticsvd.DenseBlockWritable;
+1:f43adfe: import org.apache.mahout.math.UpperTriangular;
+1:ffc7fab: 
+1:ffc7fab: import com.google.common.collect.Lists;
+1:ffc7fab: import com.google.common.io.Closeables;
+1:ffc7fab: 
+1:ffc7fab: /**
+1:ffc7fab:  * QR first step without MR abstractions and doing it just in terms of iterators
+1:ffc7fab:  * and collectors. (although Collector is probably an outdated api).
+1:ffc7fab:  * 
+1:ffc7fab:  * 
+1:ffc7fab:  */
+1:ffc7fab: @SuppressWarnings("deprecation")
+1:29a7f38: public class QRFirstStep implements Closeable, OutputCollector<Writable, Vector> {
+1:ffc7fab: 
+1:ffc7fab:   public static final String PROP_K = "ssvd.k";
+1:ffc7fab:   public static final String PROP_P = "ssvd.p";
+1:ffc7fab:   public static final String PROP_AROWBLOCK_SIZE = "ssvd.arowblock.size";
+1:ffc7fab: 
+1:ffc7fab:   private int kp;
+1:ffc7fab:   private List<double[]> yLookahead;
+1:ffc7fab:   private GivensThinSolver qSolver;
+1:ffc7fab:   private int blockCnt;
+1:ffc7fab:   private final DenseBlockWritable value = new DenseBlockWritable();
+1:ffc7fab:   private final Writable tempKey = new IntWritable();
+1:ffc7fab:   private MultipleOutputs outputs;
+1:564c3e1:   private final Deque<Closeable> closeables = Lists.newLinkedList();
+1:ffc7fab:   private SequenceFile.Writer tempQw;
+1:ffc7fab:   private Path tempQPath;
+1:ffc7fab:   private final List<UpperTriangular> rSubseq = Lists.newArrayList();
+1:1499411:   private final Configuration jobConf;
+1:ffc7fab: 
+1:1499411:   private final OutputCollector<? super Writable, ? super DenseBlockWritable> qtHatOut;
+1:1499411:   private final OutputCollector<? super Writable, ? super VectorWritable> rHatOut;
+1:ffc7fab: 
+1:ffc7fab:   public QRFirstStep(Configuration jobConf,
+1:ffc7fab:                      OutputCollector<? super Writable, ? super DenseBlockWritable> qtHatOut,
+1:1499411:                      OutputCollector<? super Writable, ? super VectorWritable> rHatOut) {
+1:ffc7fab:     this.jobConf = jobConf;
+1:ffc7fab:     this.qtHatOut = qtHatOut;
+1:ffc7fab:     this.rHatOut = rHatOut;
+1:ffc7fab:     setup();
+1:ffc7fab:   }
+1:ffc7fab: 
+1:ffc7fab:   @Override
+1:ffc7fab:   public void close() throws IOException {
+1:ffc7fab:     cleanup();
+1:ffc7fab:   }
+1:ffc7fab: 
+1:ffc7fab:   public int getKP() {
+1:ffc7fab:     return kp;
+1:ffc7fab:   }
+1:ffc7fab: 
+1:ffc7fab:   private void flushSolver() throws IOException {
+1:ffc7fab:     UpperTriangular r = qSolver.getRTilde();
+1:ffc7fab:     double[][] qt = qSolver.getThinQtTilde();
+1:ffc7fab: 
+1:ffc7fab:     rSubseq.add(r);
+1:ffc7fab: 
+1:ffc7fab:     value.setBlock(qt);
+1:ffc7fab:     getTempQw().append(tempKey, value);
+1:ffc7fab: 
+1:5a2250c:     /*
+1:5a2250c:      * this probably should be a sparse row matrix, but compressor should get it
+1:5a2250c:      * for disk and in memory we want it dense anyway, sparse random
+1:5a2250c:      * implementations would be a mostly a memory management disaster consisting
+1:5a2250c:      * of rehashes and GC // thrashing. (IMHO)
+1:5a2250c:      */
+1:ffc7fab:     value.setBlock(null);
+1:ffc7fab:     qSolver.reset();
+1:ffc7fab:   }
+1:ffc7fab: 
+1:ffc7fab:   // second pass to run a modified version of computeQHatSequence.
+1:ffc7fab:   private void flushQBlocks() throws IOException {
+1:ffc7fab:     if (blockCnt == 1) {
+1:5a2250c:       /*
+1:5a2250c:        * only one block, no temp file, no second pass. should be the default
+1:5a2250c:        * mode for efficiency in most cases. Sure mapper should be able to load
+1:5a2250c:        * the entire split in memory -- and we don't require even that.
+1:5a2250c:        */
+1:ffc7fab:       value.setBlock(qSolver.getThinQtTilde());
+1:ffc7fab:       outputQHat(value);
+1:ffc7fab:       outputR(new VectorWritable(new DenseVector(qSolver.getRTilde().getData(),
+1:ffc7fab:                                                  true)));
+1:ffc7fab: 
+1:ffc7fab:     } else {
+1:ffc7fab:       secondPass();
+1:ffc7fab:     }
+1:ffc7fab:   }
+1:ffc7fab: 
+1:ffc7fab:   private void outputQHat(DenseBlockWritable value) throws IOException {
+1:ffc7fab:     qtHatOut.collect(NullWritable.get(), value);
+1:ffc7fab:   }
+1:ffc7fab: 
+1:ffc7fab:   private void outputR(VectorWritable value) throws IOException {
+1:ffc7fab:     rHatOut.collect(NullWritable.get(), value);
+1:ffc7fab:   }
+1:ffc7fab: 
+1:ffc7fab:   private void secondPass() throws IOException {
+1:ffc7fab:     qSolver = null; // release mem
+1:ffc7fab:     FileSystem localFs = FileSystem.getLocal(jobConf);
+1:ffc7fab:     SequenceFile.Reader tempQr =
+1:ffc7fab:       new SequenceFile.Reader(localFs, tempQPath, jobConf);
+1:ffc7fab:     closeables.addFirst(tempQr);
+1:ffc7fab:     int qCnt = 0;
+1:ffc7fab:     while (tempQr.next(tempKey, value)) {
+1:ffc7fab:       value
+1:ffc7fab:         .setBlock(GivensThinSolver.computeQtHat(value.getBlock(),
+1:ffc7fab:                                                 qCnt,
+1:87c15be:                                                 new CopyConstructorIterator<>(rSubseq.iterator())));
+1:ffc7fab:       if (qCnt == 1) {
+1:5a2250c:         /*
+1:5a2250c:          * just merge r[0] <- r[1] so it doesn't have to repeat in subsequent
+1:5a2250c:          * computeQHat iterators
+1:5a2250c:          */
+1:ffc7fab:         GivensThinSolver.mergeR(rSubseq.get(0), rSubseq.remove(1));
+1:ffc7fab:       } else {
+1:ffc7fab:         qCnt++;
+1:ffc7fab:       }
+1:ffc7fab:       outputQHat(value);
+1:ffc7fab:     }
+1:ffc7fab: 
+1:ffc7fab:     assert rSubseq.size() == 1;
+1:ffc7fab: 
+1:ffc7fab:     outputR(new VectorWritable(new DenseVector(rSubseq.get(0).getData(), true)));
+1:ffc7fab: 
+1:ffc7fab:   }
+1:ffc7fab: 
+1:4fbfbc6:   protected void map(Vector incomingYRow) throws IOException {
+1:ffc7fab:     double[] yRow;
+1:ffc7fab:     if (yLookahead.size() == kp) {
+1:ffc7fab:       if (qSolver.isFull()) {
+1:ffc7fab: 
+1:ffc7fab:         flushSolver();
+1:ffc7fab:         blockCnt++;
+1:ffc7fab: 
+1:ffc7fab:       }
+1:ffc7fab:       yRow = yLookahead.remove(0);
+1:ffc7fab: 
+1:ffc7fab:       qSolver.appendRow(yRow);
+1:ffc7fab:     } else {
+1:ffc7fab:       yRow = new double[kp];
+1:ffc7fab:     }
+1:ffc7fab: 
+1:ffc7fab:     if (incomingYRow.isDense()) {
+1:1499411:       for (int i = 0; i < kp; i++) {
+1:ffc7fab:         yRow[i] = incomingYRow.get(i);
+1:1499411:       }
+1:ffc7fab:     } else {
+1:ffc7fab:       Arrays.fill(yRow, 0);
+1:dc62944:       for (Element yEl : incomingYRow.nonZeroes()) {
+1:ffc7fab:         yRow[yEl.index()] = yEl.get();
+1:ffc7fab:       }
+1:ffc7fab:     }
+1:ffc7fab: 
+1:ffc7fab:     yLookahead.add(yRow);
+1:ffc7fab:   }
+1:ffc7fab: 
+1:1499411:   protected void setup() {
+1:ffc7fab: 
+1:1499411:     int r = Integer.parseInt(jobConf.get(PROP_AROWBLOCK_SIZE));
+1:ffc7fab:     int k = Integer.parseInt(jobConf.get(PROP_K));
+1:ffc7fab:     int p = Integer.parseInt(jobConf.get(PROP_P));
+1:ffc7fab:     kp = k + p;
+1:ffc7fab: 
+1:ffc7fab:     yLookahead = Lists.newArrayListWithCapacity(kp);
+1:ffc7fab:     qSolver = new GivensThinSolver(r, kp);
+1:ffc7fab:     outputs = new MultipleOutputs(new JobConf(jobConf));
+1:ffc7fab:     closeables.addFirst(new Closeable() {
+1:ffc7fab:       @Override
+1:ffc7fab:       public void close() throws IOException {
+1:ffc7fab:         outputs.close();
+1:ffc7fab:       }
+1:ffc7fab:     });
+1:ffc7fab: 
+1:ffc7fab:   }
+1:ffc7fab: 
+1:ffc7fab:   protected void cleanup() throws IOException {
+1:ffc7fab:     try {
+1:ffc7fab:       if (qSolver == null && yLookahead.isEmpty()) {
+1:ffc7fab:         return;
+1:ffc7fab:       }
+1:ffc7fab:       if (qSolver == null) {
+1:ffc7fab:         qSolver = new GivensThinSolver(yLookahead.size(), kp);
+1:ffc7fab:       }
+1:ffc7fab:       // grow q solver up if necessary
+1:ffc7fab: 
+1:ffc7fab:       qSolver.adjust(qSolver.getCnt() + yLookahead.size());
+1:ffc7fab:       while (!yLookahead.isEmpty()) {
+1:ffc7fab: 
+1:ffc7fab:         qSolver.appendRow(yLookahead.remove(0));
+1:ffc7fab: 
+1:ffc7fab:       }
+1:ffc7fab:       assert qSolver.isFull();
+1:ffc7fab:       if (++blockCnt > 1) {
+1:ffc7fab:         flushSolver();
+1:ffc7fab:         assert tempQw != null;
+1:ffc7fab:         closeables.remove(tempQw);
+1:87d4b2e:         Closeables.close(tempQw, false);
+1:ffc7fab:       }
+1:ffc7fab:       flushQBlocks();
+1:ffc7fab: 
+1:ffc7fab:     } finally {
+1:ffc7fab:       IOUtils.close(closeables);
+1:ffc7fab:     }
+1:ffc7fab: 
+1:ffc7fab:   }
+1:ffc7fab: 
+1:ffc7fab:   private SequenceFile.Writer getTempQw() throws IOException {
+1:ffc7fab:     if (tempQw == null) {
+1:5a2250c:       /*
+1:5a2250c:        * temporary Q output hopefully will not exceed size of IO cache in which
+1:5a2250c:        * case it is only good since it is going to be managed by kernel, not
+1:5a2250c:        * java GC. And if IO cache is not good enough, then at least it is always
+1:5a2250c:        * sequential.
+1:5a2250c:        */
+1:ffc7fab:       String taskTmpDir = System.getProperty("java.io.tmpdir");
+1:ffc7fab: 
+1:ffc7fab:       FileSystem localFs = FileSystem.getLocal(jobConf);
+1:29a7f38:       Path parent = new Path(taskTmpDir);
+1:29a7f38:       Path sub = new Path(parent, "qw_" + System.currentTimeMillis());
+1:29a7f38:       tempQPath = new Path(sub, "q-temp.seq");
+1:ffc7fab:       tempQw =
+1:ffc7fab:         SequenceFile.createWriter(localFs,
+1:ffc7fab:                                   jobConf,
+1:ffc7fab:                                   tempQPath,
+1:ffc7fab:                                   IntWritable.class,
+1:ffc7fab:                                   DenseBlockWritable.class,
+1:ffc7fab:                                   CompressionType.BLOCK);
+1:ffc7fab:       closeables.addFirst(tempQw);
+1:ffc7fab:       closeables.addFirst(new IOUtils.DeleteFileOnClose(new File(tempQPath
+1:ffc7fab:         .toString())));
+1:ffc7fab:     }
+1:ffc7fab:     return tempQw;
+1:ffc7fab:   }
+1:ffc7fab: 
+1:ffc7fab:   @Override
+1:ffc7fab:   public void collect(Writable key, Vector vw) throws IOException {
+1:4fbfbc6:     map(vw);
+1:ffc7fab:   }
+1:ffc7fab: 
+1:ffc7fab: }
+============================================================================
+author:pferrel
+-------------------------------------------------------------------------------
+commit:b988c49
+author:Suneel Marthi
+-------------------------------------------------------------------------------
+commit:87c15be
+/////////////////////////////////////////////////////////////////////////
+1:                                                 new CopyConstructorIterator<>(rSubseq.iterator())));
+author:frankscholten
+-------------------------------------------------------------------------------
+commit:1a42d85
+author:Dmitriy Lyubimov
+-------------------------------------------------------------------------------
+commit:f43adfe
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.mahout.math.UpperTriangular;
+commit:5a2250c
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:   private final Deque<Closeable> closeables = Lists.<Closeable>newLinkedList();
+/////////////////////////////////////////////////////////////////////////
+1:     /*
+1:      * this probably should be a sparse row matrix, but compressor should get it
+1:      * for disk and in memory we want it dense anyway, sparse random
+1:      * implementations would be a mostly a memory management disaster consisting
+1:      * of rehashes and GC // thrashing. (IMHO)
+1:      */
+/////////////////////////////////////////////////////////////////////////
+1:       /*
+1:        * only one block, no temp file, no second pass. should be the default
+1:        * mode for efficiency in most cases. Sure mapper should be able to load
+1:        * the entire split in memory -- and we don't require even that.
+1:        */
+/////////////////////////////////////////////////////////////////////////
+1:         /*
+1:          * just merge r[0] <- r[1] so it doesn't have to repeat in subsequent
+1:          * computeQHat iterators
+1:          */
+/////////////////////////////////////////////////////////////////////////
+1:       /*
+1:        * temporary Q output hopefully will not exceed size of IO cache in which
+1:        * case it is only good since it is going to be managed by kernel, not
+1:        * java GC. And if IO cache is not good enough, then at least it is always
+1:        * sequential.
+1:        */
+commit:a8be9be
+/////////////////////////////////////////////////////////////////////////
+0: public class QRFirstStep implements Closeable,
+0:     OutputCollector<Writable, Vector> {
+/////////////////////////////////////////////////////////////////////////
+0:       tempQPath =
+0:         new Path(new Path(taskTmpDir),
+0:                  String.format("q-temp-%d.seq", System.currentTimeMillis()));
+/////////////////////////////////////////////////////////////////////////
+commit:ffc7fab
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.mahout.math.hadoop.stochasticsvd.qr;
+1: 
+1: import java.io.Closeable;
+1: import java.io.File;
+1: import java.io.IOException;
+1: import java.util.Arrays;
+1: import java.util.Deque;
+0: import java.util.Iterator;
+0: import java.util.LinkedList;
+1: import java.util.List;
+1: 
+1: import org.apache.hadoop.conf.Configuration;
+1: import org.apache.hadoop.fs.FileSystem;
+1: import org.apache.hadoop.fs.Path;
+1: import org.apache.hadoop.io.IntWritable;
+1: import org.apache.hadoop.io.NullWritable;
+1: import org.apache.hadoop.io.SequenceFile;
+1: import org.apache.hadoop.io.SequenceFile.CompressionType;
+1: import org.apache.hadoop.io.Writable;
+1: import org.apache.hadoop.mapred.JobConf;
+1: import org.apache.hadoop.mapred.OutputCollector;
+1: import org.apache.hadoop.mapred.lib.MultipleOutputs;
+1: import org.apache.mahout.common.IOUtils;
+1: import org.apache.mahout.common.iterator.CopyConstructorIterator;
+1: import org.apache.mahout.math.DenseVector;
+1: import org.apache.mahout.math.Vector;
+1: import org.apache.mahout.math.VectorWritable;
+1: import org.apache.mahout.math.hadoop.stochasticsvd.DenseBlockWritable;
+0: import org.apache.mahout.math.hadoop.stochasticsvd.UpperTriangular;
+1: 
+1: import com.google.common.collect.Lists;
+1: import com.google.common.io.Closeables;
+1: 
+1: /**
+1:  * QR first step without MR abstractions and doing it just in terms of iterators
+1:  * and collectors. (although Collector is probably an outdated api).
+1:  * 
+1:  * 
+1:  */
+1: @SuppressWarnings("deprecation")
+0: public class QRFirstStep implements Closeable,
+0:     OutputCollector<Writable, Vector> {
+1: 
+1:   public static final String PROP_K = "ssvd.k";
+1:   public static final String PROP_P = "ssvd.p";
+1:   public static final String PROP_AROWBLOCK_SIZE = "ssvd.arowblock.size";
+1: 
+1:   private int kp;
+1:   private List<double[]> yLookahead;
+1:   private GivensThinSolver qSolver;
+1:   private int blockCnt;
+0:   private int r;
+1:   private final DenseBlockWritable value = new DenseBlockWritable();
+1:   private final Writable tempKey = new IntWritable();
+1:   private MultipleOutputs outputs;
+0:   private final Deque<Closeable> closeables = new LinkedList<Closeable>();
+1:   private SequenceFile.Writer tempQw;
+1:   private Path tempQPath;
+1:   private final List<UpperTriangular> rSubseq = Lists.newArrayList();
+0:   private Configuration jobConf;
+1: 
+0:   private OutputCollector<? super Writable, ? super DenseBlockWritable> qtHatOut;
+0:   private OutputCollector<? super Writable, ? super VectorWritable> rHatOut;
+1: 
+1:   public QRFirstStep(Configuration jobConf,
+1:                      OutputCollector<? super Writable, ? super DenseBlockWritable> qtHatOut,
+0:                      OutputCollector<? super Writable, ? super VectorWritable> rHatOut) throws IOException,
+0:     InterruptedException {
+0:     super();
+1:     this.jobConf = jobConf;
+1:     this.qtHatOut = qtHatOut;
+1:     this.rHatOut = rHatOut;
+1:     setup();
+1:   }
+1: 
+1:   @Override
+1:   public void close() throws IOException {
+1:     cleanup();
+1:   }
+1: 
+1:   public int getKP() {
+1:     return kp;
+1:   }
+1: 
+1:   private void flushSolver() throws IOException {
+1:     UpperTriangular r = qSolver.getRTilde();
+1:     double[][] qt = qSolver.getThinQtTilde();
+1: 
+1:     rSubseq.add(r);
+1: 
+1:     value.setBlock(qt);
+1:     getTempQw().append(tempKey, value);
+1: 
+0:     // this probably should be
+0:     // a sparse row matrix,
+0:     // but compressor should get it for disk and in memory we want it
+0:     // dense anyway, sparse random implementations would be
+0:     // a mostly a memory management disaster consisting of rehashes and GC
+0:     // thrashing. (IMHO)
+1:     value.setBlock(null);
+1:     qSolver.reset();
+1:   }
+1: 
+1:   // second pass to run a modified version of computeQHatSequence.
+1:   private void flushQBlocks() throws IOException {
+1:     if (blockCnt == 1) {
+0:       // only one block, no temp file, no second pass. should be the default
+0:       // mode
+0:       // for efficiency in most cases. Sure mapper should be able to load
+0:       // the entire split in memory -- and we don't require even that.
+1:       value.setBlock(qSolver.getThinQtTilde());
+1:       outputQHat(value);
+1:       outputR(new VectorWritable(new DenseVector(qSolver.getRTilde().getData(),
+1:                                                  true)));
+1: 
+1:     } else {
+1:       secondPass();
+1:     }
+1:   }
+1: 
+1:   private void outputQHat(DenseBlockWritable value) throws IOException {
+1:     qtHatOut.collect(NullWritable.get(), value);
+1:   }
+1: 
+1:   private void outputR(VectorWritable value) throws IOException {
+1:     rHatOut.collect(NullWritable.get(), value);
+1:   }
+1: 
+1:   private void secondPass() throws IOException {
+1:     qSolver = null; // release mem
+1:     FileSystem localFs = FileSystem.getLocal(jobConf);
+1:     SequenceFile.Reader tempQr =
+1:       new SequenceFile.Reader(localFs, tempQPath, jobConf);
+1:     closeables.addFirst(tempQr);
+1:     int qCnt = 0;
+1:     while (tempQr.next(tempKey, value)) {
+1:       value
+1:         .setBlock(GivensThinSolver.computeQtHat(value.getBlock(),
+1:                                                 qCnt,
+0:                                                 new CopyConstructorIterator<UpperTriangular>(rSubseq
+0:                                                   .iterator())));
+1:       if (qCnt == 1) {
+0:         // just merge r[0] <- r[1] so it doesn't have to repeat
+0:         // in subsequent computeQHat iterators
+1:         GivensThinSolver.mergeR(rSubseq.get(0), rSubseq.remove(1));
+1:       } else {
+1:         qCnt++;
+1:       }
+1:       outputQHat(value);
+1:     }
+1: 
+1:     assert rSubseq.size() == 1;
+1: 
+1:     outputR(new VectorWritable(new DenseVector(rSubseq.get(0).getData(), true)));
+1: 
+1:   }
+1: 
+0:   protected void map(Writable key, Vector incomingYRow) throws IOException {
+1:     double[] yRow;
+1:     if (yLookahead.size() == kp) {
+1:       if (qSolver.isFull()) {
+1: 
+1:         flushSolver();
+1:         blockCnt++;
+1: 
+1:       }
+1:       yRow = yLookahead.remove(0);
+1: 
+1:       qSolver.appendRow(yRow);
+1:     } else {
+1:       yRow = new double[kp];
+1:     }
+1: 
+1:     if (incomingYRow.isDense()) {
+0:       for (int i = 0; i < kp; i++)
+1:         yRow[i] = incomingYRow.get(i);
+1:     } else {
+1:       Arrays.fill(yRow, 0);
+0:       for (Iterator<Vector.Element> yIter = incomingYRow.iterateNonZero(); yIter
+0:         .hasNext();) {
+0:         Vector.Element yEl = yIter.next();
+1:         yRow[yEl.index()] = yEl.get();
+1:       }
+1:     }
+1: 
+1:     yLookahead.add(yRow);
+1:   }
+1: 
+0:   protected void setup() throws IOException, InterruptedException {
+1: 
+0:     r = Integer.parseInt(jobConf.get(PROP_AROWBLOCK_SIZE));
+1:     int k = Integer.parseInt(jobConf.get(PROP_K));
+1:     int p = Integer.parseInt(jobConf.get(PROP_P));
+1:     kp = k + p;
+1: 
+1:     yLookahead = Lists.newArrayListWithCapacity(kp);
+1:     qSolver = new GivensThinSolver(r, kp);
+1:     outputs = new MultipleOutputs(new JobConf(jobConf));
+1:     closeables.addFirst(new Closeable() {
+1:       @Override
+1:       public void close() throws IOException {
+1:         outputs.close();
+1:       }
+1:     });
+1: 
+1:   }
+1: 
+1:   protected void cleanup() throws IOException {
+1:     try {
+1:       if (qSolver == null && yLookahead.isEmpty()) {
+1:         return;
+1:       }
+1:       if (qSolver == null) {
+1:         qSolver = new GivensThinSolver(yLookahead.size(), kp);
+1:       }
+1:       // grow q solver up if necessary
+1: 
+1:       qSolver.adjust(qSolver.getCnt() + yLookahead.size());
+1:       while (!yLookahead.isEmpty()) {
+1: 
+1:         qSolver.appendRow(yLookahead.remove(0));
+1: 
+1:       }
+1:       assert qSolver.isFull();
+1:       if (++blockCnt > 1) {
+1:         flushSolver();
+1:         assert tempQw != null;
+1:         closeables.remove(tempQw);
+0:         Closeables.closeQuietly(tempQw);
+1:       }
+1:       flushQBlocks();
+1: 
+1:     } finally {
+1:       IOUtils.close(closeables);
+1:     }
+1: 
+1:   }
+1: 
+1:   private SequenceFile.Writer getTempQw() throws IOException {
+1:     if (tempQw == null) {
+0:       // temporary Q output
+0:       // hopefully will not exceed size of IO cache in which case it is only
+0:       // good since it
+0:       // is going to be maanged by kernel, not java GC. And if IO cache is not
+0:       // good enough,
+0:       // then at least it is always sequential.
+1:       String taskTmpDir = System.getProperty("java.io.tmpdir");
+1:       FileSystem localFs = FileSystem.getLocal(jobConf);
+0:       tempQPath = new Path(new Path(taskTmpDir), "q-temp.seq");
+1:       tempQw =
+1:         SequenceFile.createWriter(localFs,
+1:                                   jobConf,
+1:                                   tempQPath,
+1:                                   IntWritable.class,
+1:                                   DenseBlockWritable.class,
+1:                                   CompressionType.BLOCK);
+1:       closeables.addFirst(tempQw);
+1:       closeables.addFirst(new IOUtils.DeleteFileOnClose(new File(tempQPath
+1:         .toString())));
+1:     }
+1:     return tempQw;
+1:   }
+1: 
+1:   @Override
+1:   public void collect(Writable key, Vector vw) throws IOException {
+0:     map(key, vw);
+1: 
+1:   }
+1: 
+1: }
+author:dfilimon
+-------------------------------------------------------------------------------
+commit:87d4b2e
+/////////////////////////////////////////////////////////////////////////
+1:         Closeables.close(tempQw, false);
+author:Grant Ingersoll
+-------------------------------------------------------------------------------
+commit:31cb292
+/////////////////////////////////////////////////////////////////////////
+0:         Closeables.close(tempQw, true);
+commit:29a7f38
+/////////////////////////////////////////////////////////////////////////
+1: public class QRFirstStep implements Closeable, OutputCollector<Writable, Vector> {
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:       Path parent = new Path(taskTmpDir);
+1:       Path sub = new Path(parent, "qw_" + System.currentTimeMillis());
+1:       tempQPath = new Path(sub, "q-temp.seq");
+/////////////////////////////////////////////////////////////////////////
+0: 
+author:Jacob Alexander Mannix
+-------------------------------------------------------------------------------
+commit:dc62944
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.mahout.math.Vector.Element;
+/////////////////////////////////////////////////////////////////////////
+1:       for (Element yEl : incomingYRow.nonZeroes()) {
+author:Sean R. Owen
+-------------------------------------------------------------------------------
+commit:564c3e1
+/////////////////////////////////////////////////////////////////////////
+1:   private final Deque<Closeable> closeables = Lists.newLinkedList();
+commit:4fbfbc6
+/////////////////////////////////////////////////////////////////////////
+1:   protected void map(Vector incomingYRow) throws IOException {
+/////////////////////////////////////////////////////////////////////////
+1:     map(vw);
+commit:1499411
+/////////////////////////////////////////////////////////////////////////
+0: public class QRFirstStep implements Closeable, OutputCollector<Writable, Vector> {
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:   private final Configuration jobConf;
+1:   private final OutputCollector<? super Writable, ? super DenseBlockWritable> qtHatOut;
+1:   private final OutputCollector<? super Writable, ? super VectorWritable> rHatOut;
+1:                      OutputCollector<? super Writable, ? super VectorWritable> rHatOut) {
+/////////////////////////////////////////////////////////////////////////
+1:       for (int i = 0; i < kp; i++) {
+1:       }
+/////////////////////////////////////////////////////////////////////////
+1:   protected void setup() {
+1:     int r = Integer.parseInt(jobConf.get(PROP_AROWBLOCK_SIZE));
+============================================================================

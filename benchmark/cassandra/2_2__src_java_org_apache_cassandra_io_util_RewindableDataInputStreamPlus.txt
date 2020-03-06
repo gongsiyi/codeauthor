@@ -1,0 +1,1173 @@
+1:e8651b6: /*
+1:e8651b6:  * Licensed to the Apache Software Foundation (ASF) under one
+1:e8651b6:  * or more contributor license agreements.  See the NOTICE file
+1:e8651b6:  * distributed with this work for additional information
+1:e8651b6:  * regarding copyright ownership.  The ASF licenses this file
+1:e8651b6:  * to you under the Apache License, Version 2.0 (the
+1:e8651b6:  * "License"); you may not use this file except in compliance
+1:e8651b6:  * with the License.  You may obtain a copy of the License at
+1:e8651b6:  *
+1:e8651b6:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:e8651b6:  *
+1:e8651b6:  * Unless required by applicable law or agreed to in writing, software
+1:e8651b6:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:e8651b6:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:e8651b6:  * See the License for the specific language governing permissions and
+1:e8651b6:  * limitations under the License.
+1:e8651b6:  */
+1:e8651b6: 
+1:e8651b6: package org.apache.cassandra.io.util;
+1:e8651b6: 
+1:e8651b6: import java.io.Closeable;
+1:e8651b6: import java.io.File;
+1:e8651b6: import java.io.FilterInputStream;
+1:e8651b6: import java.io.IOException;
+1:e8651b6: import java.io.InputStream;
+1:e8651b6: import java.io.RandomAccessFile;
+1:e8651b6: import java.util.concurrent.atomic.AtomicBoolean;
+1:e8651b6: 
+1:e8651b6: import static org.apache.cassandra.utils.Throwables.maybeFail;
+1:e8651b6: import static org.apache.cassandra.utils.Throwables.merge;
+1:e8651b6: 
+1:e8651b6: /**
+1:e8651b6:  * Adds mark/reset functionality to another input stream by caching read bytes to a memory buffer and
+1:e8651b6:  * spilling to disk if necessary.
+1:e8651b6:  *
+1:fe7eee0:  * When the stream is marked via {@link #mark()} or {@link #mark(int)}, up to
+1:e8651b6:  * <code>maxMemBufferSize</code> will be cached in memory (heap). If more than
+1:e8651b6:  * <code>maxMemBufferSize</code> bytes are read while the stream is marked, the
+1:e8651b6:  * following bytes are cached on the <code>spillFile</code> for up to <code>maxDiskBufferSize</code>.
+1:e8651b6:  *
+1:fe7eee0:  * Please note that successive calls to {@link #mark()} and {@link #reset()} will write
+1:e8651b6:  * sequentially to the same <code>spillFile</code> until <code>maxDiskBufferSize</code> is reached.
+1:e8651b6:  * At this point, if less than <code>maxDiskBufferSize</code> bytes are currently cached on the
+1:e8651b6:  * <code>spillFile</code>, the remaining bytes are written to the beginning of the file,
+1:e8651b6:  * treating the <code>spillFile</code> as a circular buffer.
+1:e8651b6:  *
+1:e8651b6:  * If more than <code>maxMemBufferSize + maxDiskBufferSize</code> are cached while the stream is marked,
+1:fe7eee0:  * the following {@link #reset()} invocation will throw a {@link IllegalStateException}.
+1:e8651b6:  *
+1:e8651b6:  */
+1:e8651b6: public class RewindableDataInputStreamPlus extends FilterInputStream implements RewindableDataInput, Closeable
+1:e8651b6: {
+1:e8651b6:     private boolean marked = false;
+1:e8651b6:     private boolean exhausted = false;
+1:e8651b6:     private AtomicBoolean closed = new AtomicBoolean(false);
+1:e8651b6: 
+1:e8651b6:     protected int memAvailable = 0;
+1:e8651b6:     protected int diskTailAvailable = 0;
+1:e8651b6:     protected int diskHeadAvailable = 0;
+1:e8651b6: 
+1:e8651b6:     private final File spillFile;
+1:e8651b6:     private final int initialMemBufferSize;
+1:e8651b6:     private final int maxMemBufferSize;
+1:e8651b6:     private final int maxDiskBufferSize;
+1:e8651b6: 
+1:e8651b6:     private volatile byte memBuffer[];
+1:e8651b6:     private int memBufferSize;
+1:e8651b6:     private RandomAccessFile spillBuffer;
+1:e8651b6: 
+1:e8651b6:     private final DataInputPlus dataReader;
+1:e8651b6: 
+1:e8651b6:     public RewindableDataInputStreamPlus(InputStream in, int initialMemBufferSize, int maxMemBufferSize,
+1:e8651b6:                                          File spillFile, int maxDiskBufferSize)
+1:e8651b6:     {
+1:e8651b6:         super(in);
+1:e8651b6:         dataReader = new DataInputStreamPlus(this);
+1:e8651b6:         this.initialMemBufferSize = initialMemBufferSize;
+1:e8651b6:         this.maxMemBufferSize = maxMemBufferSize;
+1:e8651b6:         this.spillFile = spillFile;
+1:e8651b6:         this.maxDiskBufferSize = maxDiskBufferSize;
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     /* RewindableDataInput methods */
+1:e8651b6: 
+1:e8651b6:     /**
+1:fe7eee0:      * Marks the current position of a stream to return to this position later via the {@link #reset(DataPosition)} method.
+1:e8651b6:      * @return An empty @link{DataPosition} object
+1:e8651b6:      */
+1:e8651b6:     public DataPosition mark()
+1:e8651b6:     {
+1:e8651b6:         mark(0);
+1:e8651b6:         return new RewindableDataInputPlusMark();
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     /**
+1:fe7eee0:      * Rewinds to the previously marked position via the {@link #mark()} method.
+1:e8651b6:      * @param mark it's not possible to return to a custom position, so this parameter is ignored.
+1:e8651b6:      * @throws IOException if an error ocurs while resetting
+1:e8651b6:      */
+1:e8651b6:     public void reset(DataPosition mark) throws IOException
+1:e8651b6:     {
+1:e8651b6:         reset();
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public long bytesPastMark(DataPosition mark)
+1:e8651b6:     {
+1:e8651b6:         return maxMemBufferSize - memAvailable + (diskTailAvailable == -1? 0 : maxDiskBufferSize - diskHeadAvailable - diskTailAvailable);
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6: 
+1:e8651b6:     protected static class RewindableDataInputPlusMark implements DataPosition
+1:e8651b6:     {
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     /* InputStream methods */
+1:e8651b6: 
+1:e8651b6:     public boolean markSupported()
+1:e8651b6:     {
+1:e8651b6:         return true;
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     /**
+1:e8651b6:      * Marks the current position of a stream to return to this position
+1:fe7eee0:      * later via the {@link #reset()} method.
+1:e8651b6:      * @param readlimit the maximum amount of bytes to cache
+1:e8651b6:      */
+1:e8651b6:     public synchronized void mark(int readlimit)
+1:e8651b6:     {
+1:e8651b6:         if (marked)
+1:e8651b6:             throw new IllegalStateException("Cannot mark already marked stream.");
+1:e8651b6: 
+1:e8651b6:         if (memAvailable > 0 || diskHeadAvailable > 0 || diskTailAvailable > 0)
+1:e8651b6:             throw new IllegalStateException("Can only mark stream after reading previously marked data.");
+1:e8651b6: 
+1:e8651b6:         marked = true;
+1:e8651b6:         memAvailable = maxMemBufferSize;
+1:e8651b6:         diskHeadAvailable = -1;
+1:e8651b6:         diskTailAvailable = -1;
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public synchronized void reset() throws IOException
+1:e8651b6:     {
+1:e8651b6:         if (!marked)
+1:e8651b6:             throw new IOException("Must call mark() before calling reset().");
+1:e8651b6: 
+1:e8651b6:         if (exhausted)
+1:e8651b6:             throw new IOException(String.format("Read more than capacity: %d bytes.", maxMemBufferSize + maxDiskBufferSize));
+1:e8651b6: 
+1:e8651b6:         memAvailable = maxMemBufferSize - memAvailable;
+1:e8651b6:         memBufferSize = memAvailable;
+1:e8651b6: 
+1:e8651b6:         if (diskTailAvailable == -1)
+1:e8651b6:         {
+1:e8651b6:             diskHeadAvailable = 0;
+1:e8651b6:             diskTailAvailable = 0;
+1:e8651b6:         }
+1:e8651b6:         else
+1:e8651b6:         {
+1:e8651b6:             int initialPos = diskTailAvailable > 0 ? 0 : (int)getIfNotClosed(spillBuffer).getFilePointer();
+1:e8651b6:             int diskMarkpos = initialPos + diskHeadAvailable;
+1:e8651b6:             getIfNotClosed(spillBuffer).seek(diskMarkpos);
+1:e8651b6: 
+1:e8651b6:             diskHeadAvailable = diskMarkpos - diskHeadAvailable;
+1:e8651b6:             diskTailAvailable = (maxDiskBufferSize - diskTailAvailable) - diskMarkpos;
+1:e8651b6:         }
+1:e8651b6: 
+1:e8651b6:         marked = false;
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public int available() throws IOException
+1:e8651b6:     {
+1:e8651b6: 
+1:e8651b6:         return super.available() + (marked? 0 : memAvailable + diskHeadAvailable + diskTailAvailable);
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public int read() throws IOException
+1:e8651b6:     {
+1:e8651b6:         int read = readOne();
+1:e8651b6:         if (read == -1)
+1:e8651b6:             return read;
+1:e8651b6: 
+1:e8651b6:         if (marked)
+1:e8651b6:         {
+1:e8651b6:             //mark exhausted
+1:e8651b6:             if (isExhausted(1))
+1:e8651b6:             {
+1:e8651b6:                 exhausted = true;
+1:e8651b6:                 return read;
+1:e8651b6:             }
+1:e8651b6: 
+1:e8651b6:             writeOne(read);
+1:e8651b6:         }
+1:e8651b6: 
+1:e8651b6:         return read;
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public int read(byte[] b, int off, int len) throws IOException
+1:e8651b6:     {
+1:e8651b6:         int readBytes = readMulti(b, off, len);
+1:e8651b6:         if (readBytes == -1)
+1:e8651b6:             return readBytes;
+1:e8651b6: 
+1:e8651b6:         if (marked)
+1:e8651b6:         {
+1:e8651b6:             //check we have space on buffer
+1:e8651b6:             if (isExhausted(readBytes))
+1:e8651b6:             {
+1:e8651b6:                 exhausted = true;
+1:e8651b6:                 return readBytes;
+1:e8651b6:             }
+1:e8651b6: 
+1:e8651b6:             writeMulti(b, off, readBytes);
+1:e8651b6:         }
+1:e8651b6: 
+1:e8651b6:         return readBytes;
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     private void maybeCreateDiskBuffer() throws IOException
+1:e8651b6:     {
+1:e8651b6:         if (spillBuffer == null)
+1:e8651b6:         {
+1:e8651b6:             if (!spillFile.getParentFile().exists())
+1:e8651b6:                 spillFile.getParentFile().mkdirs();
+1:e8651b6:             spillFile.createNewFile();
+1:e8651b6: 
+1:e8651b6:             this.spillBuffer = new RandomAccessFile(spillFile, "rw");
+1:e8651b6:         }
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6: 
+1:e8651b6:     private int readOne() throws IOException
+1:e8651b6:     {
+1:e8651b6:         if (!marked)
+1:e8651b6:         {
+1:e8651b6:             if (memAvailable > 0)
+1:e8651b6:             {
+1:e8651b6:                 int pos = memBufferSize - memAvailable;
+1:e8651b6:                 memAvailable--;
+1:e8651b6:                 return getIfNotClosed(memBuffer)[pos] & 0xff;
+1:e8651b6:             }
+1:e8651b6: 
+1:e8651b6:             if (diskTailAvailable > 0 || diskHeadAvailable > 0)
+1:e8651b6:             {
+1:e8651b6:                 int read = getIfNotClosed(spillBuffer).read();
+1:e8651b6:                 if (diskTailAvailable > 0)
+1:e8651b6:                     diskTailAvailable--;
+1:e8651b6:                 else if (diskHeadAvailable > 0)
+1:e8651b6:                     diskHeadAvailable++;
+1:e8651b6:                 if (diskTailAvailable == 0)
+1:e8651b6:                     spillBuffer.seek(0);
+1:e8651b6:                 return read;
+1:e8651b6:             }
+1:e8651b6:         }
+1:e8651b6: 
+1:e8651b6:         return getIfNotClosed(in).read();
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     private boolean isExhausted(int readBytes)
+1:e8651b6:     {
+1:e8651b6:         return exhausted || readBytes > memAvailable + (long)(diskTailAvailable == -1? maxDiskBufferSize : diskTailAvailable + diskHeadAvailable);
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     private int readMulti(byte[] b, int off, int len) throws IOException
+1:e8651b6:     {
+1:e8651b6:         int readBytes = 0;
+1:e8651b6:         if (!marked)
+1:e8651b6:         {
+1:e8651b6:             if (memAvailable > 0)
+1:e8651b6:             {
+1:e8651b6:                 readBytes += memAvailable < len ? memAvailable : len;
+1:e8651b6:                 int pos = memBufferSize - memAvailable;
+1:e8651b6:                 System.arraycopy(memBuffer, pos, b, off, readBytes);
+1:e8651b6:                 memAvailable -= readBytes;
+1:e8651b6:                 off += readBytes;
+1:e8651b6:                 len -= readBytes;
+1:e8651b6:             }
+1:e8651b6:             if (len > 0 && diskTailAvailable > 0)
+1:e8651b6:             {
+1:e8651b6:                 int readFromTail = diskTailAvailable < len? diskTailAvailable : len;
+1:9c6c072:                 readFromTail = getIfNotClosed(spillBuffer).read(b, off, readFromTail);
+1:e8651b6:                 readBytes += readFromTail;
+1:e8651b6:                 diskTailAvailable -= readFromTail;
+1:e8651b6:                 off += readFromTail;
+1:e8651b6:                 len -= readFromTail;
+1:e8651b6:                 if (diskTailAvailable == 0)
+1:e8651b6:                     spillBuffer.seek(0);
+1:e8651b6:             }
+1:e8651b6:             if (len > 0 && diskHeadAvailable > 0)
+1:e8651b6:             {
+1:e8651b6:                 int readFromHead = diskHeadAvailable < len? diskHeadAvailable : len;
+1:9c6c072:                 readFromHead = getIfNotClosed(spillBuffer).read(b, off, readFromHead);
+1:e8651b6:                 readBytes += readFromHead;
+1:e8651b6:                 diskHeadAvailable -= readFromHead;
+1:e8651b6:                 off += readFromHead;
+1:e8651b6:                 len -= readFromHead;
+1:e8651b6:             }
+1:e8651b6:         }
+1:e8651b6: 
+1:e8651b6:         if (len > 0)
+1:e8651b6:             readBytes += getIfNotClosed(in).read(b, off, len);
+1:e8651b6: 
+1:e8651b6:         return readBytes;
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     private void writeMulti(byte[] b, int off, int len) throws IOException
+1:e8651b6:     {
+1:e8651b6:         if (memAvailable > 0)
+1:e8651b6:         {
+1:e8651b6:             if (memBuffer == null)
+1:e8651b6:                 memBuffer = new byte[initialMemBufferSize];
+1:e8651b6:             int pos = maxMemBufferSize - memAvailable;
+1:e8651b6:             int memWritten = memAvailable < len? memAvailable : len;
+1:e8651b6:             if (pos + memWritten >= getIfNotClosed(memBuffer).length)
+1:e8651b6:                 growMemBuffer(pos, memWritten);
+1:e8651b6:             System.arraycopy(b, off, memBuffer, pos, memWritten);
+1:e8651b6:             off += memWritten;
+1:e8651b6:             len -= memWritten;
+1:e8651b6:             memAvailable -= memWritten;
+1:e8651b6:         }
+1:e8651b6: 
+1:e8651b6:         if (len > 0)
+1:e8651b6:         {
+1:e8651b6:             if (diskTailAvailable == -1)
+1:e8651b6:             {
+1:e8651b6:                 maybeCreateDiskBuffer();
+1:e8651b6:                 diskHeadAvailable = (int)spillBuffer.getFilePointer();
+1:e8651b6:                 diskTailAvailable = maxDiskBufferSize - diskHeadAvailable;
+1:e8651b6:             }
+1:e8651b6: 
+1:e8651b6:             if (len > 0 && diskTailAvailable > 0)
+1:e8651b6:             {
+1:e8651b6:                 int diskTailWritten = diskTailAvailable < len? diskTailAvailable : len;
+1:e8651b6:                 getIfNotClosed(spillBuffer).write(b, off, diskTailWritten);
+1:e8651b6:                 off += diskTailWritten;
+1:e8651b6:                 len -= diskTailWritten;
+1:e8651b6:                 diskTailAvailable -= diskTailWritten;
+1:e8651b6:                 if (diskTailAvailable == 0)
+1:e8651b6:                     spillBuffer.seek(0);
+1:e8651b6:             }
+1:e8651b6: 
+1:e8651b6:             if (len > 0 && diskTailAvailable > 0)
+1:e8651b6:             {
+1:e8651b6:                 int diskHeadWritten = diskHeadAvailable < len? diskHeadAvailable : len;
+1:e8651b6:                 getIfNotClosed(spillBuffer).write(b, off, diskHeadWritten);
+1:e8651b6:             }
+1:e8651b6:         }
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     private void writeOne(int value) throws IOException
+1:e8651b6:     {
+1:e8651b6:         if (memAvailable > 0)
+1:e8651b6:         {
+1:e8651b6:             if (memBuffer == null)
+1:e8651b6:                 memBuffer = new byte[initialMemBufferSize];
+1:e8651b6:             int pos = maxMemBufferSize - memAvailable;
+1:e8651b6:             if (pos == getIfNotClosed(memBuffer).length)
+1:e8651b6:                 growMemBuffer(pos, 1);
+1:e8651b6:             getIfNotClosed(memBuffer)[pos] = (byte)value;
+1:e8651b6:             memAvailable--;
+1:e8651b6:             return;
+1:e8651b6:         }
+1:e8651b6: 
+1:e8651b6:         if (diskTailAvailable == -1)
+1:e8651b6:         {
+1:e8651b6:             maybeCreateDiskBuffer();
+1:e8651b6:             diskHeadAvailable = (int)spillBuffer.getFilePointer();
+1:e8651b6:             diskTailAvailable = maxDiskBufferSize - diskHeadAvailable;
+1:e8651b6:         }
+1:e8651b6: 
+1:e8651b6:         if (diskTailAvailable > 0 || diskHeadAvailable > 0)
+1:e8651b6:         {
+1:e8651b6:             getIfNotClosed(spillBuffer).write(value);
+1:e8651b6:             if (diskTailAvailable > 0)
+1:e8651b6:                 diskTailAvailable--;
+1:e8651b6:             else if (diskHeadAvailable > 0)
+1:e8651b6:                 diskHeadAvailable--;
+1:e8651b6:             if (diskTailAvailable == 0)
+1:e8651b6:                 spillBuffer.seek(0);
+1:e8651b6:             return;
+1:e8651b6:         }
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public int read(byte[] b) throws IOException
+1:e8651b6:     {
+1:e8651b6:         return read(b, 0, b.length);
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     private void growMemBuffer(int pos, int writeSize)
+1:e8651b6:     {
+1:e8651b6:         int newSize = Math.min(2 * (pos + writeSize), maxMemBufferSize);
+1:e8651b6:         byte newBuffer[] = new byte[newSize];
+1:68d2526:         System.arraycopy(memBuffer, 0, newBuffer, 0, pos);
+1:e8651b6:         memBuffer = newBuffer;
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public long skip(long n) throws IOException
+1:e8651b6:     {
+1:e8651b6:         long skipped = 0;
+1:e8651b6: 
+1:e8651b6:         if (marked)
+1:e8651b6:         {
+1:e8651b6:             //if marked, we need to cache skipped bytes
+1:e8651b6:             while (n-- > 0 && read() != -1)
+1:e8651b6:             {
+1:e8651b6:                 skipped++;
+1:e8651b6:             }
+1:e8651b6:             return skipped;
+1:e8651b6:         }
+1:e8651b6: 
+1:e8651b6:         if (memAvailable > 0)
+1:e8651b6:         {
+1:e8651b6:             skipped += memAvailable < n ? memAvailable : n;
+1:e8651b6:             memAvailable -= skipped;
+1:e8651b6:             n -= skipped;
+1:e8651b6:         }
+1:e8651b6:         if (n > 0 && diskTailAvailable > 0)
+1:e8651b6:         {
+1:e8651b6:             int skipFromTail = diskTailAvailable < n? diskTailAvailable : (int)n;
+1:e8651b6:             getIfNotClosed(spillBuffer).skipBytes(skipFromTail);
+1:e8651b6:             diskTailAvailable -= skipFromTail;
+1:e8651b6:             skipped += skipFromTail;
+1:e8651b6:             n -= skipFromTail;
+1:e8651b6:             if (diskTailAvailable == 0)
+1:e8651b6:                 spillBuffer.seek(0);
+1:e8651b6:         }
+1:e8651b6:         if (n > 0 && diskHeadAvailable > 0)
+1:e8651b6:         {
+1:e8651b6:             int skipFromHead = diskHeadAvailable < n? diskHeadAvailable : (int)n;
+1:e8651b6:             getIfNotClosed(spillBuffer).skipBytes(skipFromHead);
+1:e8651b6:             diskHeadAvailable -= skipFromHead;
+1:e8651b6:             skipped += skipFromHead;
+1:e8651b6:             n -= skipFromHead;
+1:e8651b6:         }
+1:e8651b6: 
+1:e8651b6:         if (n > 0)
+1:e8651b6:             skipped += getIfNotClosed(in).skip(n);
+1:e8651b6: 
+1:e8651b6:         return skipped;
+1:e8651b6:     }
+1:e8651b6: 
+1:68d2526:     private <T> T getIfNotClosed(T in) throws IOException
+1:68d2526:     {
+1:e8651b6:         if (closed.get())
+1:e8651b6:             throw new IOException("Stream closed");
+1:e8651b6:         return in;
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public void close() throws IOException
+1:e8651b6:     {
+1:e8651b6:         close(true);
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public void close(boolean closeUnderlying) throws IOException
+1:e8651b6:     {
+1:e8651b6:         if (closed.compareAndSet(false, true))
+1:e8651b6:         {
+1:e8651b6:             Throwable fail = null;
+1:e8651b6:             if (closeUnderlying)
+1:e8651b6:             {
+1:e8651b6:                 try
+1:e8651b6:                 {
+1:e8651b6:                     super.close();
+1:e8651b6:                 }
+1:e8651b6:                 catch (IOException e)
+1:e8651b6:                 {
+1:e8651b6:                     fail = merge(fail, e);
+1:e8651b6:                 }
+1:e8651b6:             }
+1:68d2526:             try
+1:68d2526:             {
+1:e8651b6:                 if (spillBuffer != null)
+1:e8651b6:                 {
+1:e8651b6:                     this.spillBuffer.close();
+1:e8651b6:                     this.spillBuffer = null;
+1:e8651b6:                 }
+1:e8651b6:             } catch (IOException e)
+1:e8651b6:             {
+1:e8651b6:                 fail = merge(fail, e);
+1:e8651b6:             }
+1:e8651b6:             try
+1:e8651b6:             {
+1:e8651b6:                 if (spillFile.exists())
+1:e8651b6:                 {
+1:e8651b6:                     spillFile.delete();
+1:e8651b6:                 }
+1:e8651b6:             }
+1:e8651b6:             catch (Throwable e)
+1:e8651b6:             {
+1:e8651b6:                 fail = merge(fail, e);
+1:e8651b6:             }
+1:e8651b6:             maybeFail(fail, IOException.class);
+1:e8651b6:         }
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     /* DataInputPlus methods */
+1:e8651b6: 
+1:e8651b6:     public void readFully(byte[] b) throws IOException
+1:e8651b6:     {
+1:e8651b6:         dataReader.readFully(b);
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public void readFully(byte[] b, int off, int len) throws IOException
+1:e8651b6:     {
+1:e8651b6:         dataReader.readFully(b, off, len);
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public int skipBytes(int n) throws IOException
+1:e8651b6:     {
+1:e8651b6:         return dataReader.skipBytes(n);
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public boolean readBoolean() throws IOException
+1:e8651b6:     {
+1:e8651b6:         return dataReader.readBoolean();
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public byte readByte() throws IOException
+1:e8651b6:     {
+1:e8651b6:         return dataReader.readByte();
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public int readUnsignedByte() throws IOException
+1:e8651b6:     {
+1:e8651b6:         return dataReader.readUnsignedByte();
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public short readShort() throws IOException
+1:e8651b6:     {
+1:e8651b6:         return dataReader.readShort();
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public int readUnsignedShort() throws IOException
+1:e8651b6:     {
+1:e8651b6:         return dataReader.readUnsignedShort();
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public char readChar() throws IOException
+1:e8651b6:     {
+1:e8651b6:         return dataReader.readChar();
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public int readInt() throws IOException
+1:e8651b6:     {
+1:e8651b6:         return dataReader.readInt();
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public long readLong() throws IOException
+1:e8651b6:     {
+1:e8651b6:         return dataReader.readLong();
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public float readFloat() throws IOException
+1:e8651b6:     {
+1:e8651b6:         return dataReader.readFloat();
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public double readDouble() throws IOException
+1:e8651b6:     {
+1:e8651b6:         return dataReader.readDouble();
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public String readLine() throws IOException
+1:e8651b6:     {
+1:e8651b6:         return dataReader.readLine();
+1:e8651b6:     }
+1:e8651b6: 
+1:e8651b6:     public String readUTF() throws IOException
+1:e8651b6:     {
+1:e8651b6:         return dataReader.readUTF();
+1:e8651b6:     }
+1:e8651b6: }
+============================================================================
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:68d2526
+/////////////////////////////////////////////////////////////////////////
+1:         System.arraycopy(memBuffer, 0, newBuffer, 0, pos);
+/////////////////////////////////////////////////////////////////////////
+1:     private <T> T getIfNotClosed(T in) throws IOException
+1:     {
+/////////////////////////////////////////////////////////////////////////
+1:             try
+1:             {
+commit:9c6c072
+/////////////////////////////////////////////////////////////////////////
+1:                 readFromTail = getIfNotClosed(spillBuffer).read(b, off, readFromTail);
+/////////////////////////////////////////////////////////////////////////
+1:                 readFromHead = getIfNotClosed(spillBuffer).read(b, off, readFromHead);
+commit:fe7eee0
+/////////////////////////////////////////////////////////////////////////
+1:  * When the stream is marked via {@link #mark()} or {@link #mark(int)}, up to
+1:  * Please note that successive calls to {@link #mark()} and {@link #reset()} will write
+1:  * the following {@link #reset()} invocation will throw a {@link IllegalStateException}.
+/////////////////////////////////////////////////////////////////////////
+1:      * Marks the current position of a stream to return to this position later via the {@link #reset(DataPosition)} method.
+/////////////////////////////////////////////////////////////////////////
+1:      * Rewinds to the previously marked position via the {@link #mark()} method.
+/////////////////////////////////////////////////////////////////////////
+1:      * later via the {@link #reset()} method.
+author:Paulo Motta
+-------------------------------------------------------------------------------
+commit:e8651b6
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: 
+1: package org.apache.cassandra.io.util;
+1: 
+1: import java.io.Closeable;
+1: import java.io.File;
+1: import java.io.FilterInputStream;
+1: import java.io.IOException;
+1: import java.io.InputStream;
+1: import java.io.RandomAccessFile;
+1: import java.util.concurrent.atomic.AtomicBoolean;
+1: 
+1: import static org.apache.cassandra.utils.Throwables.maybeFail;
+1: import static org.apache.cassandra.utils.Throwables.merge;
+1: 
+1: /**
+1:  * Adds mark/reset functionality to another input stream by caching read bytes to a memory buffer and
+1:  * spilling to disk if necessary.
+1:  *
+0:  * When the stream is marked via {@link this#mark()} or {@link this#mark(int)}, up to
+1:  * <code>maxMemBufferSize</code> will be cached in memory (heap). If more than
+1:  * <code>maxMemBufferSize</code> bytes are read while the stream is marked, the
+1:  * following bytes are cached on the <code>spillFile</code> for up to <code>maxDiskBufferSize</code>.
+1:  *
+0:  * Please note that successive calls to {@link this#mark()} and {@link this#reset()} will write
+1:  * sequentially to the same <code>spillFile</code> until <code>maxDiskBufferSize</code> is reached.
+1:  * At this point, if less than <code>maxDiskBufferSize</code> bytes are currently cached on the
+1:  * <code>spillFile</code>, the remaining bytes are written to the beginning of the file,
+1:  * treating the <code>spillFile</code> as a circular buffer.
+1:  *
+1:  * If more than <code>maxMemBufferSize + maxDiskBufferSize</code> are cached while the stream is marked,
+0:  * the following {@link this#reset()} invocation will throw a {@link IllegalStateException}.
+1:  *
+1:  */
+1: public class RewindableDataInputStreamPlus extends FilterInputStream implements RewindableDataInput, Closeable
+1: {
+1:     private boolean marked = false;
+1:     private boolean exhausted = false;
+1:     private AtomicBoolean closed = new AtomicBoolean(false);
+1: 
+1:     protected int memAvailable = 0;
+1:     protected int diskTailAvailable = 0;
+1:     protected int diskHeadAvailable = 0;
+1: 
+1:     private final File spillFile;
+1:     private final int initialMemBufferSize;
+1:     private final int maxMemBufferSize;
+1:     private final int maxDiskBufferSize;
+1: 
+1:     private volatile byte memBuffer[];
+1:     private int memBufferSize;
+1:     private RandomAccessFile spillBuffer;
+1: 
+1:     private final DataInputPlus dataReader;
+1: 
+1:     public RewindableDataInputStreamPlus(InputStream in, int initialMemBufferSize, int maxMemBufferSize,
+1:                                          File spillFile, int maxDiskBufferSize)
+1:     {
+1:         super(in);
+1:         dataReader = new DataInputStreamPlus(this);
+1:         this.initialMemBufferSize = initialMemBufferSize;
+1:         this.maxMemBufferSize = maxMemBufferSize;
+1:         this.spillFile = spillFile;
+1:         this.maxDiskBufferSize = maxDiskBufferSize;
+1:     }
+1: 
+1:     /* RewindableDataInput methods */
+1: 
+1:     /**
+0:      * Marks the current position of a stream to return to this position later via the {@link this#reset(DataPosition)} method.
+1:      * @return An empty @link{DataPosition} object
+1:      */
+1:     public DataPosition mark()
+1:     {
+1:         mark(0);
+1:         return new RewindableDataInputPlusMark();
+1:     }
+1: 
+1:     /**
+0:      * Rewinds to the previously marked position via the {@link this#mark()} method.
+1:      * @param mark it's not possible to return to a custom position, so this parameter is ignored.
+1:      * @throws IOException if an error ocurs while resetting
+1:      */
+1:     public void reset(DataPosition mark) throws IOException
+1:     {
+1:         reset();
+1:     }
+1: 
+1:     public long bytesPastMark(DataPosition mark)
+1:     {
+1:         return maxMemBufferSize - memAvailable + (diskTailAvailable == -1? 0 : maxDiskBufferSize - diskHeadAvailable - diskTailAvailable);
+1:     }
+1: 
+1: 
+1:     protected static class RewindableDataInputPlusMark implements DataPosition
+1:     {
+1:     }
+1: 
+1:     /* InputStream methods */
+1: 
+1:     public boolean markSupported()
+1:     {
+1:         return true;
+1:     }
+1: 
+1:     /**
+1:      * Marks the current position of a stream to return to this position
+0:      * later via the {@link this#reset()} method.
+1:      * @param readlimit the maximum amount of bytes to cache
+1:      */
+1:     public synchronized void mark(int readlimit)
+1:     {
+1:         if (marked)
+1:             throw new IllegalStateException("Cannot mark already marked stream.");
+1: 
+1:         if (memAvailable > 0 || diskHeadAvailable > 0 || diskTailAvailable > 0)
+1:             throw new IllegalStateException("Can only mark stream after reading previously marked data.");
+1: 
+1:         marked = true;
+1:         memAvailable = maxMemBufferSize;
+1:         diskHeadAvailable = -1;
+1:         diskTailAvailable = -1;
+1:     }
+1: 
+1:     public synchronized void reset() throws IOException
+1:     {
+1:         if (!marked)
+1:             throw new IOException("Must call mark() before calling reset().");
+1: 
+1:         if (exhausted)
+1:             throw new IOException(String.format("Read more than capacity: %d bytes.", maxMemBufferSize + maxDiskBufferSize));
+1: 
+1:         memAvailable = maxMemBufferSize - memAvailable;
+1:         memBufferSize = memAvailable;
+1: 
+1:         if (diskTailAvailable == -1)
+1:         {
+1:             diskHeadAvailable = 0;
+1:             diskTailAvailable = 0;
+1:         }
+1:         else
+1:         {
+1:             int initialPos = diskTailAvailable > 0 ? 0 : (int)getIfNotClosed(spillBuffer).getFilePointer();
+1:             int diskMarkpos = initialPos + diskHeadAvailable;
+1:             getIfNotClosed(spillBuffer).seek(diskMarkpos);
+1: 
+1:             diskHeadAvailable = diskMarkpos - diskHeadAvailable;
+1:             diskTailAvailable = (maxDiskBufferSize - diskTailAvailable) - diskMarkpos;
+1:         }
+1: 
+1:         marked = false;
+1:     }
+1: 
+1:     public int available() throws IOException
+1:     {
+1: 
+1:         return super.available() + (marked? 0 : memAvailable + diskHeadAvailable + diskTailAvailable);
+1:     }
+1: 
+1:     public int read() throws IOException
+1:     {
+1:         int read = readOne();
+1:         if (read == -1)
+1:             return read;
+1: 
+1:         if (marked)
+1:         {
+1:             //mark exhausted
+1:             if (isExhausted(1))
+1:             {
+1:                 exhausted = true;
+1:                 return read;
+1:             }
+1: 
+1:             writeOne(read);
+1:         }
+1: 
+1:         return read;
+1:     }
+1: 
+1:     public int read(byte[] b, int off, int len) throws IOException
+1:     {
+1:         int readBytes = readMulti(b, off, len);
+1:         if (readBytes == -1)
+1:             return readBytes;
+1: 
+1:         if (marked)
+1:         {
+1:             //check we have space on buffer
+1:             if (isExhausted(readBytes))
+1:             {
+1:                 exhausted = true;
+1:                 return readBytes;
+1:             }
+1: 
+1:             writeMulti(b, off, readBytes);
+1:         }
+1: 
+1:         return readBytes;
+1:     }
+1: 
+1:     private void maybeCreateDiskBuffer() throws IOException
+1:     {
+1:         if (spillBuffer == null)
+1:         {
+1:             if (!spillFile.getParentFile().exists())
+1:                 spillFile.getParentFile().mkdirs();
+1:             spillFile.createNewFile();
+1: 
+1:             this.spillBuffer = new RandomAccessFile(spillFile, "rw");
+1:         }
+1:     }
+1: 
+1: 
+1:     private int readOne() throws IOException
+1:     {
+1:         if (!marked)
+1:         {
+1:             if (memAvailable > 0)
+1:             {
+1:                 int pos = memBufferSize - memAvailable;
+1:                 memAvailable--;
+1:                 return getIfNotClosed(memBuffer)[pos] & 0xff;
+1:             }
+1: 
+1:             if (diskTailAvailable > 0 || diskHeadAvailable > 0)
+1:             {
+1:                 int read = getIfNotClosed(spillBuffer).read();
+1:                 if (diskTailAvailable > 0)
+1:                     diskTailAvailable--;
+1:                 else if (diskHeadAvailable > 0)
+1:                     diskHeadAvailable++;
+1:                 if (diskTailAvailable == 0)
+1:                     spillBuffer.seek(0);
+1:                 return read;
+1:             }
+1:         }
+1: 
+1:         return getIfNotClosed(in).read();
+1:     }
+1: 
+1:     private boolean isExhausted(int readBytes)
+1:     {
+1:         return exhausted || readBytes > memAvailable + (long)(diskTailAvailable == -1? maxDiskBufferSize : diskTailAvailable + diskHeadAvailable);
+1:     }
+1: 
+1:     private int readMulti(byte[] b, int off, int len) throws IOException
+1:     {
+1:         int readBytes = 0;
+1:         if (!marked)
+1:         {
+1:             if (memAvailable > 0)
+1:             {
+1:                 readBytes += memAvailable < len ? memAvailable : len;
+1:                 int pos = memBufferSize - memAvailable;
+1:                 System.arraycopy(memBuffer, pos, b, off, readBytes);
+1:                 memAvailable -= readBytes;
+1:                 off += readBytes;
+1:                 len -= readBytes;
+1:             }
+1:             if (len > 0 && diskTailAvailable > 0)
+1:             {
+1:                 int readFromTail = diskTailAvailable < len? diskTailAvailable : len;
+0:                 getIfNotClosed(spillBuffer).read(b, off, readFromTail);
+1:                 readBytes += readFromTail;
+1:                 diskTailAvailable -= readFromTail;
+1:                 off += readFromTail;
+1:                 len -= readFromTail;
+1:                 if (diskTailAvailable == 0)
+1:                     spillBuffer.seek(0);
+1:             }
+1:             if (len > 0 && diskHeadAvailable > 0)
+1:             {
+1:                 int readFromHead = diskHeadAvailable < len? diskHeadAvailable : len;
+0:                 getIfNotClosed(spillBuffer).read(b, off, readFromHead);
+1:                 readBytes += readFromHead;
+1:                 diskHeadAvailable -= readFromHead;
+1:                 off += readFromHead;
+1:                 len -= readFromHead;
+1:             }
+1:         }
+1: 
+1:         if (len > 0)
+1:             readBytes += getIfNotClosed(in).read(b, off, len);
+1: 
+1:         return readBytes;
+1:     }
+1: 
+1:     private void writeMulti(byte[] b, int off, int len) throws IOException
+1:     {
+1:         if (memAvailable > 0)
+1:         {
+1:             if (memBuffer == null)
+1:                 memBuffer = new byte[initialMemBufferSize];
+1:             int pos = maxMemBufferSize - memAvailable;
+1:             int memWritten = memAvailable < len? memAvailable : len;
+1:             if (pos + memWritten >= getIfNotClosed(memBuffer).length)
+1:                 growMemBuffer(pos, memWritten);
+1:             System.arraycopy(b, off, memBuffer, pos, memWritten);
+1:             off += memWritten;
+1:             len -= memWritten;
+1:             memAvailable -= memWritten;
+1:         }
+1: 
+1:         if (len > 0)
+1:         {
+1:             if (diskTailAvailable == -1)
+1:             {
+1:                 maybeCreateDiskBuffer();
+1:                 diskHeadAvailable = (int)spillBuffer.getFilePointer();
+1:                 diskTailAvailable = maxDiskBufferSize - diskHeadAvailable;
+1:             }
+1: 
+1:             if (len > 0 && diskTailAvailable > 0)
+1:             {
+1:                 int diskTailWritten = diskTailAvailable < len? diskTailAvailable : len;
+1:                 getIfNotClosed(spillBuffer).write(b, off, diskTailWritten);
+1:                 off += diskTailWritten;
+1:                 len -= diskTailWritten;
+1:                 diskTailAvailable -= diskTailWritten;
+1:                 if (diskTailAvailable == 0)
+1:                     spillBuffer.seek(0);
+1:             }
+1: 
+1:             if (len > 0 && diskTailAvailable > 0)
+1:             {
+1:                 int diskHeadWritten = diskHeadAvailable < len? diskHeadAvailable : len;
+1:                 getIfNotClosed(spillBuffer).write(b, off, diskHeadWritten);
+1:             }
+1:         }
+1:     }
+1: 
+1:     private void writeOne(int value) throws IOException
+1:     {
+1:         if (memAvailable > 0)
+1:         {
+1:             if (memBuffer == null)
+1:                 memBuffer = new byte[initialMemBufferSize];
+1:             int pos = maxMemBufferSize - memAvailable;
+1:             if (pos == getIfNotClosed(memBuffer).length)
+1:                 growMemBuffer(pos, 1);
+1:             getIfNotClosed(memBuffer)[pos] = (byte)value;
+1:             memAvailable--;
+1:             return;
+1:         }
+1: 
+1:         if (diskTailAvailable == -1)
+1:         {
+1:             maybeCreateDiskBuffer();
+1:             diskHeadAvailable = (int)spillBuffer.getFilePointer();
+1:             diskTailAvailable = maxDiskBufferSize - diskHeadAvailable;
+1:         }
+1: 
+1:         if (diskTailAvailable > 0 || diskHeadAvailable > 0)
+1:         {
+1:             getIfNotClosed(spillBuffer).write(value);
+1:             if (diskTailAvailable > 0)
+1:                 diskTailAvailable--;
+1:             else if (diskHeadAvailable > 0)
+1:                 diskHeadAvailable--;
+1:             if (diskTailAvailable == 0)
+1:                 spillBuffer.seek(0);
+1:             return;
+1:         }
+1:     }
+1: 
+1:     public int read(byte[] b) throws IOException
+1:     {
+1:         return read(b, 0, b.length);
+1:     }
+1: 
+1:     private void growMemBuffer(int pos, int writeSize)
+1:     {
+1:         int newSize = Math.min(2 * (pos + writeSize), maxMemBufferSize);
+1:         byte newBuffer[] = new byte[newSize];
+0:         System.arraycopy(memBuffer, 0, newBuffer, 0, (int)pos);
+1:         memBuffer = newBuffer;
+1:     }
+1: 
+1:     public long skip(long n) throws IOException
+1:     {
+1:         long skipped = 0;
+1: 
+1:         if (marked)
+1:         {
+1:             //if marked, we need to cache skipped bytes
+1:             while (n-- > 0 && read() != -1)
+1:             {
+1:                 skipped++;
+1:             }
+1:             return skipped;
+1:         }
+1: 
+1:         if (memAvailable > 0)
+1:         {
+1:             skipped += memAvailable < n ? memAvailable : n;
+1:             memAvailable -= skipped;
+1:             n -= skipped;
+1:         }
+1:         if (n > 0 && diskTailAvailable > 0)
+1:         {
+1:             int skipFromTail = diskTailAvailable < n? diskTailAvailable : (int)n;
+1:             getIfNotClosed(spillBuffer).skipBytes(skipFromTail);
+1:             diskTailAvailable -= skipFromTail;
+1:             skipped += skipFromTail;
+1:             n -= skipFromTail;
+1:             if (diskTailAvailable == 0)
+1:                 spillBuffer.seek(0);
+1:         }
+1:         if (n > 0 && diskHeadAvailable > 0)
+1:         {
+1:             int skipFromHead = diskHeadAvailable < n? diskHeadAvailable : (int)n;
+1:             getIfNotClosed(spillBuffer).skipBytes(skipFromHead);
+1:             diskHeadAvailable -= skipFromHead;
+1:             skipped += skipFromHead;
+1:             n -= skipFromHead;
+1:         }
+1: 
+1:         if (n > 0)
+1:             skipped += getIfNotClosed(in).skip(n);
+1: 
+1:         return skipped;
+1:     }
+1: 
+0:     private <T> T getIfNotClosed(T in) throws IOException {
+1:         if (closed.get())
+1:             throw new IOException("Stream closed");
+1:         return in;
+1:     }
+1: 
+1:     public void close() throws IOException
+1:     {
+1:         close(true);
+1:     }
+1: 
+1:     public void close(boolean closeUnderlying) throws IOException
+1:     {
+1:         if (closed.compareAndSet(false, true))
+1:         {
+1:             Throwable fail = null;
+1:             if (closeUnderlying)
+1:             {
+1:                 try
+1:                 {
+1:                     super.close();
+1:                 }
+1:                 catch (IOException e)
+1:                 {
+1:                     fail = merge(fail, e);
+1:                 }
+1:             }
+1:             try
+1:             {
+1:                 if (spillBuffer != null)
+1:                 {
+1:                     this.spillBuffer.close();
+1:                     this.spillBuffer = null;
+1:                 }
+1:             } catch (IOException e)
+1:             {
+1:                 fail = merge(fail, e);
+1:             }
+0:             try {
+1:                 if (spillFile.exists())
+1:                 {
+1:                     spillFile.delete();
+1:                 }
+1:             }
+1:             catch (Throwable e)
+1:             {
+1:                 fail = merge(fail, e);
+1:             }
+1:             maybeFail(fail, IOException.class);
+1:         }
+1:     }
+1: 
+1:     /* DataInputPlus methods */
+1: 
+1:     public void readFully(byte[] b) throws IOException
+1:     {
+1:         dataReader.readFully(b);
+1:     }
+1: 
+1:     public void readFully(byte[] b, int off, int len) throws IOException
+1:     {
+1:         dataReader.readFully(b, off, len);
+1:     }
+1: 
+1:     public int skipBytes(int n) throws IOException
+1:     {
+1:         return dataReader.skipBytes(n);
+1:     }
+1: 
+1:     public boolean readBoolean() throws IOException
+1:     {
+1:         return dataReader.readBoolean();
+1:     }
+1: 
+1:     public byte readByte() throws IOException
+1:     {
+1:         return dataReader.readByte();
+1:     }
+1: 
+1:     public int readUnsignedByte() throws IOException
+1:     {
+1:         return dataReader.readUnsignedByte();
+1:     }
+1: 
+1:     public short readShort() throws IOException
+1:     {
+1:         return dataReader.readShort();
+1:     }
+1: 
+1:     public int readUnsignedShort() throws IOException
+1:     {
+1:         return dataReader.readUnsignedShort();
+1:     }
+1: 
+1:     public char readChar() throws IOException
+1:     {
+1:         return dataReader.readChar();
+1:     }
+1: 
+1:     public int readInt() throws IOException
+1:     {
+1:         return dataReader.readInt();
+1:     }
+1: 
+1:     public long readLong() throws IOException
+1:     {
+1:         return dataReader.readLong();
+1:     }
+1: 
+1:     public float readFloat() throws IOException
+1:     {
+1:         return dataReader.readFloat();
+1:     }
+1: 
+1:     public double readDouble() throws IOException
+1:     {
+1:         return dataReader.readDouble();
+1:     }
+1: 
+1:     public String readLine() throws IOException
+1:     {
+1:         return dataReader.readLine();
+1:     }
+1: 
+1:     public String readUTF() throws IOException
+1:     {
+1:         return dataReader.readUTF();
+1:     }
+1: }
+============================================================================

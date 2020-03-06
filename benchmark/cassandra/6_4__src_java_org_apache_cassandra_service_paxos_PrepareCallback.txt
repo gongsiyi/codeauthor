@@ -1,0 +1,314 @@
+1:8b0e186: package org.apache.cassandra.service.paxos;
+1:60bf7a5: /*
+1:60bf7a5:  * 
+1:60bf7a5:  * Licensed to the Apache Software Foundation (ASF) under one
+1:60bf7a5:  * or more contributor license agreements.  See the NOTICE file
+1:60bf7a5:  * distributed with this work for additional information
+1:60bf7a5:  * regarding copyright ownership.  The ASF licenses this file
+1:60bf7a5:  * to you under the Apache License, Version 2.0 (the
+1:60bf7a5:  * "License"); you may not use this file except in compliance
+1:60bf7a5:  * with the License.  You may obtain a copy of the License at
+1:60bf7a5:  * 
+1:60bf7a5:  *   http://www.apache.org/licenses/LICENSE-2.0
+1:60bf7a5:  * 
+1:60bf7a5:  * Unless required by applicable law or agreed to in writing,
+1:60bf7a5:  * software distributed under the License is distributed on an
+1:60bf7a5:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+1:60bf7a5:  * KIND, either express or implied.  See the License for the
+1:60bf7a5:  * specific language governing permissions and limitations
+1:60bf7a5:  * under the License.
+1:60bf7a5:  * 
+1:60bf7a5:  */
+1:60bf7a5: 
+4:8b0e186: 
+1:8b0e186: import java.net.InetAddress;
+1:53f8f09: import java.util.Collections;
+1:8b0e186: import java.util.Map;
+1:bab28e4: import java.util.concurrent.ConcurrentHashMap;
+1:8b0e186: 
+1:8b0e186: import com.google.common.base.Predicate;
+1:8b0e186: import com.google.common.collect.Iterables;
+1:f5e1cbc: import org.apache.cassandra.db.ConsistencyLevel;
+1:a991b64: import org.apache.cassandra.db.DecoratedKey;
+1:8b0e186: import org.slf4j.Logger;
+1:8b0e186: import org.slf4j.LoggerFactory;
+1:8b0e186: 
+1:8b0e186: import org.apache.cassandra.config.CFMetaData;
+1:53f8f09: import org.apache.cassandra.db.SystemKeyspace;
+1:8b0e186: import org.apache.cassandra.net.MessageIn;
+1:53f8f09: import org.apache.cassandra.utils.UUIDGen;
+1:8b0e186: 
+1:8b0e186: public class PrepareCallback extends AbstractPaxosCallback<PrepareResponse>
+1:8b0e186: {
+1:8b0e186:     private static final Logger logger = LoggerFactory.getLogger(PrepareCallback.class);
+1:8b0e186: 
+1:8b0e186:     public boolean promised = true;
+1:8b0e186:     public Commit mostRecentCommit;
+1:50c9d77:     public Commit mostRecentInProgressCommit;
+1:50c9d77:     public Commit mostRecentInProgressCommitWithUpdate;
+1:8b0e186: 
+1:bab28e4:     private final Map<InetAddress, Commit> commitsByReplica = new ConcurrentHashMap<InetAddress, Commit>();
+1:8b0e186: 
+1:aa83c94:     public PrepareCallback(DecoratedKey key, CFMetaData metadata, int targets, ConsistencyLevel consistency, long queryStartNanoTime)
+1:8b0e186:     {
+1:aa83c94:         super(targets, consistency, queryStartNanoTime);
+1:8b0e186:         // need to inject the right key in the empty commit so comparing with empty commits in the reply works as expected
+1:8b0e186:         mostRecentCommit = Commit.emptyCommit(key, metadata);
+1:50c9d77:         mostRecentInProgressCommit = Commit.emptyCommit(key, metadata);
+1:50c9d77:         mostRecentInProgressCommitWithUpdate = Commit.emptyCommit(key, metadata);
+1:8b0e186:     }
+1:8b0e186: 
+1:8b0e186:     public synchronized void response(MessageIn<PrepareResponse> message)
+1:8b0e186:     {
+1:8b0e186:         PrepareResponse response = message.payload;
+1:cab3d5d:         logger.trace("Prepare response {} from {}", response, message.from);
+1:8b0e186: 
+1:50c9d77:         // In case of clock skew, another node could be proposing with ballot that are quite a bit
+1:50c9d77:         // older than our own. In that case, we record the more recent commit we've received to make
+1:50c9d77:         // sure we re-prepare on an older ballot.
+1:50c9d77:         if (response.inProgressCommit.isAfter(mostRecentInProgressCommit))
+1:50c9d77:             mostRecentInProgressCommit = response.inProgressCommit;
+1:50c9d77: 
+1:8b0e186:         if (!response.promised)
+1:8b0e186:         {
+1:8b0e186:             promised = false;
+1:8b0e186:             while (latch.getCount() > 0)
+1:8b0e186:                 latch.countDown();
+1:8b0e186:             return;
+1:8b0e186:         }
+1:017ec3e: 
+1:bab28e4:         commitsByReplica.put(message.from, response.mostRecentCommit);
+1:8b0e186:         if (response.mostRecentCommit.isAfter(mostRecentCommit))
+1:8b0e186:             mostRecentCommit = response.mostRecentCommit;
+1:8b0e186: 
+1:50c9d77:         // If some response has an update, then we should replay the update with the highest ballot. So find
+1:50c9d77:         // the the highest commit that actually have an update
+1:50c9d77:         if (response.inProgressCommit.isAfter(mostRecentInProgressCommitWithUpdate) && !response.inProgressCommit.update.isEmpty())
+1:50c9d77:             mostRecentInProgressCommitWithUpdate = response.inProgressCommit;
+1:50c9d77: 
+1:8b0e186:         latch.countDown();
+1:8b0e186:     }
+1:50c9d77: 
+1:53f8f09:     public Iterable<InetAddress> replicasMissingMostRecentCommit(CFMetaData metadata, int nowInSec)
+1:8b0e186:     {
+1:53f8f09:         // In general, we need every replicas that have answered to the prepare (a quorum) to agree on the MRC (see
+1:53f8f09:         // coment in StorageProxy.beginAndRepairPaxos(), but basically we need to make sure at least a quorum of nodes
+1:53f8f09:         // have learn a commit before commit a new one otherwise that previous commit is not guaranteed to have reach a
+1:53f8f09:         // quorum and further commit may proceed on incomplete information).
+1:53f8f09:         // However, if that commit is too hold, it may have been expired from some of the replicas paxos table (we don't
+1:53f8f09:         // keep the paxos state forever or that could grow unchecked), and we could end up in some infinite loop as
+1:53f8f09:         // explained on CASSANDRA-12043. To avoid that, we ignore a MRC that is too old, i.e. older than the TTL we set
+1:53f8f09:         // on paxos tables. For such old commit, we rely on hints and repair to ensure the commit has indeed be
+1:53f8f09:         // propagated to all nodes.
+1:53f8f09:         long paxosTtlSec = SystemKeyspace.paxosTtlSec(metadata);
+1:53f8f09:         if (UUIDGen.unixTimestampInSec(mostRecentCommit.ballot) + paxosTtlSec < nowInSec)
+1:53f8f09:             return Collections.emptySet();
+1:53f8f09: 
+1:8b0e186:         return Iterables.filter(commitsByReplica.keySet(), new Predicate<InetAddress>()
+1:8b0e186:         {
+1:8b0e186:             public boolean apply(InetAddress inetAddress)
+1:8b0e186:             {
+1:8b0e186:                 return (!commitsByReplica.get(inetAddress).ballot.equals(mostRecentCommit.ballot));
+1:8b0e186:             }
+1:8b0e186:         });
+1:8b0e186:     }
+1:8b0e186: }
+============================================================================
+author:Geoffrey Yu
+-------------------------------------------------------------------------------
+commit:aa83c94
+/////////////////////////////////////////////////////////////////////////
+1:     public PrepareCallback(DecoratedKey key, CFMetaData metadata, int targets, ConsistencyLevel consistency, long queryStartNanoTime)
+1:         super(targets, consistency, queryStartNanoTime);
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:087264f
+/////////////////////////////////////////////////////////////////////////
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:53f8f09
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.Collections;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.SystemKeyspace;
+1: import org.apache.cassandra.utils.UUIDGen;
+/////////////////////////////////////////////////////////////////////////
+1:     public Iterable<InetAddress> replicasMissingMostRecentCommit(CFMetaData metadata, int nowInSec)
+1:         // In general, we need every replicas that have answered to the prepare (a quorum) to agree on the MRC (see
+1:         // coment in StorageProxy.beginAndRepairPaxos(), but basically we need to make sure at least a quorum of nodes
+1:         // have learn a commit before commit a new one otherwise that previous commit is not guaranteed to have reach a
+1:         // quorum and further commit may proceed on incomplete information).
+1:         // However, if that commit is too hold, it may have been expired from some of the replicas paxos table (we don't
+1:         // keep the paxos state forever or that could grow unchecked), and we could end up in some infinite loop as
+1:         // explained on CASSANDRA-12043. To avoid that, we ignore a MRC that is too old, i.e. older than the TTL we set
+1:         // on paxos tables. For such old commit, we rely on hints and repair to ensure the commit has indeed be
+1:         // propagated to all nodes.
+1:         long paxosTtlSec = SystemKeyspace.paxosTtlSec(metadata);
+1:         if (UUIDGen.unixTimestampInSec(mostRecentCommit.ballot) + paxosTtlSec < nowInSec)
+1:             return Collections.emptySet();
+1: 
+commit:7005972
+commit:6555a87
+commit:017ec3e
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.Collections;
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.SystemKeyspace;
+0: import org.apache.cassandra.utils.UUIDGen;
+/////////////////////////////////////////////////////////////////////////
+0:     public Iterable<InetAddress> replicasMissingMostRecentCommit(CFMetaData metadata, long now)
+0:         // In general, we need every replicas that have answered to the prepare (a quorum) to agree on the MRC (see
+0:         // coment in StorageProxy.beginAndRepairPaxos(), but basically we need to make sure at least a quorum of nodes
+0:         // have learn a commit before commit a new one otherwise that previous commit is not guaranteed to have reach a
+0:         // quorum and further commit may proceed on incomplete information).
+0:         // However, if that commit is too hold, it may have been expired from some of the replicas paxos table (we don't
+0:         // keep the paxos state forever or that could grow unchecked), and we could end up in some infinite loop as
+0:         // explained on CASSANDRA-12043. To avoid that, we ignore a MRC that is too old, i.e. older than the TTL we set
+0:         // on paxos tables. For such old commit, we rely on hints and repair to ensure the commit has indeed be
+0:         // propagated to all nodes.
+0:         long paxosTtlMicros = SystemKeyspace.paxosTtl(metadata) * 1000 * 1000;
+0:         if (UUIDGen.microsTimestamp(mostRecentCommit.ballot) + paxosTtlMicros < now)
+0:             return Collections.emptySet();
+1: 
+commit:a991b64
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.DecoratedKey;
+/////////////////////////////////////////////////////////////////////////
+0:     public PrepareCallback(DecoratedKey key, CFMetaData metadata, int targets, ConsistencyLevel consistency)
+commit:bab28e4
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.ConcurrentHashMap;
+/////////////////////////////////////////////////////////////////////////
+1:     private final Map<InetAddress, Commit> commitsByReplica = new ConcurrentHashMap<InetAddress, Commit>();
+/////////////////////////////////////////////////////////////////////////
+1:         commitsByReplica.put(message.from, response.mostRecentCommit);
+/////////////////////////////////////////////////////////////////////////
+commit:50c9d77
+/////////////////////////////////////////////////////////////////////////
+1:     public Commit mostRecentInProgressCommit;
+1:     public Commit mostRecentInProgressCommitWithUpdate;
+/////////////////////////////////////////////////////////////////////////
+1:         mostRecentInProgressCommit = Commit.emptyCommit(key, metadata);
+1:         mostRecentInProgressCommitWithUpdate = Commit.emptyCommit(key, metadata);
+/////////////////////////////////////////////////////////////////////////
+1:         // In case of clock skew, another node could be proposing with ballot that are quite a bit
+1:         // older than our own. In that case, we record the more recent commit we've received to make
+1:         // sure we re-prepare on an older ballot.
+1:         if (response.inProgressCommit.isAfter(mostRecentInProgressCommit))
+1:             mostRecentInProgressCommit = response.inProgressCommit;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         // If some response has an update, then we should replay the update with the highest ballot. So find
+1:         // the the highest commit that actually have an update
+1:         if (response.inProgressCommit.isAfter(mostRecentInProgressCommitWithUpdate) && !response.inProgressCommit.update.isEmpty())
+1:             mostRecentInProgressCommitWithUpdate = response.inProgressCommit;
+1: 
+1: 
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:70eab63
+author:Jeremiah Jordan
+-------------------------------------------------------------------------------
+commit:cab3d5d
+/////////////////////////////////////////////////////////////////////////
+1:         logger.trace("Prepare response {} from {}", response, message.from);
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:f5e1cbc
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.ConsistencyLevel;
+/////////////////////////////////////////////////////////////////////////
+0:     public PrepareCallback(ByteBuffer key, CFMetaData metadata, int targets, ConsistencyLevel consistency)
+0:         super(targets, consistency);
+commit:60bf7a5
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * 
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  * 
+1:  *   http://www.apache.org/licenses/LICENSE-2.0
+1:  * 
+1:  * Unless required by applicable law or agreed to in writing,
+1:  * software distributed under the License is distributed on an
+1:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+1:  * KIND, either express or implied.  See the License for the
+1:  * specific language governing permissions and limitations
+1:  * under the License.
+1:  * 
+1:  */
+1: 
+commit:8b0e186
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.cassandra.service.paxos;
+1: 
+1: import java.net.InetAddress;
+0: import java.nio.ByteBuffer;
+0: import java.util.HashMap;
+1: import java.util.Map;
+1: 
+1: import com.google.common.base.Predicate;
+1: import com.google.common.collect.Iterables;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import org.apache.cassandra.config.CFMetaData;
+1: import org.apache.cassandra.net.MessageIn;
+1: 
+1: public class PrepareCallback extends AbstractPaxosCallback<PrepareResponse>
+1: {
+1:     private static final Logger logger = LoggerFactory.getLogger(PrepareCallback.class);
+1: 
+1:     public boolean promised = true;
+1:     public Commit mostRecentCommit;
+0:     public Commit inProgressCommit;
+1: 
+0:     private Map<InetAddress, Commit> commitsByReplica = new HashMap<InetAddress, Commit>();
+1: 
+0:     public PrepareCallback(ByteBuffer key, CFMetaData metadata, int targets)
+1:     {
+0:         super(targets);
+1:         // need to inject the right key in the empty commit so comparing with empty commits in the reply works as expected
+1:         mostRecentCommit = Commit.emptyCommit(key, metadata);
+0:         inProgressCommit = Commit.emptyCommit(key, metadata);
+1:     }
+1: 
+1:     public synchronized void response(MessageIn<PrepareResponse> message)
+1:     {
+1:         PrepareResponse response = message.payload;
+0:         logger.debug("Prepare response {} from {}", response, message.from);
+1: 
+1:         if (!response.promised)
+1:         {
+1:             promised = false;
+1:             while (latch.getCount() > 0)
+1:                 latch.countDown();
+1:             return;
+1:         }
+1: 
+1:         if (response.mostRecentCommit.isAfter(mostRecentCommit))
+1:             mostRecentCommit = response.mostRecentCommit;
+1: 
+0:         if (response.inProgressCommit.isAfter(inProgressCommit))
+0:             inProgressCommit = response.inProgressCommit;
+1: 
+1:         latch.countDown();
+1:     }
+1: 
+0:     public Iterable<InetAddress> replicasMissingMostRecentCommit()
+1:     {
+1:         return Iterables.filter(commitsByReplica.keySet(), new Predicate<InetAddress>()
+1:         {
+1:             public boolean apply(InetAddress inetAddress)
+1:             {
+1:                 return (!commitsByReplica.get(inetAddress).ballot.equals(mostRecentCommit.ballot));
+1:             }
+1:         });
+1:     }
+1: }
+============================================================================

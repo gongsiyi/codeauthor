@@ -1,0 +1,265 @@
+1:5420b7a: /*
+1:5420b7a:  * Licensed to the Apache Software Foundation (ASF) under one
+1:5420b7a:  * or more contributor license agreements.  See the NOTICE file
+1:5420b7a:  * distributed with this work for additional information
+1:5420b7a:  * regarding copyright ownership.  The ASF licenses this file
+1:5420b7a:  * to you under the Apache License, Version 2.0 (the
+1:5420b7a:  * "License"); you may not use this file except in compliance
+1:5420b7a:  * with the License.  You may obtain a copy of the License at
+3:5420b7a:  *
+1:5420b7a:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:5420b7a:  *
+1:5420b7a:  * Unless required by applicable law or agreed to in writing, software
+1:5420b7a:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:5420b7a:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:5420b7a:  * See the License for the specific language governing permissions and
+1:5420b7a:  * limitations under the License.
+1:5420b7a:  */
+1:5420b7a: package org.apache.cassandra.concurrent;
+1:5420b7a: 
+1:5420b7a: import java.util.List;
+1:5420b7a: import java.util.Map;
+1:5420b7a: import java.util.concurrent.ConcurrentSkipListMap;
+1:5420b7a: import java.util.concurrent.CopyOnWriteArrayList;
+1:5420b7a: import java.util.concurrent.atomic.AtomicInteger;
+1:5420b7a: import java.util.concurrent.atomic.AtomicLong;
+1:5420b7a: 
+1:5420b7a: import static org.apache.cassandra.concurrent.SEPWorker.Work;
+1:5420b7a: 
+1:5420b7a: /**
+1:5420b7a:  * A pool of worker threads that are shared between all Executors created with it. Each executor is treated as a distinct
+1:5420b7a:  * unit, with its own concurrency and task queue limits, but the threads that service the tasks on each executor are
+1:5420b7a:  * free to hop between executors at will.
+1:5420b7a:  *
+1:5420b7a:  * To keep producers from incurring unnecessary delays, once an executor is "spun up" (i.e. is processing tasks at a steady
+1:5420b7a:  * rate), adding tasks to the executor often involves only placing the task on the work queue and updating the
+1:5420b7a:  * task permits (which imposes our max queue length constraints). Only when it cannot be guaranteed the task will be serviced
+1:68d2526:  * promptly, and the maximum concurrency has not been reached, does the producer have to schedule a thread itself to perform
+1:ca43188:  * the work ('promptly' in this context means we already have a worker spinning for work, as described next).
+1:ca43188:  *
+1:ca43188:  * Otherwise the worker threads schedule themselves: when they are assigned a task, they will attempt to spawn
+1:5420b7a:  * a partner worker to service any other work outstanding on the queue (if any); once they have finished the task they
+1:5420b7a:  * will either take another (if any remaining) and repeat this, or they will attempt to assign themselves to another executor
+1:5420b7a:  * that does have tasks remaining. If both fail, it will enter a non-busy-spinning phase, where it will sleep for a short
+1:5420b7a:  * random interval (based upon the number of threads in this mode, so that the total amount of non-sleeping time remains
+1:ca43188:  * approximately fixed regardless of the number of spinning threads), and upon waking will again try to assign itself to
+1:ca43188:  * an executor with outstanding tasks to perform. As a result of always scheduling a partner before committing to performing
+1:68d2526:  * any work, with a steady state of task arrival we should generally have either one spinning worker ready to promptly respond
+1:ca43188:  * to incoming work, or all possible workers actively committed to tasks.
+1:68d2526:  *
+1:ca43188:  * In order to prevent this executor pool acting like a noisy neighbour to other processes on the system, workers also deschedule
+1:68d2526:  * themselves when it is detected that there are too many for the current rate of operation arrival. This is decided as a function
+1:ca43188:  * of the total time spent spinning by all workers in an interval; as more workers spin, workers are descheduled more rapidly.
+1:5420b7a:  */
+1:5420b7a: public class SharedExecutorPool
+1:5420b7a: {
+1:5420b7a: 
+1:8896a70:     public static final SharedExecutorPool SHARED = new SharedExecutorPool("SharedPool");
+1:8896a70: 
+1:5420b7a:     // the name assigned to workers in the pool, and the id suffix
+1:5420b7a:     final String poolName;
+1:5420b7a:     final AtomicLong workerId = new AtomicLong();
+1:5420b7a: 
+1:5420b7a:     // the collection of executors serviced by this pool; periodically ordered by traffic volume
+1:5420b7a:     final List<SEPExecutor> executors = new CopyOnWriteArrayList<>();
+1:5420b7a: 
+1:5420b7a:     // the number of workers currently in a spinning state
+1:5420b7a:     final AtomicInteger spinningCount = new AtomicInteger();
+1:5420b7a:     // see SEPWorker.maybeStop() - used to self coordinate stopping of threads
+1:5420b7a:     final AtomicLong stopCheck = new AtomicLong();
+1:5420b7a:     // the collection of threads that are (most likely) in a spinning state - new workers are scheduled from here first
+1:5420b7a:     // TODO: consider using a queue partially-ordered by scheduled wake-up time
+1:5420b7a:     // (a full-fledged correctly ordered SkipList is overkill)
+1:5420b7a:     final ConcurrentSkipListMap<Long, SEPWorker> spinning = new ConcurrentSkipListMap<>();
+1:5420b7a:     // the collection of threads that have been asked to stop/deschedule - new workers are scheduled from here last
+1:5420b7a:     final ConcurrentSkipListMap<Long, SEPWorker> descheduled = new ConcurrentSkipListMap<>();
+1:5420b7a: 
+1:5420b7a:     public SharedExecutorPool(String poolName)
+1:5420b7a:     {
+1:5420b7a:         this.poolName = poolName;
+2:5420b7a:     }
+1:5420b7a: 
+1:5420b7a:     void schedule(Work work)
+1:5420b7a:     {
+1:5420b7a:         // we try to hand-off our work to the spinning queue before the descheduled queue, even though we expect it to be empty
+1:5420b7a:         // all we're doing here is hoping to find a worker without work to do, but it doesn't matter too much what we find;
+1:5420b7a:         // we atomically set the task so even if this were a collection of all workers it would be safe, and if they are both
+1:5420b7a:         // empty we schedule a new thread
+1:5420b7a:         Map.Entry<Long, SEPWorker> e;
+1:5420b7a:         while (null != (e = spinning.pollFirstEntry()) || null != (e = descheduled.pollFirstEntry()))
+1:5420b7a:             if (e.getValue().assign(work, false))
+1:5420b7a:                 return;
+1:5420b7a: 
+1:5420b7a:         if (!work.isStop())
+1:5420b7a:             new SEPWorker(workerId.incrementAndGet(), work, this);
+1:5420b7a:     }
+1:5420b7a: 
+1:5420b7a:     void maybeStartSpinningWorker()
+1:5420b7a:     {
+1:5420b7a:         // in general the workers manage spinningCount directly; however if it is zero, we increment it atomically
+1:5420b7a:         // ourselves to avoid starting a worker unless we have to
+1:5420b7a:         int current = spinningCount.get();
+1:5420b7a:         if (current == 0 && spinningCount.compareAndSet(0, 1))
+1:5420b7a:             schedule(Work.SPINNING);
+1:ca43188:     }
+1:8896a70: 
+1:dbf6e62:     public LocalAwareExecutorService newExecutor(int maxConcurrency, int maxQueuedTasks, String jmxPath, String name)
+1:8896a70:     {
+1:8896a70:         SEPExecutor executor = new SEPExecutor(this, maxConcurrency, maxQueuedTasks, jmxPath, name);
+1:8896a70:         executors.add(executor);
+1:8896a70:         return executor;
+1:8896a70:     }
+1:5420b7a: }
+============================================================================
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:68d2526
+/////////////////////////////////////////////////////////////////////////
+1:  * promptly, and the maximum concurrency has not been reached, does the producer have to schedule a thread itself to perform
+/////////////////////////////////////////////////////////////////////////
+1:  * any work, with a steady state of task arrival we should generally have either one spinning worker ready to promptly respond
+1:  *
+1:  * themselves when it is detected that there are too many for the current rate of operation arrival. This is decided as a function
+commit:1def02f
+/////////////////////////////////////////////////////////////////////////
+author:Carl Yeksigian
+-------------------------------------------------------------------------------
+commit:dbf6e62
+/////////////////////////////////////////////////////////////////////////
+1:     public LocalAwareExecutorService newExecutor(int maxConcurrency, int maxQueuedTasks, String jmxPath, String name)
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:8896a70
+/////////////////////////////////////////////////////////////////////////
+1:     public static final SharedExecutorPool SHARED = new SharedExecutorPool("SharedPool");
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:     public TracingAwareExecutorService newExecutor(int maxConcurrency, int maxQueuedTasks, String jmxPath, String name)
+1:     {
+1:         SEPExecutor executor = new SEPExecutor(this, maxConcurrency, maxQueuedTasks, jmxPath, name);
+1:         executors.add(executor);
+1:         return executor;
+1:     }
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:1c4768a
+commit:ca43188
+/////////////////////////////////////////////////////////////////////////
+0:  * promptly, and the maximum concurrency has not been reached, does the producer have to schedule a thread itself to perform 
+1:  * the work ('promptly' in this context means we already have a worker spinning for work, as described next).
+1:  * Otherwise the worker threads schedule themselves: when they are assigned a task, they will attempt to spawn
+1:  * approximately fixed regardless of the number of spinning threads), and upon waking will again try to assign itself to
+1:  * an executor with outstanding tasks to perform. As a result of always scheduling a partner before committing to performing
+0:  * any work, with a steady state of task arrival we should generally have either one spinning worker ready to promptly respond 
+1:  * to incoming work, or all possible workers actively committed to tasks.
+1:  * 
+1:  * In order to prevent this executor pool acting like a noisy neighbour to other processes on the system, workers also deschedule
+0:  * themselves when it is detected that there are too many for the current rate of operation arrival. This is decided as a function 
+1:  * of the total time spent spinning by all workers in an interval; as more workers spin, workers are descheduled more rapidly.
+/////////////////////////////////////////////////////////////////////////
+1: }
+author:belliottsmith
+-------------------------------------------------------------------------------
+commit:5420b7a
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.concurrent;
+1: 
+1: import java.util.List;
+1: import java.util.Map;
+0: import java.util.concurrent.ConcurrentLinkedQueue;
+1: import java.util.concurrent.ConcurrentSkipListMap;
+1: import java.util.concurrent.CopyOnWriteArrayList;
+1: import java.util.concurrent.atomic.AtomicInteger;
+1: import java.util.concurrent.atomic.AtomicLong;
+1: 
+1: import static org.apache.cassandra.concurrent.SEPWorker.Work;
+1: 
+1: /**
+1:  * A pool of worker threads that are shared between all Executors created with it. Each executor is treated as a distinct
+1:  * unit, with its own concurrency and task queue limits, but the threads that service the tasks on each executor are
+1:  * free to hop between executors at will.
+1:  *
+1:  * To keep producers from incurring unnecessary delays, once an executor is "spun up" (i.e. is processing tasks at a steady
+1:  * rate), adding tasks to the executor often involves only placing the task on the work queue and updating the
+1:  * task permits (which imposes our max queue length constraints). Only when it cannot be guaranteed the task will be serviced
+0:  * promptly does the producer have to signal a thread itself to perform the work.
+1:  *
+0:  * We do this by scheduling only if
+1:  *
+0:  * The worker threads schedule themselves as far as possible: when they are assigned a task, they will attempt to spawn
+1:  * a partner worker to service any other work outstanding on the queue (if any); once they have finished the task they
+1:  * will either take another (if any remaining) and repeat this, or they will attempt to assign themselves to another executor
+1:  * that does have tasks remaining. If both fail, it will enter a non-busy-spinning phase, where it will sleep for a short
+1:  * random interval (based upon the number of threads in this mode, so that the total amount of non-sleeping time remains
+0:  * approximately fixed regardless of the number of spinning threads), and upon waking up will again try to assign themselves
+0:  * an executor with outstanding tasks to perform.
+1:  */
+1: public class SharedExecutorPool
+1: {
+1: 
+1:     // the name assigned to workers in the pool, and the id suffix
+1:     final String poolName;
+1:     final AtomicLong workerId = new AtomicLong();
+1: 
+1:     // the collection of executors serviced by this pool; periodically ordered by traffic volume
+1:     final List<SEPExecutor> executors = new CopyOnWriteArrayList<>();
+1: 
+1:     // the number of workers currently in a spinning state
+1:     final AtomicInteger spinningCount = new AtomicInteger();
+1:     // see SEPWorker.maybeStop() - used to self coordinate stopping of threads
+1:     final AtomicLong stopCheck = new AtomicLong();
+1:     // the collection of threads that are (most likely) in a spinning state - new workers are scheduled from here first
+1:     // TODO: consider using a queue partially-ordered by scheduled wake-up time
+1:     // (a full-fledged correctly ordered SkipList is overkill)
+1:     final ConcurrentSkipListMap<Long, SEPWorker> spinning = new ConcurrentSkipListMap<>();
+1:     // the collection of threads that have been asked to stop/deschedule - new workers are scheduled from here last
+1:     final ConcurrentSkipListMap<Long, SEPWorker> descheduled = new ConcurrentSkipListMap<>();
+1: 
+1:     public SharedExecutorPool(String poolName)
+1:     {
+1:         this.poolName = poolName;
+1:     }
+1: 
+1:     void schedule(Work work)
+1:     {
+1:         // we try to hand-off our work to the spinning queue before the descheduled queue, even though we expect it to be empty
+1:         // all we're doing here is hoping to find a worker without work to do, but it doesn't matter too much what we find;
+1:         // we atomically set the task so even if this were a collection of all workers it would be safe, and if they are both
+1:         // empty we schedule a new thread
+1:         Map.Entry<Long, SEPWorker> e;
+1:         while (null != (e = spinning.pollFirstEntry()) || null != (e = descheduled.pollFirstEntry()))
+1:             if (e.getValue().assign(work, false))
+1:                 return;
+1: 
+1:         if (!work.isStop())
+1:             new SEPWorker(workerId.incrementAndGet(), work, this);
+1:     }
+1: 
+1:     void maybeStartSpinningWorker()
+1:     {
+1:         // in general the workers manage spinningCount directly; however if it is zero, we increment it atomically
+1:         // ourselves to avoid starting a worker unless we have to
+1:         int current = spinningCount.get();
+1:         if (current == 0 && spinningCount.compareAndSet(0, 1))
+1:             schedule(Work.SPINNING);
+1:     }
+1: }
+============================================================================

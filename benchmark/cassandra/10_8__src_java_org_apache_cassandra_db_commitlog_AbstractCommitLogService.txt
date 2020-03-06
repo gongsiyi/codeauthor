@@ -1,0 +1,617 @@
+1:22e18f5: /*
+1:22e18f5:  * Licensed to the Apache Software Foundation (ASF) under one
+1:22e18f5:  * or more contributor license agreements.  See the NOTICE file
+1:22e18f5:  * distributed with this work for additional information
+1:22e18f5:  * regarding copyright ownership.  The ASF licenses this file
+1:22e18f5:  * to you under the Apache License, Version 2.0 (the
+1:22e18f5:  * "License"); you may not use this file except in compliance
+1:22e18f5:  * with the License.  You may obtain a copy of the License at
+1:22e18f5:  *
+1:22e18f5:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:22e18f5:  *
+1:22e18f5:  * Unless required by applicable law or agreed to in writing, software
+1:22e18f5:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:22e18f5:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:22e18f5:  * See the License for the specific language governing permissions and
+1:22e18f5:  * limitations under the License.
+1:22e18f5:  */
+1:22e18f5: package org.apache.cassandra.db.commitlog;
+1:22e18f5: 
+1:22e18f5: import java.util.concurrent.TimeUnit;
+1:22e18f5: import java.util.concurrent.atomic.AtomicLong;
+1:e8907c1: import java.util.concurrent.locks.LockSupport;
+1:22e18f5: 
+1:e8907c1: import org.slf4j.Logger;
+1:e8907c1: import org.slf4j.LoggerFactory;
+1:e8907c1: 
+1:e8907c1: import com.codahale.metrics.Timer.Context;
+1:e8907c1: 
+1:e8907c1: import org.apache.cassandra.db.commitlog.CommitLogSegment.Allocation;
+1:e8907c1: import org.apache.cassandra.utils.NoSpamLogger;
+1:e8907c1: import org.apache.cassandra.utils.concurrent.WaitQueue;
+1:22e18f5: 
+1:22e18f5: public abstract class AbstractCommitLogService
+1:22e18f5: {
+1:2732752:     private Thread thread;
+1:22e18f5:     private volatile boolean shutdown = false;
+1:22e18f5: 
+1:22e18f5:     // all Allocations written before this time will be synced
+1:22e18f5:     protected volatile long lastSyncedAt = System.currentTimeMillis();
+1:22e18f5: 
+1:22e18f5:     // counts of total written, and pending, log messages
+1:22e18f5:     private final AtomicLong written = new AtomicLong(0);
+1:22e18f5:     protected final AtomicLong pending = new AtomicLong(0);
+1:22e18f5: 
+1:22e18f5:     // signal that writers can wait on to be notified of a completed sync
+1:22e18f5:     protected final WaitQueue syncComplete = new WaitQueue();
+1:22e18f5: 
+1:44f8254:     final CommitLog commitLog;
+1:2732752:     private final String name;
+1:e8907c1:     private final long pollIntervalNanos;
+1:22e18f5: 
+1:22e18f5:     private static final Logger logger = LoggerFactory.getLogger(AbstractCommitLogService.class);
+1:22e18f5: 
+1:22e18f5:     /**
+1:22e18f5:      * CommitLogService provides a fsync service for Allocations, fulfilling either the
+1:22e18f5:      * Batch or Periodic contract.
+1:22e18f5:      *
+1:22e18f5:      * Subclasses may be notified when a sync finishes by using the syncComplete WaitQueue.
+1:22e18f5:      */
+1:22e18f5:     AbstractCommitLogService(final CommitLog commitLog, final String name, final long pollIntervalMillis)
+1:22e18f5:     {
+1:2732752:         this.commitLog = commitLog;
+1:2732752:         this.name = name;
+1:e8907c1:         this.pollIntervalNanos = TimeUnit.NANOSECONDS.convert(pollIntervalMillis, TimeUnit.MILLISECONDS);
+1:22e18f5:     }
+1:22e18f5: 
+1:44f8254:     // Separated into individual method to ensure relevant objects are constructed before this is started.
+1:44f8254:     void start()
+1:22e18f5:     {
+1:e8907c1:         if (pollIntervalNanos < 1)
+1:e8907c1:             throw new IllegalArgumentException(String.format("Commit log flush interval must be positive: %fms",
+1:e8907c1:                                                              pollIntervalNanos * 1e-6));
+1:2732752: 
+1:22e18f5:         Runnable runnable = new Runnable()
+1:22e18f5:         {
+1:22e18f5:             public void run()
+1:22e18f5:             {
+1:e978034:                 long firstLagAt = 0;
+1:e978034:                 long totalSyncDuration = 0; // total time spent syncing since firstLagAt
+1:e978034:                 long syncExceededIntervalBy = 0; // time that syncs exceeded pollInterval since firstLagAt
+1:e978034:                 int lagCount = 0;
+1:e978034:                 int syncCount = 0;
+1:22e18f5: 
+1:e8907c1:                 while (true)
+1:22e18f5:                 {
+1:e8907c1:                     // always run once after shutdown signalled
+1:e8907c1:                     boolean shutdownRequested = shutdown;
+1:e8907c1: 
+3:22e18f5:                     try
+1:22e18f5:                     {
+1:22e18f5:                         // sync and signal
+1:e8907c1:                         long syncStarted = System.nanoTime();
+1:e31e216:                         // This is a target for Byteman in CommitLogSegmentManagerTest
+1:e8907c1:                         commitLog.sync();
+1:22e18f5:                         lastSyncedAt = syncStarted;
+1:22e18f5:                         syncComplete.signalAll();
+1:22e18f5: 
+1:2732752: 
+1:22e18f5:                         // sleep any time we have left before the next one is due
+1:e8907c1:                         long now = System.nanoTime();
+1:e8907c1:                         long wakeUpAt = syncStarted + pollIntervalNanos;
+1:e8907c1:                         if (wakeUpAt < now)
+1:22e18f5:                         {
+1:e978034:                             // if we have lagged noticeably, update our lag counter
+1:e978034:                             if (firstLagAt == 0)
+1:22e18f5:                             {
+1:e978034:                                 firstLagAt = now;
+1:e978034:                                 totalSyncDuration = syncExceededIntervalBy = syncCount = lagCount = 0;
+1:22e18f5:                             }
+1:e8907c1:                             syncExceededIntervalBy += now - wakeUpAt;
+1:e978034:                             lagCount++;
+1:22e18f5:                         }
+1:e978034:                         syncCount++;
+1:e978034:                         totalSyncDuration += now - syncStarted;
+1:2732752: 
+1:cb06283:                         if (firstLagAt > 0)
+1:22e18f5:                         {
+1:cb06283:                             //Only reset the lag tracking if it actually logged this time
+1:e8907c1:                             boolean logged = NoSpamLogger.log(logger,
+1:e8907c1:                                                               NoSpamLogger.Level.WARN,
+1:e8907c1:                                                               5,
+1:e8907c1:                                                               TimeUnit.MINUTES,
+1:e8907c1:                                                               "Out of {} commit log syncs over the past {}s with average duration of {}ms, {} have exceeded the configured commit interval by an average of {}ms",
+1:e8907c1:                                                               syncCount,
+1:e8907c1:                                                               String.format("%.2f", (now - firstLagAt) * 1e-9d),
+1:e8907c1:                                                               String.format("%.2f", totalSyncDuration * 1e-6d / syncCount),
+1:e8907c1:                                                               lagCount,
+1:e8907c1:                                                               String.format("%.2f", syncExceededIntervalBy * 1e-6d / lagCount));
+1:cb06283:                            if (logged)
+1:cb06283:                                firstLagAt = 0;
+1:22e18f5:                         }
+1:e978034: 
+1:e8907c1:                         if (shutdownRequested)
+1:e8907c1:                             return;
+1:e978034: 
+1:e8907c1:                         if (wakeUpAt > now)
+1:e8907c1:                             LockSupport.parkNanos(wakeUpAt - now);
+1:22e18f5:                     }
+1:22e18f5:                     catch (Throwable t)
+1:22e18f5:                     {
+1:da3606e:                         if (!CommitLog.handleCommitError("Failed to persist commits to disk", t))
+1:da3606e:                             break;
+1:da3606e: 
+1:22e18f5:                         // sleep for full poll-interval after an error, so we don't spam the log file
+1:e8907c1:                         LockSupport.parkNanos(pollIntervalNanos);
+1:22e18f5:                     }
+1:22e18f5:                 }
+1:22e18f5:             }
+1:22e18f5:         };
+1:22e18f5: 
+1:e8907c1:         shutdown = false;
+1:22e18f5:         thread = new Thread(runnable, name);
+1:22e18f5:         thread.start();
+1:22e18f5:     }
+1:22e18f5: 
+1:22e18f5:     /**
+1:22e18f5:      * Block for @param alloc to be sync'd as necessary, and handle bookkeeping
+1:22e18f5:      */
+1:22e18f5:     public void finishWriteFor(Allocation alloc)
+1:22e18f5:     {
+1:22e18f5:         maybeWaitForSync(alloc);
+1:22e18f5:         written.incrementAndGet();
+1:22e18f5:     }
+1:22e18f5: 
+1:22e18f5:     protected abstract void maybeWaitForSync(Allocation alloc);
+1:22e18f5: 
+1:22e18f5:     /**
+1:e8907c1:      * Request an additional sync cycle without blocking.
+1:22e18f5:      */
+1:e8907c1:     public void requestExtraSync()
+1:22e18f5:     {
+1:e8907c1:         LockSupport.unpark(thread);
+1:22e18f5:     }
+1:22e18f5: 
+1:22e18f5:     public void shutdown()
+1:22e18f5:     {
+1:22e18f5:         shutdown = true;
+1:e8907c1:         requestExtraSync();
+1:22e18f5:     }
+1:22e18f5: 
+1:2732752:     /**
+1:e8907c1:      * Request sync and wait until the current state is synced.
+1:e8907c1:      *
+1:e8907c1:      * Note: If a sync is in progress at the time of this request, the call will return after both it and a cycle
+1:e8907c1:      * initiated immediately afterwards complete.
+1:2732752:      */
+1:e8907c1:     public void syncBlocking()
+1:22e18f5:     {
+1:e8907c1:         long requestTime = System.nanoTime();
+1:e8907c1:         requestExtraSync();
+1:e8907c1:         awaitSyncAt(requestTime, null);
+1:e8907c1:     }
+1:2732752: 
+1:e8907c1:     void awaitSyncAt(long syncTime, Context context)
+1:e8907c1:     {
+1:e8907c1:         do
+1:2732752:         {
+1:e8907c1:             WaitQueue.Signal signal = context != null ? syncComplete.register(context) : syncComplete.register();
+1:e8907c1:             if (lastSyncedAt < syncTime)
+1:e8907c1:                 signal.awaitUninterruptibly();
+1:e8907c1:             else
+1:e8907c1:                 signal.cancel();
+1:22e18f5:         }
+1:e8907c1:         while (lastSyncedAt < syncTime);
+1:44f8254:     }
+4:e978034: 
+1:22e18f5:     public void awaitTermination() throws InterruptedException
+1:22e18f5:     {
+1:22e18f5:         thread.join();
+1:22e18f5:     }
+1:22e18f5: 
+1:22e18f5:     public long getCompletedTasks()
+1:22e18f5:     {
+1:ac70e37:         return written.get();
+1:22e18f5:     }
+1:22e18f5: 
+1:22e18f5:     public long getPendingTasks()
+1:22e18f5:     {
+1:2215c49:         return pending.get();
+1:22e18f5:     }
+1:22e18f5: }
+============================================================================
+author:Branimir Lambov
+-------------------------------------------------------------------------------
+commit:e8907c1
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.locks.LockSupport;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import com.codahale.metrics.Timer.Context;
+1: 
+1: import org.apache.cassandra.db.commitlog.CommitLogSegment.Allocation;
+1: import org.apache.cassandra.utils.NoSpamLogger;
+1: import org.apache.cassandra.utils.concurrent.WaitQueue;
+/////////////////////////////////////////////////////////////////////////
+1:     private final long pollIntervalNanos;
+/////////////////////////////////////////////////////////////////////////
+1:         this.pollIntervalNanos = TimeUnit.NANOSECONDS.convert(pollIntervalMillis, TimeUnit.MILLISECONDS);
+1:         if (pollIntervalNanos < 1)
+1:             throw new IllegalArgumentException(String.format("Commit log flush interval must be positive: %fms",
+1:                                                              pollIntervalNanos * 1e-6));
+/////////////////////////////////////////////////////////////////////////
+1:                 while (true)
+1:                     // always run once after shutdown signalled
+1:                     boolean shutdownRequested = shutdown;
+1: 
+1:                         long syncStarted = System.nanoTime();
+1:                         commitLog.sync();
+1:                         long now = System.nanoTime();
+1:                         long wakeUpAt = syncStarted + pollIntervalNanos;
+1:                         if (wakeUpAt < now)
+/////////////////////////////////////////////////////////////////////////
+1:                             syncExceededIntervalBy += now - wakeUpAt;
+/////////////////////////////////////////////////////////////////////////
+1:                             boolean logged = NoSpamLogger.log(logger,
+1:                                                               NoSpamLogger.Level.WARN,
+1:                                                               5,
+1:                                                               TimeUnit.MINUTES,
+1:                                                               "Out of {} commit log syncs over the past {}s with average duration of {}ms, {} have exceeded the configured commit interval by an average of {}ms",
+1:                                                               syncCount,
+1:                                                               String.format("%.2f", (now - firstLagAt) * 1e-9d),
+1:                                                               String.format("%.2f", totalSyncDuration * 1e-6d / syncCount),
+1:                                                               lagCount,
+1:                                                               String.format("%.2f", syncExceededIntervalBy * 1e-6d / lagCount));
+1:                         if (shutdownRequested)
+1:                             return;
+1:                         if (wakeUpAt > now)
+1:                             LockSupport.parkNanos(wakeUpAt - now);
+/////////////////////////////////////////////////////////////////////////
+1:                         LockSupport.parkNanos(pollIntervalNanos);
+1:         shutdown = false;
+/////////////////////////////////////////////////////////////////////////
+1:      * Request an additional sync cycle without blocking.
+1:     public void requestExtraSync()
+1:         LockSupport.unpark(thread);
+1:         requestExtraSync();
+1:      * Request sync and wait until the current state is synced.
+1:      *
+1:      * Note: If a sync is in progress at the time of this request, the call will return after both it and a cycle
+1:      * initiated immediately afterwards complete.
+1:     public void syncBlocking()
+1:         long requestTime = System.nanoTime();
+1:         requestExtraSync();
+1:         awaitSyncAt(requestTime, null);
+1:     }
+1:     void awaitSyncAt(long syncTime, Context context)
+1:     {
+1:         do
+1:             WaitQueue.Signal signal = context != null ? syncComplete.register(context) : syncComplete.register();
+1:             if (lastSyncedAt < syncTime)
+1:                 signal.awaitUninterruptibly();
+1:             else
+1:                 signal.cancel();
+1:         while (lastSyncedAt < syncTime);
+commit:f8f6fd2
+/////////////////////////////////////////////////////////////////////////
+0:     public void restartUnsafe()
+author:Josh McKenzie
+-------------------------------------------------------------------------------
+commit:e31e216
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:                         // This is a target for Byteman in CommitLogSegmentManagerTest
+author:Ariel Weisberg
+-------------------------------------------------------------------------------
+commit:ee40e3b
+/////////////////////////////////////////////////////////////////////////
+0:                         //This is a target for Byteman in CommitLogSegmentManagerTest
+commit:9995521
+/////////////////////////////////////////////////////////////////////////
+0:                         //This is a target for Byteman in CommitLogSegmentManagerTest
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:7ea2ce1
+commit:6fd41ab
+commit:98a08eb
+/////////////////////////////////////////////////////////////////////////
+0:     protected final Semaphore haveWork = new Semaphore(1);
+/////////////////////////////////////////////////////////////////////////
+0:                             haveWork.drainPermits();
+commit:da3606e
+/////////////////////////////////////////////////////////////////////////
+1:                         if (!CommitLog.handleCommitError("Failed to persist commits to disk", t))
+1:                             break;
+1: 
+author:ariel
+-------------------------------------------------------------------------------
+commit:cb06283
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.utils.NoSpamLogger;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:                         if (firstLagAt > 0)
+1:                             //Only reset the lag tracking if it actually logged this time
+0:                             boolean logged = NoSpamLogger.log(
+0:                                     logger,
+0:                                     NoSpamLogger.Level.WARN,
+0:                                     5,
+0:                                     TimeUnit.MINUTES,
+0:                                     "Out of {} commit log syncs over the past {}s with average duration of {}ms, {} have exceeded the configured commit interval by an average of {}ms",
+0:                                                       syncCount, (now - firstLagAt) / 1000, String.format("%.2f", (double) totalSyncDuration / syncCount), lagCount, String.format("%.2f", (double) syncExceededIntervalBy / lagCount));
+1:                            if (logged)
+1:                                firstLagAt = 0;
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:894b7b9
+commit:ac70e37
+/////////////////////////////////////////////////////////////////////////
+1:         return written.get();
+commit:2c15d82
+commit:2215c49
+/////////////////////////////////////////////////////////////////////////
+1:         return pending.get();
+commit:4b54b8a
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.utils.concurrent.WaitQueue;
+/////////////////////////////////////////////////////////////////////////
+0:     public WaitQueue.Signal requestExtraSync()
+0:         WaitQueue.Signal signal = syncComplete.register();
+0:         haveWork.release(1);
+0:         return signal;
+commit:22e18f5
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.db.commitlog;
+1: 
+0: import org.apache.cassandra.utils.WaitQueue;
+0: import org.slf4j.*;
+1: 
+0: import java.util.concurrent.Semaphore;
+1: import java.util.concurrent.TimeUnit;
+1: import java.util.concurrent.atomic.AtomicLong;
+1: 
+0: import static org.apache.cassandra.db.commitlog.CommitLogSegment.Allocation;
+1: 
+1: public abstract class AbstractCommitLogService
+1: {
+0:     private final Thread thread;
+1:     private volatile boolean shutdown = false;
+1: 
+1:     // all Allocations written before this time will be synced
+1:     protected volatile long lastSyncedAt = System.currentTimeMillis();
+1: 
+1:     // counts of total written, and pending, log messages
+1:     private final AtomicLong written = new AtomicLong(0);
+1:     protected final AtomicLong pending = new AtomicLong(0);
+1: 
+1:     // signal that writers can wait on to be notified of a completed sync
+1:     protected final WaitQueue syncComplete = new WaitQueue();
+0:     private final Semaphore haveWork = new Semaphore(1);
+1: 
+1:     private static final Logger logger = LoggerFactory.getLogger(AbstractCommitLogService.class);
+1: 
+1:     /**
+1:      * CommitLogService provides a fsync service for Allocations, fulfilling either the
+1:      * Batch or Periodic contract.
+1:      *
+1:      * Subclasses may be notified when a sync finishes by using the syncComplete WaitQueue.
+1:      */
+1:     AbstractCommitLogService(final CommitLog commitLog, final String name, final long pollIntervalMillis)
+1:     {
+0:         if (pollIntervalMillis < 1)
+0:             throw new IllegalArgumentException(String.format("Commit log flush interval must be positive: %dms", pollIntervalMillis));
+1: 
+1:         Runnable runnable = new Runnable()
+1:         {
+1:             public void run()
+1:             {
+0:                 boolean run = true;
+0:                 while (run)
+1:                 {
+1:                     try
+1:                     {
+0:                         // always run once after shutdown signalled
+0:                         run = !shutdown;
+1: 
+1:                         // sync and signal
+0:                         long syncStarted = System.currentTimeMillis();
+0:                         commitLog.sync(shutdown);
+1:                         lastSyncedAt = syncStarted;
+1:                         syncComplete.signalAll();
+1: 
+1:                         // sleep any time we have left before the next one is due
+0:                         long sleep = syncStarted + pollIntervalMillis - System.currentTimeMillis();
+0:                         if (sleep < 0)
+1:                         {
+0:                             logger.warn(String.format("Commit log sync took longer than sync interval (by %.2fs), indicating it is a bottleneck", sleep / -1000d));
+0:                             // don't sleep, as we probably have work to do
+0:                             continue;
+1:                         }
+1:                         try
+1:                         {
+0:                             haveWork.tryAcquire(sleep, TimeUnit.MILLISECONDS);
+1:                         }
+0:                         catch (InterruptedException e)
+1:                         {
+0:                             throw new AssertionError();
+1:                         }
+1:                     }
+1:                     catch (Throwable t)
+1:                     {
+0:                         logger.error("Commit log sync failed", t);
+1:                         // sleep for full poll-interval after an error, so we don't spam the log file
+1:                         try
+1:                         {
+0:                             haveWork.tryAcquire(pollIntervalMillis, TimeUnit.MILLISECONDS);
+1:                         }
+0:                         catch (InterruptedException e)
+1:                         {
+0:                             throw new AssertionError();
+1:                         }
+1:                     }
+1:                 }
+1:             }
+1:         };
+1: 
+1:         thread = new Thread(runnable, name);
+1:         thread.start();
+1:     }
+1: 
+1:     /**
+1:      * Block for @param alloc to be sync'd as necessary, and handle bookkeeping
+1:      */
+1:     public void finishWriteFor(Allocation alloc)
+1:     {
+1:         maybeWaitForSync(alloc);
+1:         written.incrementAndGet();
+1:     }
+1: 
+1:     protected abstract void maybeWaitForSync(Allocation alloc);
+1: 
+1:     /**
+0:      * Sync immediately, but don't block for the sync to cmplete
+1:      */
+0:     public void requestExtraSync()
+1:     {
+0:         haveWork.release();
+1:     }
+1: 
+1:     public void shutdown()
+1:     {
+1:         shutdown = true;
+0:         haveWork.release(1);
+1:     }
+1: 
+1:     public void awaitTermination() throws InterruptedException
+1:     {
+1:         thread.join();
+1:     }
+1: 
+1:     public long getCompletedTasks()
+1:     {
+0:         return written.incrementAndGet();
+1:     }
+1: 
+1:     public long getPendingTasks()
+1:     {
+0:         return pending.incrementAndGet();
+1:     }
+1: }
+author:blambov
+-------------------------------------------------------------------------------
+commit:44f8254
+/////////////////////////////////////////////////////////////////////////
+1:     final CommitLog commitLog;
+/////////////////////////////////////////////////////////////////////////
+1:     // Separated into individual method to ensure relevant objects are constructed before this is started.
+1:     void start()
+/////////////////////////////////////////////////////////////////////////
+1: }
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:2732752
+/////////////////////////////////////////////////////////////////////////
+1:     private Thread thread;
+/////////////////////////////////////////////////////////////////////////
+0:     private final CommitLog commitLog;
+1:     private final String name;
+0:     private final long pollIntervalMillis;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         this.commitLog = commitLog;
+1:         this.name = name;
+0:         this.pollIntervalMillis = pollIntervalMillis;
+0:         start();
+0:     }
+1: 
+0:     // Separated into individual method for unit testing stop/start capability
+0:     private void start()
+1:     {
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+0:      * FOR TESTING ONLY
+1:      */
+0:     public void startUnsafe()
+0:     {
+0:         while (haveWork.availablePermits() < 1)
+0:             haveWork.release();
+1: 
+0:         while (haveWork.availablePermits() > 1)
+0:         {
+0:             try
+0:             {
+0:                 haveWork.acquire();
+0:             }
+0:             catch (InterruptedException e)
+0:             {
+0:                 throw new RuntimeException(e);
+0:             }
+0:         }
+0:         shutdown = false;
+0:         start();
+0:     }
+1: 
+author:Brandon Williams
+-------------------------------------------------------------------------------
+commit:5edf948
+/////////////////////////////////////////////////////////////////////////
+0:                         if (sleep < 0 || !run)
+author:belliottsmith
+-------------------------------------------------------------------------------
+commit:e978034
+/////////////////////////////////////////////////////////////////////////
+0:     // how often should we log syngs that lag behind our desired period
+0:     private static final long LAG_REPORT_INTERVAL = TimeUnit.MINUTES.toMillis(5);
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 long firstLagAt = 0;
+1:                 long totalSyncDuration = 0; // total time spent syncing since firstLagAt
+1:                 long syncExceededIntervalBy = 0; // time that syncs exceeded pollInterval since firstLagAt
+1:                 int lagCount = 0;
+1:                 int syncCount = 0;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:                         long now = System.currentTimeMillis();
+0:                         long sleep = syncStarted + pollIntervalMillis - now;
+1:                             // if we have lagged noticeably, update our lag counter
+1:                             if (firstLagAt == 0)
+0:                             {
+1:                                 firstLagAt = now;
+1:                                 totalSyncDuration = syncExceededIntervalBy = syncCount = lagCount = 0;
+0:                             }
+0:                             syncExceededIntervalBy -= sleep;
+1:                             lagCount++;
+1:                         syncCount++;
+1:                         totalSyncDuration += now - syncStarted;
+1: 
+0:                         if (firstLagAt > 0 && now - firstLagAt >= LAG_REPORT_INTERVAL)
+0:                         {
+0:                             logger.warn(String.format("Out of %d commit log syncs over the past %ds with average duration of %.2fms, %d have exceeded the configured commit interval by an average of %.2fms",
+0:                                                       syncCount, (now - firstLagAt) / 1000, (double) totalSyncDuration / syncCount, lagCount, (double) syncExceededIntervalBy / lagCount));
+0:                             firstLagAt = 0;
+0:                         }
+1: 
+0:                         // if we have lagged this round, we probably have work to do already so we don't sleep
+0:                         if (sleep < 0)
+0:                             continue;
+1: 
+============================================================================

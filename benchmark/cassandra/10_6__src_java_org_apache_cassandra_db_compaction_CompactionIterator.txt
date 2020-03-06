@@ -1,0 +1,1991 @@
+2:a991b64: /*
+1:a991b64:  * Licensed to the Apache Software Foundation (ASF) under one
+1:a991b64:  * or more contributor license agreements.  See the NOTICE file
+1:a991b64:  * distributed with this work for additional information
+1:a991b64:  * regarding copyright ownership.  The ASF licenses this file
+1:a991b64:  * to you under the Apache License, Version 2.0 (the
+1:a991b64:  * "License"); you may not use this file except in compliance
+1:a991b64:  * with the License.  You may obtain a copy of the License at
+1:a991b64:  *
+1:a991b64:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:a991b64:  *
+1:a991b64:  * Unless required by applicable law or agreed to in writing, software
+1:a991b64:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:a991b64:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:a991b64:  * See the License for the specific language governing permissions and
+1:a991b64:  * limitations under the License.
+2:a991b64:  */
+1:a991b64: package org.apache.cassandra.db.compaction;
+12:a991b64: 
+1:d40ac78: import java.util.*;
+1:7ed395d: 
+1:d40ac78: import com.google.common.collect.Ordering;
+1:a991b64: 
+1:8a97969: import org.apache.cassandra.config.CFMetaData;
+1:a991b64: import org.apache.cassandra.db.*;
+1:d40ac78: import org.apache.cassandra.db.filter.ColumnFilter;
+1:6094974: import org.apache.cassandra.db.partitions.PurgeFunction;
+1:0626be8: import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+1:0626be8: import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+1:a991b64: import org.apache.cassandra.db.rows.*;
+1:6094974: import org.apache.cassandra.db.transform.Transformation;
+1:0626be8: import org.apache.cassandra.index.transactions.CompactionTransaction;
+1:a991b64: import org.apache.cassandra.io.sstable.ISSTableScanner;
+1:a991b64: import org.apache.cassandra.metrics.CompactionMetrics;
+1:d40ac78: import org.apache.cassandra.schema.CompactionParams.TombstoneOption;
+1:a991b64: 
+1:a991b64: /**
+1:a991b64:  * Merge multiple iterators over the content of sstable into a "compacted" iterator.
+1:a991b64:  * <p>
+1:a991b64:  * On top of the actual merging the source iterators, this class:
+1:a991b64:  * <ul>
+1:2457599:  *   <li>purge gc-able tombstones if possible (see PurgeIterator below).</li>
+1:a991b64:  *   <li>update 2ndary indexes if necessary (as we don't read-before-write on index updates, index entries are
+1:a991b64:  *       not deleted on deletion of the base table data, which is ok because we'll fix index inconsistency
+1:a991b64:  *       on reads. This however mean that potentially obsolete index entries could be kept a long time for
+1:a991b64:  *       data that is not read often, so compaction "pro-actively" fix such index entries. This is mainly
+1:a991b64:  *       an optimization).</li>
+1:a991b64:  *   <li>invalidate cached partitions that are empty post-compaction. This avoids keeping partitions with
+1:a991b64:  *       only purgable tombstones in the row cache.</li>
+1:a991b64:  *   <li>keep tracks of the compaction progress.</li>
+1:a991b64:  * </ul>
+1:a991b64:  */
+1:a991b64: public class CompactionIterator extends CompactionInfo.Holder implements UnfilteredPartitionIterator
+9:a991b64: {
+1:a991b64:     private static final long UNFILTERED_TO_UPDATE_PROGRESS = 100;
+1:7ed395d: 
+1:a991b64:     private final OperationType type;
+1:a991b64:     private final CompactionController controller;
+1:a991b64:     private final List<ISSTableScanner> scanners;
+1:a991b64:     private final int nowInSec;
+1:a991b64:     private final UUID compactionId;
+1:7ed395d: 
+1:a991b64:     private final long totalBytes;
+1:a991b64:     private long bytesRead;
+1:fbbedce:     private long totalSourceCQLRows;
+1:a991b64: 
+1:a991b64:     /*
+1:a991b64:      * counters for merged rows.
+1:a991b64:      * array index represents (number of merged rows - 1), so index 0 is counter for no merge (1 row),
+1:a991b64:      * index 1 is counter for 2 rows merged, and so on.
+1:a991b64:      */
+1:a991b64:     private final long[] mergeCounters;
+1:a991b64: 
+1:2457599:     private final UnfilteredPartitionIterator compacted;
+1:a991b64:     private final CompactionMetrics metrics;
+1:a991b64: 
+1:a991b64:     public CompactionIterator(OperationType type, List<ISSTableScanner> scanners, CompactionController controller, int nowInSec, UUID compactionId)
+1:a991b64:     {
+1:a991b64:         this(type, scanners, controller, nowInSec, compactionId, null);
+8:a991b64:     }
+1:7ed395d: 
+1:a991b64:     @SuppressWarnings("resource") // We make sure to close mergedIterator in close() and CompactionIterator is itself an AutoCloseable
+1:a991b64:     public CompactionIterator(OperationType type, List<ISSTableScanner> scanners, CompactionController controller, int nowInSec, UUID compactionId, CompactionMetrics metrics)
+1:7ed395d:     {
+1:a991b64:         this.controller = controller;
+1:a991b64:         this.type = type;
+1:a991b64:         this.scanners = scanners;
+1:a991b64:         this.nowInSec = nowInSec;
+1:a991b64:         this.compactionId = compactionId;
+1:a991b64:         this.bytesRead = 0;
+1:a991b64: 
+1:a991b64:         long bytes = 0;
+1:a991b64:         for (ISSTableScanner scanner : scanners)
+1:a991b64:             bytes += scanner.getLengthInBytes();
+1:a991b64:         this.totalBytes = bytes;
+1:a991b64:         this.mergeCounters = new long[scanners.size()];
+1:a991b64:         this.metrics = metrics;
+1:a991b64: 
+1:a991b64:         if (metrics != null)
+1:a991b64:             metrics.beginCompaction(this);
+1:a991b64: 
+1:6094974:         UnfilteredPartitionIterator merged = scanners.isEmpty()
+1:6094974:                                              ? EmptyIterators.unfilteredPartition(controller.cfs.metadata, false)
+1:6094974:                                              : UnfilteredPartitionIterators.merge(scanners, nowInSec, listener());
+1:6094974:         boolean isForThrift = merged.isForThrift(); // to stop capture of iterator in Purger, which is confusing for debug
+1:d40ac78:         merged = Transformation.apply(merged, new GarbageSkipper(controller, nowInSec));
+1:d3f4ae8:         this.compacted = Transformation.apply(merged, new Purger(isForThrift, controller, nowInSec));
+1:7ed395d:     }
+1:a991b64: 
+1:a991b64:     public boolean isForThrift()
+1:a991b64:     {
+1:a991b64:         return false;
+1:a991b64:     }
+1:a991b64: 
+1:8a97969:     public CFMetaData metadata()
+1:8a97969:     {
+1:8a97969:         return controller.cfs.metadata;
+1:8a97969:     }
+1:8a97969: 
+1:a991b64:     public CompactionInfo getCompactionInfo()
+1:a991b64:     {
+1:a991b64:         return new CompactionInfo(controller.cfs.metadata,
+1:a991b64:                                   type,
+1:a991b64:                                   bytesRead,
+1:a991b64:                                   totalBytes,
+1:a991b64:                                   compactionId);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     private void updateCounterFor(int rows)
+1:a991b64:     {
+1:a991b64:         assert rows > 0 && rows - 1 < mergeCounters.length;
+1:a991b64:         mergeCounters[rows - 1] += 1;
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public long[] getMergedRowCounts()
+1:a991b64:     {
+1:a991b64:         return mergeCounters;
+1:a991b64:     }
+1:a991b64: 
+1:fbbedce:     public long getTotalSourceCQLRows()
+1:fbbedce:     {
+1:fbbedce:         return totalSourceCQLRows;
+1:fbbedce:     }
+1:fbbedce: 
+1:a991b64:     private UnfilteredPartitionIterators.MergeListener listener()
+1:a991b64:     {
+1:a991b64:         return new UnfilteredPartitionIterators.MergeListener()
+1:a991b64:         {
+1:a991b64:             public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List<UnfilteredRowIterator> versions)
+1:a991b64:             {
+1:a991b64:                 int merged = 0;
+1:a991b64:                 for (UnfilteredRowIterator iter : versions)
+1:a991b64:                 {
+1:a991b64:                     if (iter != null)
+1:a991b64:                         merged++;
+1:a991b64:                 }
+1:a991b64: 
+1:a991b64:                 assert merged > 0;
+1:a991b64: 
+1:a991b64:                 CompactionIterator.this.updateCounterFor(merged);
+1:a991b64: 
+1:2457599:                 if (type != OperationType.COMPACTION || !controller.cfs.indexManager.hasIndexes())
+1:2457599:                     return null;
+1:2457599: 
+1:0626be8:                 Columns statics = Columns.NONE;
+1:0626be8:                 Columns regulars = Columns.NONE;
+1:0626be8:                 for (UnfilteredRowIterator iter : versions)
+1:2457599:                 {
+1:0626be8:                     if (iter != null)
+1:2457599:                     {
+1:0626be8:                         statics = statics.mergeTo(iter.columns().statics);
+1:0626be8:                         regulars = regulars.mergeTo(iter.columns().regulars);
+1:2457599:                     }
+1:2457599:                 }
+1:0626be8:                 final PartitionColumns partitionColumns = new PartitionColumns(statics, regulars);
+1:2457599: 
+1:2457599:                 // If we have a 2ndary index, we must update it with deleted/shadowed cells.
+1:0626be8:                 // we can reuse a single CleanupTransaction for the duration of a partition.
+1:0626be8:                 // Currently, it doesn't do any batching of row updates, so every merge event
+1:0626be8:                 // for a single partition results in a fresh cycle of:
+1:0626be8:                 // * Get new Indexer instances
+1:0626be8:                 // * Indexer::start
+1:0626be8:                 // * Indexer::onRowMerge (for every row being merged by the compaction)
+1:0626be8:                 // * Indexer::commit
+1:0626be8:                 // A new OpOrder.Group is opened in an ARM block wrapping the commits
+1:2457599:                 // TODO: this should probably be done asynchronously and batched.
+1:0626be8:                 final CompactionTransaction indexTransaction =
+1:0626be8:                     controller.cfs.indexManager.newCompactionTransaction(partitionKey,
+1:0626be8:                                                                          partitionColumns,
+1:0626be8:                                                                          versions.size(),
+1:0626be8:                                                                          nowInSec);
+1:2457599: 
+1:a991b64:                 return new UnfilteredRowIterators.MergeListener()
+1:2457599:                 {
+1:2457599:                     public void onMergedPartitionLevelDeletion(DeletionTime mergedDeletion, DeletionTime[] versions)
+1:2457599:                     {
+1:2457599:                     }
+1:2457599: 
+1:aa57626:                     public void onMergedRows(Row merged, Row[] versions)
+1:2457599:                     {
+1:0626be8:                         indexTransaction.start();
+1:aa57626:                         indexTransaction.onRowMerge(merged, versions);
+1:0626be8:                         indexTransaction.commit();
+1:2457599:                     }
+1:a991b64: 
+1:a991b64:                     public void onMergedRangeTombstoneMarkers(RangeTombstoneMarker mergedMarker, RangeTombstoneMarker[] versions)
+1:a991b64:                     {
+1:a991b64:                     }
+1:a991b64: 
+1:a991b64:                     public void close()
+1:a991b64:                     {
+1:a991b64:                     }
+1:2457599:                 };
+1:a991b64:             }
+1:a991b64: 
+1:a991b64:             public void close()
+1:a991b64:             {
+1:a991b64:             }
+2:a991b64:         };
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     private void updateBytesRead()
+1:a991b64:     {
+1:a991b64:         long n = 0;
+1:a991b64:         for (ISSTableScanner scanner : scanners)
+1:a991b64:             n += scanner.getCurrentPosition();
+1:a991b64:         bytesRead = n;
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public boolean hasNext()
+1:a991b64:     {
+1:2457599:         return compacted.hasNext();
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public UnfilteredRowIterator next()
+1:a991b64:     {
+1:2457599:         return compacted.next();
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public void remove()
+1:a991b64:     {
+1:a991b64:         throw new UnsupportedOperationException();
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public void close()
+1:a991b64:     {
+1:a991b64:         try
+1:a991b64:         {
+1:2457599:             compacted.close();
+1:a991b64:         }
+1:a991b64:         finally
+1:a991b64:         {
+1:a991b64:             if (metrics != null)
+1:a991b64:                 metrics.finishCompaction(this);
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public String toString()
+1:a991b64:     {
+1:a991b64:         return this.getCompactionInfo().toString();
+1:a991b64:     }
+1:a991b64: 
+1:6094974:     private class Purger extends PurgeFunction
+1:a991b64:     {
+1:a991b64:         private final CompactionController controller;
+1:a991b64: 
+1:a991b64:         private DecoratedKey currentKey;
+1:a991b64:         private long maxPurgeableTimestamp;
+1:a991b64:         private boolean hasCalculatedMaxPurgeableTimestamp;
+1:a991b64: 
+1:2457599:         private long compactedUnfiltered;
+1:2457599: 
+1:d3f4ae8:         private Purger(boolean isForThrift, CompactionController controller, int nowInSec)
+1:a991b64:         {
+1:b7da003:             super(isForThrift, nowInSec, controller.gcBefore, controller.compactingRepaired() ? Integer.MAX_VALUE : Integer.MIN_VALUE, controller.cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones());
+1:a991b64:             this.controller = controller;
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         @Override
+1:2457599:         protected void onEmptyPartitionPostPurge(DecoratedKey key)
+1:a991b64:         {
+1:a991b64:             if (type == OperationType.COMPACTION)
+1:a991b64:                 controller.cfs.invalidateCachedPartition(key);
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         @Override
+1:2457599:         protected void onNewPartition(DecoratedKey key)
+1:a991b64:         {
+1:2457599:             currentKey = key;
+1:a991b64:             hasCalculatedMaxPurgeableTimestamp = false;
+1:2457599:         }
+1:a991b64: 
+1:2457599:         @Override
+1:2457599:         protected void updateProgress()
+1:2457599:         {
+1:fbbedce:             totalSourceCQLRows++;
+1:2457599:             if ((++compactedUnfiltered) % UNFILTERED_TO_UPDATE_PROGRESS == 0)
+1:2457599:                 updateBytesRead();
+1:a991b64:         }
+1:a991b64: 
+1:a991b64:         /*
+1:a991b64:          * Tombstones with a localDeletionTime before this can be purged. This is the minimum timestamp for any sstable
+1:a991b64:          * containing `currentKey` outside of the set of sstables involved in this compaction. This is computed lazily
+1:a991b64:          * on demand as we only need this if there is tombstones and this a bit expensive (see #8914).
+1:a991b64:          */
+1:a991b64:         protected long getMaxPurgeableTimestamp()
+1:a991b64:         {
+1:a991b64:             if (!hasCalculatedMaxPurgeableTimestamp)
+1:a991b64:             {
+1:a991b64:                 hasCalculatedMaxPurgeableTimestamp = true;
+1:a991b64:                 maxPurgeableTimestamp = controller.maxPurgeableTimestamp(currentKey);
+1:a991b64:             }
+1:a991b64:             return maxPurgeableTimestamp;
+1:a991b64:         }
+1:a991b64:     }
+1:d40ac78: 
+1:d40ac78:     /**
+1:d40ac78:      * Unfiltered row iterator that removes deleted data as provided by a "tombstone source" for the partition.
+1:d40ac78:      * The result produced by this iterator is such that when merged with tombSource it produces the same output
+1:d40ac78:      * as the merge of dataSource and tombSource.
+1:d40ac78:      */
+1:d40ac78:     private static class GarbageSkippingUnfilteredRowIterator extends WrappingUnfilteredRowIterator
+1:d40ac78:     {
+1:d40ac78:         final UnfilteredRowIterator tombSource;
+1:d40ac78:         final DeletionTime partitionLevelDeletion;
+1:d40ac78:         final Row staticRow;
+1:d40ac78:         final ColumnFilter cf;
+1:d40ac78:         final int nowInSec;
+1:d40ac78:         final CFMetaData metadata;
+1:d40ac78:         final boolean cellLevelGC;
+1:d40ac78: 
+1:d40ac78:         DeletionTime tombOpenDeletionTime = DeletionTime.LIVE;
+1:d40ac78:         DeletionTime dataOpenDeletionTime = DeletionTime.LIVE;
+1:d40ac78:         DeletionTime openDeletionTime = DeletionTime.LIVE;
+1:d40ac78:         DeletionTime partitionDeletionTime;
+1:d40ac78:         DeletionTime activeDeletionTime;
+1:d40ac78:         Unfiltered tombNext = null;
+1:d40ac78:         Unfiltered dataNext = null;
+1:d40ac78:         Unfiltered next = null;
+1:d40ac78: 
+1:d40ac78:         /**
+1:d40ac78:          * Construct an iterator that filters out data shadowed by the provided "tombstone source".
+1:d40ac78:          *
+1:d40ac78:          * @param dataSource The input row. The result is a filtered version of this.
+1:d40ac78:          * @param tombSource Tombstone source, i.e. iterator used to identify deleted data in the input row.
+1:d40ac78:          * @param nowInSec Current time, used in choosing the winner when cell expiration is involved.
+1:d40ac78:          * @param cellLevelGC If false, the iterator will only look at row-level deletion times and tombstones.
+1:d40ac78:          *                    If true, deleted or overwritten cells within a surviving row will also be removed.
+1:d40ac78:          */
+1:d40ac78:         protected GarbageSkippingUnfilteredRowIterator(UnfilteredRowIterator dataSource, UnfilteredRowIterator tombSource, int nowInSec, boolean cellLevelGC)
+1:d40ac78:         {
+1:d40ac78:             super(dataSource);
+1:d40ac78:             this.tombSource = tombSource;
+1:d40ac78:             this.nowInSec = nowInSec;
+1:d40ac78:             this.cellLevelGC = cellLevelGC;
+1:d40ac78:             metadata = dataSource.metadata();
+1:d40ac78:             cf = ColumnFilter.all(metadata);
+1:d40ac78: 
+1:d40ac78:             activeDeletionTime = partitionDeletionTime = tombSource.partitionLevelDeletion();
+1:d40ac78: 
+1:d40ac78:             // Only preserve partition level deletion if not shadowed. (Note: Shadowing deletion must not be copied.)
+1:d40ac78:             this.partitionLevelDeletion = dataSource.partitionLevelDeletion().supersedes(tombSource.partitionLevelDeletion()) ?
+1:d40ac78:                     dataSource.partitionLevelDeletion() :
+1:d40ac78:                     DeletionTime.LIVE;
+1:d40ac78: 
+1:d40ac78:             Row dataStaticRow = garbageFilterRow(dataSource.staticRow(), tombSource.staticRow());
+1:d40ac78:             this.staticRow = dataStaticRow != null ? dataStaticRow : Rows.EMPTY_STATIC_ROW;
+1:d40ac78: 
+1:d40ac78:             tombNext = advance(tombSource);
+1:d40ac78:             dataNext = advance(dataSource);
+1:d40ac78:         }
+1:d40ac78: 
+1:d40ac78:         private static Unfiltered advance(UnfilteredRowIterator source)
+1:d40ac78:         {
+1:d40ac78:             return source.hasNext() ? source.next() : null;
+1:d40ac78:         }
+1:d40ac78: 
+1:d40ac78:         @Override
+1:d40ac78:         public DeletionTime partitionLevelDeletion()
+1:d40ac78:         {
+1:d40ac78:             return partitionLevelDeletion;
+1:d40ac78:         }
+1:d40ac78: 
+1:d40ac78:         public void close()
+1:d40ac78:         {
+1:d40ac78:             super.close();
+1:d40ac78:             tombSource.close();
+1:d40ac78:         }
+1:d40ac78: 
+1:d40ac78:         @Override
+1:d40ac78:         public Row staticRow()
+1:d40ac78:         {
+1:d40ac78:             return staticRow;
+1:d40ac78:         }
+1:d40ac78: 
+1:d40ac78:         @Override
+1:d40ac78:         public boolean hasNext()
+1:d40ac78:         {
+1:d40ac78:             // Produce the next element. This may consume multiple elements from both inputs until we find something
+1:d40ac78:             // from dataSource that is still live. We track the currently open deletion in both sources, as well as the
+1:d40ac78:             // one we have last issued to the output. The tombOpenDeletionTime is used to filter out content; the others
+1:d40ac78:             // to decide whether or not a tombstone is superseded, and to be able to surface (the rest of) a deletion
+1:d40ac78:             // range from the input when a suppressing deletion ends.
+1:d40ac78:             while (next == null && dataNext != null)
+1:d40ac78:             {
+1:d40ac78:                 int cmp = tombNext == null ? -1 : metadata.comparator.compare(dataNext, tombNext);
+1:d40ac78:                 if (cmp < 0)
+1:d40ac78:                 {
+1:d40ac78:                     if (dataNext.isRow())
+1:d40ac78:                         next = ((Row) dataNext).filter(cf, activeDeletionTime, false, metadata);
+1:d40ac78:                     else
+1:d40ac78:                         next = processDataMarker();
+1:d40ac78:                 }
+1:d40ac78:                 else if (cmp == 0)
+1:d40ac78:                 {
+1:d40ac78:                     if (dataNext.isRow())
+1:d40ac78:                     {
+1:d40ac78:                         next = garbageFilterRow((Row) dataNext, (Row) tombNext);
+1:d40ac78:                     }
+1:d40ac78:                     else
+1:d40ac78:                     {
+1:d40ac78:                         tombOpenDeletionTime = updateOpenDeletionTime(tombOpenDeletionTime, tombNext);
+1:d40ac78:                         activeDeletionTime = Ordering.natural().max(partitionDeletionTime,
+1:d40ac78:                                                                     tombOpenDeletionTime);
+1:d40ac78:                         next = processDataMarker();
+1:d40ac78:                     }
+1:d40ac78:                 }
+1:d40ac78:                 else // (cmp > 0)
+1:d40ac78:                 {
+1:d40ac78:                     if (tombNext.isRangeTombstoneMarker())
+1:d40ac78:                     {
+1:d40ac78:                         tombOpenDeletionTime = updateOpenDeletionTime(tombOpenDeletionTime, tombNext);
+1:d40ac78:                         activeDeletionTime = Ordering.natural().max(partitionDeletionTime,
+1:d40ac78:                                                                     tombOpenDeletionTime);
+1:d40ac78:                         boolean supersededBefore = openDeletionTime.isLive();
+1:d40ac78:                         boolean supersededAfter = !dataOpenDeletionTime.supersedes(activeDeletionTime);
+1:d40ac78:                         // If a range open was not issued because it was superseded and the deletion isn't superseded any more, we need to open it now.
+1:d40ac78:                         if (supersededBefore && !supersededAfter)
+1:d40ac78:                             next = new RangeTombstoneBoundMarker(((RangeTombstoneMarker) tombNext).closeBound(false).invert(), dataOpenDeletionTime);
+1:d40ac78:                         // If the deletion begins to be superseded, we don't close the range yet. This can save us a close/open pair if it ends after the superseding range.
+1:d40ac78:                     }
+1:d40ac78:                 }
+1:d40ac78: 
+1:d40ac78:                 if (next instanceof RangeTombstoneMarker)
+1:d40ac78:                     openDeletionTime = updateOpenDeletionTime(openDeletionTime, next);
+1:d40ac78: 
+1:d40ac78:                 if (cmp <= 0)
+1:d40ac78:                     dataNext = advance(wrapped);
+1:d40ac78:                 if (cmp >= 0)
+1:d40ac78:                     tombNext = advance(tombSource);
+1:d40ac78:             }
+1:d40ac78:             return next != null;
+1:d40ac78:         }
+1:d40ac78: 
+1:d40ac78:         protected Row garbageFilterRow(Row dataRow, Row tombRow)
+1:d40ac78:         {
+1:d40ac78:             if (cellLevelGC)
+1:d40ac78:             {
+1:d40ac78:                 return Rows.removeShadowedCells(dataRow, tombRow, activeDeletionTime, nowInSec);
+1:d40ac78:             }
+1:d40ac78:             else
+1:d40ac78:             {
+1:d40ac78:                 DeletionTime deletion = Ordering.natural().max(tombRow.deletion().time(),
+1:d40ac78:                                                                activeDeletionTime);
+1:d40ac78:                 return dataRow.filter(cf, deletion, false, metadata);
+1:d40ac78:             }
+1:d40ac78:         }
+1:d40ac78: 
+1:d40ac78:         /**
+1:d40ac78:          * Decide how to act on a tombstone marker from the input iterator. We can decide what to issue depending on
+1:d40ac78:          * whether or not the ranges before and after the marker are superseded/live -- if none are, we can reuse the
+1:d40ac78:          * marker; if both are, the marker can be ignored; otherwise we issue a corresponding start/end marker.
+1:d40ac78:          */
+1:d40ac78:         private RangeTombstoneMarker processDataMarker()
+1:d40ac78:         {
+1:d40ac78:             dataOpenDeletionTime = updateOpenDeletionTime(dataOpenDeletionTime, dataNext);
+1:d40ac78:             boolean supersededBefore = openDeletionTime.isLive();
+1:d40ac78:             boolean supersededAfter = !dataOpenDeletionTime.supersedes(activeDeletionTime);
+1:d40ac78:             RangeTombstoneMarker marker = (RangeTombstoneMarker) dataNext;
+1:d40ac78:             if (!supersededBefore)
+1:d40ac78:                 if (!supersededAfter)
+1:d40ac78:                     return marker;
+1:d40ac78:                 else
+1:d40ac78:                     return new RangeTombstoneBoundMarker(marker.closeBound(false), marker.closeDeletionTime(false));
+1:d40ac78:             else
+1:d40ac78:                 if (!supersededAfter)
+1:d40ac78:                     return new RangeTombstoneBoundMarker(marker.openBound(false), marker.openDeletionTime(false));
+1:d40ac78:                 else
+1:d40ac78:                     return null;
+1:d40ac78:         }
+1:d40ac78: 
+1:d40ac78:         @Override
+1:d40ac78:         public Unfiltered next()
+1:d40ac78:         {
+1:d40ac78:             if (!hasNext())
+1:d40ac78:                 throw new IllegalStateException();
+1:d40ac78: 
+1:d40ac78:             Unfiltered v = next;
+1:d40ac78:             next = null;
+1:d40ac78:             return v;
+1:d40ac78:         }
+1:d40ac78: 
+1:d40ac78:         private DeletionTime updateOpenDeletionTime(DeletionTime openDeletionTime, Unfiltered next)
+1:d40ac78:         {
+1:d40ac78:             RangeTombstoneMarker marker = (RangeTombstoneMarker) next;
+1:d40ac78:             assert openDeletionTime.isLive() == !marker.isClose(false);
+1:d40ac78:             assert openDeletionTime.isLive() || openDeletionTime.equals(marker.closeDeletionTime(false));
+1:d40ac78:             return marker.isOpen(false) ? marker.openDeletionTime(false) : DeletionTime.LIVE;
+1:d40ac78:         }
+1:d40ac78:     }
+1:d40ac78: 
+1:d40ac78:     /**
+1:d40ac78:      * Partition transformation applying GarbageSkippingUnfilteredRowIterator, obtaining tombstone sources for each
+1:d40ac78:      * partition using the controller's shadowSources method.
+1:d40ac78:      */
+1:d40ac78:     private static class GarbageSkipper extends Transformation<UnfilteredRowIterator>
+1:d40ac78:     {
+1:d40ac78:         final int nowInSec;
+1:d40ac78:         final CompactionController controller;
+1:d40ac78:         final boolean cellLevelGC;
+1:d40ac78: 
+1:d40ac78:         private GarbageSkipper(CompactionController controller, int nowInSec)
+1:d40ac78:         {
+1:d40ac78:             this.controller = controller;
+1:d40ac78:             this.nowInSec = nowInSec;
+1:d40ac78:             cellLevelGC = controller.tombstoneOption == TombstoneOption.CELL;
+1:d40ac78:         }
+1:d40ac78: 
+1:d40ac78:         @Override
+1:d40ac78:         protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+1:d40ac78:         {
+1:d40ac78:             Iterable<UnfilteredRowIterator> sources = controller.shadowSources(partition.partitionKey(), !cellLevelGC);
+1:d40ac78:             if (sources == null)
+1:d40ac78:                 return partition;
+1:d40ac78:             List<UnfilteredRowIterator> iters = new ArrayList<>();
+1:d40ac78:             for (UnfilteredRowIterator iter : sources)
+1:d40ac78:             {
+1:d40ac78:                 if (!iter.isEmpty())
+1:d40ac78:                     iters.add(iter);
+1:d40ac78:                 else
+1:d40ac78:                     iter.close();
+1:d40ac78:             }
+1:d40ac78:             if (iters.isEmpty())
+1:d40ac78:                 return partition;
+1:d40ac78: 
+1:d40ac78:             return new GarbageSkippingUnfilteredRowIterator(partition, UnfilteredRowIterators.merge(iters, nowInSec), nowInSec, cellLevelGC);
+1:d40ac78:         }
+1:d40ac78:     }
+1:a991b64: }
+============================================================================
+author:Marcus Eriksson
+-------------------------------------------------------------------------------
+commit:5777013
+commit:6f0c12f
+/////////////////////////////////////////////////////////////////////////
+0:             super(toPurge, controller.gcBefore, controller.compactingRepaired() ? Integer.MIN_VALUE : Integer.MAX_VALUE, controller.cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones());
+author:sharvanath
+-------------------------------------------------------------------------------
+commit:b7da003
+/////////////////////////////////////////////////////////////////////////
+1:             super(isForThrift, nowInSec, controller.gcBefore, controller.compactingRepaired() ? Integer.MAX_VALUE : Integer.MIN_VALUE, controller.cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones());
+author:Branimir Lambov
+-------------------------------------------------------------------------------
+commit:d40ac78
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.*;
+1: import com.google.common.collect.Ordering;
+1: import org.apache.cassandra.db.filter.ColumnFilter;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.schema.CompactionParams.TombstoneOption;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         merged = Transformation.apply(merged, new GarbageSkipper(controller, nowInSec));
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     /**
+1:      * Unfiltered row iterator that removes deleted data as provided by a "tombstone source" for the partition.
+1:      * The result produced by this iterator is such that when merged with tombSource it produces the same output
+1:      * as the merge of dataSource and tombSource.
+1:      */
+1:     private static class GarbageSkippingUnfilteredRowIterator extends WrappingUnfilteredRowIterator
+1:     {
+1:         final UnfilteredRowIterator tombSource;
+1:         final DeletionTime partitionLevelDeletion;
+1:         final Row staticRow;
+1:         final ColumnFilter cf;
+1:         final int nowInSec;
+1:         final CFMetaData metadata;
+1:         final boolean cellLevelGC;
+1: 
+1:         DeletionTime tombOpenDeletionTime = DeletionTime.LIVE;
+1:         DeletionTime dataOpenDeletionTime = DeletionTime.LIVE;
+1:         DeletionTime openDeletionTime = DeletionTime.LIVE;
+1:         DeletionTime partitionDeletionTime;
+1:         DeletionTime activeDeletionTime;
+1:         Unfiltered tombNext = null;
+1:         Unfiltered dataNext = null;
+1:         Unfiltered next = null;
+1: 
+1:         /**
+1:          * Construct an iterator that filters out data shadowed by the provided "tombstone source".
+1:          *
+1:          * @param dataSource The input row. The result is a filtered version of this.
+1:          * @param tombSource Tombstone source, i.e. iterator used to identify deleted data in the input row.
+1:          * @param nowInSec Current time, used in choosing the winner when cell expiration is involved.
+1:          * @param cellLevelGC If false, the iterator will only look at row-level deletion times and tombstones.
+1:          *                    If true, deleted or overwritten cells within a surviving row will also be removed.
+1:          */
+1:         protected GarbageSkippingUnfilteredRowIterator(UnfilteredRowIterator dataSource, UnfilteredRowIterator tombSource, int nowInSec, boolean cellLevelGC)
+1:         {
+1:             super(dataSource);
+1:             this.tombSource = tombSource;
+1:             this.nowInSec = nowInSec;
+1:             this.cellLevelGC = cellLevelGC;
+1:             metadata = dataSource.metadata();
+1:             cf = ColumnFilter.all(metadata);
+1: 
+1:             activeDeletionTime = partitionDeletionTime = tombSource.partitionLevelDeletion();
+1: 
+1:             // Only preserve partition level deletion if not shadowed. (Note: Shadowing deletion must not be copied.)
+1:             this.partitionLevelDeletion = dataSource.partitionLevelDeletion().supersedes(tombSource.partitionLevelDeletion()) ?
+1:                     dataSource.partitionLevelDeletion() :
+1:                     DeletionTime.LIVE;
+1: 
+1:             Row dataStaticRow = garbageFilterRow(dataSource.staticRow(), tombSource.staticRow());
+1:             this.staticRow = dataStaticRow != null ? dataStaticRow : Rows.EMPTY_STATIC_ROW;
+1: 
+1:             tombNext = advance(tombSource);
+1:             dataNext = advance(dataSource);
+1:         }
+1: 
+1:         private static Unfiltered advance(UnfilteredRowIterator source)
+1:         {
+1:             return source.hasNext() ? source.next() : null;
+1:         }
+1: 
+1:         @Override
+1:         public DeletionTime partitionLevelDeletion()
+1:         {
+1:             return partitionLevelDeletion;
+1:         }
+1: 
+1:         public void close()
+1:         {
+1:             super.close();
+1:             tombSource.close();
+1:         }
+1: 
+1:         @Override
+1:         public Row staticRow()
+1:         {
+1:             return staticRow;
+1:         }
+1: 
+1:         @Override
+1:         public boolean hasNext()
+1:         {
+1:             // Produce the next element. This may consume multiple elements from both inputs until we find something
+1:             // from dataSource that is still live. We track the currently open deletion in both sources, as well as the
+1:             // one we have last issued to the output. The tombOpenDeletionTime is used to filter out content; the others
+1:             // to decide whether or not a tombstone is superseded, and to be able to surface (the rest of) a deletion
+1:             // range from the input when a suppressing deletion ends.
+1:             while (next == null && dataNext != null)
+1:             {
+1:                 int cmp = tombNext == null ? -1 : metadata.comparator.compare(dataNext, tombNext);
+1:                 if (cmp < 0)
+1:                 {
+1:                     if (dataNext.isRow())
+1:                         next = ((Row) dataNext).filter(cf, activeDeletionTime, false, metadata);
+1:                     else
+1:                         next = processDataMarker();
+1:                 }
+1:                 else if (cmp == 0)
+1:                 {
+1:                     if (dataNext.isRow())
+1:                     {
+1:                         next = garbageFilterRow((Row) dataNext, (Row) tombNext);
+1:                     }
+1:                     else
+1:                     {
+1:                         tombOpenDeletionTime = updateOpenDeletionTime(tombOpenDeletionTime, tombNext);
+1:                         activeDeletionTime = Ordering.natural().max(partitionDeletionTime,
+1:                                                                     tombOpenDeletionTime);
+1:                         next = processDataMarker();
+1:                     }
+1:                 }
+1:                 else // (cmp > 0)
+1:                 {
+1:                     if (tombNext.isRangeTombstoneMarker())
+1:                     {
+1:                         tombOpenDeletionTime = updateOpenDeletionTime(tombOpenDeletionTime, tombNext);
+1:                         activeDeletionTime = Ordering.natural().max(partitionDeletionTime,
+1:                                                                     tombOpenDeletionTime);
+1:                         boolean supersededBefore = openDeletionTime.isLive();
+1:                         boolean supersededAfter = !dataOpenDeletionTime.supersedes(activeDeletionTime);
+1:                         // If a range open was not issued because it was superseded and the deletion isn't superseded any more, we need to open it now.
+1:                         if (supersededBefore && !supersededAfter)
+1:                             next = new RangeTombstoneBoundMarker(((RangeTombstoneMarker) tombNext).closeBound(false).invert(), dataOpenDeletionTime);
+1:                         // If the deletion begins to be superseded, we don't close the range yet. This can save us a close/open pair if it ends after the superseding range.
+1:                     }
+1:                 }
+1: 
+1:                 if (next instanceof RangeTombstoneMarker)
+1:                     openDeletionTime = updateOpenDeletionTime(openDeletionTime, next);
+1: 
+1:                 if (cmp <= 0)
+1:                     dataNext = advance(wrapped);
+1:                 if (cmp >= 0)
+1:                     tombNext = advance(tombSource);
+1:             }
+1:             return next != null;
+1:         }
+1: 
+1:         protected Row garbageFilterRow(Row dataRow, Row tombRow)
+1:         {
+1:             if (cellLevelGC)
+1:             {
+1:                 return Rows.removeShadowedCells(dataRow, tombRow, activeDeletionTime, nowInSec);
+1:             }
+1:             else
+1:             {
+1:                 DeletionTime deletion = Ordering.natural().max(tombRow.deletion().time(),
+1:                                                                activeDeletionTime);
+1:                 return dataRow.filter(cf, deletion, false, metadata);
+1:             }
+1:         }
+1: 
+1:         /**
+1:          * Decide how to act on a tombstone marker from the input iterator. We can decide what to issue depending on
+1:          * whether or not the ranges before and after the marker are superseded/live -- if none are, we can reuse the
+1:          * marker; if both are, the marker can be ignored; otherwise we issue a corresponding start/end marker.
+1:          */
+1:         private RangeTombstoneMarker processDataMarker()
+1:         {
+1:             dataOpenDeletionTime = updateOpenDeletionTime(dataOpenDeletionTime, dataNext);
+1:             boolean supersededBefore = openDeletionTime.isLive();
+1:             boolean supersededAfter = !dataOpenDeletionTime.supersedes(activeDeletionTime);
+1:             RangeTombstoneMarker marker = (RangeTombstoneMarker) dataNext;
+1:             if (!supersededBefore)
+1:                 if (!supersededAfter)
+1:                     return marker;
+1:                 else
+1:                     return new RangeTombstoneBoundMarker(marker.closeBound(false), marker.closeDeletionTime(false));
+1:             else
+1:                 if (!supersededAfter)
+1:                     return new RangeTombstoneBoundMarker(marker.openBound(false), marker.openDeletionTime(false));
+1:                 else
+1:                     return null;
+1:         }
+1: 
+1:         @Override
+1:         public Unfiltered next()
+1:         {
+1:             if (!hasNext())
+1:                 throw new IllegalStateException();
+1: 
+1:             Unfiltered v = next;
+1:             next = null;
+1:             return v;
+1:         }
+1: 
+1:         private DeletionTime updateOpenDeletionTime(DeletionTime openDeletionTime, Unfiltered next)
+1:         {
+1:             RangeTombstoneMarker marker = (RangeTombstoneMarker) next;
+1:             assert openDeletionTime.isLive() == !marker.isClose(false);
+1:             assert openDeletionTime.isLive() || openDeletionTime.equals(marker.closeDeletionTime(false));
+1:             return marker.isOpen(false) ? marker.openDeletionTime(false) : DeletionTime.LIVE;
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Partition transformation applying GarbageSkippingUnfilteredRowIterator, obtaining tombstone sources for each
+1:      * partition using the controller's shadowSources method.
+1:      */
+1:     private static class GarbageSkipper extends Transformation<UnfilteredRowIterator>
+1:     {
+1:         final int nowInSec;
+1:         final CompactionController controller;
+1:         final boolean cellLevelGC;
+1: 
+1:         private GarbageSkipper(CompactionController controller, int nowInSec)
+1:         {
+1:             this.controller = controller;
+1:             this.nowInSec = nowInSec;
+1:             cellLevelGC = controller.tombstoneOption == TombstoneOption.CELL;
+1:         }
+1: 
+1:         @Override
+1:         protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+1:         {
+1:             Iterable<UnfilteredRowIterator> sources = controller.shadowSources(partition.partitionKey(), !cellLevelGC);
+1:             if (sources == null)
+1:                 return partition;
+1:             List<UnfilteredRowIterator> iters = new ArrayList<>();
+1:             for (UnfilteredRowIterator iter : sources)
+1:             {
+1:                 if (!iter.isEmpty())
+1:                     iters.add(iter);
+1:                 else
+1:                     iter.close();
+1:             }
+1:             if (iters.isEmpty())
+1:                 return partition;
+1: 
+1:             return new GarbageSkippingUnfilteredRowIterator(partition, UnfilteredRowIterators.merge(iters, nowInSec), nowInSec, cellLevelGC);
+1:         }
+1:     }
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:fbbedce
+/////////////////////////////////////////////////////////////////////////
+1:     private long totalSourceCQLRows;
+/////////////////////////////////////////////////////////////////////////
+1:     public long getTotalSourceCQLRows()
+1:     {
+1:         return totalSourceCQLRows;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             totalSourceCQLRows++;
+commit:7ed395d
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:     private boolean hasRowsInPageCache;
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:         if(current.hasRowsInPageCache())
+0:             hasRowsInPageCache = true;
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:     public boolean hasRowsInPageCache()
+1:     {
+0:         return hasRowsInPageCache;
+1:     }
+1: 
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:d3f4ae8
+/////////////////////////////////////////////////////////////////////////
+1:         this.compacted = Transformation.apply(merged, new Purger(isForThrift, controller, nowInSec));
+/////////////////////////////////////////////////////////////////////////
+1:         private Purger(boolean isForThrift, CompactionController controller, int nowInSec)
+0:             super(isForThrift, nowInSec, controller.gcBefore, controller.compactingRepaired() ? Integer.MIN_VALUE : Integer.MAX_VALUE, controller.cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones());
+commit:1d7bacc
+/////////////////////////////////////////////////////////////////////////
+0:         this.compacted = Transformation.apply(merged, new Purger(isForThrift, controller, nowInSec));
+/////////////////////////////////////////////////////////////////////////
+0:         private Purger(boolean isForThrift, CompactionController controller, int nowInSec)
+0:             super(isForThrift, nowInSec, controller.gcBefore, controller.compactingRepaired() ? Integer.MIN_VALUE : Integer.MAX_VALUE, controller.cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones());
+commit:8a97969
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.config.CFMetaData;
+/////////////////////////////////////////////////////////////////////////
+0:                        ? UnfilteredPartitionIterators.empty(controller.cfs.metadata)
+/////////////////////////////////////////////////////////////////////////
+1:     public CFMetaData metadata()
+1:     {
+1:         return controller.cfs.metadata;
+1:     }
+1: 
+commit:2457599
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:  *   <li>purge gc-able tombstones if possible (see PurgeIterator below).</li>
+/////////////////////////////////////////////////////////////////////////
+1:     private final UnfilteredPartitionIterator compacted;
+/////////////////////////////////////////////////////////////////////////
+0:         this.compacted = scanners.isEmpty()
+0:                        ? UnfilteredPartitionIterators.EMPTY
+0:                        : new PurgeIterator(UnfilteredPartitionIterators.merge(scanners, nowInSec, listener()), controller);
+/////////////////////////////////////////////////////////////////////////
+1:                 if (type != OperationType.COMPACTION || !controller.cfs.indexManager.hasIndexes())
+1:                     return null;
+1: 
+1:                 // If we have a 2ndary index, we must update it with deleted/shadowed cells.
+1:                 // TODO: this should probably be done asynchronously and batched.
+0:                 final SecondaryIndexManager.Updater indexer = controller.cfs.indexManager.gcUpdaterFor(partitionKey, nowInSec);
+0:                 final RowDiffListener diffListener = new RowDiffListener()
+1:                 {
+0:                     public void onPrimaryKeyLivenessInfo(int i, Clustering clustering, LivenessInfo merged, LivenessInfo original)
+1:                     {
+1:                     }
+1: 
+0:                     public void onDeletion(int i, Clustering clustering, DeletionTime merged, DeletionTime original)
+1:                     {
+1:                     }
+1: 
+0:                     public void onComplexDeletion(int i, Clustering clustering, ColumnDefinition column, DeletionTime merged, DeletionTime original)
+1:                     {
+1:                     }
+1: 
+0:                     public void onCell(int i, Clustering clustering, Cell merged, Cell original)
+1:                     {
+0:                         if (original != null && (merged == null || !merged.isLive(nowInSec)))
+0:                             indexer.remove(clustering, original);
+1:                     }
+1:                 };
+1:                     public void onMergedPartitionLevelDeletion(DeletionTime mergedDeletion, DeletionTime[] versions)
+0:                     public void onMergedRows(Row merged, Columns columns, Row[] versions)
+0:                         Rows.diff(merged, columns, versions, diffListener);
+/////////////////////////////////////////////////////////////////////////
+1:         return compacted.hasNext();
+1:         return compacted.next();
+/////////////////////////////////////////////////////////////////////////
+1:             compacted.close();
+/////////////////////////////////////////////////////////////////////////
+0:     private class PurgeIterator extends PurgingPartitionIterator
+/////////////////////////////////////////////////////////////////////////
+1:         private long compactedUnfiltered;
+1: 
+0:         private PurgeIterator(UnfilteredPartitionIterator toPurge, CompactionController controller)
+1:         protected void onEmptyPartitionPostPurge(DecoratedKey key)
+1:         protected void onNewPartition(DecoratedKey key)
+1:             currentKey = key;
+1:         }
+1:         @Override
+1:         protected void updateProgress()
+1:         {
+1:             if ((++compactedUnfiltered) % UNFILTERED_TO_UPDATE_PROGRESS == 0)
+1:                 updateBytesRead();
+commit:a991b64
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.db.compaction;
+1: 
+0: import java.util.UUID;
+0: import java.util.List;
+1: 
+0: import org.apache.cassandra.config.ColumnDefinition;
+1: import org.apache.cassandra.db.*;
+0: import org.apache.cassandra.db.index.SecondaryIndexManager;
+0: import org.apache.cassandra.db.partitions.*;
+1: import org.apache.cassandra.db.rows.*;
+1: import org.apache.cassandra.io.sstable.ISSTableScanner;
+0: import org.apache.cassandra.io.sstable.format.SSTableFormat;
+1: import org.apache.cassandra.metrics.CompactionMetrics;
+1: 
+1: /**
+1:  * Merge multiple iterators over the content of sstable into a "compacted" iterator.
+1:  * <p>
+1:  * On top of the actual merging the source iterators, this class:
+1:  * <ul>
+0:  *   <li>purge gc-able tombstones if possible (see PurgingPartitionIterator below).</li>
+1:  *   <li>update 2ndary indexes if necessary (as we don't read-before-write on index updates, index entries are
+1:  *       not deleted on deletion of the base table data, which is ok because we'll fix index inconsistency
+1:  *       on reads. This however mean that potentially obsolete index entries could be kept a long time for
+1:  *       data that is not read often, so compaction "pro-actively" fix such index entries. This is mainly
+1:  *       an optimization).</li>
+1:  *   <li>invalidate cached partitions that are empty post-compaction. This avoids keeping partitions with
+1:  *       only purgable tombstones in the row cache.</li>
+1:  *   <li>keep tracks of the compaction progress.</li>
+1:  * </ul>
+1:  */
+1: public class CompactionIterator extends CompactionInfo.Holder implements UnfilteredPartitionIterator
+1: {
+1:     private static final long UNFILTERED_TO_UPDATE_PROGRESS = 100;
+1: 
+1:     private final OperationType type;
+1:     private final CompactionController controller;
+1:     private final List<ISSTableScanner> scanners;
+1:     private final int nowInSec;
+1:     private final UUID compactionId;
+1: 
+1:     private final long totalBytes;
+1:     private long bytesRead;
+1: 
+1:     /*
+1:      * counters for merged rows.
+1:      * array index represents (number of merged rows - 1), so index 0 is counter for no merge (1 row),
+1:      * index 1 is counter for 2 rows merged, and so on.
+1:      */
+1:     private final long[] mergeCounters;
+1: 
+0:     private final UnfilteredPartitionIterator mergedIterator;
+1:     private final CompactionMetrics metrics;
+1: 
+0:     // The number of row/RT merged by the iterator
+0:     private int merged;
+1: 
+1:     public CompactionIterator(OperationType type, List<ISSTableScanner> scanners, CompactionController controller, int nowInSec, UUID compactionId)
+1:     {
+1:         this(type, scanners, controller, nowInSec, compactionId, null);
+1:     }
+1: 
+1:     @SuppressWarnings("resource") // We make sure to close mergedIterator in close() and CompactionIterator is itself an AutoCloseable
+1:     public CompactionIterator(OperationType type, List<ISSTableScanner> scanners, CompactionController controller, int nowInSec, UUID compactionId, CompactionMetrics metrics)
+1:     {
+1:         this.controller = controller;
+1:         this.type = type;
+1:         this.scanners = scanners;
+1:         this.nowInSec = nowInSec;
+1:         this.compactionId = compactionId;
+1:         this.bytesRead = 0;
+1: 
+1:         long bytes = 0;
+1:         for (ISSTableScanner scanner : scanners)
+1:             bytes += scanner.getLengthInBytes();
+1:         this.totalBytes = bytes;
+1:         this.mergeCounters = new long[scanners.size()];
+1:         this.metrics = metrics;
+1: 
+1:         if (metrics != null)
+1:             metrics.beginCompaction(this);
+1: 
+0:         this.mergedIterator = scanners.isEmpty()
+0:                             ? UnfilteredPartitionIterators.EMPTY
+0:                             : UnfilteredPartitionIterators.convertExpiredCellsToTombstones(new PurgingPartitionIterator(UnfilteredPartitionIterators.merge(scanners, nowInSec, listener()), controller), nowInSec);
+1:     }
+1: 
+1:     public boolean isForThrift()
+1:     {
+1:         return false;
+1:     }
+1: 
+1:     public CompactionInfo getCompactionInfo()
+1:     {
+1:         return new CompactionInfo(controller.cfs.metadata,
+1:                                   type,
+1:                                   bytesRead,
+1:                                   totalBytes,
+1:                                   compactionId);
+1:     }
+1: 
+1:     private void updateCounterFor(int rows)
+1:     {
+1:         assert rows > 0 && rows - 1 < mergeCounters.length;
+1:         mergeCounters[rows - 1] += 1;
+1:     }
+1: 
+1:     public long[] getMergedRowCounts()
+1:     {
+1:         return mergeCounters;
+1:     }
+1: 
+1:     private UnfilteredPartitionIterators.MergeListener listener()
+1:     {
+1:         return new UnfilteredPartitionIterators.MergeListener()
+1:         {
+1:             public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List<UnfilteredRowIterator> versions)
+1:             {
+1:                 int merged = 0;
+1:                 for (UnfilteredRowIterator iter : versions)
+1:                 {
+1:                     if (iter != null)
+1:                         merged++;
+1:                 }
+1: 
+1:                 assert merged > 0;
+1: 
+1:                 CompactionIterator.this.updateCounterFor(merged);
+1: 
+1:                 /*
+0:                  * The row level listener does 2 things:
+0:                  *  - It updates 2ndary indexes for deleted/shadowed cells
+0:                  *  - It updates progress regularly (every UNFILTERED_TO_UPDATE_PROGRESS)
+1:                  */
+0:                 final SecondaryIndexManager.Updater indexer = type == OperationType.COMPACTION
+0:                                                             ? controller.cfs.indexManager.gcUpdaterFor(partitionKey, nowInSec)
+0:                                                             : SecondaryIndexManager.nullUpdater;
+1: 
+1:                 return new UnfilteredRowIterators.MergeListener()
+1:                 {
+0:                     private Clustering clustering;
+1: 
+0:                     public void onMergePartitionLevelDeletion(DeletionTime mergedDeletion, DeletionTime[] versions)
+1:                     {
+1:                     }
+1: 
+0:                     public void onMergingRows(Clustering clustering, LivenessInfo mergedInfo, DeletionTime mergedDeletion, Row[] versions)
+1:                     {
+0:                         this.clustering = clustering;
+1:                     }
+1: 
+0:                     public void onMergedComplexDeletion(ColumnDefinition c, DeletionTime mergedCompositeDeletion, DeletionTime[] versions)
+1:                     {
+1:                     }
+1: 
+0:                     public void onMergedCells(Cell mergedCell, Cell[] versions)
+1:                     {
+0:                         if (indexer == SecondaryIndexManager.nullUpdater)
+0:                             return;
+1: 
+0:                         for (int i = 0; i < versions.length; i++)
+1:                         {
+0:                             Cell version = versions[i];
+0:                             if (version != null && (mergedCell == null || !mergedCell.equals(version)))
+0:                                 indexer.remove(clustering, version);
+1:                         }
+1:                     }
+1: 
+0:                     public void onRowDone()
+1:                     {
+0:                         int merged = ++CompactionIterator.this.merged;
+0:                         if (merged % UNFILTERED_TO_UPDATE_PROGRESS == 0)
+0:                             updateBytesRead();
+1:                     }
+1: 
+1:                     public void onMergedRangeTombstoneMarkers(RangeTombstoneMarker mergedMarker, RangeTombstoneMarker[] versions)
+1:                     {
+0:                         int merged = ++CompactionIterator.this.merged;
+0:                         if (merged % UNFILTERED_TO_UPDATE_PROGRESS == 0)
+0:                             updateBytesRead();
+1:                     }
+1: 
+1:                     public void close()
+1:                     {
+1:                     }
+1:                 };
+1:             }
+1: 
+1:             public void close()
+1:             {
+1:             }
+1:         };
+1:     }
+1: 
+1:     private void updateBytesRead()
+1:     {
+1:         long n = 0;
+1:         for (ISSTableScanner scanner : scanners)
+1:             n += scanner.getCurrentPosition();
+1:         bytesRead = n;
+1:     }
+1: 
+1:     public boolean hasNext()
+1:     {
+0:         return mergedIterator.hasNext();
+1:     }
+1: 
+1:     public UnfilteredRowIterator next()
+1:     {
+0:         return mergedIterator.next();
+1:     }
+1: 
+1:     public void remove()
+1:     {
+1:         throw new UnsupportedOperationException();
+1:     }
+1: 
+1:     public void close()
+1:     {
+1:         try
+1:         {
+0:             mergedIterator.close();
+1:         }
+1:         finally
+1:         {
+1:             if (metrics != null)
+1:                 metrics.finishCompaction(this);
+1:         }
+1:     }
+1: 
+1:     public String toString()
+1:     {
+1:         return this.getCompactionInfo().toString();
+1:     }
+1: 
+0:     private class PurgingPartitionIterator extends TombstonePurgingPartitionIterator
+1:     {
+1:         private final CompactionController controller;
+1: 
+1:         private DecoratedKey currentKey;
+1:         private long maxPurgeableTimestamp;
+1:         private boolean hasCalculatedMaxPurgeableTimestamp;
+1: 
+0:         private PurgingPartitionIterator(UnfilteredPartitionIterator toPurge, CompactionController controller)
+1:         {
+0:             super(toPurge, controller.gcBefore);
+1:             this.controller = controller;
+1:         }
+1: 
+1:         @Override
+0:         protected void onEmpty(DecoratedKey key)
+1:         {
+1:             if (type == OperationType.COMPACTION)
+1:                 controller.cfs.invalidateCachedPartition(key);
+1:         }
+1: 
+1:         @Override
+0:         protected boolean shouldFilter(UnfilteredRowIterator iterator)
+1:         {
+0:             currentKey = iterator.partitionKey();
+1:             hasCalculatedMaxPurgeableTimestamp = false;
+1: 
+0:             // TODO: we could be able to skip filtering if UnfilteredRowIterator was giving us some stats
+0:             // (like the smallest local deletion time).
+0:             return true;
+1:         }
+1: 
+1:         /*
+1:          * Tombstones with a localDeletionTime before this can be purged. This is the minimum timestamp for any sstable
+1:          * containing `currentKey` outside of the set of sstables involved in this compaction. This is computed lazily
+1:          * on demand as we only need this if there is tombstones and this a bit expensive (see #8914).
+1:          */
+1:         protected long getMaxPurgeableTimestamp()
+1:         {
+1:             if (!hasCalculatedMaxPurgeableTimestamp)
+1:             {
+1:                 hasCalculatedMaxPurgeableTimestamp = true;
+1:                 maxPurgeableTimestamp = controller.maxPurgeableTimestamp(currentKey);
+1:             }
+1:             return maxPurgeableTimestamp;
+1:         }
+1:     }
+1: }
+commit:b76a5b5
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:             AbstractCompactedRow compactedRow = controller.getCompactedRow(rows);
+/////////////////////////////////////////////////////////////////////////
+commit:32ac6ee
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.CompactionManager;
+/////////////////////////////////////////////////////////////////////////
+0:     // the bytes that had been compacted the last time we delayed to throttle,
+0:     // and the time in milliseconds when we last throttled
+0:     private long bytesAtLastDelay;
+0:     private long timeAtLastDelay;
+0: 
+0:     // current target bytes to compact per millisecond
+0:     private int targetBytesPerMS = -1;
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:                 throttle();
+/////////////////////////////////////////////////////////////////////////
+0:     private void throttle()
+0:     {
+0:         if (DatabaseDescriptor.getCompactionThroughputMbPerSec() < 1)
+0:             // throttling disabled
+0:             return;
+0:         int totalBytesPerMS = DatabaseDescriptor.getCompactionThroughputMbPerSec() * 1024 * 1024 / 1000;
+0: 
+0:         // bytes compacted and time passed since last delay
+0:         long bytesSinceLast = bytesRead - bytesAtLastDelay;
+0:         long msSinceLast = System.currentTimeMillis() - timeAtLastDelay;
+0: 
+0:         // determine the current target
+0:         int newTarget = totalBytesPerMS /
+0:             Math.max(1, CompactionManager.instance.getActiveCompactions());
+0:         if (newTarget != targetBytesPerMS)
+0:             logger.info(String.format("%s now compacting at %d bytes/ms.",
+0:                                       this,
+0:                                       newTarget));
+0:         targetBytesPerMS = newTarget;
+0: 
+0:         // the excess bytes that were compacted in this period
+0:         long excessBytes = bytesSinceLast - msSinceLast * targetBytesPerMS;
+0: 
+0:         // the time to delay to recap the deficit
+0:         long timeToDelay = excessBytes / Math.max(1, targetBytesPerMS);
+0:         if (timeToDelay > 0)
+0:         {
+0:             if (logger.isTraceEnabled())
+0:                 logger.trace(String.format("Compacted %d bytes in %d ms: throttling for %d ms",
+0:                                            bytesSinceLast, msSinceLast, timeToDelay));
+0:             try { Thread.sleep(timeToDelay); } catch (InterruptedException e) { throw new AssertionError(e); }
+0:         }
+0:         bytesAtLastDelay = bytesRead;
+0:         timeAtLastDelay = System.currentTimeMillis();
+0:     }
+0: 
+commit:beac419
+/////////////////////////////////////////////////////////////////////////
+0: implements Closeable, CompactionInfo.Holder
+0:     protected final String type;
+0:     public CompactionIterator(String type, Iterable<SSTableReader> sstables, CompactionController controller) throws IOException
+0:         this(type, getCollatingIterator(sstables), controller);
+0:     protected CompactionIterator(String type, Iterator iter, CompactionController controller)
+0:         this.type = type;
+/////////////////////////////////////////////////////////////////////////
+0:     public CompactionInfo getCompactionInfo()
+0:     {
+0:         return new CompactionInfo(controller.getKeyspace(),
+0:                                   controller.getColumnFamily(),
+0:                                   type,
+0:                                   bytesRead,
+0:                                   totalBytes);
+0:     }
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:     public String toString()
+0:         return this.getCompactionInfo().toString();
+commit:6f4daea
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.ColumnFamily;
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:             // If the raw is cached, we call removeDeleted on it to have/ coherent query returns. However it would look
+0:             // like some deleted columns lived longer than gc_grace + compaction. This can also free up big amount of
+0:             // memory on long running instances
+0:             controller.removeDeletedInCache(compactedRow.key);
+0: 
+0:             return compactedRow;
+commit:22fc25b
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.HashSet;
+0: import java.util.Set;
+/////////////////////////////////////////////////////////////////////////
+0:     protected final CompactionController controller;
+0:     public CompactionIterator(Iterable<SSTableReader> sstables, CompactionController controller) throws IOException
+0:         this(getCollatingIterator(sstables), controller);
+0:     protected CompactionIterator(Iterator iter, CompactionController controller)
+0:         this.controller = controller;
+/////////////////////////////////////////////////////////////////////////
+0:                 controller.invalidateCachedRow(compactedRow.key);
+/////////////////////////////////////////////////////////////////////////
+0:             return new LazilyCompactedRow(controller, rows);
+0:         return new PrecompactedRow(controller, rows);
+/////////////////////////////////////////////////////////////////////////
+0:         return controller.isMajor ? "Major" : "Minor";
+commit:9026700
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.util.FileUtils;
+/////////////////////////////////////////////////////////////////////////
+0:         FileUtils.close(getScanners());
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:6094974
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.partitions.PurgeFunction;
+1: import org.apache.cassandra.db.transform.Transformation;
+/////////////////////////////////////////////////////////////////////////
+1:         UnfilteredPartitionIterator merged = scanners.isEmpty()
+1:                                              ? EmptyIterators.unfilteredPartition(controller.cfs.metadata, false)
+1:                                              : UnfilteredPartitionIterators.merge(scanners, nowInSec, listener());
+1:         boolean isForThrift = merged.isForThrift(); // to stop capture of iterator in Purger, which is confusing for debug
+0:         this.compacted = Transformation.apply(merged, new Purger(isForThrift, controller));
+/////////////////////////////////////////////////////////////////////////
+1:     private class Purger extends PurgeFunction
+/////////////////////////////////////////////////////////////////////////
+0:         private Purger(boolean isForThrift, CompactionController controller)
+0:             super(isForThrift, controller.gcBefore, controller.compactingRepaired() ? Integer.MIN_VALUE : Integer.MAX_VALUE, controller.cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones());
+commit:aa57626
+/////////////////////////////////////////////////////////////////////////
+1:                     public void onMergedRows(Row merged, Row[] versions)
+1:                         indexTransaction.onRowMerge(merged, versions);
+author:Sam Tunnicliffe
+-------------------------------------------------------------------------------
+commit:0626be8
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.UUID;
+0: 
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+0: import org.apache.cassandra.db.partitions.PurgingPartitionIterator;
+1: import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+1: import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+1: import org.apache.cassandra.index.transactions.CompactionTransaction;
+/////////////////////////////////////////////////////////////////////////
+0:     private static final Logger logger = LoggerFactory.getLogger(CompactionIterator.class);
+/////////////////////////////////////////////////////////////////////////
+1:                 Columns statics = Columns.NONE;
+1:                 Columns regulars = Columns.NONE;
+1:                 for (UnfilteredRowIterator iter : versions)
+1:                     if (iter != null)
+1:                         statics = statics.mergeTo(iter.columns().statics);
+1:                         regulars = regulars.mergeTo(iter.columns().regulars);
+0:                 }
+1:                 final PartitionColumns partitionColumns = new PartitionColumns(statics, regulars);
+0:                 // If we have a 2ndary index, we must update it with deleted/shadowed cells.
+1:                 // we can reuse a single CleanupTransaction for the duration of a partition.
+1:                 // Currently, it doesn't do any batching of row updates, so every merge event
+1:                 // for a single partition results in a fresh cycle of:
+1:                 // * Get new Indexer instances
+1:                 // * Indexer::start
+1:                 // * Indexer::onRowMerge (for every row being merged by the compaction)
+1:                 // * Indexer::commit
+1:                 // A new OpOrder.Group is opened in an ARM block wrapping the commits
+0:                 // TODO: this should probably be done asynchronously and batched.
+1:                 final CompactionTransaction indexTransaction =
+1:                     controller.cfs.indexManager.newCompactionTransaction(partitionKey,
+1:                                                                          partitionColumns,
+1:                                                                          versions.size(),
+1:                                                                          nowInSec);
+/////////////////////////////////////////////////////////////////////////
+1:                         indexTransaction.start();
+0:                         indexTransaction.onRowMerge(columns, merged, versions);
+1:                         indexTransaction.commit();
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:53dc854
+commit:26dfdac
+/////////////////////////////////////////////////////////////////////////
+0:                 AbstractCompactedRow compactedRow = controller.getCompactedRow(new ArrayList<SSTableIdentityIterator>(rows));
+commit:08d598e
+/////////////////////////////////////////////////////////////////////////
+0: public class CompactionIterator
+/////////////////////////////////////////////////////////////////////////
+0:     public boolean hasNext()
+0:         return source.hasNext();
+0:     }
+0: 
+0:     public AbstractCompactedRow next()
+0:     {
+0:     public void remove()
+0:     {
+0:         throw new UnsupportedOperationException();
+0:     }
+0: 
+commit:b803c37
+commit:d8b1fc3
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.Comparator;
+0: import com.google.common.collect.AbstractIterator;
+0: 
+0: import org.apache.cassandra.db.columniterator.IColumnIterator;
+0: import org.apache.cassandra.service.StorageService;
+0: import org.apache.cassandra.utils.ByteBufferUtil;
+0: import org.apache.cassandra.utils.CloseableIterator;
+0: import org.apache.cassandra.utils.MergeIterator;
+0: public class CompactionIterator extends AbstractIterator<AbstractCompactedRow>
+0: implements CloseableIterator<AbstractCompactedRow>, CompactionInfo.Holder
+0:     private final MergeIterator<IColumnIterator, AbstractCompactedRow> source;
+/////////////////////////////////////////////////////////////////////////
+0:         this(type, getScanners(sstables), controller);
+0:     protected CompactionIterator(CompactionType type, List<SSTableScanner> scanners, CompactionController controller)
+0:         this.source = MergeIterator.get(scanners, ICOMP, new Reducer());
+0:         for (SSTableScanner scanner : scanners)
+0:     protected static List<SSTableScanner> getScanners(Iterable<SSTableReader> sstables) throws IOException
+0:         ArrayList<SSTableScanner> scanners = new ArrayList<SSTableScanner>();
+0:             scanners.add(sstable.getDirectScanner(FILE_BUFFER_SIZE));
+0:         return scanners;
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:     public AbstractCompactedRow computeNext()
+0:         if (!source.hasNext())
+0:             return endOfData();
+0:         return source.next();
+/////////////////////////////////////////////////////////////////////////
+0:         source.close();
+0:         return (Iterable<SSTableScanner>)(source.iterators());
+0:     
+0:     protected class Reducer extends MergeIterator.Reducer<IColumnIterator, AbstractCompactedRow>
+0:     {
+0:         protected final List<SSTableIdentityIterator> rows = new ArrayList<SSTableIdentityIterator>();
+0: 
+0:         public void reduce(IColumnIterator current)
+0:         {
+0:             rows.add((SSTableIdentityIterator)current);
+0:         }
+0: 
+0:         protected AbstractCompactedRow getReduced()
+0:         {
+0:             assert rows.size() > 0;
+0: 
+0:             try
+0:             {
+0:                 AbstractCompactedRow compactedRow = controller.getCompactedRow(rows);
+0:                 if (compactedRow.isEmpty())
+0:                 {
+0:                     controller.invalidateCachedRow(compactedRow.key);
+0:                     return null;
+0:                 }
+0: 
+0:                 // If the raw is cached, we call removeDeleted on it to have/ coherent query returns. However it would look
+0:                 // like some deleted columns lived longer than gc_grace + compaction. This can also free up big amount of
+0:                 // memory on long running instances
+0:                 controller.removeDeletedInCache(compactedRow.key);
+0: 
+0:                 return compactedRow;
+0:             }
+0:             finally
+0:             {
+0:                 rows.clear();
+0:                 if ((row++ % 1000) == 0)
+0:                 {
+0:                     bytesRead = 0;
+0:                     for (SSTableScanner scanner : getScanners())
+0:                     {
+0:                         bytesRead += scanner.getFilePointer();
+0:                     }
+0:                     throttle();
+0:                 }
+0:             }
+0:         }
+0:     }
+0: 
+0:     public final static Comparator<IColumnIterator> ICOMP = new Comparator<IColumnIterator>()
+0:     {
+0:         public int compare(IColumnIterator i1, IColumnIterator i2)
+0:         {
+0:             return i1.getKey().compareTo(i2.getKey());
+0:         }
+0:     };
+commit:3c4687c
+/////////////////////////////////////////////////////////////////////////
+0: package org.apache.cassandra.db.compaction;
+/////////////////////////////////////////////////////////////////////////
+commit:7bc35b8
+/////////////////////////////////////////////////////////////////////////
+0:             if (compactedRow.isEmpty())
+0:             {
+0:                 cfs.invalidateCachedRow(compactedRow.key);
+0:                 return null;
+0:             }
+0:             else
+0:             {
+0:                 return compactedRow;
+0:             }
+commit:fc4502a
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+commit:c280e20
+/////////////////////////////////////////////////////////////////////////
+0:             return new LazilyCompactedRow(cfs, rows, major, gcBefore, false);
+0:         return new PrecompactedRow(cfs, rows, major, gcBefore, false);
+commit:d935e68
+/////////////////////////////////////////////////////////////////////////
+0:     public long getBytesComplete()
+commit:6350c16
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.utils.ByteBufferUtil;
+/////////////////////////////////////////////////////////////////////////
+0:                                       ByteBufferUtil.bytesToHex(rows.get(0).getKey().key), rowSize));
+commit:ebdc7cd
+/////////////////////////////////////////////////////////////////////////
+0:     public static final int FILE_BUFFER_SIZE = 1024 * 1024;
+commit:3991fba
+/////////////////////////////////////////////////////////////////////////
+0:             iter.addIterator(sstable.getDirectScanner(FILE_BUFFER_SIZE));
+commit:ef25537
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.List;
+0: 
+0: import org.apache.commons.collections.iterators.CollatingIterator;
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+0: import org.apache.cassandra.utils.FBUtilities;
+0: import org.apache.cassandra.utils.ReducingIterator;
+commit:b81927a
+/////////////////////////////////////////////////////////////////////////
+0:         return major ? "Major" : "Minor";
+commit:b182e5e
+/////////////////////////////////////////////////////////////////////////
+0:     public String getTaskType()
+0:     {
+0:         return "Compaction";
+0:     }
+commit:8e68f3b
+/////////////////////////////////////////////////////////////////////////
+0:         // TODO CollatingIterator iter = FBUtilities.<SSTableIdentityIterator>getCollatingIterator();
+0:         CollatingIterator iter = FBUtilities.getCollatingIterator();
+commit:4c530a1
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.ColumnFamilyStore;
+/////////////////////////////////////////////////////////////////////////
+0: public class CompactionIterator extends ReducingIterator<SSTableIdentityIterator, AbstractCompactedRow>
+0: implements Closeable, ICompactionInfo
+commit:ca9c207
+/////////////////////////////////////////////////////////////////////////
+0:             rowSize += row.dataSize;
+commit:4dd8fa5
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     private final ColumnFamilyStore cfs;
+/////////////////////////////////////////////////////////////////////////
+0:     public CompactionIterator(ColumnFamilyStore cfs, Iterable<SSTableReader> sstables, int gcBefore, boolean major) throws IOException
+0:         this(cfs, getCollatingIterator(sstables), gcBefore, major);
+0:     protected CompactionIterator(ColumnFamilyStore cfs, Iterator iter, int gcBefore, boolean major)
+/////////////////////////////////////////////////////////////////////////
+0:         this.cfs = cfs;
+/////////////////////////////////////////////////////////////////////////
+0:             return new LazilyCompactedRow(cfs, rows, major, gcBefore);
+0:         return new PrecompactedRow(cfs, rows, major, gcBefore);
+commit:e3c2703
+/////////////////////////////////////////////////////////////////////////
+0:             logger.info(String.format("Compacting large row %s (%d bytes) incrementally",
+0:                                       FBUtilities.bytesToHex(rows.get(0).getKey().key), rowSize));
+commit:0ed7494
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.config.DatabaseDescriptor;
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:         if (rowSize > DatabaseDescriptor.getInMemoryCompactionLimit())
+0:         {
+0:             logger.info("Compacting large row (" + rowSize + " bytes) incrementally");
+0:         }
+0:         return new PrecompactedRow(rows, major, gcBefore);
+commit:35db73c
+/////////////////////////////////////////////////////////////////////////
+0:     protected final List<SSTableIdentityIterator> rows = new ArrayList<SSTableIdentityIterator>();
+/////////////////////////////////////////////////////////////////////////
+0:             AbstractCompactedRow compactedRow = getCompactedRow();
+/////////////////////////////////////////////////////////////////////////
+0:     protected AbstractCompactedRow getCompactedRow()
+0:     {
+0:         long rowSize = 0;
+0:         for (SSTableIdentityIterator row : rows)
+0:         {
+0:             rowSize += row.getDataSize();
+0:         }
+0:         if (rowSize > 512 * 1024 * 1024)
+0:             return new LazilyCompactedRow(rows, major, gcBefore);
+0:         else
+0:             return new PrecompactedRow(rows, major, gcBefore);
+0:     }
+0: 
+commit:d5968e6
+/////////////////////////////////////////////////////////////////////////
+0: public class CompactionIterator extends ReducingIterator<SSTableIdentityIterator, AbstractCompactedRow> implements Closeable
+/////////////////////////////////////////////////////////////////////////
+0:     protected AbstractCompactedRow getReduced()
+0:             PrecompactedRow compactedRow = new PrecompactedRow(rows, major, gcBefore);
+0:             return compactedRow.isEmpty() ? null : compactedRow;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+commit:ee88039
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
+/////////////////////////////////////////////////////////////////////////
+0: public class CompactionIterator extends ReducingIterator<SSTableIdentityIterator, CompactionIterator.CompactedRow> implements Closeable
+0:     private final List<SSTableIdentityIterator> rows = new ArrayList<SSTableIdentityIterator>();
+/////////////////////////////////////////////////////////////////////////
+0:         CollatingIterator iter = FBUtilities.<SSTableIdentityIterator>getCollatingIterator();
+/////////////////////////////////////////////////////////////////////////
+0:     protected boolean isEqual(SSTableIdentityIterator o1, SSTableIdentityIterator o2)
+0:     public void reduce(SSTableIdentityIterator current)
+/////////////////////////////////////////////////////////////////////////
+0:                 for (SSTableIdentityIterator row : rows)
+commit:86eaf90
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.sstable.SSTableReader;
+0: import org.apache.cassandra.io.sstable.SSTableScanner;
+commit:dc6e4fe
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.util.DataOutputBuffer;
+commit:76de711
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         for (SSTableScanner scanner : getScanners())
+0:             totalBytes += scanner.getFileLength();
+/////////////////////////////////////////////////////////////////////////
+0:                 for (SSTableScanner scanner : getScanners())
+0:                     bytesRead += scanner.getFilePointer();
+/////////////////////////////////////////////////////////////////////////
+0:         for (SSTableScanner scanner : getScanners())
+0:             scanner.close();
+0:     protected Iterable<SSTableScanner> getScanners()
+0:     {
+0:         return ((CollatingIterator)source).getIterators();
+0:     }
+0: 
+commit:b2b057f
+/////////////////////////////////////////////////////////////////////////
+0:     private final boolean major;
+0: 
+0:     private long totalBytes;
+0:     private long bytesRead;
+0:     private long row;
+0: <<<<<<< HEAD
+/////////////////////////////////////////////////////////////////////////
+0: =======
+0:         super(getCollatingIterator(sstables));
+0:         row = 0;
+0:         totalBytes = bytesRead = 0;
+0:         for (SSTableScanner iter : (List<SSTableScanner>)((CollatingIterator)source).getIterators())
+0:         {
+0:             totalBytes += iter.getFileLength();
+0:         }
+0: >>>>>>> make estimation of pendingtasks for CompactionManager sane
+/////////////////////////////////////////////////////////////////////////
+0:             if ((row++ % 1000) == 0)
+0:             {
+0:                 bytesRead = 0;
+0:                 for (SSTableScanner iter : (List<SSTableScanner>)((CollatingIterator)source).getIterators())
+0:                 {
+0:                     bytesRead += iter.getFilePointer();
+0:                 }
+0:             }
+/////////////////////////////////////////////////////////////////////////
+0:     public long getTotalBytes()
+0:     {
+0:         return totalBytes;
+0:     }
+0: 
+0:     public long getBytesRead()
+0:     {
+0:         return bytesRead;
+0:     }
+0: 
+commit:278f77e
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.Iterator;
+0: import org.apache.cassandra.utils.FBUtilities;
+/////////////////////////////////////////////////////////////////////////
+0:     protected static final int FILE_BUFFER_SIZE = 1024 * 1024;
+0:         this(getCollatingIterator(sstables), gcBefore, major);
+0:     }
+0: 
+0:     @SuppressWarnings("unchecked")
+0:     protected CompactionIterator(Iterator iter, int gcBefore, boolean major)
+0:     {
+0:         super(iter);
+0:     protected static CollatingIterator getCollatingIterator(Iterable<SSTableReader> sstables) throws IOException
+0:         CollatingIterator iter = FBUtilities.<IteratingRow>getCollatingIterator();
+commit:0cf4bcd
+/////////////////////////////////////////////////////////////////////////
+0:     private static final int FILE_BUFFER_SIZE = 1024 * 1024;
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:             iter.addIterator(sstable.getScanner(FILE_BUFFER_SIZE));
+commit:3e574a9
+/////////////////////////////////////////////////////////////////////////
+0: import java.io.IOError;
+/////////////////////////////////////////////////////////////////////////
+0:     private boolean major;
+0:     public CompactionIterator(Iterable<SSTableReader> sstables, int gcBefore, boolean major) throws IOException
+0:         this.major = major;
+/////////////////////////////////////////////////////////////////////////
+0:         try
+0:             if (rows.size() > 1 || major)
+0:                 ColumnFamily cf = null;
+0:                 for (IteratingRow row : rows)
+0:                 {
+0:                     ColumnFamily thisCF;
+0:                     try
+0:                     {
+0:                         thisCF = row.getColumnFamily();
+0:                     }
+0:                     catch (IOException e)
+0:                     {
+0:                         logger.error("Skipping row " + key + " in " + row.getPath(), e);
+0:                         continue;
+0:                     }
+0:                     if (cf == null)
+0:                     {
+0:                         cf = thisCF;
+0:                     }
+0:                     else
+0:                     {
+0:                         cf.addAll(thisCF);
+0:                     }
+0:                 }
+0:                 ColumnFamily cfPurged = major ? ColumnFamilyStore.removeDeleted(cf, gcBefore) : cf;
+0:                 if (cfPurged == null)
+0:                     return null;
+0:                 ColumnFamily.serializer().serializeWithIndexes(cfPurged, buffer);
+0:                 assert rows.size() == 1;
+0:                 try
+0:                 {
+0:                     rows.get(0).echoData(buffer);
+0:                 }
+0:                 catch (IOException e)
+0:                 {
+0:                     throw new IOError(e);
+0:                 }
+0:         finally
+0:         {
+0:             rows.clear();
+0:         }
+commit:e972ec8
+/////////////////////////////////////////////////////////////////////////
+0: /*
+0:  * 
+0:  * Licensed to the Apache Software Foundation (ASF) under one
+0:  * or more contributor license agreements.  See the NOTICE file
+0:  * distributed with this work for additional information
+0:  * regarding copyright ownership.  The ASF licenses this file
+0:  * to you under the Apache License, Version 2.0 (the
+0:  * "License"); you may not use this file except in compliance
+0:  * with the License.  You may obtain a copy of the License at
+0:  * 
+0:  *   http://www.apache.org/licenses/LICENSE-2.0
+0:  * 
+0:  * Unless required by applicable law or agreed to in writing,
+0:  * software distributed under the License is distributed on an
+0:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+0:  * KIND, either express or implied.  See the License for the
+0:  * specific language governing permissions and limitations
+0:  * under the License.
+0:  * 
+0:  */
+0: 
+commit:e1b622e
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.log4j.Logger;
+/////////////////////////////////////////////////////////////////////////
+0:     private static Logger logger = Logger.getLogger(CompactionIterator.class);
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:         assert rows.size() > 0;
+0:             ColumnFamily thisCF;
+0:             try
+0:             {
+0:                 thisCF = row.getColumnFamily();
+0:             }
+0:             catch (IOException e)
+0:             {
+0:                 logger.error("Skipping row " + key + " in " + row.getPath(), e);
+0:                 continue;
+0:             }
+0:                 cf = thisCF;
+0:                 cf.addAll(thisCF);
+/////////////////////////////////////////////////////////////////////////
+0: 
+commit:7518f7c
+/////////////////////////////////////////////////////////////////////////
+0:         assert rows.size() > 0;
+0: 
+0:         ColumnFamily cf = null;
+0:         for (IteratingRow row : rows)
+0:             if (cf == null)
+0:                 cf = row.getColumnFamily();
+0:             else
+0:             {
+0:                 cf.addAll(row.getColumnFamily());
+0:             }
+0: 
+0:         ColumnFamily cfPurged = ColumnFamilyStore.removeDeleted(cf, gcBefore);
+0:         if (cfPurged == null)
+0:             return null;
+0:         ColumnFamily.serializer().serializeWithIndexes(cfPurged, buffer);
+commit:b0e6053
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.ColumnFamilyStore;
+0:     private final int gcBefore;
+0:     public CompactionIterator(Iterable<SSTableReader> sstables, int gcBefore) throws IOException
+0:         this.gcBefore = gcBefore;
+/////////////////////////////////////////////////////////////////////////
+0:             ColumnFamily cfPurged = ColumnFamilyStore.removeDeleted(cf, gcBefore);
+0:             if (cfPurged == null)
+0:                 return null;
+0:             ColumnFamily.serializer().serializeWithIndexes(cfPurged, buffer);
+commit:67ae1ee
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.DecoratedKey;
+/////////////////////////////////////////////////////////////////////////
+0:         DecoratedKey key = rows.get(0).getKey();
+/////////////////////////////////////////////////////////////////////////
+0:         public final DecoratedKey key;
+0:         public CompactedRow(DecoratedKey key, DataOutputBuffer buffer)
+commit:b618106
+/////////////////////////////////////////////////////////////////////////
+0: package org.apache.cassandra.io;
+0: 
+0: import java.io.Closeable;
+0: import java.io.IOException;
+0: import java.util.List;
+0: import java.util.ArrayList;
+0: import java.util.Comparator;
+0: 
+0: import org.apache.commons.collections.iterators.CollatingIterator;
+0: 
+0: import org.apache.cassandra.utils.ReducingIterator;
+0: import org.apache.cassandra.db.ColumnFamily;
+0: 
+0: public class CompactionIterator extends ReducingIterator<IteratingRow, CompactionIterator.CompactedRow> implements Closeable
+0: {
+0:     private final List<IteratingRow> rows = new ArrayList<IteratingRow>();
+0: 
+0:     @SuppressWarnings("unchecked")
+0:     public CompactionIterator(Iterable<SSTableReader> sstables) throws IOException
+0:     {
+0:         super(getCollatingIterator(sstables));
+0:     }
+0: 
+0:     @SuppressWarnings("unchecked")
+0:     private static CollatingIterator getCollatingIterator(Iterable<SSTableReader> sstables) throws IOException
+0:     {
+0:         // CollatingIterator has a bug that causes NPE when you try to use default comparator. :(
+0:         CollatingIterator iter = new CollatingIterator(new Comparator()
+0:         {
+0:             public int compare(Object o1, Object o2)
+0:             {
+0:                 return ((Comparable)o1).compareTo(o2);
+0:             }
+0:         });
+0:         for (SSTableReader sstable : sstables)
+0:         {
+0:             iter.addIterator(sstable.getScanner());
+0:         }
+0:         return iter;
+0:     }
+0: 
+0:     @Override
+0:     protected boolean isEqual(IteratingRow o1, IteratingRow o2)
+0:     {
+0:         return o1.getKey().equals(o2.getKey());
+0:     }
+0: 
+0:     public void reduce(IteratingRow current)
+0:     {
+0:         rows.add(current);
+0:     }
+0: 
+0:     protected CompactedRow getReduced()
+0:     {
+0:         try
+0:         {
+0:             return getReducedRaw();
+0:         }
+0:         catch (IOException e)
+0:         {
+0:             throw new RuntimeException(e);
+0:         }
+0:     }
+0: 
+0:     protected CompactedRow getReducedRaw() throws IOException
+0:     {
+0:         DataOutputBuffer buffer = new DataOutputBuffer();
+0:         String key = rows.get(0).getKey();
+0:         if (rows.size() > 1)
+0:         {
+0:             ColumnFamily cf = null;
+0:             for (IteratingRow row : rows)
+0:             {
+0:                 if (cf == null)
+0:                 {
+0:                     cf = row.getColumnFamily();
+0:                 }
+0:                 else
+0:                 {
+0:                     cf.addAll(row.getColumnFamily());
+0:                 }
+0:             }
+0:             ColumnFamily.serializer().serializeWithIndexes(cf, buffer);
+0:         }
+0:         else
+0:         {
+0:             assert rows.size() == 1;
+0:             rows.get(0).echoData(buffer);
+0:         }
+0:         rows.clear();
+0:         return new CompactedRow(key, buffer);
+0:     }
+0: 
+0:     public void close() throws IOException
+0:     {
+0:         for (Object o : ((CollatingIterator)source).getIterators())
+0:         {
+0:             ((SSTableScanner)o).close();
+0:         }
+0:     }
+0: 
+0:     public static class CompactedRow
+0:     {
+0:         public final String key;
+0:         public final DataOutputBuffer buffer;
+0: 
+0:         public CompactedRow(String key, DataOutputBuffer buffer)
+0:         {
+0:             this.key = key;
+0:             this.buffer = buffer;
+0:         }
+0:     }
+0: }
+author:Chris Goffinet
+-------------------------------------------------------------------------------
+commit:6711275
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.service.StorageService;
+/////////////////////////////////////////////////////////////////////////
+0:         if (DatabaseDescriptor.getCompactionThroughputMbPerSec() < 1 || StorageService.instance.isBootstrapMode())
+author:Gary Dusbabek
+-------------------------------------------------------------------------------
+commit:8a6feef
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     protected final CompactionType type;
+/////////////////////////////////////////////////////////////////////////
+0:     public CompactionIterator(CompactionType type, Iterable<SSTableReader> sstables, CompactionController controller) throws IOException
+0:     protected CompactionIterator(CompactionType type, Iterator iter, CompactionController controller)
+commit:0095f0c
+/////////////////////////////////////////////////////////////////////////
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+/////////////////////////////////////////////////////////////////////////
+0:     private static Logger logger = LoggerFactory.getLogger(CompactionIterator.class);
+============================================================================

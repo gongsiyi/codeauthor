@@ -1,0 +1,460 @@
+1:0da82f3: /*
+1:0da82f3:  * Licensed to the Apache Software Foundation (ASF) under one
+1:0da82f3:  * or more contributor license agreements.  See the NOTICE file
+1:0da82f3:  * distributed with this work for additional information
+1:0da82f3:  * regarding copyright ownership.  The ASF licenses this file
+1:0da82f3:  * to you under the Apache License, Version 2.0 (the
+1:0da82f3:  * "License"); you may not use this file except in compliance
+1:0da82f3:  * with the License.  You may obtain a copy of the License at
+1:07cdfd0:  *
+1:07cf56f:  *     http://www.apache.org/licenses/LICENSE-2.0
+3:07cdfd0:  *
+1:07cf56f:  * Unless required by applicable law or agreed to in writing, software
+1:07cf56f:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:07cf56f:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:07cf56f:  * See the License for the specific language governing permissions and
+1:07cf56f:  * limitations under the License.
+1:0da82f3:  */
+1:07cf56f: package org.apache.cassandra.scheduler;
+1:07cf56f: 
+4:0da82f3: 
+1:0da82f3: import java.util.Map;
+1:0da82f3: import java.util.concurrent.Semaphore;
+1:7c08ecd: import java.util.concurrent.TimeoutException;
+1:0da82f3: 
+1:e98eb1c: import org.slf4j.Logger;
+1:e98eb1c: import org.slf4j.LoggerFactory;
+1:e98eb1c: 
+1:0da82f3: import org.apache.cassandra.config.RequestSchedulerOptions;
+1:0da82f3: import org.cliffc.high_scale_lib.NonBlockingHashMap;
+1:0da82f3: 
+1:0da82f3: /**
+1:07cdfd0:  * A very basic Round Robin implementation of the RequestScheduler. It handles
+1:07cdfd0:  * request groups identified on user/keyspace by placing them in separate
+1:93d3a22:  * queues and servicing a request from each queue in a RoundRobin fashion.
+1:93d3a22:  * It optionally adds weights for each round.
+1:0da82f3:  */
+1:0da82f3: public class RoundRobinScheduler implements IRequestScheduler
+2:0da82f3: {
+1:0da82f3:     private static final Logger logger = LoggerFactory.getLogger(RoundRobinScheduler.class);
+1:93d3a22: 
+1:3193fd5:     //Map of queue id to weighted queue
+1:3193fd5:     private final NonBlockingHashMap<String, WeightedQueue> queues;
+1:93d3a22: 
+1:0da82f3:     private final Semaphore taskCount;
+1:0da82f3: 
+1:3193fd5:     // Tracks the count of threads available in all queues
+1:0da82f3:     // Used by the the scheduler thread so we don't need to busy-wait until there is a request to process
+1:0da82f3:     private final Semaphore queueSize = new Semaphore(0, false);
+1:93d3a22: 
+1:5a6e2b0:     private final int defaultWeight;
+1:5a6e2b0:     private final Map<String, Integer> weights;
+1:0da82f3: 
+1:0da82f3:     public RoundRobinScheduler(RequestSchedulerOptions options)
+1:0da82f3:     {
+1:93d3a22:         defaultWeight = options.default_weight;
+1:93d3a22:         weights = options.weights;
+1:93d3a22: 
+1:52841cb:         // the task count is acquired for the first time _after_ releasing a thread, so we pre-decrement
+1:52841cb:         taskCount = new Semaphore(options.throttle_limit - 1);
+1:52841cb: 
+1:3193fd5:         queues = new NonBlockingHashMap<String, WeightedQueue>();
+1:0da82f3:         Runnable runnable = new Runnable()
+1:0da82f3:         {
+1:0da82f3:             public void run()
+1:0da82f3:             {
+1:0da82f3:                 while (true)
+1:0da82f3:                 {
+1:0da82f3:                     schedule();
+2:0da82f3:                 }
+1:0da82f3:             }
+1:0da82f3:         };
+1:0da82f3:         Thread scheduler = new Thread(runnable, "REQUEST-SCHEDULER");
+1:0da82f3:         scheduler.start();
+1:3193fd5:         logger.info("Started the RoundRobin Request Scheduler");
+1:0da82f3:     }
+1:0da82f3: 
+1:7c08ecd:     public void queue(Thread t, String id, long timeoutMS) throws TimeoutException
+1:0da82f3:     {
+1:3193fd5:         WeightedQueue weightedQueue = getWeightedQueue(id);
+1:0da82f3: 
+1:0da82f3:         try
+1:0da82f3:         {
+1:0da82f3:             queueSize.release();
+1:52841cb:             try
+1:52841cb:             {
+1:52841cb:                 weightedQueue.put(t, timeoutMS);
+1:52841cb:                 // the scheduler will release us when a slot is available
+1:52841cb:             }
+1:01880a4:             catch (TimeoutException | InterruptedException e)
+1:52841cb:             {
+1:52841cb:                 queueSize.acquireUninterruptibly();
+2:52841cb:                 throw e;
+1:52841cb:             }
+1:52841cb:         }
+1:52841cb:         catch (InterruptedException e)
+1:52841cb:         {
+1:0da82f3:             throw new RuntimeException("Interrupted while queueing requests", e);
+1:0da82f3:         }
+1:0da82f3:     }
+1:0da82f3: 
+1:0da82f3:     public void release()
+1:0da82f3:     {
+1:0da82f3:         taskCount.release();
+1:0da82f3:     }
+1:0da82f3: 
+1:0da82f3:     private void schedule()
+1:0da82f3:     {
+1:52841cb:         queueSize.acquireUninterruptibly();
+1:3193fd5:         for (Map.Entry<String,WeightedQueue> request : queues.entrySet())
+1:0da82f3:         {
+1:3193fd5:             WeightedQueue queue = request.getValue();
+1:93d3a22:             //Using the weight, process that many requests at a time (for that scheduler id)
+1:3193fd5:             for (int i=0; i<queue.weight; i++)
+1:0da82f3:             {
+1:3193fd5:                 Thread t = queue.poll();
+1:93d3a22:                 if (t == null)
+1:93d3a22:                     break;
+1:93d3a22:                 else
+1:93d3a22:                 {
+1:93d3a22:                     taskCount.acquireUninterruptibly();
+1:93d3a22:                     queueSize.acquireUninterruptibly();
+1:93d3a22:                 }
+1:0da82f3:             }
+1:0da82f3:         }
+1:0da82f3:         queueSize.release();
+1:0da82f3:     }
+1:0da82f3: 
+1:0da82f3:     /*
+1:07cdfd0:      * Get the Queue for the respective id, if one is not available
+1:0da82f3:      * create a new queue for that corresponding id and return it
+1:0da82f3:      */
+1:3193fd5:     private WeightedQueue getWeightedQueue(String id)
+1:0da82f3:     {
+1:3193fd5:         WeightedQueue weightedQueue = queues.get(id);
+1:93d3a22:         if (weightedQueue != null)
+1:0da82f3:             // queue existed
+1:93d3a22:             return weightedQueue;
+1:0da82f3: 
+1:3193fd5:         WeightedQueue maybenew = new WeightedQueue(id, getWeight(id));
+1:93d3a22:         weightedQueue = queues.putIfAbsent(id, maybenew);
+1:93d3a22:         if (weightedQueue == null)
+1:3193fd5:         {
+1:0da82f3:             return maybenew;
+1:3193fd5:         }
+1:0da82f3: 
+1:0da82f3:         // another thread created the queue
+1:93d3a22:         return weightedQueue;
+1:0da82f3:     }
+1:182457a: 
+1:182457a:     Semaphore getTaskCount()
+1:182457a:     {
+1:182457a:         return taskCount;
+1:182457a:     }
+1:93d3a22: 
+1:93d3a22:     private int getWeight(String weightingVar)
+1:93d3a22:     {
+1:93d3a22:         return (weights != null && weights.containsKey(weightingVar))
+1:93d3a22:                 ? weights.get(weightingVar)
+1:93d3a22:                 : defaultWeight;
+1:93d3a22:     }
+1:0da82f3: }
+============================================================================
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:01880a4
+/////////////////////////////////////////////////////////////////////////
+1:             catch (TimeoutException | InterruptedException e)
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:8896a70
+/////////////////////////////////////////////////////////////////////////
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:07cdfd0
+/////////////////////////////////////////////////////////////////////////
+1:  *
+/////////////////////////////////////////////////////////////////////////
+1:  *
+1:  *
+1:  *
+/////////////////////////////////////////////////////////////////////////
+1:  * A very basic Round Robin implementation of the RequestScheduler. It handles
+1:  * request groups identified on user/keyspace by placing them in separate
+/////////////////////////////////////////////////////////////////////////
+1:      * Get the Queue for the respective id, if one is not available
+commit:2fd3268
+/////////////////////////////////////////////////////////////////////////
+0:  * A very basic Round Robin implementation of the RequestScheduler. It handles
+0:  * request groups identified on user/keyspace by placing them in separate
+/////////////////////////////////////////////////////////////////////////
+0:      * Get the Queue for the respective id, if one is not available
+commit:5a6e2b0
+/////////////////////////////////////////////////////////////////////////
+1:     private final int defaultWeight;
+1:     private final Map<String, Integer> weights;
+commit:07cf56f
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+0:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1: package org.apache.cassandra.scheduler;
+1: 
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:52841cb
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         // the task count is acquired for the first time _after_ releasing a thread, so we pre-decrement
+1:         taskCount = new Semaphore(options.throttle_limit - 1);
+1: 
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:             try
+1:             {
+1:                 weightedQueue.put(t, timeoutMS);
+1:                 // the scheduler will release us when a slot is available
+1:             }
+0:             catch (TimeoutException e)
+1:             {
+1:                 queueSize.acquireUninterruptibly();
+1:                 throw e;
+1:             }
+1:             catch (InterruptedException e)
+1:             {
+1:                 queueSize.acquireUninterruptibly();
+1:                 throw e;
+1:             }
+commit:7c08ecd
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.TimeoutException;
+/////////////////////////////////////////////////////////////////////////
+1:     public void queue(Thread t, String id, long timeoutMS) throws TimeoutException
+0:             weightedQueue.put(t, timeoutMS);
+commit:3193fd5
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     //Map of queue id to weighted queue
+1:     private final NonBlockingHashMap<String, WeightedQueue> queues;
+1:     // Tracks the count of threads available in all queues
+0:     private int defaultWeight;
+/////////////////////////////////////////////////////////////////////////
+1:         queues = new NonBlockingHashMap<String, WeightedQueue>();
+/////////////////////////////////////////////////////////////////////////
+1:         logger.info("Started the RoundRobin Request Scheduler");
+1:         WeightedQueue weightedQueue = getWeightedQueue(id);
+0:             weightedQueue.put(t);
+/////////////////////////////////////////////////////////////////////////
+1:         for (Map.Entry<String,WeightedQueue> request : queues.entrySet())
+1:             WeightedQueue queue = request.getValue();
+1:             for (int i=0; i<queue.weight; i++)
+1:                 Thread t = queue.poll();
+/////////////////////////////////////////////////////////////////////////
+1:     private WeightedQueue getWeightedQueue(String id)
+1:         WeightedQueue weightedQueue = queues.get(id);
+1:         WeightedQueue maybenew = new WeightedQueue(id, getWeight(id));
+1:         {
+0:             // created new queue: register for monitoring
+0:             maybenew.register();
+1:         }
+commit:e98eb1c
+/////////////////////////////////////////////////////////////////////////
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+commit:93d3a22
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.utils.Pair;
+/////////////////////////////////////////////////////////////////////////
+1:  * queues and servicing a request from each queue in a RoundRobin fashion.
+1:  * It optionally adds weights for each round.
+1: 
+0:     //The Pair is the weighted queue - the left is the weight and the right is the queue
+0:     private final NonBlockingHashMap<String, Pair<Integer, SynchronousQueue<Thread>>> queues;
+/////////////////////////////////////////////////////////////////////////
+0:     private Integer defaultWeight;
+0:     private Map<String, Integer> weights;
+1: 
+1:         defaultWeight = options.default_weight;
+1:         weights = options.weights;
+1: 
+0:         queues = new NonBlockingHashMap<String, Pair<Integer, SynchronousQueue<Thread>>>();
+/////////////////////////////////////////////////////////////////////////
+0:         Pair<Integer, SynchronousQueue<Thread>> weightedQueue = getWeightedQueue(id);
+0:             weightedQueue.right.put(t);
+/////////////////////////////////////////////////////////////////////////
+0:         int weight;
+0:         SynchronousQueue<Thread> queue;
+0:         Thread t;
+1: 
+0:         for (Map.Entry<String,Pair<Integer, SynchronousQueue<Thread>>> request : queues.entrySet())
+0:             weight = request.getValue().left;
+0:             queue = request.getValue().right;
+1:             //Using the weight, process that many requests at a time (for that scheduler id)
+0:             for (int i=0; i<weight; i++)
+0:                 t = queue.poll();
+1:                 if (t == null)
+1:                     break;
+1:                 else
+1:                 {
+1:                     taskCount.acquireUninterruptibly();
+1:                     queueSize.acquireUninterruptibly();
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+0:     private Pair<Integer, SynchronousQueue<Thread>> getWeightedQueue(String id)
+0:         Pair<Integer, SynchronousQueue<Thread>> weightedQueue = queues.get(id);
+1:         if (weightedQueue != null)
+1:             return weightedQueue;
+0:         Pair<Integer, SynchronousQueue<Thread>> maybenew = new Pair(getWeight(id), new SynchronousQueue<Thread>(true));
+1:         weightedQueue = queues.putIfAbsent(id, maybenew);
+1:         if (weightedQueue == null)
+1:         return weightedQueue;
+1: 
+1:     private int getWeight(String weightingVar)
+1:     {
+1:         return (weights != null && weights.containsKey(weightingVar))
+1:                 ? weights.get(weightingVar)
+1:                 : defaultWeight;
+1:     }
+commit:182457a
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     Semaphore getTaskCount()
+1:     {
+1:         return taskCount;
+1:     }
+commit:0da82f3
+/////////////////////////////////////////////////////////////////////////
+0: package org.apache.cassandra.scheduler;
+1: 
+1: /*
+0:  * 
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+0:  * 
+0:  *   http://www.apache.org/licenses/LICENSE-2.0
+0:  * 
+0:  * Unless required by applicable law or agreed to in writing,
+0:  * software distributed under the License is distributed on an
+0:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+0:  * KIND, either express or implied.  See the License for the
+0:  * specific language governing permissions and limitations
+0:  * under the License.
+0:  * 
+1:  */
+1: 
+1: import java.util.Map;
+1: import java.util.concurrent.Semaphore;
+0: import java.util.concurrent.SynchronousQueue;
+1: 
+1: import org.apache.cassandra.config.RequestSchedulerOptions;
+1: import org.cliffc.high_scale_lib.NonBlockingHashMap;
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+1: 
+1: /**
+0:  * A very basic Round Robin implementation of the RequestScheduler. It handles 
+0:  * request groups identified on user/keyspace by placing them in separate 
+0:  * queues and servicing a request from each queue in a RoundRobin fashion. 
+1:  */
+1: public class RoundRobinScheduler implements IRequestScheduler
+1: {
+1:     private static final Logger logger = LoggerFactory.getLogger(RoundRobinScheduler.class);
+0:     private final NonBlockingHashMap<String, SynchronousQueue<Thread>> queues;
+0:     private static boolean started = false;
+1: 
+1:     private final Semaphore taskCount;
+1: 
+1:     // Used by the the scheduler thread so we don't need to busy-wait until there is a request to process
+1:     private final Semaphore queueSize = new Semaphore(0, false);
+1: 
+1:     public RoundRobinScheduler(RequestSchedulerOptions options)
+1:     {
+0:         assert !started;
+1: 
+0:         taskCount = new Semaphore(options.throttle_limit);
+0:         queues = new NonBlockingHashMap<String, SynchronousQueue<Thread>>();
+1:         Runnable runnable = new Runnable()
+1:         {
+1:             public void run()
+1:             {
+1:                 while (true)
+1:                 {
+1:                     schedule();
+1:                 }
+1:             }
+1:         };
+1:         Thread scheduler = new Thread(runnable, "REQUEST-SCHEDULER");
+1:         scheduler.start();
+0:         logger.info("Started the RoundRobin Request Scheduler");
+0:         started = true;
+1:     }
+1: 
+0:     public void queue(Thread t, String id)
+1:     {
+0:         SynchronousQueue<Thread> queue = getQueue(id);
+1: 
+1:         try
+1:         {
+1:             queueSize.release();
+0:             queue.put(t);
+1:         }
+0:         catch (InterruptedException e)
+1:         {
+1:             throw new RuntimeException("Interrupted while queueing requests", e);
+1:         }
+1:     }
+1: 
+1:     public void release()
+1:     {
+1:         taskCount.release();
+1:     }
+1: 
+1:     private void schedule()
+1:     {
+0:         queueSize.acquireUninterruptibly();
+0:         for (SynchronousQueue<Thread> queue : queues.values())
+1:         {
+0:             Thread t = queue.poll();
+0:             if (t != null)
+1:             {
+0:                 taskCount.acquireUninterruptibly();
+0:                 queueSize.acquireUninterruptibly();
+1:             }
+1:         }
+1:         queueSize.release();
+1:     }
+1: 
+1:     /*
+0:      * Get the Queue for the respective id, if one is not available 
+1:      * create a new queue for that corresponding id and return it
+1:      */
+0:     private SynchronousQueue<Thread> getQueue(String id)
+1:     {
+0:         SynchronousQueue<Thread> queue = queues.get(id);
+0:         if (queue != null)
+1:             // queue existed
+0:             return queue;
+1: 
+0:         SynchronousQueue<Thread> maybenew = new SynchronousQueue<Thread>(true);
+0:         queue = queues.putIfAbsent(id, maybenew);
+0:         if (queue == null)
+0:             // created new queue
+1:             return maybenew;
+1: 
+1:         // another thread created the queue
+0:         return queue;
+1:     }
+1: }
+============================================================================

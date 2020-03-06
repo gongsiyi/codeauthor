@@ -1,0 +1,1382 @@
+1:3c19232: /*
+1:3c19232:  * Licensed to the Apache Software Foundation (ASF) under one
+1:3c19232:  * or more contributor license agreements.  See the NOTICE file
+1:3c19232:  * distributed with this work for additional information
+1:3c19232:  * regarding copyright ownership.  The ASF licenses this file
+1:3c19232:  * to you under the Apache License, Version 2.0 (the
+1:3c19232:  * "License"); you may not use this file except in compliance
+1:3c19232:  * with the License.  You may obtain a copy of the License at
+1:07cdfd0:  *
+1:07cf56f:  *     http://www.apache.org/licenses/LICENSE-2.0
+3:07cdfd0:  *
+1:07cf56f:  * Unless required by applicable law or agreed to in writing, software
+1:07cf56f:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:07cf56f:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:07cf56f:  * See the License for the specific language governing permissions and
+1:07cf56f:  * limitations under the License.
+1:3c19232:  */
+1:6675da3: package org.apache.cassandra.service;
+1:4921e6b: 
+1:8f2a26c: import java.lang.management.GarbageCollectorMXBean;
+1:55db039: import java.lang.management.ManagementFactory;
+1:55db039: import java.lang.management.MemoryUsage;
+1:16499ca: import java.lang.reflect.Field;
+1:8f2a26c: import java.util.Arrays;
+1:8f2a26c: import java.util.HashMap;
+1:8f2a26c: import java.util.Map;
+1:0e652e7: import java.util.concurrent.TimeUnit;
+1:0e652e7: import java.util.concurrent.atomic.AtomicReference;
+1:488db6f: 
+1:6675da3: import javax.management.MBeanServer;
+1:41a85af: import javax.management.Notification;
+1:41a85af: import javax.management.NotificationListener;
+1:6675da3: import javax.management.ObjectName;
+1:41a85af: import javax.management.openmbean.CompositeData;
+1:16499ca: 
+1:488db6f: import com.sun.management.GarbageCollectionNotificationInfo;
+1:488db6f: import com.sun.management.GcInfo;
+1:488db6f: 
+1:55db039: import org.slf4j.Logger;
+1:55db039: import org.slf4j.LoggerFactory;
+1:16499ca: 
+1:488db6f: import org.apache.cassandra.config.DatabaseDescriptor;
+1:51a1f23: 
+1:351c7ca: import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+1:5728a20: import org.apache.cassandra.utils.StatusLogger;
+1:51a1f23: 
+1:0e652e7: public class GCInspector implements NotificationListener, GCInspectorMXBean
+1:51a1f23: {
+1:0e652e7:     public static final String MBEAN_NAME = "org.apache.cassandra.service:type=GCInspector";
+1:0095f0c:     private static final Logger logger = LoggerFactory.getLogger(GCInspector.class);
+1:f0d1d75:     final static long MIN_LOG_DURATION = DatabaseDescriptor.getGCLogThreshold();
+1:488db6f:     final static long GC_WARN_THRESHOLD_IN_MS = DatabaseDescriptor.getGCWarnThreshold();
+1:fccded5:     final static long STAT_THRESHOLD = GC_WARN_THRESHOLD_IN_MS != 0 ? GC_WARN_THRESHOLD_IN_MS : MIN_LOG_DURATION;
+1:0e652e7: 
+1:16499ca:     /*
+1:16499ca:      * The field from java.nio.Bits that tracks the total number of allocated
+1:16499ca:      * bytes of direct memory requires via ByteBuffer.allocateDirect that have not been GCed.
+1:16499ca:      */
+1:16499ca:     final static Field BITS_TOTAL_CAPACITY;
+1:16499ca: 
+1:16499ca:     static
+1:16499ca:     {
+1:16499ca:         Field temp = null;
+1:16499ca:         try
+1:16499ca:         {
+1:16499ca:             Class<?> bitsClass = Class.forName("java.nio.Bits");
+1:16499ca:             Field f = bitsClass.getDeclaredField("totalCapacity");
+1:16499ca:             f.setAccessible(true);
+1:16499ca:             temp = f;
+1:16499ca:         }
+1:16499ca:         catch (Throwable t)
+1:16499ca:         {
+1:16499ca:             logger.debug("Error accessing field of java.nio.Bits", t);
+1:16499ca:             //Don't care, will just return the dummy value -1 if we can't get at the field in this JVM
+1:16499ca:         }
+1:16499ca:         BITS_TOTAL_CAPACITY = temp;
+1:16499ca:     }
+1:0e652e7: 
+1:0e652e7:     static final class State
+1:0e652e7:     {
+1:0e652e7:         final double maxRealTimeElapsed;
+1:0e652e7:         final double totalRealTimeElapsed;
+1:0e652e7:         final double sumSquaresRealTimeElapsed;
+1:0e652e7:         final double totalBytesReclaimed;
+1:0e652e7:         final double count;
+1:0e652e7:         final long startNanos;
+1:0e652e7: 
+1:0e652e7:         State(double extraElapsed, double extraBytes, State prev)
+1:0e652e7:         {
+1:0e652e7:             this.totalRealTimeElapsed = prev.totalRealTimeElapsed + extraElapsed;
+1:0e652e7:             this.totalBytesReclaimed = prev.totalBytesReclaimed + extraBytes;
+1:0e652e7:             this.sumSquaresRealTimeElapsed = prev.sumSquaresRealTimeElapsed + (extraElapsed * extraElapsed);
+1:0e652e7:             this.startNanos = prev.startNanos;
+1:0e652e7:             this.count = prev.count + 1;
+1:0e652e7:             this.maxRealTimeElapsed = Math.max(prev.maxRealTimeElapsed, extraElapsed);
+1:0e652e7:         }
+1:0e652e7: 
+1:0e652e7:         State()
+1:0e652e7:         {
+1:0e652e7:             count = maxRealTimeElapsed = sumSquaresRealTimeElapsed = totalRealTimeElapsed = totalBytesReclaimed = 0;
+1:0e652e7:             startNanos = System.nanoTime();
+1:0e652e7:         }
+1:0e652e7:     }
+1:0e652e7: 
+1:8f2a26c:     static final class GCState
+1:8f2a26c:     {
+1:8f2a26c:         final GarbageCollectorMXBean gcBean;
+1:8f2a26c:         final boolean assumeGCIsPartiallyConcurrent;
+1:8f2a26c:         final boolean assumeGCIsOldGen;
+1:8f2a26c:         private String[] keys;
+1:8f2a26c:         long lastGcTotalDuration = 0;
+1:8f2a26c: 
+1:8f2a26c: 
+1:8f2a26c:         GCState(GarbageCollectorMXBean gcBean, boolean assumeGCIsPartiallyConcurrent, boolean assumeGCIsOldGen)
+1:8f2a26c:         {
+1:8f2a26c:             this.gcBean = gcBean;
+1:8f2a26c:             this.assumeGCIsPartiallyConcurrent = assumeGCIsPartiallyConcurrent;
+1:8f2a26c:             this.assumeGCIsOldGen = assumeGCIsOldGen;
+1:8f2a26c:         }
+1:8f2a26c: 
+1:8f2a26c:         String[] keys(GarbageCollectionNotificationInfo info)
+1:8f2a26c:         {
+1:8f2a26c:             if (keys != null)
+1:8f2a26c:                 return keys;
+1:8f2a26c: 
+1:8f2a26c:             keys = info.getGcInfo().getMemoryUsageBeforeGc().keySet().toArray(new String[0]);
+1:8f2a26c:             Arrays.sort(keys);
+1:8f2a26c: 
+1:8f2a26c:             return keys;
+1:8f2a26c:         }
+1:8f2a26c:     }
+1:8f2a26c: 
+1:0e652e7:     final AtomicReference<State> state = new AtomicReference<>(new State());
+1:0e652e7: 
+1:8f2a26c:     final Map<String, GCState> gcStates = new HashMap<>();
+1:8f2a26c: 
+1:0e652e7:     public GCInspector()
+1:0e652e7:     {
+1:0e652e7:         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+1:0e652e7: 
+1:0e652e7:         try
+1:0e652e7:         {
+1:8f2a26c:             ObjectName gcName = new ObjectName(ManagementFactory.GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + ",*");
+1:8f2a26c:             for (ObjectName name : mbs.queryNames(gcName, null))
+1:8f2a26c:             {
+1:8f2a26c:                 GarbageCollectorMXBean gc = ManagementFactory.newPlatformMXBeanProxy(mbs, name.getCanonicalName(), GarbageCollectorMXBean.class);
+1:8f2a26c:                 gcStates.put(gc.getName(), new GCState(gc, assumeGCIsPartiallyConcurrent(gc), assumeGCIsOldGen(gc)));
+1:8f2a26c:             }
+1:8f2a26c: 
+1:0e652e7:             mbs.registerMBean(this, new ObjectName(MBEAN_NAME));
+1:0e652e7:         }
+1:0e652e7:         catch (Exception e)
+1:0e652e7:         {
+1:0e652e7:             throw new RuntimeException(e);
+1:0e652e7:         }
+1:0e652e7:     }
+1:0e652e7: 
+1:41a85af:     public static void register() throws Exception
+1:51a1f23:     {
+1:41a85af:         GCInspector inspector = new GCInspector();
+1:6675da3:         MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+1:41a85af:         ObjectName gcName = new ObjectName(ManagementFactory.GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + ",*");
+1:41a85af:         for (ObjectName name : server.queryNames(gcName, null))
+1:51a1f23:         {
+1:41a85af:             server.addNotificationListener(name, inspector, null, null);
+1:51a1f23:         }
+1:51a1f23:     }
+1:41a85af: 
+1:8f2a26c:     /*
+1:8f2a26c:      * Assume that a GC type is at least partially concurrent and so a side channel method
+1:8f2a26c:      * should be used to calculate application stopped time due to the GC.
+1:8f2a26c:      *
+1:8f2a26c:      * If the GC isn't recognized then assume that is concurrent and we need to do our own calculation
+1:8f2a26c:      * via the the side channel.
+1:8f2a26c:      */
+1:8f2a26c:     private static boolean assumeGCIsPartiallyConcurrent(GarbageCollectorMXBean gc)
+1:8f2a26c:     {
+1:8f2a26c:         switch (gc.getName())
+1:8f2a26c:         {
+1:8f2a26c:                 //First two are from the serial collector
+1:8f2a26c:             case "Copy":
+1:8f2a26c:             case "MarkSweepCompact":
+1:8f2a26c:                 //Parallel collector
+1:8f2a26c:             case "PS MarkSweep":
+1:8f2a26c:             case "PS Scavenge":
+1:8f2a26c:             case "G1 Young Generation":
+1:8f2a26c:                 //CMS young generation collector
+1:8f2a26c:             case "ParNew":
+1:8f2a26c:                 return false;
+1:8f2a26c:             case "ConcurrentMarkSweep":
+1:8f2a26c:             case "G1 Old Generation":
+1:8f2a26c:                 return true;
+1:8f2a26c:             default:
+1:8f2a26c:                 //Assume possibly concurrent if unsure
+1:8f2a26c:                 return true;
+1:8f2a26c:         }
+1:8f2a26c:     }
+1:8f2a26c: 
+1:8f2a26c:     /*
+1:b09e60f:      * Assume that a GC type is an old generation collection so TransactionLogs.rescheduleFailedTasks()
+1:8f2a26c:      * should be invoked.
+1:8f2a26c:      *
+1:b09e60f:      * Defaults to not invoking TransactionLogs.rescheduleFailedTasks() on unrecognized GC names
+1:8f2a26c:      */
+1:8f2a26c:     private static boolean assumeGCIsOldGen(GarbageCollectorMXBean gc)
+1:8f2a26c:     {
+1:8f2a26c:         switch (gc.getName())
+1:8f2a26c:         {
+1:8f2a26c:             case "Copy":
+1:8f2a26c:             case "PS Scavenge":
+1:8f2a26c:             case "G1 Young Generation":
+1:8f2a26c:             case "ParNew":
+1:8f2a26c:                 return false;
+1:8f2a26c:             case "MarkSweepCompact":
+1:8f2a26c:             case "PS MarkSweep":
+1:8f2a26c:             case "ConcurrentMarkSweep":
+1:8f2a26c:             case "G1 Old Generation":
+1:8f2a26c:                 return true;
+1:8f2a26c:             default:
+1:8f2a26c:                 //Assume not old gen otherwise, don't call
+1:b09e60f:                 //TransactionLogs.rescheduleFailedTasks()
+1:8f2a26c:                 return false;
+1:8f2a26c:         }
+1:8f2a26c:     }
+1:8f2a26c: 
+1:8f2a26c:     public void handleNotification(final Notification notification, final Object handback)
+1:51a1f23:     {
+1:41a85af:         String type = notification.getType();
+1:41a85af:         if (type.equals(GarbageCollectionNotificationInfo.GARBAGE_COLLECTION_NOTIFICATION))
+1:51a1f23:         {
+1:41a85af:             // retrieve the garbage collection notification information
+1:41a85af:             CompositeData cd = (CompositeData) notification.getUserData();
+1:41a85af:             GarbageCollectionNotificationInfo info = GarbageCollectionNotificationInfo.from(cd);
+1:8f2a26c:             String gcName = info.getGcName();
+1:8f2a26c:             GcInfo gcInfo = info.getGcInfo();
+1:41a85af: 
+1:8f2a26c:             long duration = gcInfo.getDuration();
+1:8f2a26c: 
+1:8f2a26c:             /*
+1:8f2a26c:              * The duration supplied in the notification info includes more than just
+1:8f2a26c:              * application stopped time for concurrent GCs. Try and do a better job coming up with a good stopped time
+1:8f2a26c:              * value by asking for and tracking cumulative time spent blocked in GC.
+1:8f2a26c:              */
+1:8f2a26c:             GCState gcState = gcStates.get(gcName);
+1:8f2a26c:             if (gcState.assumeGCIsPartiallyConcurrent)
+1:8f2a26c:             {
+1:8f2a26c:                 long previousTotal = gcState.lastGcTotalDuration;
+1:8f2a26c:                 long total = gcState.gcBean.getCollectionTime();
+1:8f2a26c:                 gcState.lastGcTotalDuration = total;
+1:8f2a26c:                 duration = total - previousTotal; // may be zero for a really fast collection
+1:8f2a26c:             }
+1:41a85af: 
+1:41a85af:             StringBuilder sb = new StringBuilder();
+1:41a85af:             sb.append(info.getGcName()).append(" GC in ").append(duration).append("ms.  ");
+1:0e652e7:             long bytes = 0;
+1:8f2a26c:             Map<String, MemoryUsage> beforeMemoryUsage = gcInfo.getMemoryUsageBeforeGc();
+1:8f2a26c:             Map<String, MemoryUsage> afterMemoryUsage = gcInfo.getMemoryUsageAfterGc();
+1:8f2a26c:             for (String key : gcState.keys(info))
+1:51a1f23:             {
+1:8f2a26c:                 MemoryUsage before = beforeMemoryUsage.get(key);
+1:8f2a26c:                 MemoryUsage after = afterMemoryUsage.get(key);
+1:41a85af:                 if (after != null && after.getUsed() != before.getUsed())
+1:41a85af:                 {
+1:41a85af:                     sb.append(key).append(": ").append(before.getUsed());
+1:41a85af:                     sb.append(" -> ");
+1:41a85af:                     sb.append(after.getUsed());
+1:8f2a26c:                     if (!key.equals(gcState.keys[gcState.keys.length - 1]))
+1:41a85af:                         sb.append("; ");
+1:0e652e7:                     bytes += before.getUsed() - after.getUsed();
+1:41a85af:                 }
+1:51a1f23:             }
+1:51a1f23: 
+1:0e652e7:             while (true)
+1:0e652e7:             {
+1:0e652e7:                 State prev = state.get();
+1:0e652e7:                 if (state.compareAndSet(prev, new State(duration, bytes, prev)))
+1:0e652e7:                     break;
+1:0e652e7:             }
+1:0e652e7: 
+1:41a85af:             String st = sb.toString();
+1:488db6f:             if (GC_WARN_THRESHOLD_IN_MS != 0 && duration > GC_WARN_THRESHOLD_IN_MS)
+1:488db6f:                 logger.warn(st);
+1:488db6f:             else if (duration > MIN_LOG_DURATION)
+1:51a1f23:                 logger.info(st);
+1:4a849ef:             else if (logger.isTraceEnabled())
+1:4a849ef:                 logger.trace(st);
+1:51a1f23: 
+1:488db6f:             if (duration > STAT_THRESHOLD)
+1:51a1f23:                 StatusLogger.log();
+1:51a1f23: 
+1:8f2a26c:             // if we just finished an old gen collection and we're still using a lot of memory, try to reduce the pressure
+1:8f2a26c:             if (gcState.assumeGCIsOldGen)
+1:351c7ca:                 LifecycleTransaction.rescheduleFailedDeletions();
+1:51a1f23:         }
+1:51a1f23:     }
+1:51a1f23: 
+1:0e652e7:     public State getTotalSinceLastCheck()
+1:0e652e7:     {
+1:0e652e7:         return state.getAndSet(new State());
+1:0e652e7:     }
+1:0e652e7: 
+1:0e652e7:     public double[] getAndResetStats()
+1:0e652e7:     {
+1:0e652e7:         State state = getTotalSinceLastCheck();
+1:16499ca:         double[] r = new double[7];
+1:0e652e7:         r[0] = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - state.startNanos);
+1:0e652e7:         r[1] = state.maxRealTimeElapsed;
+1:0e652e7:         r[2] = state.totalRealTimeElapsed;
+1:0e652e7:         r[3] = state.sumSquaresRealTimeElapsed;
+1:0e652e7:         r[4] = state.totalBytesReclaimed;
+1:0e652e7:         r[5] = state.count;
+1:16499ca:         r[6] = getAllocatedDirectMemory();
+1:16499ca: 
+1:0e652e7:         return r;
+1:0e652e7:     }
+1:16499ca: 
+1:16499ca:     private static long getAllocatedDirectMemory()
+1:16499ca:     {
+1:16499ca:         if (BITS_TOTAL_CAPACITY == null) return -1;
+1:16499ca:         try
+1:16499ca:         {
+1:16499ca:             return BITS_TOTAL_CAPACITY.getLong(null);
+1:16499ca:         }
+1:16499ca:         catch (Throwable t)
+1:16499ca:         {
+1:16499ca:             logger.trace("Error accessing field of java.nio.Bits", t);
+1:16499ca:             //Don't care how or why we failed to get the value in this JVM. Return -1 to indicate failure
+1:16499ca:             return -1;
+1:16499ca:         }
+1:16499ca:     }
+3:5e18204: }
+============================================================================
+author:Josh McKenzie
+-------------------------------------------------------------------------------
+commit:e99ee19
+commit:14918b7
+commit:280da18
+author:Jeff Jirsa
+-------------------------------------------------------------------------------
+commit:f0d1d75
+/////////////////////////////////////////////////////////////////////////
+1:     final static long MIN_LOG_DURATION = DatabaseDescriptor.getGCLogThreshold();
+author:jasonstack
+-------------------------------------------------------------------------------
+commit:fccded5
+/////////////////////////////////////////////////////////////////////////
+1:     final static long STAT_THRESHOLD = GC_WARN_THRESHOLD_IN_MS != 0 ? GC_WARN_THRESHOLD_IN_MS : MIN_LOG_DURATION;
+author:blerer
+-------------------------------------------------------------------------------
+commit:aa60cde
+author:Paulo Motta
+-------------------------------------------------------------------------------
+commit:4a849ef
+/////////////////////////////////////////////////////////////////////////
+1:             else if (logger.isTraceEnabled())
+1:                 logger.trace(st);
+author:Joshua McKenzie
+-------------------------------------------------------------------------------
+commit:00264e8
+commit:53d0449
+commit:488db6f
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: import com.sun.management.GarbageCollectionNotificationInfo;
+1: import com.sun.management.GcInfo;
+1: 
+1: import org.apache.cassandra.config.DatabaseDescriptor;
+/////////////////////////////////////////////////////////////////////////
+1:     final static long GC_WARN_THRESHOLD_IN_MS = DatabaseDescriptor.getGCWarnThreshold();
+0:     final static long STAT_THRESHOLD = Math.min(GC_WARN_THRESHOLD_IN_MS != 0 ? GC_WARN_THRESHOLD_IN_MS : MIN_LOG_DURATION, MIN_LOG_DURATION);
+/////////////////////////////////////////////////////////////////////////
+1:             if (GC_WARN_THRESHOLD_IN_MS != 0 && duration > GC_WARN_THRESHOLD_IN_MS)
+1:                 logger.warn(st);
+1:             else if (duration > MIN_LOG_DURATION)
+1:             if (duration > STAT_THRESHOLD)
+author:Stefania Alborghetti
+-------------------------------------------------------------------------------
+commit:351c7ca
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+/////////////////////////////////////////////////////////////////////////
+1:                 LifecycleTransaction.rescheduleFailedDeletions();
+commit:5726625
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.lifecycle.TransactionLog;
+/////////////////////////////////////////////////////////////////////////
+0:                 TransactionLog.rescheduleFailedDeletions();
+commit:b09e60f
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.lifecycle.TransactionLogs;
+/////////////////////////////////////////////////////////////////////////
+1:      * Assume that a GC type is an old generation collection so TransactionLogs.rescheduleFailedTasks()
+1:      * Defaults to not invoking TransactionLogs.rescheduleFailedTasks() on unrecognized GC names
+/////////////////////////////////////////////////////////////////////////
+1:                 //TransactionLogs.rescheduleFailedTasks()
+/////////////////////////////////////////////////////////////////////////
+0:                 TransactionLogs.rescheduleFailedDeletions();
+author:Ariel Weisberg
+-------------------------------------------------------------------------------
+commit:cdfa9ed
+commit:8f2a26c
+/////////////////////////////////////////////////////////////////////////
+1: import java.lang.management.GarbageCollectorMXBean;
+1: import java.util.Arrays;
+1: import java.util.HashMap;
+1: import java.util.Map;
+/////////////////////////////////////////////////////////////////////////
+0: import com.sun.management.GcInfo;
+/////////////////////////////////////////////////////////////////////////
+1:     static final class GCState
+1:     {
+1:         final GarbageCollectorMXBean gcBean;
+1:         final boolean assumeGCIsPartiallyConcurrent;
+1:         final boolean assumeGCIsOldGen;
+1:         private String[] keys;
+1:         long lastGcTotalDuration = 0;
+1: 
+1: 
+1:         GCState(GarbageCollectorMXBean gcBean, boolean assumeGCIsPartiallyConcurrent, boolean assumeGCIsOldGen)
+1:         {
+1:             this.gcBean = gcBean;
+1:             this.assumeGCIsPartiallyConcurrent = assumeGCIsPartiallyConcurrent;
+1:             this.assumeGCIsOldGen = assumeGCIsOldGen;
+1:         }
+1: 
+1:         String[] keys(GarbageCollectionNotificationInfo info)
+1:         {
+1:             if (keys != null)
+1:                 return keys;
+1: 
+1:             keys = info.getGcInfo().getMemoryUsageBeforeGc().keySet().toArray(new String[0]);
+1:             Arrays.sort(keys);
+1: 
+1:             return keys;
+1:         }
+1:     }
+1: 
+1:     final Map<String, GCState> gcStates = new HashMap<>();
+1: 
+1:             ObjectName gcName = new ObjectName(ManagementFactory.GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + ",*");
+1:             for (ObjectName name : mbs.queryNames(gcName, null))
+1:             {
+1:                 GarbageCollectorMXBean gc = ManagementFactory.newPlatformMXBeanProxy(mbs, name.getCanonicalName(), GarbageCollectorMXBean.class);
+1:                 gcStates.put(gc.getName(), new GCState(gc, assumeGCIsPartiallyConcurrent(gc), assumeGCIsOldGen(gc)));
+1:             }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     /*
+1:      * Assume that a GC type is at least partially concurrent and so a side channel method
+1:      * should be used to calculate application stopped time due to the GC.
+1:      *
+1:      * If the GC isn't recognized then assume that is concurrent and we need to do our own calculation
+1:      * via the the side channel.
+1:      */
+1:     private static boolean assumeGCIsPartiallyConcurrent(GarbageCollectorMXBean gc)
+1:     {
+1:         switch (gc.getName())
+1:         {
+1:                 //First two are from the serial collector
+1:             case "Copy":
+1:             case "MarkSweepCompact":
+1:                 //Parallel collector
+1:             case "PS MarkSweep":
+1:             case "PS Scavenge":
+1:             case "G1 Young Generation":
+1:                 //CMS young generation collector
+1:             case "ParNew":
+1:                 return false;
+1:             case "ConcurrentMarkSweep":
+1:             case "G1 Old Generation":
+1:                 return true;
+1:             default:
+1:                 //Assume possibly concurrent if unsure
+1:                 return true;
+1:         }
+1:     }
+1: 
+1:     /*
+0:      * Assume that a GC type is an old generation collection so SSTableDeletingTask.rescheduleFailedTasks()
+1:      * should be invoked.
+1:      *
+0:      * Defaults to not invoking SSTableDeletingTask.rescheduleFailedTasks() on unrecognized GC names
+1:      */
+1:     private static boolean assumeGCIsOldGen(GarbageCollectorMXBean gc)
+1:     {
+1:         switch (gc.getName())
+1:         {
+1:             case "Copy":
+1:             case "PS Scavenge":
+1:             case "G1 Young Generation":
+1:             case "ParNew":
+1:                 return false;
+1:             case "MarkSweepCompact":
+1:             case "PS MarkSweep":
+1:             case "ConcurrentMarkSweep":
+1:             case "G1 Old Generation":
+1:                 return true;
+1:             default:
+1:                 //Assume not old gen otherwise, don't call
+0:                 //SSTableDeletingTask.rescheduleFailedTasks()
+1:                 return false;
+1:         }
+1:     }
+1: 
+1:     public void handleNotification(final Notification notification, final Object handback)
+/////////////////////////////////////////////////////////////////////////
+1:             String gcName = info.getGcName();
+1:             GcInfo gcInfo = info.getGcInfo();
+1:             long duration = gcInfo.getDuration();
+1: 
+1:             /*
+1:              * The duration supplied in the notification info includes more than just
+1:              * application stopped time for concurrent GCs. Try and do a better job coming up with a good stopped time
+1:              * value by asking for and tracking cumulative time spent blocked in GC.
+1:              */
+1:             GCState gcState = gcStates.get(gcName);
+1:             if (gcState.assumeGCIsPartiallyConcurrent)
+1:             {
+1:                 long previousTotal = gcState.lastGcTotalDuration;
+1:                 long total = gcState.gcBean.getCollectionTime();
+1:                 gcState.lastGcTotalDuration = total;
+1:                 duration = total - previousTotal; // may be zero for a really fast collection
+1:             }
+1:             Map<String, MemoryUsage> beforeMemoryUsage = gcInfo.getMemoryUsageBeforeGc();
+1:             Map<String, MemoryUsage> afterMemoryUsage = gcInfo.getMemoryUsageAfterGc();
+1:             for (String key : gcState.keys(info))
+1:                 MemoryUsage before = beforeMemoryUsage.get(key);
+1:                 MemoryUsage after = afterMemoryUsage.get(key);
+1:                     if (!key.equals(gcState.keys[gcState.keys.length - 1]))
+/////////////////////////////////////////////////////////////////////////
+1:             // if we just finished an old gen collection and we're still using a lot of memory, try to reduce the pressure
+1:             if (gcState.assumeGCIsOldGen)
+commit:16499ca
+/////////////////////////////////////////////////////////////////////////
+1: import java.lang.reflect.Field;
+0: import java.nio.ByteBuffer;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     /*
+1:      * The field from java.nio.Bits that tracks the total number of allocated
+1:      * bytes of direct memory requires via ByteBuffer.allocateDirect that have not been GCed.
+1:      */
+1:     final static Field BITS_TOTAL_CAPACITY;
+1: 
+1:     static
+1:     {
+1:         Field temp = null;
+1:         try
+1:         {
+1:             Class<?> bitsClass = Class.forName("java.nio.Bits");
+1:             Field f = bitsClass.getDeclaredField("totalCapacity");
+1:             f.setAccessible(true);
+1:             temp = f;
+1:         }
+1:         catch (Throwable t)
+1:         {
+1:             logger.debug("Error accessing field of java.nio.Bits", t);
+1:             //Don't care, will just return the dummy value -1 if we can't get at the field in this JVM
+1:         }
+1:         BITS_TOTAL_CAPACITY = temp;
+1:     }
+/////////////////////////////////////////////////////////////////////////
+1:         double[] r = new double[7];
+1:         r[6] = getAllocatedDirectMemory();
+1: 
+1: 
+1:     private static long getAllocatedDirectMemory()
+1:     {
+1:         if (BITS_TOTAL_CAPACITY == null) return -1;
+1:         try
+1:         {
+1:             return BITS_TOTAL_CAPACITY.getLong(null);
+1:         }
+1:         catch (Throwable t)
+1:         {
+1:             logger.trace("Error accessing field of java.nio.Bits", t);
+1:             //Don't care how or why we failed to get the value in this JVM. Return -1 to indicate failure
+1:             return -1;
+1:         }
+1:     }
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:0e652e7
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.TimeUnit;
+1: import java.util.concurrent.atomic.AtomicReference;
+/////////////////////////////////////////////////////////////////////////
+1: public class GCInspector implements NotificationListener, GCInspectorMXBean
+1:     public static final String MBEAN_NAME = "org.apache.cassandra.service:type=GCInspector";
+0:     final static long MIN_LOG_DURATION = 200;
+0:     final static long MIN_LOG_DURATION_TPSTATS = 1000;
+1: 
+1:     static final class State
+1:     {
+1:         final double maxRealTimeElapsed;
+1:         final double totalRealTimeElapsed;
+1:         final double sumSquaresRealTimeElapsed;
+1:         final double totalBytesReclaimed;
+1:         final double count;
+1:         final long startNanos;
+1: 
+1:         State(double extraElapsed, double extraBytes, State prev)
+1:         {
+1:             this.totalRealTimeElapsed = prev.totalRealTimeElapsed + extraElapsed;
+1:             this.totalBytesReclaimed = prev.totalBytesReclaimed + extraBytes;
+1:             this.sumSquaresRealTimeElapsed = prev.sumSquaresRealTimeElapsed + (extraElapsed * extraElapsed);
+1:             this.startNanos = prev.startNanos;
+1:             this.count = prev.count + 1;
+1:             this.maxRealTimeElapsed = Math.max(prev.maxRealTimeElapsed, extraElapsed);
+1:         }
+1: 
+1:         State()
+1:         {
+1:             count = maxRealTimeElapsed = sumSquaresRealTimeElapsed = totalRealTimeElapsed = totalBytesReclaimed = 0;
+1:             startNanos = System.nanoTime();
+1:         }
+1:     }
+1: 
+1:     final AtomicReference<State> state = new AtomicReference<>(new State());
+1: 
+1:     public GCInspector()
+1:     {
+1:         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+1: 
+1:         try
+1:         {
+1:             mbs.registerMBean(this, new ObjectName(MBEAN_NAME));
+1:         }
+1:         catch (Exception e)
+1:         {
+1:             throw new RuntimeException(e);
+1:         }
+1: 
+1:     }
+/////////////////////////////////////////////////////////////////////////
+1:             long bytes = 0;
+/////////////////////////////////////////////////////////////////////////
+1:                     bytes += before.getUsed() - after.getUsed();
+1:             while (true)
+1:             {
+1:                 State prev = state.get();
+1:                 if (state.compareAndSet(prev, new State(duration, bytes, prev)))
+1:                     break;
+1:             }
+1: 
+0:             if (duration > MIN_LOG_DURATION)
+0:             if (duration > MIN_LOG_DURATION_TPSTATS)
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     public State getTotalSinceLastCheck()
+1:     {
+1:         return state.getAndSet(new State());
+1:     }
+1: 
+1:     public double[] getAndResetStats()
+1:     {
+1:         State state = getTotalSinceLastCheck();
+0:         double[] r = new double[6];
+1:         r[0] = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - state.startNanos);
+1:         r[1] = state.maxRealTimeElapsed;
+1:         r[2] = state.totalRealTimeElapsed;
+1:         r[3] = state.sumSquaresRealTimeElapsed;
+1:         r[4] = state.totalBytesReclaimed;
+1:         r[5] = state.count;
+1:         return r;
+1:     }
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:d33e29a
+commit:41a85af
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.Collections;
+0: import java.util.Map;
+1: import javax.management.Notification;
+1: import javax.management.NotificationListener;
+1: import javax.management.openmbean.CompositeData;
+0: import com.sun.management.GarbageCollectionNotificationInfo;
+0: public class GCInspector implements NotificationListener
+1:     public static void register() throws Exception
+1:         GCInspector inspector = new GCInspector();
+1:         ObjectName gcName = new ObjectName(ManagementFactory.GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + ",*");
+1:         for (ObjectName name : server.queryNames(gcName, null))
+1:             server.addNotificationListener(name, inspector, null, null);
+0:     public void handleNotification(Notification notification, Object handback)
+1:         String type = notification.getType();
+1:         if (type.equals(GarbageCollectionNotificationInfo.GARBAGE_COLLECTION_NOTIFICATION))
+1:             // retrieve the garbage collection notification information
+1:             CompositeData cd = (CompositeData) notification.getUserData();
+1:             GarbageCollectionNotificationInfo info = GarbageCollectionNotificationInfo.from(cd);
+1: 
+0:             long duration = info.getGcInfo().getDuration();
+1: 
+1:             StringBuilder sb = new StringBuilder();
+1:             sb.append(info.getGcName()).append(" GC in ").append(duration).append("ms.  ");
+1: 
+0:             List<String> keys = new ArrayList<>(info.getGcInfo().getMemoryUsageBeforeGc().keySet());
+0:             Collections.sort(keys);
+0:             for (String key : keys)
+0:                 MemoryUsage before = info.getGcInfo().getMemoryUsageBeforeGc().get(key);
+0:                 MemoryUsage after = info.getGcInfo().getMemoryUsageAfterGc().get(key);
+1:                 if (after != null && after.getUsed() != before.getUsed())
+1:                 {
+1:                     sb.append(key).append(": ").append(before.getUsed());
+1:                     sb.append(" -> ");
+1:                     sb.append(after.getUsed());
+0:                     if (!key.equals(keys.get(keys.size() - 1)))
+1:                         sb.append("; ");
+1:                 }
+1:             String st = sb.toString();
+0:             if (duration > MIN_DURATION)
+0:             if (duration > MIN_DURATION_TPSTATS)
+0:             if (info.getGcName().equals("ConcurrentMarkSweep"))
+commit:51a1f23
+/////////////////////////////////////////////////////////////////////////
+0: import java.lang.reflect.UndeclaredThrowableException;
+/////////////////////////////////////////////////////////////////////////
+0:     public void start()
+0:         buildMXBeanList();
+1: 
+0:         // don't bother starting a thread that will do nothing.
+0:         if (beans.isEmpty())
+0:             return;
+1: 
+0:         Runnable t = new Runnable()
+1:         {
+0:             public void run()
+1:             {
+0:                 logGCResults();
+1:             }
+0:         };
+0:         StorageService.scheduledTasks.scheduleWithFixedDelay(t, INTERVAL_IN_MS, INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
+1:     }
+1: 
+0:     private void buildMXBeanList()
+1:     {
+0:         beans.clear();
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         boolean gcChanged = false;
+0:         try
+0:             for (GarbageCollectorMXBean gc : beans)
+1:             {
+0:                 if (!gc.isValid())
+1:                 {
+0:                     gcChanged = true;
+0:                     continue;
+1:                 }
+0:                 Long previousTotal = gctimes.get(gc.getName());
+0:                 Long total = gc.getCollectionTime();
+0:                 if (previousTotal == null)
+0:                     previousTotal = 0L;
+0:                 if (previousTotal.equals(total))
+0:                     continue;
+0:                 gctimes.put(gc.getName(), total);
+0:                 Long duration = total - previousTotal; // may be zero for a really fast collection
+0:                 Long previousCount = gccounts.get(gc.getName());
+0:                 Long count = gc.getCollectionCount();
+0:                 if (previousCount == null)
+0:                     previousCount = 0L;
+0:                 if (count.equals(previousCount))
+0:                     continue;
+0:                 gccounts.put(gc.getName(), count);
+0:                 MemoryUsage mu = membean.getHeapMemoryUsage();
+0:                 long memoryUsed = mu.getUsed();
+0:                 long memoryMax = mu.getMax();
+0:                 String st = String.format("GC for %s: %s ms for %s collections, %s used; max is %s",
+0:                                           gc.getName(), duration, count - previousCount, memoryUsed, memoryMax);
+0:                 long durationPerCollection = duration / (count - previousCount);
+0:                 if (durationPerCollection > MIN_DURATION)
+1:                     logger.info(st);
+0:                 else if (logger.isDebugEnabled())
+0:                     logger.debug(st);
+0:                 if (durationPerCollection > MIN_DURATION_TPSTATS)
+1:                     StatusLogger.log();
+1: 
+0:                 // if we just finished a full collection and we're still using a lot of memory, try to reduce the pressure
+0:                 if (gc.getName().equals("ConcurrentMarkSweep"))
+0:                     SSTableDeletingTask.rescheduleFailedTasks();
+1:             }
+0:         catch (UndeclaredThrowableException e)
+1:         {
+0:             // valid-ness may have changed out from under us, even though we check for it explicitly.
+0:             // if so, gc.getName() will throw UTE when reflection runs into InstanceNotFoundException.
+0:             // See CASSANDRA-5345
+0:             gcChanged = true;
+1:         }
+1: 
+0:         if (gcChanged)
+0:             buildMXBeanList();
+commit:6c28169
+commit:b41e645
+/////////////////////////////////////////////////////////////////////////
+0:             Long duration = total - previousTotal; // may be zero for a really fast collection
+commit:b1a087e
+commit:71ebcaf
+/////////////////////////////////////////////////////////////////////////
+0:             if (count.equals(previousCount))
+commit:91b5dd0
+/////////////////////////////////////////////////////////////////////////
+commit:1a01343
+/////////////////////////////////////////////////////////////////////////
+commit:4921e6b
+/////////////////////////////////////////////////////////////////////////
+0: import java.lang.management.GarbageCollectorMXBean;
+0: import java.lang.management.MemoryMXBean;
+0: import java.util.ArrayList;
+0: import java.util.HashMap;
+0: import java.util.List;
+/////////////////////////////////////////////////////////////////////////
+0:     private HashMap<String, Long> gccounts = new HashMap<String, Long>();
+0:     List<GarbageCollectorMXBean> beans = new ArrayList<GarbageCollectorMXBean>();
+0:     MemoryMXBean membean = ManagementFactory.getMemoryMXBean();
+1: 
+0:                 GarbageCollectorMXBean gc = ManagementFactory.newPlatformMXBeanProxy(server, name.getCanonicalName(), GarbageCollectorMXBean.class);
+/////////////////////////////////////////////////////////////////////////
+0:         for (GarbageCollectorMXBean gc : beans)
+0:             Long previousTotal = gctimes.get(gc.getName());
+0:             Long total = gc.getCollectionTime();
+0:             if (previousTotal == null)
+0:                 previousTotal = 0L;
+0:             if (previousTotal.equals(total))
+0:             gctimes.put(gc.getName(), total);
+0:             Long duration = total - previousTotal;
+0:             assert duration > 0;
+0:             Long previousCount = gccounts.get(gc.getName());
+0:             Long count = gc.getCollectionCount();
+0:             if (previousCount == null)
+0:                 previousCount = 0L;
+0:             gccounts.put(gc.getName(), count);
+0:             assert count > previousCount;
+0:             MemoryUsage mu = membean.getHeapMemoryUsage();
+0:             long memoryUsed = mu.getUsed();
+0:             long memoryMax = mu.getMax();
+0:             String st = String.format("GC for %s: %s ms for %s collections, %s used; max is %s",
+0:                                       gc.getName(), duration, count - previousCount, memoryUsed, memoryMax);
+0:             long durationPerCollection = duration / (count - previousCount);
+0:             if (durationPerCollection > MIN_DURATION)
+0:             if (durationPerCollection > MIN_DURATION_TPSTATS)
+0:             if (gc.getName().equals("ConcurrentMarkSweep"))
+/////////////////////////////////////////////////////////////////////////
+commit:42ebfb1
+commit:5e18204
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.config.DatabaseDescriptor;
+/////////////////////////////////////////////////////////////////////////
+0:     private volatile boolean cacheSizesReduced;
+/////////////////////////////////////////////////////////////////////////
+0:                 logGCResults();
+0:     private void logGCResults()
+/////////////////////////////////////////////////////////////////////////
+0:                                       gcw.getName(), gcw.getDuration(), previousMemoryUsed - memoryUsed, memoryUsed, memoryMax);
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:             // if we just finished a full collection and we're still using a lot of memory, try to reduce the pressure
+0:             if (gcw.getName().equals("ConcurrentMarkSweep"))
+0:             {
+0:                 double usage = (double) memoryUsed / memoryMax;
+0: 
+0:                 if (memoryUsed > DatabaseDescriptor.getReduceCacheSizesAt() * memoryMax && !cacheSizesReduced)
+0:                 {
+0:                     cacheSizesReduced = true;
+0:                     logger.warn("Heap is " + usage + " full.  You may need to reduce memtable and/or cache sizes.  Cassandra is now reducing cache sizes to free up memory.  Adjust reduce_cache_sizes_at threshold in cassandra.yaml if you don't want Cassandra to do this automatically");
+0:                     StorageService.instance.reduceCacheSizes();
+1:                 }
+0: 
+0:                 if (memoryUsed > DatabaseDescriptor.getFlushLargestMemtablesAt() * memoryMax)
+0:                 {
+0:                     logger.warn("Heap is " + usage + " full.  You may need to reduce memtable and/or cache sizes.  Cassandra will now flush up to the two largest memtables to free up memory.  Adjust flush_largest_memtables_at threshold in cassandra.yaml if you don't want Cassandra to do this automatically");
+0:                     StorageService.instance.flushLargestMemtables();
+1:                 }
+1:             }
+commit:5728a20
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.StatusLogger;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:                 StatusLogger.log();
+/////////////////////////////////////////////////////////////////////////
+commit:37ec7d3
+/////////////////////////////////////////////////////////////////////////
+0:         for (int n : MessagingService.instance().getCommandPendingTasks().values())
+0:         for (int n : MessagingService.instance().getResponsePendingTasks().values())
+commit:6c2cef0
+/////////////////////////////////////////////////////////////////////////
+0:     
+0:     public static final GCInspector instance = new GCInspector();
+commit:91133a4
+/////////////////////////////////////////////////////////////////////////
+0:     private static final class SunGcWrapper
+commit:886de85
+/////////////////////////////////////////////////////////////////////////
+0:                 logStats();
+0:     public void logStats()
+0:         Set<ObjectName> request, internal;
+0:         try
+0:         {
+0:             request = server.queryNames(new ObjectName("org.apache.cassandra.request:type=*"), null);
+0:             internal = server.queryNames(new ObjectName("org.apache.cassandra.internal:type=*"), null);
+0:         }
+0:         catch (MalformedObjectNameException e)
+0:         {
+0:             throw new RuntimeException(e);
+0:         }
+0:         for (ObjectName objectName : Iterables.concat(request, internal))
+commit:55db039
+/////////////////////////////////////////////////////////////////////////
+1: import java.lang.management.ManagementFactory;
+1: import java.lang.management.MemoryUsage;
+0: import java.util.concurrent.TimeUnit;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+0: 
+0: import org.apache.cassandra.concurrent.IExecutorMBean;
+0: import org.apache.cassandra.db.ColumnFamilyStore;
+0: import org.apache.cassandra.db.CompactionManager;
+0: import org.apache.cassandra.net.MessagingService;
+/////////////////////////////////////////////////////////////////////////
+0:         Runnable t = new Runnable()
+0:         StorageService.scheduledTasks.scheduleWithFixedDelay(t, INTERVAL_IN_MS, INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
+commit:43eae6f
+/////////////////////////////////////////////////////////////////////////
+0: import com.google.common.collect.Iterables;
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:         Set<ObjectName> requests = server.queryNames(new ObjectName("org.apache.cassandra.request:type=*"), null);
+0:         Set<ObjectName> internal = server.queryNames(new ObjectName("org.apache.cassandra.internal:type=*"), null);
+0:         for (ObjectName objectName : Iterables.concat(requests, internal))
+commit:5a1dccf
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.net.MessagingService;
+/////////////////////////////////////////////////////////////////////////
+0:         int pendingCommands = 0;
+0:         for (int n : MessagingService.instance.getCommandPendingTasks().values())
+0:         {
+0:             pendingCommands += n;
+0:         }
+0:         int pendingResponses = 0;
+0:         for (int n : MessagingService.instance.getResponsePendingTasks().values())
+0:         {
+0:             pendingResponses += n;
+0:         }
+0:         logger.info(String.format("%-25s%10s%10s",
+0:                                   "MessagingService", "n/a", pendingCommands + "," + pendingResponses));
+commit:f9f97d4
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.db.ColumnFamilyStore;
+0: import org.apache.cassandra.db.CompactionManager;
+/////////////////////////////////////////////////////////////////////////
+0:                     logStats();
+/////////////////////////////////////////////////////////////////////////
+0:     private void logStats() throws MalformedObjectNameException
+0:         // everything from o.a.c.concurrent
+0:         for (ObjectName objectName : server.queryNames(new ObjectName("org.apache.cassandra.concurrent:type=*"), null))
+0:             logger.info(String.format("%-25s%10s%10s",
+0:                                       poolName, threadPoolProxy.getActiveCount(), threadPoolProxy.getPendingTasks()));
+0:         // one offs
+0:         logger.info(String.format("%-25s%10s%10s",
+0:                                   "CompactionManager", "n/a", CompactionManager.instance.getPendingTasks()));
+0: 
+0:         // per-CF stats
+0:         logger.info(String.format("%-25s%20s%20s%20s", "ColumnFamily", "Memtable ops,data", "Row cache size/cap", "Key cache size/cap"));
+0:         for (ColumnFamilyStore cfs : ColumnFamilyStore.all())
+0:         {
+0:             logger.info(String.format("%-25s%20s%20s%20s",
+0:                                       cfs.table.name + "." + cfs.columnFamily,
+0:                                       cfs.getMemtableColumnsCount() + "," + cfs.getMemtableDataSize(),
+0:                                       cfs.getRowCacheSize() + "/" + cfs.getRowCacheCapacity(),
+0:                                       cfs.getKeyCacheSize() + "/" + cfs.getKeyCacheCapacity()));
+0:         }
+commit:6675da3
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.cassandra.service;
+0: 
+0: import org.apache.log4j.Logger;
+0: 
+0: import java.util.*;
+0: import java.util.concurrent.ExecutorService;
+0: import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
+0: import org.apache.cassandra.utils.WrappedRunnable;
+0: 
+0: import com.sun.management.GarbageCollectorMXBean;
+0: import com.sun.management.GcInfo;
+0: import java.lang.management.MemoryUsage;
+0: import java.lang.management.ManagementFactory;
+1: import javax.management.MBeanServer;
+1: import javax.management.ObjectName;
+0: 
+0: public class GCInspector
+0: {
+0:     public static final GCInspector instance = new GCInspector();
+0: 
+0:     private static final Logger logger = Logger.getLogger(GCInspector.class);
+0:     final static long INTERVAL_IN_MS = 10 * 1000;
+0:     final static long MIN_DURATION = 200;
+0: 
+0:     private HashMap<String, Long> gctimes = new HashMap<String, Long>();
+0: 
+0:     List<GarbageCollectorMXBean> beans = new ArrayList<GarbageCollectorMXBean>();
+0: 
+0:     public GCInspector()
+0:     {
+1:         MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+0:         try
+0:         {
+0:             ObjectName gcName = new ObjectName(ManagementFactory.GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + ",*");
+0:             for (ObjectName name : server.queryNames(gcName, null))
+0:             {
+0:                 GarbageCollectorMXBean gc = ManagementFactory.newPlatformMXBeanProxy(server, name.getCanonicalName(), GarbageCollectorMXBean.class);
+0:                 beans.add(gc);
+0:             }
+0:         }
+0:         catch (Exception e)
+0:         {
+0:             throw new RuntimeException(e);
+0:         }
+0:     }
+0: 
+0:     public void start()
+0:     {
+0:         TimerTask t = new TimerTask()
+0:         {
+0:             public void run()
+0:             {
+0:                 logIntervalGCStats();
+0:             }
+0:         };
+0:         new Timer("GC inspection").schedule(t, INTERVAL_IN_MS, INTERVAL_IN_MS);
+0:     }
+0: 
+0:     private void logIntervalGCStats()
+0:     {
+0:         for (GarbageCollectorMXBean gc : beans)
+0:         {
+0:             GcInfo gci = gc.getLastGcInfo();
+0:             if (gci == null)
+0:                 continue;
+0: 
+0:             Long previous = gctimes.get(gc.getName());
+0:             if (previous != null && previous == gc.getCollectionTime())
+0:                 continue;
+0:             gctimes.put(gc.getName(), gc.getCollectionTime());
+0: 
+0:             long previousMemoryUsed = 0;
+0:             long memoryUsed = 0;
+0:             long memoryMax = 0;
+0:             for (Map.Entry<String, MemoryUsage> entry : gci.getMemoryUsageBeforeGc().entrySet())
+0:             {
+0:                 previousMemoryUsed += entry.getValue().getUsed();
+0:             }
+0:             for (Map.Entry<String, MemoryUsage> entry : gci.getMemoryUsageAfterGc().entrySet())
+0:             {
+0:                 MemoryUsage mu = entry.getValue();
+0:                 memoryUsed += mu.getUsed();
+0:                 memoryMax += mu.getMax();
+0:             }
+0: 
+0:             String st = String.format("GC for %s: %s ms, %s reclaimed leaving %s used; max is %s",
+0:                                       gc.getName(), gci.getDuration(), previousMemoryUsed - memoryUsed, memoryUsed, memoryMax);
+0:             if (gci.getDuration() > MIN_DURATION)
+0:                 logger.info(st);
+0:             else if (logger.isDebugEnabled())
+0:                 logger.debug(st);
+0:         }
+0:     }
+0: }
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:e79d9fb
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:07cdfd0
+/////////////////////////////////////////////////////////////////////////
+1:  *
+/////////////////////////////////////////////////////////////////////////
+1:  *
+1:  *
+1:  *
+/////////////////////////////////////////////////////////////////////////
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:             return;
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:                 previousCount = 0L;
+0: 
+commit:2fd3268
+/////////////////////////////////////////////////////////////////////////
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:             return;
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:                 previousCount = 0L;
+0: 
+commit:5a6e2b0
+/////////////////////////////////////////////////////////////////////////
+0:     private final HashMap<String, Long> gctimes = new HashMap<String, Long>();
+0:     private final HashMap<String, Long> gccounts = new HashMap<String, Long>();
+0:     final List<GarbageCollectorMXBean> beans = new ArrayList<GarbageCollectorMXBean>();
+0:     final MemoryMXBean membean = ManagementFactory.getMemoryMXBean();
+commit:07cf56f
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+0:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+0: package org.apache.cassandra.service;
+commit:04c0b81
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.sstable.SSTableDeletingTask;
+/////////////////////////////////////////////////////////////////////////
+0:                 SSTableDeletingTask.rescheduleFailedTasks();
+0: 
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:295aedb
+/////////////////////////////////////////////////////////////////////////
+0:                     CacheService.instance.reduceCacheSizes();
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:99cfe85
+commit:6e325c5
+/////////////////////////////////////////////////////////////////////////
+0:             
+0:                 previousCount = 0L;           
+0:             if (count == previousCount)
+0:                 continue;
+0:             
+commit:2ec8621
+commit:51d20ba
+/////////////////////////////////////////////////////////////////////////
+0:             if (count == 0)
+0:                 continue;
+commit:16d7385
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:             if (count == 0)
+0:                 continue;
+0: 
+author:Brandon Williams
+-------------------------------------------------------------------------------
+commit:c953ee6
+/////////////////////////////////////////////////////////////////////////
+0: import java.lang.management.GarbageCollectorMXBean;
+0: import java.lang.management.MemoryMXBean;
+0: import java.util.ArrayList;
+0: import java.util.HashMap;
+0: import java.util.List;
+/////////////////////////////////////////////////////////////////////////
+0:     private HashMap<String, Long> gccounts = new HashMap<String, Long>();
+0:     List<GarbageCollectorMXBean> beans = new ArrayList<GarbageCollectorMXBean>();
+0:     MemoryMXBean membean = ManagementFactory.getMemoryMXBean();
+0: 
+0:                 GarbageCollectorMXBean gc = ManagementFactory.newPlatformMXBeanProxy(server, name.getCanonicalName(), GarbageCollectorMXBean.class);
+/////////////////////////////////////////////////////////////////////////
+0:         for (GarbageCollectorMXBean gc : beans)
+0:             Long previousTotal = gctimes.get(gc.getName());
+0:             Long total = gc.getCollectionTime();
+0:             if (previousTotal == null)
+0:                 previousTotal = 0L;
+0:             if (previousTotal.equals(total))            
+0:             gctimes.put(gc.getName(), total);
+0:             Long duration = total - previousTotal;
+0:             assert duration > 0;
+0:             Long previousCount = gccounts.get(gc.getName());
+0:             Long count = gc.getCollectionCount();
+0:             if (previousCount == null)
+0:                 previousCount = 0L;
+0:             gccounts.put(gc.getName(), count);
+0:             assert count > previousCount;
+0:             MemoryUsage mu = membean.getHeapMemoryUsage();
+0:             long memoryUsed = mu.getUsed();
+0:             long memoryMax = mu.getMax();
+0:             String st = String.format("GC for %s: %s ms for %s collections, %s used; max is %s",
+0:                                       gc.getName(), duration, count - previousCount, memoryUsed, memoryMax);
+0:             long durationPerCollection = duration / (count - previousCount);
+0:             if (durationPerCollection > MIN_DURATION)                          
+0:             if (durationPerCollection > MIN_DURATION_TPSTATS)
+0:             if (gc.getName().equals("ConcurrentMarkSweep"))
+/////////////////////////////////////////////////////////////////////////
+commit:dbe2de3
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.concurrent.IExecutorMBean;
+0: import org.apache.cassandra.db.CompactionManagerMBean;
+0: import javax.management.JMX;
+0: import javax.management.MalformedObjectNameException;
+/////////////////////////////////////////////////////////////////////////
+0:     final static long MIN_DURATION_TPSTATS = 1000;
+0:     private final MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+/////////////////////////////////////////////////////////////////////////
+0:             if (gci.getDuration() > MIN_DURATION_TPSTATS)
+0:             {
+0:                 try
+0:                 {
+0:                     logThreadPoolStats();
+0:                 }
+0:                 catch (MalformedObjectNameException e)
+0:                 {
+0:                     throw new RuntimeException(e);
+0:                 }
+0:             }
+0: 
+0:     private void logThreadPoolStats() throws MalformedObjectNameException
+0:     {
+0:         ObjectName query = new ObjectName("org.apache.cassandra.concurrent:type=*");
+0:         Iterator<ObjectName> tpiter = server.queryNames(query, null).iterator();
+0:         logger.info(String.format("%-25s%10s%10s", "Pool Name", "Active", "Pending"));
+0:         while(tpiter.hasNext())
+0:         {
+0:             ObjectName objectName = tpiter.next();
+0:             String poolName = objectName.getKeyProperty("type");
+0:             IExecutorMBean threadPoolProxy = JMX.newMBeanProxy(server, objectName, IExecutorMBean.class);
+0:             logger.info(String.format("%-25s%10d%10d", poolName, threadPoolProxy.getActiveCount(), threadPoolProxy.getPendingTasks()));
+0:         }
+0:         // one off for compaction
+0:         ObjectName cm = new ObjectName("org.apache.cassandra.db:type=CompactionManager");
+0:         CompactionManagerMBean cmProxy = JMX.newMBeanProxy(server, cm, CompactionManagerMBean.class);
+0:         logger.info(String.format("%-25s%10s%10s", "CompactionManager", "n/a", cmProxy.getPendingTasks()));
+0:     }
+author:Gary Dusbabek
+-------------------------------------------------------------------------------
+commit:3adc03e
+/////////////////////////////////////////////////////////////////////////
+0: import java.lang.reflect.InvocationTargetException;
+0: import java.lang.reflect.Method;
+/////////////////////////////////////////////////////////////////////////
+0:     List<Object> beans = new ArrayList<Object>(); // these are instances of com.sun.management.GarbageCollectorMXBean
+0:         // we only want this class to do its thing on sun jdks, or when the sun classes are present.
+0:         Class gcBeanClass = null;
+0:         try
+0:         {
+0:             gcBeanClass = Class.forName("com.sun.management.GarbageCollectorMXBean");
+0:             Class.forName("com.sun.management.GcInfo");
+0:         }
+0:         catch (ClassNotFoundException ex)
+0:         {
+0:             // this happens when using a non-sun jdk.
+0:             logger.warn("Cannot load sun GC monitoring classes. GCInspector is disabled.");
+0:         }
+0:         
+0:                 Object gc = ManagementFactory.newPlatformMXBeanProxy(server, name.getCanonicalName(), gcBeanClass);
+/////////////////////////////////////////////////////////////////////////
+0:         // don't bother starting a thread that will do nothing.
+0:         if (beans.size() == 0)
+0:             return;         
+/////////////////////////////////////////////////////////////////////////
+0:         for (Object gc : beans)
+0:             SunGcWrapper gcw = new SunGcWrapper(gc);
+0:             if (gcw.isLastGcInfoNull())
+0:             Long previous = gctimes.get(gcw.getName());
+0:             if (previous != null && previous.longValue() == gcw.getCollectionTime().longValue())            
+0:             gctimes.put(gcw.getName(), gcw.getCollectionTime());
+0:             for (Map.Entry<String, MemoryUsage> entry : gcw.getMemoryUsageBeforeGc().entrySet())
+0:             for (Map.Entry<String, MemoryUsage> entry : gcw.getMemoryUsageAfterGc().entrySet())
+/////////////////////////////////////////////////////////////////////////
+0:                     gcw.getName(), gcw.getDuration(), previousMemoryUsed - memoryUsed, memoryUsed, memoryMax);
+0:             if (gcw.getDuration() > MIN_DURATION)                          
+0:             if (gcw.getDuration() > MIN_DURATION_TPSTATS)
+/////////////////////////////////////////////////////////////////////////
+0:     
+0:     
+0:     // wrapper for sun class. this enables other jdks to compile this class.
+0:     private final class SunGcWrapper
+0:     {
+0:         
+0:         private Map<String, MemoryUsage> usageBeforeGc = null;
+0:         private Map<String, MemoryUsage> usageAfterGc = null;
+0:         private String name;
+0:         private Long collectionTime;
+0:         private Long duration;
+0:         
+0:         SunGcWrapper(Object gcMxBean)
+0:         {
+0:             // if we've gotten this far, we've already verified that the right classes are in the CP. Now we just
+0:             // need to check for boneheadedness.
+0:             // grab everything we need here so that we don't have to deal with try/catch everywhere.
+0:             try
+0:             {
+0:                 assert Class.forName("com.sun.management.GarbageCollectorMXBean").isAssignableFrom(gcMxBean.getClass());
+0:                 Method getGcInfo = gcMxBean.getClass().getDeclaredMethod("getLastGcInfo");
+0:                 Object lastGcInfo = getGcInfo.invoke(gcMxBean);
+0:                 if (lastGcInfo != null)
+0:                 {
+0:                     usageBeforeGc = (Map<String, MemoryUsage>)lastGcInfo.getClass().getDeclaredMethod("getMemoryUsageBeforeGc").invoke(lastGcInfo);
+0:                     usageAfterGc = (Map<String, MemoryUsage>)lastGcInfo.getClass().getDeclaredMethod("getMemoryUsageAfterGc").invoke(lastGcInfo);
+0:                     duration = (Long)lastGcInfo.getClass().getDeclaredMethod("getDuration").invoke(lastGcInfo);
+0:                     name = (String)gcMxBean.getClass().getDeclaredMethod("getName").invoke(gcMxBean);
+0:                     collectionTime = (Long)gcMxBean.getClass().getDeclaredMethod("getCollectionTime").invoke(gcMxBean);
+0:                 }
+0:             }
+0:             catch (ClassNotFoundException e)
+0:             {
+0:                 throw new RuntimeException(e);
+0:             }
+0:             catch (NoSuchMethodException e)
+0:             {
+0:                 throw new RuntimeException(e);
+0:             }
+0:             catch (IllegalAccessException e)
+0:             {
+0:                 throw new RuntimeException(e);
+0:             }
+0:             catch (InvocationTargetException e)
+0:             {
+0:                 throw new RuntimeException(e);
+0:             }
+0:         }
+0:         
+0:         String getName()
+0:         {
+0:             return name;
+0:         }
+0:         
+0:         Long getCollectionTime()
+0:         {
+0:             return collectionTime;
+0:         }
+0:         
+0:         Long getDuration()
+0:         {
+0:             return duration;
+0:         }
+0:         
+0:         Map<String, MemoryUsage> getMemoryUsageAfterGc()
+0:         {
+0:             return usageAfterGc;
+0:         }
+0:         
+0:         Map<String, MemoryUsage> getMemoryUsageBeforeGc()
+0:         {
+0:             return usageBeforeGc;
+0:         }
+0:         
+0:         boolean isLastGcInfoNull()
+0:         {
+0:             return usageBeforeGc == null;
+0:         }
+0:     }
+0:     
+commit:e9fd49d
+/////////////////////////////////////////////////////////////////////////
+0:     final static long INTERVAL_IN_MS = 1000;
+commit:3c19232
+/////////////////////////////////////////////////////////////////////////
+1: /*
+0:  * 
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+0:  * 
+0:  *   http://www.apache.org/licenses/LICENSE-2.0
+0:  * 
+0:  * Unless required by applicable law or agreed to in writing,
+0:  * software distributed under the License is distributed on an
+0:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+0:  * KIND, either express or implied.  See the License for the
+0:  * specific language governing permissions and limitations
+0:  * under the License.
+0:  * 
+1:  */
+commit:0095f0c
+/////////////////////////////////////////////////////////////////////////
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+/////////////////////////////////////////////////////////////////////////
+1:     private static final Logger logger = LoggerFactory.getLogger(GCInspector.class);
+============================================================================

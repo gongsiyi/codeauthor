@@ -1,0 +1,3136 @@
+1:9f14856: /*
+1:9f14856:  * Licensed to the Apache Software Foundation (ASF) under one
+1:9f14856:  * or more contributor license agreements.  See the NOTICE file
+1:9f14856:  * distributed with this work for additional information
+1:9f14856:  * regarding copyright ownership.  The ASF licenses this file
+1:9f14856:  * to you under the Apache License, Version 2.0 (the
+1:9f14856:  * "License"); you may not use this file except in compliance
+1:9f14856:  * with the License.  You may obtain a copy of the License at
+1:9f14856:  *
+1:9f14856:  *   http://www.apache.org/licenses/LICENSE-2.0
+1:9f14856:  *
+1:9f14856:  * Unless required by applicable law or agreed to in writing,
+1:9f14856:  * software distributed under the License is distributed on an
+1:9f14856:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+1:9f14856:  * KIND, either express or implied.  See the License for the
+1:9f14856:  * specific language governing permissions and limitations
+1:9f14856:  * under the License.
+1:9f14856:  */
+1:412b053: package org.apache.cassandra.utils.btree;
+25:412b053: 
+1:5250d7f: import java.util.*;
+1:dc9ed46: import java.util.function.Consumer;
+1:5250d7f: 
+1:639d4b2: import com.google.common.base.Function;
+1:dc9ed46: import com.google.common.base.Predicate;
+1:639d4b2: import com.google.common.collect.Iterators;
+1:5250d7f: import com.google.common.collect.Ordering;
+1:412b053: 
+1:1e92ce4: import io.netty.util.Recycler;
+1:4b54b8a: import org.apache.cassandra.utils.ObjectSizes;
+1:e6e596d: 
+1:639d4b2: import static com.google.common.collect.Iterables.concat;
+1:639d4b2: import static com.google.common.collect.Iterables.filter;
+1:639d4b2: import static com.google.common.collect.Iterables.transform;
+1:5250d7f: import static java.lang.Math.max;
+1:5250d7f: import static java.lang.Math.min;
+1:5250d7f: 
+1:412b053: public class BTree
+1:4b54b8a: {
+3:412b053:     /**
+1:412b053:      * Leaf Nodes are a raw array of values: Object[V1, V1, ...,].
+5:412b053:      *
+1:5250d7f:      * Branch Nodes: Object[V1, V2, ..., child[&lt;V1.key], child[&lt;V2.key], ..., child[&lt; Inf], size], where
+1:412b053:      * each child is another node, i.e., an Object[].  Thus, the value elements in a branch node are the
+1:5250d7f:      * first half of the array (minus one).  In our implementation, each value must include its own key;
+1:412b053:      * we access these via Comparator, rather than directly. 
+1:412b053:      *
+1:5250d7f:      * So we can quickly distinguish between leaves and branches, we require that leaf nodes are always an odd number
+1:5250d7f:      * of elements (padded with a null, if necessary), and branches are always an even number of elements.
+1:412b053:      *
+1:412b053:      * BTrees are immutable; updating one returns a new tree that reuses unmodified nodes.
+1:412b053:      *
+1:412b053:      * There are no references back to a parent node from its children.  (This would make it impossible to re-use
+1:412b053:      * subtrees when modifying the tree, since the modified tree would need new parent references.)
+1:412b053:      * Instead, we store these references in a Path as needed when navigating the tree.
+3:412b053:      */
+1:412b053: 
+1:412b053:     // The maximum fan factor used for B-Trees
+1:412b053:     static final int FAN_SHIFT;
+1:412b053:     static
+1:2fd2d89:     {
+1:412b053:         int fanfactor = 32;
+1:412b053:         if (System.getProperty("cassandra.btree.fanfactor") != null)
+1:412b053:             fanfactor = Integer.parseInt(System.getProperty("cassandra.btree.fanfactor"));
+1:412b053:         int shift = 1;
+1:412b053:         while (1 << shift < fanfactor)
+1:412b053:             shift += 1;
+1:412b053:         FAN_SHIFT = shift;
+1:2fd2d89:     }
+1:412b053:     // NB we encode Path indexes as Bytes, so this needs to be less than Byte.MAX_VALUE / 2
+1:412b053:     static final int FAN_FACTOR = 1 << FAN_SHIFT;
+1:e51f83b: 
+1:1c62850:     static final int MINIMAL_NODE_SIZE = FAN_FACTOR >> 1;
+1:1c62850: 
+1:412b053:     // An empty BTree Leaf - which is the same as an empty BTree
+1:5250d7f:     static final Object[] EMPTY_LEAF = new Object[1];
+1:0cb1e3d: 
+1:412b053:     // An empty BTree branch - used only for internal purposes in Modifier
+1:5250d7f:     static final Object[] EMPTY_BRANCH = new Object[] { null, new int[0] };
+1:412b053: 
+1:639d4b2:     // direction of iteration
+1:639d4b2:     public static enum Dir
+1:639d4b2:     {
+1:639d4b2:         ASC, DESC;
+1:639d4b2:         public Dir invert() { return this == ASC ? DESC : ASC; }
+1:639d4b2:         public static Dir asc(boolean asc) { return asc ? ASC : DESC; }
+1:639d4b2:         public static Dir desc(boolean desc) { return desc ? DESC : ASC; }
+1:639d4b2:     }
+1:639d4b2: 
+1:412b053:     public static Object[] empty()
+1:0cb1e3d:     {
+1:412b053:         return EMPTY_LEAF;
+1:0cb1e3d:     }
+1:0cb1e3d: 
+1:5250d7f:     public static Object[] singleton(Object value)
+1:5250d7f:     {
+1:5250d7f:         return new Object[] { value };
+1:5250d7f:     }
+1:5250d7f: 
+1:a991b64:     public static <C, K extends C, V extends C> Object[] build(Collection<K> source, UpdateFunction<K, V> updateF)
+1:0cb1e3d:     {
+1:639d4b2:         return buildInternal(source, source.size(), updateF);
+1:639d4b2:     }
+1:639d4b2: 
+1:639d4b2:     public static <C, K extends C, V extends C> Object[] build(Iterable<K> source, UpdateFunction<K, V> updateF)
+1:639d4b2:     {
+1:639d4b2:         return buildInternal(source, -1, updateF);
+1:0cb1e3d:     }
+1:412b053: 
+1:412b053:     /**
+1:412b053:      * Creates a BTree containing all of the objects in the provided collection
+1:412b053:      *
+1:5250d7f:      * @param source  the items to build the tree with. MUST BE IN STRICTLY ASCENDING ORDER.
+1:639d4b2:      * @param size    the size of the source iterable
+1:5250d7f:      * @return        a btree representing the contents of the provided iterable
+1:412b053:      */
+1:a991b64:     public static <C, K extends C, V extends C> Object[] build(Iterable<K> source, int size, UpdateFunction<K, V> updateF)
+21:412b053:     {
+1:639d4b2:         if (size < 0)
+1:639d4b2:             throw new IllegalArgumentException(Integer.toString(size));
+1:639d4b2:         return buildInternal(source, size, updateF);
+1:639d4b2:     }
+1:639d4b2: 
+1:639d4b2:     /**
+1:639d4b2:      * As build(), except:
+1:639d4b2:      * @param size    < 0 if size is unknown
+1:639d4b2:      */
+1:639d4b2:     private static <C, K extends C, V extends C> Object[] buildInternal(Iterable<K> source, int size, UpdateFunction<K, V> updateF)
+1:639d4b2:     {
+1:639d4b2:         if ((size >= 0) & (size < FAN_FACTOR))
+1:412b053:         {
+1:5250d7f:             if (size == 0)
+1:5250d7f:                 return EMPTY_LEAF;
+1:5250d7f:             // pad to odd length to match contract that all leaf nodes are odd
+1:5250d7f:             V[] values = (V[]) new Object[size | 1];
+1:412b053:             {
+1:0cb1e3d:                 int i = 0;
+1:a991b64:                 for (K k : source)
+1:a991b64:                     values[i++] = updateF.apply(k);
+1:4b54b8a:             }
+1:dc9ed46:             if (updateF != UpdateFunction.noOp())
+1:dc9ed46:                 updateF.allocated(ObjectSizes.sizeOfArray(values));
+1:412b053:             return values;
+21:412b053:         }
+1:412b053: 
+1:1e92ce4:         TreeBuilder builder = TreeBuilder.newInstance();
+1:0cb1e3d:         Object[] btree = builder.build(source, updateF, size);
+1:1e92ce4: 
+1:5223c47:         return btree;
+1:412b053:     }
+1:412b053: 
+1:a991b64:     public static <C, K extends C, V extends C> Object[] update(Object[] btree,
+1:a991b64:                                                                 Comparator<C> comparator,
+1:a991b64:                                                                 Collection<K> updateWith,
+1:a991b64:                                                                 UpdateFunction<K, V> updateF)
+1:412b053:     {
+1:a991b64:         return update(btree, comparator, updateWith, updateWith.size(), updateF);
+1:412b053:     }
+1:412b053: 
+1:412b053:     /**
+1:5250d7f:      * Returns a new BTree with the provided collection inserting/replacing as necessary any equal items
+1:412b053:      *
+2:412b053:      * @param btree              the tree to update
+2:412b053:      * @param comparator         the comparator that defines the ordering over the items in the tree
+1:5250d7f:      * @param updateWith         the items to either insert / update. MUST BE IN STRICTLY ASCENDING ORDER.
+1:a991b64:      * @param updateWithLength   then number of elements in updateWith
+1:4b54b8a:      * @param updateF            the update function to apply to any pairs we are swapping, and maybe abort early
+5:412b053:      * @param <V>
+6:412b053:      * @return
+1:412b053:      */
+1:a991b64:     public static <C, K extends C, V extends C> Object[] update(Object[] btree,
+1:a991b64:                                                                 Comparator<C> comparator,
+1:a991b64:                                                                 Iterable<K> updateWith,
+1:a991b64:                                                                 int updateWithLength,
+1:a991b64:                                                                 UpdateFunction<K, V> updateF)
+1:0cb1e3d:     {
+1:5250d7f:         if (isEmpty(btree))
+1:a991b64:             return build(updateWith, updateWithLength, updateF);
+1:1e92ce4: 
+1:412b053: 
+1:1e92ce4:         TreeBuilder builder = TreeBuilder.newInstance();
+1:5223c47:         btree = builder.update(btree, comparator, updateWith, updateF);
+1:5223c47:         return btree;
+1:412b053:     }
+1:412b053: 
+1:e51f83b:     public static <K> Object[] merge(Object[] tree1, Object[] tree2, Comparator<? super K> comparator, UpdateFunction<K, K> updateF)
+1:5250d7f:     {
+1:5250d7f:         if (size(tree1) < size(tree2))
+1:5250d7f:         {
+1:5250d7f:             Object[] tmp = tree1;
+1:5250d7f:             tree1 = tree2;
+1:5250d7f:             tree2 = tmp;
+1:5250d7f:         }
+1:dc9ed46:         return update(tree1, comparator, new BTreeSet<>(tree2, comparator), updateF);
+1:5250d7f:     }
+1:5250d7f: 
+1:639d4b2:     public static <V> Iterator<V> iterator(Object[] btree)
+1:639d4b2:     {
+1:639d4b2:         return iterator(btree, Dir.ASC);
+1:639d4b2:     }
+1:639d4b2: 
+1:639d4b2:     public static <V> Iterator<V> iterator(Object[] btree, Dir dir)
+1:639d4b2:     {
+1:1e92ce4:         return new BTreeSearchIterator<>(btree, null, dir);
+1:639d4b2:     }
+1:639d4b2: 
+1:639d4b2:     public static <V> Iterator<V> iterator(Object[] btree, int lb, int ub, Dir dir)
+1:639d4b2:     {
+1:1e92ce4:         return new BTreeSearchIterator<>(btree, null, dir, lb, ub);
+1:639d4b2:     }
+1:639d4b2: 
+1:639d4b2:     public static <V> Iterable<V> iterable(Object[] btree)
+1:639d4b2:     {
+1:639d4b2:         return iterable(btree, Dir.ASC);
+1:639d4b2:     }
+1:639d4b2: 
+1:639d4b2:     public static <V> Iterable<V> iterable(Object[] btree, Dir dir)
+1:639d4b2:     {
+1:639d4b2:         return () -> iterator(btree, dir);
+1:639d4b2:     }
+1:639d4b2: 
+1:639d4b2:     public static <V> Iterable<V> iterable(Object[] btree, int lb, int ub, Dir dir)
+1:639d4b2:     {
+1:639d4b2:         return () -> iterator(btree, lb, ub, dir);
+1:639d4b2:     }
+1:639d4b2: 
+1:412b053:     /**
+1:412b053:      * Returns an Iterator over the entire tree
+1:412b053:      *
+1:639d4b2:      * @param btree  the tree to iterate over
+1:639d4b2:      * @param dir    direction of iteration
+1:412b053:      * @param <V>
+1:412b053:      * @return
+1:412b053:      */
+1:639d4b2:     public static <K, V> BTreeSearchIterator<K, V> slice(Object[] btree, Comparator<? super K> comparator, Dir dir)
+1:412b053:     {
+1:639d4b2:         return new BTreeSearchIterator<>(btree, comparator, dir);
+1:412b053:     }
+1:412b053: 
+1:412b053:     /**
+2:412b053:      * @param btree      the tree to iterate over
+3:412b053:      * @param comparator the comparator that defines the ordering over the items in the tree
+1:5250d7f:      * @param start      the beginning of the range to return, inclusive (in ascending order)
+1:5250d7f:      * @param end        the end of the range to return, exclusive (in ascending order)
+1:639d4b2:      * @param dir   if false, the iterator will start at the last item and move backwards
+2:5250d7f:      * @return           an Iterator over the defined sub-range of the tree
+1:412b053:      */
+1:639d4b2:     public static <K, V extends K> BTreeSearchIterator<K, V> slice(Object[] btree, Comparator<? super K> comparator, K start, K end, Dir dir)
+1:412b053:     {
+1:639d4b2:         return slice(btree, comparator, start, true, end, false, dir);
+1:412b053:     }
+1:412b053: 
+1:412b053:     /**
+1:5250d7f:      * @param btree          the tree to iterate over
+1:5250d7f:      * @param comparator     the comparator that defines the ordering over the items in the tree
+1:5250d7f:      * @param start          low bound of the range
+1:5250d7f:      * @param startInclusive inclusivity of lower bound
+1:5250d7f:      * @param end            high bound of the range
+1:5250d7f:      * @param endInclusive   inclusivity of higher bound
+1:639d4b2:      * @param dir            direction of iteration
+1:639d4b2:      * @return               an Iterator over the defined sub-range of the tree
+1:412b053:      */
+1:639d4b2:     public static <K, V extends K> BTreeSearchIterator<K, V> slice(Object[] btree, Comparator<? super K> comparator, K start, boolean startInclusive, K end, boolean endInclusive, Dir dir)
+1:412b053:     {
+1:5250d7f:         int inclusiveLowerBound = max(0,
+1:5250d7f:                                       start == null ? Integer.MIN_VALUE
+1:5250d7f:                                                     : startInclusive ? ceilIndex(btree, comparator, start)
+1:5250d7f:                                                                      : higherIndex(btree, comparator, start));
+1:5250d7f:         int inclusiveUpperBound = min(size(btree) - 1,
+1:5250d7f:                                       end == null ? Integer.MAX_VALUE
+1:5250d7f:                                                   : endInclusive ? floorIndex(btree, comparator, end)
+1:5250d7f:                                                                  : lowerIndex(btree, comparator, end));
+1:639d4b2:         return new BTreeSearchIterator<>(btree, comparator, dir, inclusiveLowerBound, inclusiveUpperBound);
+1:639d4b2:     }
+1:639d4b2: 
+1:639d4b2:     /**
+1:639d4b2:      * @return the item in the tree that sorts as equal to the search argument, or null if no such item
+1:639d4b2:      */
+1:639d4b2:     public static <V> V find(Object[] node, Comparator<? super V> comparator, V find)
+1:639d4b2:     {
+1:639d4b2:         while (true)
+1:639d4b2:         {
+1:639d4b2:             int keyEnd = getKeyEnd(node);
+1:639d4b2:             int i = Arrays.binarySearch((V[]) node, 0, keyEnd, find, comparator);
+1:639d4b2: 
+1:639d4b2:             if (i >= 0)
+1:639d4b2:                 return (V) node[i];
+1:639d4b2: 
+1:639d4b2:             if (isLeaf(node))
+1:639d4b2:                 return null;
+1:639d4b2: 
+1:639d4b2:             i = -1 - i;
+1:639d4b2:             node = (Object[]) node[keyEnd + i];
+1:639d4b2:         }
+1:639d4b2:     }
+1:639d4b2: 
+1:639d4b2:     /**
+1:639d4b2:      * Modifies the provided btree directly. THIS SHOULD NOT BE USED WITHOUT EXTREME CARE as BTrees are meant to be immutable.
+1:1c62850:      * Finds and replaces the item provided by index in the tree.
+1:1c62850:      */
+1:1c62850:     public static <V> void replaceInSitu(Object[] tree, int index, V replace)
+1:1c62850:     {
+1:1c62850:         // WARNING: if semantics change, see also InternalCursor.seekTo, which mirrors this implementation
+1:1c62850:         if ((index < 0) | (index >= size(tree)))
+1:1c62850:             throw new IndexOutOfBoundsException(index + " not in range [0.." + size(tree) + ")");
+1:1c62850: 
+1:1c62850:         while (!isLeaf(tree))
+1:1c62850:         {
+1:1c62850:             final int[] sizeMap = getSizeMap(tree);
+1:1c62850:             int boundary = Arrays.binarySearch(sizeMap, index);
+1:1c62850:             if (boundary >= 0)
+1:1c62850:             {
+1:1c62850:                 // exact match, in this branch node
+1:1c62850:                 assert boundary < sizeMap.length - 1;
+1:1c62850:                 tree[boundary] = replace;
+1:1c62850:                 return;
+1:1c62850:             }
+1:1c62850: 
+1:1c62850:             boundary = -1 -boundary;
+1:1c62850:             if (boundary > 0)
+1:1c62850:             {
+1:1c62850:                 assert boundary < sizeMap.length;
+1:1c62850:                 index -= (1 + sizeMap[boundary - 1]);
+1:1c62850:             }
+1:1c62850:             tree = (Object[]) tree[getChildStart(tree) + boundary];
+1:1c62850:         }
+1:1c62850:         assert index < getLeafKeyEnd(tree);
+1:1c62850:         tree[index] = replace;
+1:1c62850:     }
+1:1c62850: 
+1:1c62850:     /**
+1:1c62850:      * Modifies the provided btree directly. THIS SHOULD NOT BE USED WITHOUT EXTREME CARE as BTrees are meant to be immutable.
+1:639d4b2:      * Finds and replaces the provided item in the tree. Both should sort as equal to each other (although this is not enforced)
+1:639d4b2:      */
+1:639d4b2:     public static <V> void replaceInSitu(Object[] node, Comparator<? super V> comparator, V find, V replace)
+1:639d4b2:     {
+1:639d4b2:         while (true)
+1:639d4b2:         {
+1:639d4b2:             int keyEnd = getKeyEnd(node);
+1:639d4b2:             int i = Arrays.binarySearch((V[]) node, 0, keyEnd, find, comparator);
+1:639d4b2: 
+1:639d4b2:             if (i >= 0)
+1:639d4b2:             {
+1:639d4b2:                 assert find == node[i];
+1:639d4b2:                 node[i] = replace;
+1:639d4b2:                 return;
+1:639d4b2:             }
+1:639d4b2: 
+1:639d4b2:             if (isLeaf(node))
+1:639d4b2:                 throw new NoSuchElementException();
+1:639d4b2: 
+1:639d4b2:             i = -1 - i;
+1:639d4b2:             node = (Object[]) node[keyEnd + i];
+1:639d4b2:         }
+1:412b053:     }
+1:412b053: 
+1:5250d7f:     /**
+1:5250d7f:      * Honours result semantics of {@link Arrays#binarySearch}, as though it were performed on the tree flattened into an array
+1:5250d7f:      * @return index of item in tree, or <tt>(-(<i>insertion point</i>) - 1)</tt> if not present
+1:5250d7f:      */
+1:639d4b2:     public static <V> int findIndex(Object[] node, Comparator<? super V> comparator, V find)
+1:412b053:     {
+1:5250d7f:         int lb = 0;
+1:412b053:         while (true)
+1:412b053:         {
+1:412b053:             int keyEnd = getKeyEnd(node);
+1:5250d7f:             int i = Arrays.binarySearch((V[]) node, 0, keyEnd, find, comparator);
+1:5250d7f:             boolean exact = i >= 0;
+1:5250d7f: 
+1:5250d7f:             if (isLeaf(node))
+1:5250d7f:                 return exact ? lb + i : i - lb;
+1:5250d7f: 
+1:5250d7f:             if (!exact)
+1:5250d7f:                 i = -1 - i;
+1:5250d7f: 
+1:5250d7f:             int[] sizeMap = getSizeMap(node);
+1:5250d7f:             if (exact)
+1:5250d7f:                 return lb + sizeMap[i];
+1:5250d7f:             else if (i > 0)
+1:5250d7f:                 lb += sizeMap[i - 1] + 1;
+1:5250d7f: 
+1:5250d7f:             node = (Object[]) node[keyEnd + i];
+1:412b053:         }
+1:412b053:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * @return the value at the index'th position in the tree, in tree order
+1:5250d7f:      */
+1:5250d7f:     public static <V> V findByIndex(Object[] tree, int index)
+1:5250d7f:     {
+1:5250d7f:         // WARNING: if semantics change, see also InternalCursor.seekTo, which mirrors this implementation
+1:5250d7f:         if ((index < 0) | (index >= size(tree)))
+1:5250d7f:             throw new IndexOutOfBoundsException(index + " not in range [0.." + size(tree) + ")");
+1:5250d7f: 
+1:5250d7f:         Object[] node = tree;
+1:5250d7f:         while (true)
+1:5250d7f:         {
+1:5250d7f:             if (isLeaf(node))
+1:5250d7f:             {
+1:5250d7f:                 int keyEnd = getLeafKeyEnd(node);
+1:5250d7f:                 assert index < keyEnd;
+1:5250d7f:                 return (V) node[index];
+1:5250d7f:             }
+1:5250d7f: 
+1:5250d7f:             int[] sizeMap = getSizeMap(node);
+1:5250d7f:             int boundary = Arrays.binarySearch(sizeMap, index);
+1:5250d7f:             if (boundary >= 0)
+1:5250d7f:             {
+1:5250d7f:                 // exact match, in this branch node
+1:5250d7f:                 assert boundary < sizeMap.length - 1;
+1:5250d7f:                 return (V) node[boundary];
+1:5250d7f:             }
+1:5250d7f: 
+1:5250d7f:             boundary = -1 -boundary;
+1:5250d7f:             if (boundary > 0)
+1:5250d7f:             {
+1:5250d7f:                 assert boundary < sizeMap.length;
+1:5250d7f:                 index -= (1 + sizeMap[boundary - 1]);
+1:5250d7f:             }
+1:5250d7f:             node = (Object[]) node[getChildStart(node) + boundary];
+1:5250d7f:         }
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /* since we have access to binarySearch semantics within indexOf(), we can use this to implement
+1:5250d7f:      * lower/upper/floor/higher very trivially
+1:5250d7f:      *
+1:5250d7f:      * this implementation is *not* optimal; it requires two logarithmic traversals, although the second is much cheaper
+1:5250d7f:      * (having less height, and operating over only primitive arrays), and the clarity is compelling
+1:5250d7f:      */
+1:5250d7f: 
+1:5250d7f:     public static <V> int lowerIndex(Object[] btree, Comparator<? super V> comparator, V find)
+1:5250d7f:     {
+1:5250d7f:         int i = findIndex(btree, comparator, find);
+1:5250d7f:         if (i < 0)
+1:5250d7f:             i = -1 -i;
+1:5250d7f:         return i - 1;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     public static <V> V lower(Object[] btree, Comparator<? super V> comparator, V find)
+1:5250d7f:     {
+1:5250d7f:         int i = lowerIndex(btree, comparator, find);
+1:5250d7f:         return i >= 0 ? findByIndex(btree, i) : null;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     public static <V> int floorIndex(Object[] btree, Comparator<? super V> comparator, V find)
+1:5250d7f:     {
+1:5250d7f:         int i = findIndex(btree, comparator, find);
+1:5250d7f:         if (i < 0)
+1:5250d7f:             i = -2 -i;
+1:5250d7f:         return i;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     public static <V> V floor(Object[] btree, Comparator<? super V> comparator, V find)
+1:5250d7f:     {
+1:5250d7f:         int i = floorIndex(btree, comparator, find);
+1:5250d7f:         return i >= 0 ? findByIndex(btree, i) : null;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     public static <V> int higherIndex(Object[] btree, Comparator<? super V> comparator, V find)
+1:5250d7f:     {
+1:5250d7f:         int i = findIndex(btree, comparator, find);
+1:5250d7f:         if (i < 0) i = -1 -i;
+1:5250d7f:         else i++;
+1:5250d7f:         return i;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     public static <V> V higher(Object[] btree, Comparator<? super V> comparator, V find)
+1:5250d7f:     {
+1:5250d7f:         int i = higherIndex(btree, comparator, find);
+1:5250d7f:         return i < size(btree) ? findByIndex(btree, i) : null;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     public static <V> int ceilIndex(Object[] btree, Comparator<? super V> comparator, V find)
+1:5250d7f:     {
+1:5250d7f:         int i = findIndex(btree, comparator, find);
+1:5250d7f:         if (i < 0)
+1:5250d7f:             i = -1 -i;
+1:5250d7f:         return i;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     public static <V> V ceil(Object[] btree, Comparator<? super V> comparator, V find)
+1:5250d7f:     {
+1:5250d7f:         int i = ceilIndex(btree, comparator, find);
+1:5250d7f:         return i < size(btree) ? findByIndex(btree, i) : null;
+1:5250d7f:     }
+1:412b053: 
+1:412b053:     // UTILITY METHODS
+1:412b053: 
+1:412b053:     // get the upper bound we should search in for keys in the node
+1:412b053:     static int getKeyEnd(Object[] node)
+1:412b053:     {
+1:412b053:         if (isLeaf(node))
+1:412b053:             return getLeafKeyEnd(node);
+5:412b053:         else
+1:412b053:             return getBranchKeyEnd(node);
+1:412b053:     }
+1:412b053: 
+1:412b053:     // get the last index that is non-null in the leaf node
+1:412b053:     static int getLeafKeyEnd(Object[] node)
+1:412b053:     {
+1:412b053:         int len = node.length;
+1:5250d7f:         return node[len - 1] == null ? len - 1 : len;
+1:412b053:     }
+1:412b053: 
+1:412b053:     // return the boundary position between keys/children for the branch node
+1:5250d7f:     // == number of keys, as they are indexed from zero
+1:5250d7f:     static int getBranchKeyEnd(Object[] branchNode)
+1:412b053:     {
+1:5250d7f:         return (branchNode.length / 2) - 1;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * @return first index in a branch node containing child nodes
+1:5250d7f:      */
+1:5250d7f:     static int getChildStart(Object[] branchNode)
+1:5250d7f:     {
+1:5250d7f:         return getBranchKeyEnd(branchNode);
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * @return last index + 1 in a branch node containing child nodes
+1:5250d7f:      */
+1:5250d7f:     static int getChildEnd(Object[] branchNode)
+1:5250d7f:     {
+1:5250d7f:         return branchNode.length - 1;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * @return number of children in a branch node
+1:5250d7f:      */
+1:5250d7f:     static int getChildCount(Object[] branchNode)
+1:5250d7f:     {
+1:5250d7f:         return branchNode.length / 2;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * @return the size map for the branch node
+1:5250d7f:      */
+1:5250d7f:     static int[] getSizeMap(Object[] branchNode)
+1:5250d7f:     {
+1:5250d7f:         return (int[]) branchNode[getChildEnd(branchNode)];
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * @return the size map for the branch node
+1:5250d7f:      */
+1:5250d7f:     static int lookupSizeMap(Object[] branchNode, int index)
+1:5250d7f:     {
+1:5250d7f:         return getSizeMap(branchNode)[index];
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     // get the size from the btree's index (fails if not present)
+1:5250d7f:     public static int size(Object[] tree)
+1:5250d7f:     {
+1:5250d7f:         if (isLeaf(tree))
+1:5250d7f:             return getLeafKeyEnd(tree);
+1:5250d7f:         int length = tree.length;
+1:5250d7f:         // length - 1 == getChildEnd == getPositionOfSizeMap
+1:5250d7f:         // (length / 2) - 1 == getChildCount - 1 == position of full tree size
+1:5250d7f:         // hard code this, as will be used often;
+1:5250d7f:         return ((int[]) tree[length - 1])[(length / 2) - 1];
+1:412b053:     }
+1:412b053: 
+1:639d4b2:     public static long sizeOfStructureOnHeap(Object[] tree)
+1:639d4b2:     {
+1:639d4b2:         long size = ObjectSizes.sizeOfArray(tree);
+1:639d4b2:         if (isLeaf(tree))
+1:639d4b2:             return size;
+1:639d4b2:         for (int i = getChildStart(tree) ; i < getChildEnd(tree) ; i++)
+1:639d4b2:             size += sizeOfStructureOnHeap((Object[]) tree[i]);
+1:639d4b2:         return size;
+1:639d4b2:     }
+1:639d4b2: 
+1:412b053:     // returns true if the provided node is a leaf, false if it is a branch
+1:412b053:     static boolean isLeaf(Object[] node)
+1:412b053:     {
+1:5250d7f:         return (node.length & 1) == 1;
+1:412b053:     }
+1:412b053: 
+1:0cb1e3d:     public static boolean isEmpty(Object[] tree)
+1:0cb1e3d:     {
+1:5250d7f:         return tree == EMPTY_LEAF;
+1:0cb1e3d:     }
+1:0cb1e3d: 
+1:948964b:     public static int depth(Object[] tree)
+1:948964b:     {
+1:948964b:         int depth = 1;
+1:948964b:         while (!isLeaf(tree))
+1:948964b:         {
+1:948964b:             depth++;
+1:948964b:             tree = (Object[]) tree[getKeyEnd(tree)];
+1:948964b:         }
+1:948964b:         return depth;
+1:948964b:     }
+1:948964b: 
+1:5250d7f:     /**
+1:5250d7f:      * Fill the target array with the contents of the provided subtree, in ascending order, starting at targetOffset
+1:5250d7f:      * @param tree source
+1:5250d7f:      * @param target array
+1:5250d7f:      * @param targetOffset offset in target array
+1:5250d7f:      * @return number of items copied (size of tree)
+1:5250d7f:      */
+1:5250d7f:     public static int toArray(Object[] tree, Object[] target, int targetOffset)
+1:412b053:     {
+1:5250d7f:         return toArray(tree, 0, size(tree), target, targetOffset);
+1:5250d7f:     }
+1:5250d7f:     public static int toArray(Object[] tree, int treeStart, int treeEnd, Object[] target, int targetOffset)
+1:412b053:     {
+1:5250d7f:         if (isLeaf(tree))
+1:412b053:         {
+1:5250d7f:             int count = treeEnd - treeStart;
+1:5250d7f:             System.arraycopy(tree, treeStart, target, targetOffset, count);
+1:5250d7f:             return count;
+1:412b053:         }
+1:412b053: 
+1:5250d7f:         int newTargetOffset = targetOffset;
+1:5250d7f:         int childCount = getChildCount(tree);
+1:5250d7f:         int childOffset = getChildStart(tree);
+1:5250d7f:         for (int i = 0 ; i < childCount ; i++)
+1:5250d7f:         {
+1:5250d7f:             int childStart = treeIndexOffsetOfChild(tree, i);
+1:5250d7f:             int childEnd = treeIndexOfBranchKey(tree, i);
+1:5250d7f:             if (childStart <= treeEnd && childEnd >= treeStart)
+1:5250d7f:             {
+1:5250d7f:                 newTargetOffset += toArray((Object[]) tree[childOffset + i], max(0, treeStart - childStart), min(childEnd, treeEnd) - childStart,
+1:5250d7f:                                            target, newTargetOffset);
+1:5250d7f:                 if (treeStart <= childEnd && treeEnd > childEnd) // this check will always fail for the non-existent key
+1:5250d7f:                     target[newTargetOffset++] = tree[i];
+1:5250d7f:             }
+1:5250d7f:         }
+1:5250d7f:         return newTargetOffset - targetOffset;
+1:5250d7f:     }
+1:5250d7f: 
+1:639d4b2:     // simple class for avoiding duplicate transformation work
+1:639d4b2:     private static class FiltrationTracker<V> implements Function<V, V>
+1:639d4b2:     {
+1:639d4b2:         final Function<? super V, ? extends V> wrapped;
+1:639d4b2:         int index;
+1:639d4b2:         boolean failed;
+1:639d4b2: 
+1:639d4b2:         private FiltrationTracker(Function<? super V, ? extends V> wrapped)
+1:639d4b2:         {
+1:639d4b2:             this.wrapped = wrapped;
+1:639d4b2:         }
+1:639d4b2: 
+1:639d4b2:         public V apply(V i)
+1:639d4b2:         {
+1:639d4b2:             V o = wrapped.apply(i);
+1:639d4b2:             if (o != null) index++;
+1:639d4b2:             else failed = true;
+1:639d4b2:             return o;
+1:639d4b2:         }
+1:639d4b2:     }
+1:639d4b2: 
+1:639d4b2:     /**
+1:639d4b2:      * Takes a btree and transforms it using the provided function, filtering out any null results.
+1:639d4b2:      * The result of any transformation must sort identically wrt the other results as their originals
+1:639d4b2:      */
+1:639d4b2:     public static <V> Object[] transformAndFilter(Object[] btree, Function<? super V, ? extends V> function)
+1:639d4b2:     {
+1:639d4b2:         if (isEmpty(btree))
+1:639d4b2:             return btree;
+1:639d4b2: 
+1:639d4b2:         // TODO: can be made more efficient
+1:639d4b2:         FiltrationTracker<V> wrapped = new FiltrationTracker<>(function);
+1:639d4b2:         Object[] result = transformAndFilter(btree, wrapped);
+1:639d4b2:         if (!wrapped.failed)
+1:639d4b2:             return result;
+1:639d4b2: 
+1:639d4b2:         // take the already transformed bits from the head of the partial result
+1:639d4b2:         Iterable<V> head = iterable(result, 0, wrapped.index - 1, Dir.ASC);
+1:639d4b2:         // and concatenate with remainder of original tree, with transformation applied
+1:639d4b2:         Iterable<V> remainder = iterable(btree, wrapped.index + 1, size(btree) - 1, Dir.ASC);
+1:639d4b2:         remainder = filter(transform(remainder, function), (x) -> x != null);
+1:639d4b2:         Iterable<V> build = concat(head, remainder);
+1:639d4b2: 
+1:639d4b2:         return buildInternal(build, -1, UpdateFunction.<V>noOp());
+1:639d4b2:     }
+1:639d4b2: 
+1:639d4b2:     private static <V> Object[] transformAndFilter(Object[] btree, FiltrationTracker<V> function)
+1:639d4b2:     {
+1:639d4b2:         Object[] result = btree;
+1:639d4b2:         boolean isLeaf = isLeaf(btree);
+1:639d4b2:         int childOffset = isLeaf ? Integer.MAX_VALUE : getChildStart(btree);
+1:639d4b2:         int limit = isLeaf ? getLeafKeyEnd(btree) : btree.length - 1;
+1:639d4b2:         for (int i = 0 ; i < limit ; i++)
+1:639d4b2:         {
+1:639d4b2:             // we want to visit in iteration order, so we visit our key nodes inbetween our children
+1:639d4b2:             int idx = isLeaf ? i : (i / 2) + (i % 2 == 0 ? childOffset : 0);
+1:639d4b2:             Object current = btree[idx];
+1:639d4b2:             Object updated = idx < childOffset ? function.apply((V) current) : transformAndFilter((Object[]) current, function);
+1:639d4b2:             if (updated != current)
+1:639d4b2:             {
+1:639d4b2:                 if (result == btree)
+1:639d4b2:                     result = btree.clone();
+1:639d4b2:                 result[idx] = updated;
+1:639d4b2:             }
+1:639d4b2:             if (function.failed)
+1:639d4b2:                 return result;
+1:639d4b2:         }
+1:639d4b2:         return result;
+1:639d4b2:     }
+1:639d4b2: 
+1:639d4b2:     public static boolean equals(Object[] a, Object[] b)
+1:639d4b2:     {
+1:ace28c9:         return size(a) == size(b) && Iterators.elementsEqual(iterator(a), iterator(b));
+1:ace28c9:     }
+1:ace28c9: 
+1:ace28c9:     public static int hashCode(Object[] btree)
+1:ace28c9:     {
+1:ace28c9:         // we can't just delegate to Arrays.deepHashCode(),
+1:ace28c9:         // because two equivalent trees may be represented by differently shaped trees
+1:ace28c9:         int result = 1;
+1:ace28c9:         for (Object v : iterable(btree))
+1:ace28c9:             result = 31 * result + Objects.hashCode(v);
+1:ace28c9:         return result;
+1:ace28c9: 
+1:639d4b2:     }
+1:639d4b2: 
+1:5250d7f:     /**
+1:5250d7f:      * tree index => index of key wrt all items in the tree laid out serially
+1:5250d7f:      *
+1:5250d7f:      * This version of the method permits requesting out-of-bounds indexes, -1 and size
+1:5250d7f:      * @param root to calculate tree index within
+1:5250d7f:      * @param keyIndex root-local index of key to calculate tree-index
+1:5250d7f:      * @return the number of items preceding the key in the whole tree of root
+1:5250d7f:      */
+1:5250d7f:     public static int treeIndexOfKey(Object[] root, int keyIndex)
+1:5250d7f:     {
+1:5250d7f:         if (isLeaf(root))
+1:5250d7f:             return keyIndex;
+1:5250d7f:         int[] sizeMap = getSizeMap(root);
+1:5250d7f:         if ((keyIndex >= 0) & (keyIndex < sizeMap.length))
+1:5250d7f:             return sizeMap[keyIndex];
+1:5250d7f:         // we support asking for -1 or size, so that we can easily use this for iterator bounds checking
+1:5250d7f:         if (keyIndex < 0)
+1:5250d7f:             return -1;
+1:5250d7f:         return sizeMap[keyIndex - 1] + 1;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * @param keyIndex node-local index of the key to calculate index of
+1:5250d7f:      * @return keyIndex; this method is here only for symmetry and clarity
+1:5250d7f:      */
+1:5250d7f:     public static int treeIndexOfLeafKey(int keyIndex)
+1:5250d7f:     {
+1:5250d7f:         return keyIndex;
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * @param root to calculate tree-index within
+1:5250d7f:      * @param keyIndex root-local index of key to calculate tree-index of
+1:5250d7f:      * @return the number of items preceding the key in the whole tree of root
+1:5250d7f:      */
+1:5250d7f:     public static int treeIndexOfBranchKey(Object[] root, int keyIndex)
+1:5250d7f:     {
+1:5250d7f:         return lookupSizeMap(root, keyIndex);
+1:5250d7f:     }
+1:5250d7f: 
+1:5250d7f:     /**
+1:5250d7f:      * @param root to calculate tree-index within
+1:5250d7f:      * @param childIndex root-local index of *child* to calculate tree-index of
+1:5250d7f:      * @return the number of items preceding the child in the whole tree of root
+1:5250d7f:      */
+1:5250d7f:     public static int treeIndexOffsetOfChild(Object[] root, int childIndex)
+1:5250d7f:     {
+1:5250d7f:         if (childIndex == 0)
+1:5250d7f:             return 0;
+1:5250d7f:         return 1 + lookupSizeMap(root, childIndex - 1);
+1:5250d7f:     }
+1:5250d7f: 
+1:1e92ce4:     final static Recycler<Builder> builderRecycler = new Recycler<Builder>()
+1:5250d7f:     {
+1:1e92ce4:         protected Builder newObject(Handle handle)
+1:412b053:         {
+1:1e92ce4:             return new Builder(handle);
+1:5250d7f:         }
+3:412b053:     };
+1:412b053: 
+1:5250d7f:     public static <V> Builder<V> builder(Comparator<? super V> comparator)
+1:5250d7f:     {
+1:1e92ce4:         Builder<V> builder = builderRecycler.get();
+1:1e92ce4:         builder.reuse(comparator);
+1:1e92ce4: 
+1:1e92ce4:         return builder;
+1:5250d7f:     }
+1:5250d7f: 
+1:e51f83b:     public static <V> Builder<V> builder(Comparator<? super V> comparator, int initialCapacity)
+1:e51f83b:     {
+1:1e92ce4:         return builder(comparator);
+1:e51f83b:     }
+1:e51f83b: 
+1:5250d7f:     public static class Builder<V>
+1:5250d7f:     {
+1:e51f83b:         // a user-defined bulk resolution, to be applied manually via resolve()
+1:639d4b2:         public static interface Resolver
+1:639d4b2:         {
+1:639d4b2:             // can return a different output type to input, so long as sort order is maintained
+1:639d4b2:             // if a resolver is present, this method will be called for every sequence of equal inputs
+1:639d4b2:             // even those with only one item
+1:639d4b2:             Object resolve(Object[] array, int lb, int ub);
+1:639d4b2:         }
+1:5250d7f: 
+1:e51f83b:         // a user-defined resolver that is applied automatically on encountering two duplicate values
+1:e51f83b:         public static interface QuickResolver<V>
+1:e51f83b:         {
+1:e51f83b:             // can return a different output type to input, so long as sort order is maintained
+1:e51f83b:             // if a resolver is present, this method will be called for every sequence of equal inputs
+1:e51f83b:             // even those with only one item
+1:e51f83b:             V resolve(V a, V b);
+1:e51f83b:         }
+1:e51f83b: 
+1:639d4b2:         Comparator<? super V> comparator;
+1:e51f83b:         Object[] values;
+1:5250d7f:         int count;
+1:e51f83b:         boolean detected = true; // true if we have managed to cheaply ensure sorted (+ filtered, if resolver == null) as we have added
+1:639d4b2:         boolean auto = true; // false if the user has promised to enforce the sort order and resolve any duplicates
+1:e51f83b:         QuickResolver<V> quickResolver;
+1:1e92ce4:         final Recycler.Handle recycleHandle;
+1:e51f83b: 
+1:e51f83b: 
+1:1e92ce4:         private Builder(Recycler.Handle handle)
+1:e51f83b:         {
+1:1e92ce4:             this.recycleHandle = handle;
+1:1e92ce4:             this.values = new Object[16];
+1:e51f83b:         }
+1:639d4b2: 
+1:e51f83b:         public Builder<V> setQuickResolver(QuickResolver<V> quickResolver)
+1:e51f83b:         {
+1:e51f83b:             this.quickResolver = quickResolver;
+1:5250d7f:             return this;
+1:639d4b2:         }
+1:5250d7f: 
+1:1e92ce4:         public void recycle()
+1:639d4b2:         {
+1:1e92ce4:             if (recycleHandle != null)
+1:578c85d:             {
+1:578c85d:                 this.cleanup();
+1:1e92ce4:                 builderRecycler.recycle(this, recycleHandle);
+1:578c85d:             }
+1:639d4b2:         }
+1:5250d7f: 
+1:578c85d:         /**
+1:578c85d:          * Cleans up the Builder instance before recycling it.
+1:578c85d:          */
+1:578c85d:         private void cleanup()
+1:639d4b2:         {
+1:1e92ce4:             quickResolver = null;
+1:eb5a59a:             Arrays.fill(values, 0, count, null);
+1:639d4b2:             count = 0;
+1:639d4b2:             detected = true;
+1:1e92ce4:             auto = true;
+1:639d4b2:         }
+1:639d4b2: 
+1:1e92ce4:         private void reuse(Comparator<? super V> comparator)
+1:578c85d:         {
+1:578c85d:             this.comparator = comparator;
+1:578c85d:         }
+1:578c85d: 
+1:639d4b2:         public Builder<V> auto(boolean auto)
+1:639d4b2:         {
+1:639d4b2:             this.auto = auto;
+1:e51f83b:             return this;
+1:e51f83b:         }
+1:639d4b2: 
+1:5250d7f:         public Builder<V> add(V v)
+1:5250d7f:         {
+1:5250d7f:             if (count == values.length)
+1:5250d7f:                 values = Arrays.copyOf(values, count * 2);
+1:5250d7f: 
+1:e51f83b:             Object[] values = this.values;
+1:e51f83b:             int prevCount = this.count++;
+1:e51f83b:             values[prevCount] = v;
+1:e51f83b: 
+1:e51f83b:             if (auto && detected && prevCount > 0)
+1:5250d7f:             {
+1:e51f83b:                 V prev = (V) values[prevCount - 1];
+1:e51f83b:                 int c = comparator.compare(prev, v);
+1:639d4b2:                 if (c == 0 && auto)
+1:639d4b2:                 {
+1:e51f83b:                     count = prevCount;
+1:e51f83b:                     if (quickResolver != null)
+1:e51f83b:                         values[prevCount - 1] = quickResolver.resolve(prev, v);
+1:639d4b2:                 }
+1:639d4b2:                 else if (c > 0)
+1:639d4b2:                 {
+1:639d4b2:                     detected = false;
+1:5250d7f:                 }
+1:5250d7f:             }
+1:5250d7f: 
+1:639d4b2:             return this;
+1:5250d7f:         }
+1:5250d7f: 
+1:5250d7f:         public Builder<V> addAll(Collection<V> add)
+1:5250d7f:         {
+1:639d4b2:             if (auto && add instanceof SortedSet && equalComparators(comparator, ((SortedSet) add).comparator()))
+1:5250d7f:             {
+1:5250d7f:                 // if we're a SortedSet, permit quick order-preserving addition of items
+1:639d4b2:                 // if we collect all duplicates, don't bother as merge will necessarily be more expensive than sorting at end
+1:5250d7f:                 return mergeAll(add, add.size());
+1:5250d7f:             }
+1:5250d7f:             detected = false;
+1:5250d7f:             if (values.length < count + add.size())
+1:5250d7f:                 values = Arrays.copyOf(values, max(count + add.size(), count * 2));
+1:5250d7f:             for (V v : add)
+2:5250d7f:                 values[count++] = v;
+1:5250d7f:             return this;
+1:639d4b2:         }
+1:5250d7f: 
+1:5250d7f:         private static boolean equalComparators(Comparator<?> a, Comparator<?> b)
+1:5250d7f:         {
+1:5250d7f:             return a == b || (isNaturalComparator(a) && isNaturalComparator(b));
+1:5250d7f:         }
+1:5250d7f: 
+1:5250d7f:         private static boolean isNaturalComparator(Comparator<?> a)
+1:5250d7f:         {
+1:5250d7f:             return a == null || a == Comparator.naturalOrder() || a == Ordering.natural();
+1:5250d7f:         }
+1:5250d7f: 
+2:5250d7f:         // iter must be in sorted order!
+1:639d4b2:         private Builder<V> mergeAll(Iterable<V> add, int addCount)
+1:5250d7f:         {
+1:639d4b2:             assert auto;
+1:5250d7f:             // ensure the existing contents are in order
+1:639d4b2:             autoEnforce();
+1:5250d7f: 
+1:5250d7f:             int curCount = count;
+1:5250d7f:             // we make room for curCount * 2 + addCount, so that we can copy the current values to the end
+1:5250d7f:             // if necessary for continuing the merge, and have the new values directly after the current value range
+1:5250d7f:             if (values.length < curCount * 2 + addCount)
+1:5250d7f:                 values = Arrays.copyOf(values, max(curCount * 2 + addCount, curCount * 3));
+1:5250d7f: 
+1:5250d7f:             if (add instanceof BTreeSet)
+1:5250d7f:             {
+1:5250d7f:                 // use btree set's fast toArray method, to append directly
+1:5250d7f:                 ((BTreeSet) add).toArray(values, curCount);
+1:5250d7f:             }
+1:5250d7f:             else
+1:5250d7f:             {
+1:5250d7f:                 // consider calling toArray() and System.arraycopy
+1:5250d7f:                 int i = curCount;
+1:5250d7f:                 for (V v : add)
+1:5250d7f:                     values[i++] = v;
+1:5250d7f:             }
+1:5250d7f:             return mergeAll(addCount);
+1:5250d7f:         }
+1:5250d7f: 
+1:5250d7f:         private Builder<V> mergeAll(int addCount)
+1:5250d7f:         {
+1:5250d7f:             Object[] a = values;
+1:5250d7f:             int addOffset = count;
+1:5250d7f: 
+1:5250d7f:             int i = 0, j = addOffset;
+1:5250d7f:             int curEnd = addOffset, addEnd = addOffset + addCount;
+1:639d4b2: 
+1:639d4b2:             // save time in cases where we already have a subset, by skipping dir
+1:5250d7f:             while (i < curEnd && j < addEnd)
+1:5250d7f:             {
+1:639d4b2:                 V ai = (V) a[i], aj = (V) a[j];
+1:639d4b2:                 // in some cases, such as Columns, we may have identity supersets, so perform a cheap object-identity check
+1:639d4b2:                 int c = ai == aj ? 0 : comparator.compare(ai, aj);
+1:5250d7f:                 if (c > 0)
+1:5250d7f:                     break;
+1:5250d7f:                 else if (c == 0)
+1:e51f83b:                 {
+1:e51f83b:                     if (quickResolver != null)
+1:e51f83b:                         a[i] = quickResolver.resolve(ai, aj);
+1:5250d7f:                     j++;
+1:e51f83b:                 }
+1:5250d7f:                 i++;
+1:5250d7f:             }
+1:5250d7f: 
+1:5250d7f:             if (j == addEnd)
+1:5250d7f:                 return this; // already a superset of the new values
+1:5250d7f: 
+1:5250d7f:             // otherwise, copy the remaining existing values to the very end, freeing up space for merge result
+1:5250d7f:             int newCount = i;
+1:5250d7f:             System.arraycopy(a, i, a, addEnd, count - i);
+1:5250d7f:             curEnd = addEnd + (count - i);
+1:5250d7f:             i = addEnd;
+1:5250d7f: 
+1:5250d7f:             while (i < curEnd && j < addEnd)
+1:5250d7f:             {
+1:e51f83b:                 V ai = (V) a[i];
+1:e51f83b:                 V aj = (V) a[j];
+1:5250d7f:                 // could avoid one comparison if we cared, but would make this ugly
+1:e51f83b:                 int c = comparator.compare(ai, aj);
+1:5250d7f:                 if (c == 0)
+1:5250d7f:                 {
+1:e51f83b:                     Object newValue = quickResolver == null ? ai : quickResolver.resolve(ai, aj);
+1:e51f83b:                     a[newCount++] = newValue;
+1:5250d7f:                     i++;
+1:5250d7f:                     j++;
+1:5250d7f:                 }
+1:5250d7f:                 else
+1:5250d7f:                 {
+1:5250d7f:                     a[newCount++] =  c < 0 ? a[i++] : a[j++];
+1:5250d7f:                 }
+1:5250d7f:             }
+1:5250d7f: 
+1:5250d7f:             // exhausted one of the inputs; fill in remainder of the other
+1:5250d7f:             if (i < curEnd)
+1:5250d7f:             {
+1:5250d7f:                 System.arraycopy(a, i, a, newCount, curEnd - i);
+1:5250d7f:                 newCount += curEnd - i;
+1:5250d7f:             }
+1:5250d7f:             else if (j < addEnd)
+1:5250d7f:             {
+1:5250d7f:                 if (j != newCount)
+1:5250d7f:                     System.arraycopy(a, j, a, newCount, addEnd - j);
+1:5250d7f:                 newCount += addEnd - j;
+1:5250d7f:             }
+1:5250d7f:             count = newCount;
+1:5250d7f:             return this;
+1:5250d7f:         }
+1:5250d7f: 
+1:5250d7f:         public boolean isEmpty()
+1:5250d7f:         {
+1:5250d7f:             return count == 0;
+1:5250d7f:         }
+1:5250d7f: 
+1:e51f83b:         public Builder<V> reverse()
+1:e51f83b:         {
+1:e51f83b:             assert !auto;
+1:e51f83b:             int mid = count / 2;
+1:e51f83b:             for (int i = 0 ; i < mid ; i++)
+1:e51f83b:             {
+1:e51f83b:                 Object t = values[i];
+1:e51f83b:                 values[i] = values[count - (1 + i)];
+1:e51f83b:                 values[count - (1 + i)] = t;
+1:e51f83b:             }
+1:e51f83b:             return this;
+1:e51f83b:         }
+1:e51f83b: 
+1:639d4b2:         public Builder<V> sort()
+1:639d4b2:         {
+1:639d4b2:             Arrays.sort((V[]) values, 0, count, comparator);
+1:639d4b2:             return this;
+1:639d4b2:         }
+1:639d4b2: 
+1:639d4b2:         // automatically enforce sorted+filtered
+1:639d4b2:         private void autoEnforce()
+1:5250d7f:         {
+1:5250d7f:             if (!detected && count > 1)
+1:5250d7f:             {
+1:639d4b2:                 sort();
+1:e51f83b:                 int prevIdx = 0;
+1:e51f83b:                 V prev = (V) values[0];
+1:5250d7f:                 for (int i = 1 ; i < count ; i++)
+1:e51f83b:                 {
+1:e51f83b:                     V next = (V) values[i];
+1:e51f83b:                     if (comparator.compare(prev, next) != 0)
+1:e51f83b:                         values[++prevIdx] = prev = next;
+1:e51f83b:                     else if (quickResolver != null)
+1:e51f83b:                         values[prevIdx] = prev = quickResolver.resolve(prev, next);
+1:e51f83b:                 }
+1:e51f83b:                 count = prevIdx + 1;
+1:5250d7f:             }
+1:5250d7f:             detected = true;
+1:5250d7f:         }
+1:5250d7f: 
+1:639d4b2:         public Builder<V> resolve(Resolver resolver)
+1:639d4b2:         {
+1:639d4b2:             if (count > 0)
+1:639d4b2:             {
+1:639d4b2:                 int c = 0;
+1:639d4b2:                 int prev = 0;
+1:639d4b2:                 for (int i = 1 ; i < count ; i++)
+1:639d4b2:                 {
+1:639d4b2:                     if (comparator.compare((V) values[i], (V) values[prev]) != 0)
+1:639d4b2:                     {
+1:639d4b2:                         values[c++] = resolver.resolve((V[]) values, prev, i);
+1:639d4b2:                         prev = i;
+1:639d4b2:                     }
+1:639d4b2:                 }
+1:639d4b2:                 values[c++] = resolver.resolve((V[]) values, prev, count);
+1:639d4b2:                 count = c;
+1:639d4b2:             }
+1:639d4b2:             return this;
+1:639d4b2:         }
+1:639d4b2: 
+1:5250d7f:         public Object[] build()
+1:5250d7f:         {
+1:1e92ce4:             try
+1:1e92ce4:             {
+1:1e92ce4:                 if (auto)
+1:1e92ce4:                     autoEnforce();
+1:1e92ce4:                 return BTree.build(Arrays.asList(values).subList(0, count), UpdateFunction.noOp());
+1:1e92ce4:             }
+1:1e92ce4:             finally
+1:1e92ce4:             {
+1:1e92ce4:                 this.recycle();
+1:1e92ce4:             }
+1:5250d7f:         }
+1:5250d7f:     }
+1:5250d7f: 
+1:412b053:     /** simple static wrapper to calls to cmp.compare() which checks if either a or b are Special (i.e. represent an infinity) */
+1:412b053:     static <V> int compare(Comparator<V> cmp, Object a, Object b)
+1:412b053:     {
+1:5250d7f:         if (a == b)
+1:5250d7f:             return 0;
+1:5250d7f:         if (a == NEGATIVE_INFINITY | b == POSITIVE_INFINITY)
+1:5250d7f:             return -1;
+1:5250d7f:         if (b == NEGATIVE_INFINITY | a == POSITIVE_INFINITY)
+1:5250d7f:             return 1;
+1:412b053:         return cmp.compare((V) a, (V) b);
+1:0cb1e3d:     }
+1:0cb1e3d: 
+1:5250d7f:     static Object POSITIVE_INFINITY = new Object();
+1:5250d7f:     static Object NEGATIVE_INFINITY = new Object();
+1:5250d7f: 
+1:412b053:     public static boolean isWellFormed(Object[] btree, Comparator<? extends Object> cmp)
+1:412b053:     {
+1:412b053:         return isWellFormed(cmp, btree, true, NEGATIVE_INFINITY, POSITIVE_INFINITY);
+1:412b053:     }
+1:0cb1e3d: 
+1:412b053:     private static boolean isWellFormed(Comparator<?> cmp, Object[] node, boolean isRoot, Object min, Object max)
+1:412b053:     {
+1:412b053:         if (cmp != null && !isNodeWellFormed(cmp, node, min, max))
+1:412b053:             return false;
+1:412b053: 
+1:412b053:         if (isLeaf(node))
+1:412b053:         {
+1:412b053:             if (isRoot)
+1:5250d7f:                 return node.length <= FAN_FACTOR + 1;
+1:5250d7f:             return node.length >= FAN_FACTOR / 2 && node.length <= FAN_FACTOR + 1;
+1:412b053:         }
+1:412b053: 
+1:1c62850:         final int keyCount = getBranchKeyEnd(node);
+1:1c62850:         if ((!isRoot && keyCount < FAN_FACTOR / 2) || keyCount > FAN_FACTOR + 1)
+1:1c62850:             return false;
+1:1c62850: 
+1:412b053:         int type = 0;
+1:1c62850:         int size = -1;
+1:1c62850:         int[] sizeMap = getSizeMap(node);
+1:412b053:         // compare each child node with the branch element at the head of this node it corresponds with
+1:5250d7f:         for (int i = getChildStart(node); i < getChildEnd(node) ; i++)
+1:412b053:         {
+1:412b053:             Object[] child = (Object[]) node[i];
+1:1c62850:             size += size(child) + 1;
+1:1c62850:             if (sizeMap[i - getChildStart(node)] != size)
+1:1c62850:                 return false;
+1:5250d7f:             Object localmax = i < node.length - 2 ? node[i - getChildStart(node)] : max;
+1:412b053:             if (!isWellFormed(cmp, child, false, min, localmax))
+1:412b053:                 return false;
+1:412b053:             type |= isLeaf(child) ? 1 : 2;
+1:412b053:             min = localmax;
+1:412b053:         }
+1:412b053:         return type < 3; // either all leaves or all branches but not a mix
+1:412b053:     }
+1:412b053: 
+1:412b053:     private static boolean isNodeWellFormed(Comparator<?> cmp, Object[] node, Object min, Object max)
+1:412b053:     {
+1:412b053:         Object previous = min;
+1:412b053:         int end = getKeyEnd(node);
+1:412b053:         for (int i = 0; i < end; i++)
+1:412b053:         {
+1:412b053:             Object current = node[i];
+1:412b053:             if (compare(cmp, previous, current) >= 0)
+1:412b053:                 return false;
+1:412b053:             previous = current;
+1:412b053:         }
+1:412b053:         return compare(cmp, previous, max) < 0;
+1:412b053:     }
+1:dc9ed46: 
+1:dc9ed46:     /**
+1:dc9ed46:      * Simple method to walk the btree forwards or reversed and apply a function to each element
+1:dc9ed46:      *
+1:dc9ed46:      * Public method
+1:dc9ed46:      *
+1:dc9ed46:      */
+1:dc9ed46:     public static <V> void apply(Object[] btree, Consumer<V> function, boolean reversed)
+1:dc9ed46:     {
+1:dc9ed46:         if (reversed)
+1:dc9ed46:             applyReverse(btree, function, null);
+1:dc9ed46:         else
+1:dc9ed46:             applyForwards(btree, function, null);
+1:dc9ed46:     }
+1:dc9ed46: 
+1:dc9ed46:     /**
+1:dc9ed46:      * Simple method to walk the btree forwards or reversed and apply a function till a stop condition is reached
+1:dc9ed46:      *
+1:dc9ed46:      * Public method
+1:dc9ed46:      *
+1:dc9ed46:      */
+1:dc9ed46:     public static <V> void apply(Object[] btree, Consumer<V> function, Predicate<V> stopCondition, boolean reversed)
+1:dc9ed46:     {
+1:dc9ed46:         if (reversed)
+1:dc9ed46:             applyReverse(btree, function, stopCondition);
+1:dc9ed46:         else
+1:dc9ed46:             applyForwards(btree, function, stopCondition);
+1:dc9ed46:     }
+1:dc9ed46: 
+1:dc9ed46: 
+1:dc9ed46: 
+1:dc9ed46: 
+1:dc9ed46:     /**
+1:dc9ed46:      * Simple method to walk the btree forwards and apply a function till a stop condition is reached
+1:dc9ed46:      *
+1:dc9ed46:      * Private method
+1:dc9ed46:      *
+1:dc9ed46:      * @param btree
+1:dc9ed46:      * @param function
+1:dc9ed46:      * @param stopCondition
+1:dc9ed46:      */
+1:dc9ed46:     private static <V> boolean applyForwards(Object[] btree, Consumer<V> function, Predicate<V> stopCondition)
+1:dc9ed46:     {
+1:dc9ed46:         boolean isLeaf = isLeaf(btree);
+1:dc9ed46:         int childOffset = isLeaf ? Integer.MAX_VALUE : getChildStart(btree);
+1:dc9ed46:         int limit = isLeaf ? getLeafKeyEnd(btree) : btree.length - 1;
+1:dc9ed46:         for (int i = 0 ; i < limit ; i++)
+1:dc9ed46:         {
+1:dc9ed46:             // we want to visit in iteration order, so we visit our key nodes inbetween our children
+1:dc9ed46:             int idx = isLeaf ? i : (i / 2) + (i % 2 == 0 ? childOffset : 0);
+1:dc9ed46:             Object current = btree[idx];
+1:dc9ed46:             if (idx < childOffset)
+1:dc9ed46:             {
+1:dc9ed46:                 V castedCurrent = (V) current;
+1:dc9ed46:                 if (stopCondition != null && stopCondition.apply(castedCurrent))
+1:dc9ed46:                     return true;
+1:dc9ed46: 
+1:dc9ed46:                 function.accept(castedCurrent);
+1:dc9ed46:             }
+1:dc9ed46:             else
+1:dc9ed46:             {
+1:dc9ed46:                 if (applyForwards((Object[]) current, function, stopCondition))
+1:dc9ed46:                     return true;
+1:dc9ed46:             }
+1:dc9ed46:         }
+1:dc9ed46: 
+1:dc9ed46:         return false;
+1:dc9ed46:     }
+1:dc9ed46: 
+1:dc9ed46:     /**
+1:dc9ed46:      * Simple method to walk the btree in reverse and apply a function till a stop condition is reached
+1:dc9ed46:      *
+1:dc9ed46:      * Private method
+1:dc9ed46:      *
+1:dc9ed46:      * @param btree
+1:dc9ed46:      * @param function
+1:dc9ed46:      * @param stopCondition
+1:dc9ed46:      */
+1:dc9ed46:     private static <V> boolean applyReverse(Object[] btree, Consumer<V> function, Predicate<V> stopCondition)
+1:dc9ed46:     {
+1:dc9ed46:         boolean isLeaf = isLeaf(btree);
+1:dc9ed46:         int childOffset = isLeaf ? 0 : getChildStart(btree);
+1:dc9ed46:         int limit = isLeaf ? getLeafKeyEnd(btree)  : btree.length - 1;
+1:dc9ed46:         for (int i = limit - 1, visited = 0; i >= 0 ; i--, visited++)
+1:dc9ed46:         {
+1:dc9ed46:             int idx = i;
+1:dc9ed46: 
+1:dc9ed46:             // we want to visit in reverse iteration order, so we visit our children nodes inbetween our keys
+1:dc9ed46:             if (!isLeaf)
+1:dc9ed46:             {
+1:dc9ed46:                 int typeOffset = visited / 2;
+1:dc9ed46: 
+1:dc9ed46:                 if (i % 2 == 0)
+1:dc9ed46:                 {
+1:dc9ed46:                     // This is a child branch. Since children are in the second half of the array, we must
+1:dc9ed46:                     // adjust for the key's we've visited along the way
+1:dc9ed46:                     idx += typeOffset;
+1:dc9ed46:                 }
+1:dc9ed46:                 else
+1:dc9ed46:                 {
+1:dc9ed46:                     // This is a key. Since the keys are in the first half of the array and we are iterating
+1:dc9ed46:                     // in reverse we subtract the childOffset and adjust for children we've walked so far
+1:dc9ed46:                     idx = i - childOffset + typeOffset;
+1:dc9ed46:                 }
+1:dc9ed46:             }
+1:dc9ed46: 
+1:dc9ed46:             Object current = btree[idx];
+1:dc9ed46:             if (isLeaf || idx < childOffset)
+1:dc9ed46:             {
+1:dc9ed46:                 V castedCurrent = (V) current;
+1:dc9ed46:                 if (stopCondition != null && stopCondition.apply(castedCurrent))
+1:dc9ed46:                     return true;
+1:dc9ed46: 
+1:dc9ed46:                 function.accept(castedCurrent);
+1:dc9ed46:             }
+1:dc9ed46:             else
+1:dc9ed46:             {
+1:dc9ed46:                 if (applyReverse((Object[]) current, function, stopCondition))
+1:dc9ed46:                     return true;
+1:dc9ed46:             }
+1:dc9ed46:         }
+1:dc9ed46: 
+1:dc9ed46:         return false;
+1:dc9ed46:     }
+1:412b053: }
+============================================================================
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:dc9ed46
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.function.Consumer;
+1: import com.google.common.base.Predicate;
+/////////////////////////////////////////////////////////////////////////
+1:             if (updateF != UpdateFunction.noOp())
+1:                 updateF.allocated(ObjectSizes.sizeOfArray(values));
+/////////////////////////////////////////////////////////////////////////
+1:         return update(tree1, comparator, new BTreeSet<>(tree2, comparator), updateF);
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     /**
+1:      * Simple method to walk the btree forwards or reversed and apply a function to each element
+1:      *
+1:      * Public method
+1:      *
+1:      */
+1:     public static <V> void apply(Object[] btree, Consumer<V> function, boolean reversed)
+1:     {
+1:         if (reversed)
+1:             applyReverse(btree, function, null);
+1:         else
+1:             applyForwards(btree, function, null);
+1:     }
+1: 
+1:     /**
+1:      * Simple method to walk the btree forwards or reversed and apply a function till a stop condition is reached
+1:      *
+1:      * Public method
+1:      *
+1:      */
+1:     public static <V> void apply(Object[] btree, Consumer<V> function, Predicate<V> stopCondition, boolean reversed)
+1:     {
+1:         if (reversed)
+1:             applyReverse(btree, function, stopCondition);
+1:         else
+1:             applyForwards(btree, function, stopCondition);
+1:     }
+1: 
+1: 
+1: 
+1: 
+1:     /**
+1:      * Simple method to walk the btree forwards and apply a function till a stop condition is reached
+1:      *
+1:      * Private method
+1:      *
+1:      * @param btree
+1:      * @param function
+1:      * @param stopCondition
+1:      */
+1:     private static <V> boolean applyForwards(Object[] btree, Consumer<V> function, Predicate<V> stopCondition)
+1:     {
+1:         boolean isLeaf = isLeaf(btree);
+1:         int childOffset = isLeaf ? Integer.MAX_VALUE : getChildStart(btree);
+1:         int limit = isLeaf ? getLeafKeyEnd(btree) : btree.length - 1;
+1:         for (int i = 0 ; i < limit ; i++)
+1:         {
+1:             // we want to visit in iteration order, so we visit our key nodes inbetween our children
+1:             int idx = isLeaf ? i : (i / 2) + (i % 2 == 0 ? childOffset : 0);
+1:             Object current = btree[idx];
+1:             if (idx < childOffset)
+1:             {
+1:                 V castedCurrent = (V) current;
+1:                 if (stopCondition != null && stopCondition.apply(castedCurrent))
+1:                     return true;
+1: 
+1:                 function.accept(castedCurrent);
+1:             }
+1:             else
+1:             {
+1:                 if (applyForwards((Object[]) current, function, stopCondition))
+1:                     return true;
+1:             }
+1:         }
+1: 
+1:         return false;
+1:     }
+1: 
+1:     /**
+1:      * Simple method to walk the btree in reverse and apply a function till a stop condition is reached
+1:      *
+1:      * Private method
+1:      *
+1:      * @param btree
+1:      * @param function
+1:      * @param stopCondition
+1:      */
+1:     private static <V> boolean applyReverse(Object[] btree, Consumer<V> function, Predicate<V> stopCondition)
+1:     {
+1:         boolean isLeaf = isLeaf(btree);
+1:         int childOffset = isLeaf ? 0 : getChildStart(btree);
+1:         int limit = isLeaf ? getLeafKeyEnd(btree)  : btree.length - 1;
+1:         for (int i = limit - 1, visited = 0; i >= 0 ; i--, visited++)
+1:         {
+1:             int idx = i;
+1: 
+1:             // we want to visit in reverse iteration order, so we visit our children nodes inbetween our keys
+1:             if (!isLeaf)
+1:             {
+1:                 int typeOffset = visited / 2;
+1: 
+1:                 if (i % 2 == 0)
+1:                 {
+1:                     // This is a child branch. Since children are in the second half of the array, we must
+1:                     // adjust for the key's we've visited along the way
+1:                     idx += typeOffset;
+1:                 }
+1:                 else
+1:                 {
+1:                     // This is a key. Since the keys are in the first half of the array and we are iterating
+1:                     // in reverse we subtract the childOffset and adjust for children we've walked so far
+1:                     idx = i - childOffset + typeOffset;
+1:                 }
+1:             }
+1: 
+1:             Object current = btree[idx];
+1:             if (isLeaf || idx < childOffset)
+1:             {
+1:                 V castedCurrent = (V) current;
+1:                 if (stopCondition != null && stopCondition.apply(castedCurrent))
+1:                     return true;
+1: 
+1:                 function.accept(castedCurrent);
+1:             }
+1:             else
+1:             {
+1:                 if (applyReverse((Object[]) current, function, stopCondition))
+1:                     return true;
+1:             }
+1:         }
+1: 
+1:         return false;
+1:     }
+commit:1e92ce4
+/////////////////////////////////////////////////////////////////////////
+1: import io.netty.util.Recycler;
+/////////////////////////////////////////////////////////////////////////
+1:         TreeBuilder builder = TreeBuilder.newInstance();
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         TreeBuilder builder = TreeBuilder.newInstance();
+/////////////////////////////////////////////////////////////////////////
+1:         return new BTreeSearchIterator<>(btree, null, dir);
+1:         return new BTreeSearchIterator<>(btree, null, dir, lb, ub);
+/////////////////////////////////////////////////////////////////////////
+1:     final static Recycler<Builder> builderRecycler = new Recycler<Builder>()
+1:         protected Builder newObject(Handle handle)
+1:             return new Builder(handle);
+1:         Builder<V> builder = builderRecycler.get();
+1:         builder.reuse(comparator);
+1: 
+1:         return builder;
+1:         return builder(comparator);
+/////////////////////////////////////////////////////////////////////////
+1:         final Recycler.Handle recycleHandle;
+1:         private Builder(Recycler.Handle handle)
+1:             this.recycleHandle = handle;
+1:             this.values = new Object[16];
+/////////////////////////////////////////////////////////////////////////
+1:         public void recycle()
+1:             if (recycleHandle != null)
+1:                 builderRecycler.recycle(this, recycleHandle);
+1:         private void reuse(Comparator<? super V> comparator)
+1:             quickResolver = null;
+1:             auto = true;
+/////////////////////////////////////////////////////////////////////////
+1:             try
+1:             {
+1:                 if (auto)
+1:                     autoEnforce();
+1:                 return BTree.build(Arrays.asList(values).subList(0, count), UpdateFunction.noOp());
+1:             }
+1:             finally
+1:             {
+1:                 this.recycle();
+1:             }
+author:Alex Petrov
+-------------------------------------------------------------------------------
+commit:578c85d
+/////////////////////////////////////////////////////////////////////////
+1:             {
+1:                 this.cleanup();
+1:             }
+1:         /**
+1:          * Cleans up the Builder instance before recycling it.
+1:          */
+1:         private void cleanup()
+/////////////////////////////////////////////////////////////////////////
+0:         private void reuse(Comparator<? super V> comparator)
+1:         {
+1:             this.comparator = comparator;
+1:         }
+1: 
+commit:eb5a59a
+/////////////////////////////////////////////////////////////////////////
+1:             Arrays.fill(values, 0, count, null);
+author:Piotr Jastrzebski
+-------------------------------------------------------------------------------
+commit:1c62850
+/////////////////////////////////////////////////////////////////////////
+1:     static final int MINIMAL_NODE_SIZE = FAN_FACTOR >> 1;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:      * Finds and replaces the item provided by index in the tree.
+1:      */
+1:     public static <V> void replaceInSitu(Object[] tree, int index, V replace)
+1:     {
+1:         // WARNING: if semantics change, see also InternalCursor.seekTo, which mirrors this implementation
+1:         if ((index < 0) | (index >= size(tree)))
+1:             throw new IndexOutOfBoundsException(index + " not in range [0.." + size(tree) + ")");
+1: 
+1:         while (!isLeaf(tree))
+1:         {
+1:             final int[] sizeMap = getSizeMap(tree);
+1:             int boundary = Arrays.binarySearch(sizeMap, index);
+1:             if (boundary >= 0)
+1:             {
+1:                 // exact match, in this branch node
+1:                 assert boundary < sizeMap.length - 1;
+1:                 tree[boundary] = replace;
+1:                 return;
+1:             }
+1: 
+1:             boundary = -1 -boundary;
+1:             if (boundary > 0)
+1:             {
+1:                 assert boundary < sizeMap.length;
+1:                 index -= (1 + sizeMap[boundary - 1]);
+1:             }
+1:             tree = (Object[]) tree[getChildStart(tree) + boundary];
+1:         }
+1:         assert index < getLeafKeyEnd(tree);
+1:         tree[index] = replace;
+1:     }
+1: 
+1:     /**
+1:      * Modifies the provided btree directly. THIS SHOULD NOT BE USED WITHOUT EXTREME CARE as BTrees are meant to be immutable.
+/////////////////////////////////////////////////////////////////////////
+1:         final int keyCount = getBranchKeyEnd(node);
+1:         if ((!isRoot && keyCount < FAN_FACTOR / 2) || keyCount > FAN_FACTOR + 1)
+1:             return false;
+1: 
+1:         int size = -1;
+1:         int[] sizeMap = getSizeMap(node);
+1:             size += size(child) + 1;
+1:             if (sizeMap[i - getChildStart(node)] != size)
+1:                 return false;
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:e51f83b
+/////////////////////////////////////////////////////////////////////////
+1:     public static <K> Object[] merge(Object[] tree1, Object[] tree2, Comparator<? super K> comparator, UpdateFunction<K, K> updateF)
+/////////////////////////////////////////////////////////////////////////
+0:         return update(tree1, comparator, new BTreeSet<K>(tree2, comparator), updateF);
+/////////////////////////////////////////////////////////////////////////
+1:     public static <V> Builder<V> builder(Comparator<? super V> comparator, int initialCapacity)
+1:     {
+0:         return new Builder<>(comparator);
+1:     }
+1: 
+1: 
+1:         // a user-defined bulk resolution, to be applied manually via resolve()
+/////////////////////////////////////////////////////////////////////////
+1:         // a user-defined resolver that is applied automatically on encountering two duplicate values
+1:         public static interface QuickResolver<V>
+1:         {
+1:             // can return a different output type to input, so long as sort order is maintained
+1:             // if a resolver is present, this method will be called for every sequence of equal inputs
+1:             // even those with only one item
+1:             V resolve(V a, V b);
+1:         }
+1: 
+1:         Object[] values;
+1:         boolean detected = true; // true if we have managed to cheaply ensure sorted (+ filtered, if resolver == null) as we have added
+1:         QuickResolver<V> quickResolver;
+0:             this(comparator, 16);
+1:         }
+1: 
+0:         protected Builder(Comparator<? super V> comparator, int initialCapacity)
+1:         {
+0:             this.values = new Object[initialCapacity];
+1:         }
+1: 
+1:         public Builder<V> setQuickResolver(QuickResolver<V> quickResolver)
+1:         {
+1:             this.quickResolver = quickResolver;
+1:             return this;
+/////////////////////////////////////////////////////////////////////////
+1:             Object[] values = this.values;
+1:             int prevCount = this.count++;
+1:             values[prevCount] = v;
+1: 
+1:             if (auto && detected && prevCount > 0)
+1:                 V prev = (V) values[prevCount - 1];
+1:                 int c = comparator.compare(prev, v);
+1:                     count = prevCount;
+1:                     if (quickResolver != null)
+1:                         values[prevCount - 1] = quickResolver.resolve(prev, v);
+/////////////////////////////////////////////////////////////////////////
+1:                 {
+1:                     if (quickResolver != null)
+1:                         a[i] = quickResolver.resolve(ai, aj);
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+1:                 V ai = (V) a[i];
+1:                 V aj = (V) a[j];
+1:                 int c = comparator.compare(ai, aj);
+1:                     Object newValue = quickResolver == null ? ai : quickResolver.resolve(ai, aj);
+1:                     a[newCount++] = newValue;
+/////////////////////////////////////////////////////////////////////////
+1:         public Builder<V> reverse()
+1:         {
+1:             assert !auto;
+1:             int mid = count / 2;
+1:             for (int i = 0 ; i < mid ; i++)
+1:             {
+1:                 Object t = values[i];
+1:                 values[i] = values[count - (1 + i)];
+1:                 values[count - (1 + i)] = t;
+1:             }
+1:             return this;
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 int prevIdx = 0;
+1:                 V prev = (V) values[0];
+1:                 {
+1:                     V next = (V) values[i];
+1:                     if (comparator.compare(prev, next) != 0)
+1:                         values[++prevIdx] = prev = next;
+1:                     else if (quickResolver != null)
+1:                         values[prevIdx] = prev = quickResolver.resolve(prev, next);
+1:                 }
+1:                 count = prevIdx + 1;
+commit:ace28c9
+/////////////////////////////////////////////////////////////////////////
+1:         return size(a) == size(b) && Iterators.elementsEqual(iterator(a), iterator(b));
+1:     }
+1: 
+1:     public static int hashCode(Object[] btree)
+1:     {
+1:         // we can't just delegate to Arrays.deepHashCode(),
+1:         // because two equivalent trees may be represented by differently shaped trees
+1:         int result = 1;
+1:         for (Object v : iterable(btree))
+1:             result = 31 * result + Objects.hashCode(v);
+1:         return result;
+1: 
+commit:639d4b2
+/////////////////////////////////////////////////////////////////////////
+1: import com.google.common.base.Function;
+1: import com.google.common.collect.Iterators;
+1: import static com.google.common.collect.Iterables.concat;
+1: import static com.google.common.collect.Iterables.filter;
+1: import static com.google.common.collect.Iterables.transform;
+/////////////////////////////////////////////////////////////////////////
+1:     // direction of iteration
+1:     public static enum Dir
+1:     {
+1:         ASC, DESC;
+1:         public Dir invert() { return this == ASC ? DESC : ASC; }
+1:         public static Dir asc(boolean asc) { return asc ? ASC : DESC; }
+1:         public static Dir desc(boolean desc) { return desc ? DESC : ASC; }
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         return buildInternal(source, source.size(), updateF);
+1:     }
+1: 
+1:     public static <C, K extends C, V extends C> Object[] build(Iterable<K> source, UpdateFunction<K, V> updateF)
+1:     {
+1:         return buildInternal(source, -1, updateF);
+1:      * @param size    the size of the source iterable
+1:         if (size < 0)
+1:             throw new IllegalArgumentException(Integer.toString(size));
+1:         return buildInternal(source, size, updateF);
+1:     }
+1: 
+1:     /**
+1:      * As build(), except:
+1:      * @param size    < 0 if size is unknown
+1:      */
+1:     private static <C, K extends C, V extends C> Object[] buildInternal(Iterable<K> source, int size, UpdateFunction<K, V> updateF)
+1:     {
+1:         if ((size >= 0) & (size < FAN_FACTOR))
+/////////////////////////////////////////////////////////////////////////
+1:     public static <V> Iterator<V> iterator(Object[] btree)
+1:     {
+1:         return iterator(btree, Dir.ASC);
+1:     }
+1: 
+1:     public static <V> Iterator<V> iterator(Object[] btree, Dir dir)
+1:     {
+0:         return new BTreeSearchIterator<V, V>(btree, null, dir);
+1:     }
+1: 
+1:     public static <V> Iterator<V> iterator(Object[] btree, int lb, int ub, Dir dir)
+1:     {
+0:         return new BTreeSearchIterator<V, V>(btree, null, dir, lb, ub);
+1:     }
+1: 
+1:     public static <V> Iterable<V> iterable(Object[] btree)
+1:     {
+1:         return iterable(btree, Dir.ASC);
+1:     }
+1: 
+1:     public static <V> Iterable<V> iterable(Object[] btree, Dir dir)
+1:     {
+1:         return () -> iterator(btree, dir);
+1:     }
+1: 
+1:     public static <V> Iterable<V> iterable(Object[] btree, int lb, int ub, Dir dir)
+1:     {
+1:         return () -> iterator(btree, lb, ub, dir);
+1:     }
+1: 
+1:      * @param btree  the tree to iterate over
+1:      * @param dir    direction of iteration
+1:     public static <K, V> BTreeSearchIterator<K, V> slice(Object[] btree, Comparator<? super K> comparator, Dir dir)
+1:         return new BTreeSearchIterator<>(btree, comparator, dir);
+/////////////////////////////////////////////////////////////////////////
+1:      * @param dir   if false, the iterator will start at the last item and move backwards
+1:     public static <K, V extends K> BTreeSearchIterator<K, V> slice(Object[] btree, Comparator<? super K> comparator, K start, K end, Dir dir)
+1:         return slice(btree, comparator, start, true, end, false, dir);
+/////////////////////////////////////////////////////////////////////////
+1:      * @param dir            direction of iteration
+1:      * @return               an Iterator over the defined sub-range of the tree
+1:     public static <K, V extends K> BTreeSearchIterator<K, V> slice(Object[] btree, Comparator<? super K> comparator, K start, boolean startInclusive, K end, boolean endInclusive, Dir dir)
+/////////////////////////////////////////////////////////////////////////
+1:         return new BTreeSearchIterator<>(btree, comparator, dir, inclusiveLowerBound, inclusiveUpperBound);
+1:     }
+1: 
+1:     /**
+1:      * @return the item in the tree that sorts as equal to the search argument, or null if no such item
+1:      */
+1:     public static <V> V find(Object[] node, Comparator<? super V> comparator, V find)
+1:     {
+1:         while (true)
+1:         {
+1:             int keyEnd = getKeyEnd(node);
+1:             int i = Arrays.binarySearch((V[]) node, 0, keyEnd, find, comparator);
+1: 
+1:             if (i >= 0)
+1:                 return (V) node[i];
+1: 
+1:             if (isLeaf(node))
+1:                 return null;
+1: 
+1:             i = -1 - i;
+1:             node = (Object[]) node[keyEnd + i];
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Modifies the provided btree directly. THIS SHOULD NOT BE USED WITHOUT EXTREME CARE as BTrees are meant to be immutable.
+1:      * Finds and replaces the provided item in the tree. Both should sort as equal to each other (although this is not enforced)
+1:      */
+1:     public static <V> void replaceInSitu(Object[] node, Comparator<? super V> comparator, V find, V replace)
+1:     {
+1:         while (true)
+1:         {
+1:             int keyEnd = getKeyEnd(node);
+1:             int i = Arrays.binarySearch((V[]) node, 0, keyEnd, find, comparator);
+1: 
+1:             if (i >= 0)
+1:             {
+1:                 assert find == node[i];
+1:                 node[i] = replace;
+1:                 return;
+1:             }
+1: 
+1:             if (isLeaf(node))
+1:                 throw new NoSuchElementException();
+1: 
+1:             i = -1 - i;
+1:             node = (Object[]) node[keyEnd + i];
+1:         }
+1:     public static <V> int findIndex(Object[] node, Comparator<? super V> comparator, V find)
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     public static long sizeOfStructureOnHeap(Object[] tree)
+1:     {
+1:         long size = ObjectSizes.sizeOfArray(tree);
+1:         if (isLeaf(tree))
+1:             return size;
+1:         for (int i = getChildStart(tree) ; i < getChildEnd(tree) ; i++)
+1:             size += sizeOfStructureOnHeap((Object[]) tree[i]);
+1:         return size;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     // simple class for avoiding duplicate transformation work
+1:     private static class FiltrationTracker<V> implements Function<V, V>
+1:     {
+1:         final Function<? super V, ? extends V> wrapped;
+1:         int index;
+1:         boolean failed;
+1: 
+1:         private FiltrationTracker(Function<? super V, ? extends V> wrapped)
+1:         {
+1:             this.wrapped = wrapped;
+1:         }
+1: 
+1:         public V apply(V i)
+1:         {
+1:             V o = wrapped.apply(i);
+1:             if (o != null) index++;
+1:             else failed = true;
+1:             return o;
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Takes a btree and transforms it using the provided function, filtering out any null results.
+1:      * The result of any transformation must sort identically wrt the other results as their originals
+1:      */
+1:     public static <V> Object[] transformAndFilter(Object[] btree, Function<? super V, ? extends V> function)
+1:     {
+1:         if (isEmpty(btree))
+1:             return btree;
+1: 
+1:         // TODO: can be made more efficient
+1:         FiltrationTracker<V> wrapped = new FiltrationTracker<>(function);
+1:         Object[] result = transformAndFilter(btree, wrapped);
+1:         if (!wrapped.failed)
+1:             return result;
+1: 
+1:         // take the already transformed bits from the head of the partial result
+1:         Iterable<V> head = iterable(result, 0, wrapped.index - 1, Dir.ASC);
+1:         // and concatenate with remainder of original tree, with transformation applied
+1:         Iterable<V> remainder = iterable(btree, wrapped.index + 1, size(btree) - 1, Dir.ASC);
+1:         remainder = filter(transform(remainder, function), (x) -> x != null);
+1:         Iterable<V> build = concat(head, remainder);
+1: 
+1:         return buildInternal(build, -1, UpdateFunction.<V>noOp());
+1:     }
+1: 
+1:     private static <V> Object[] transformAndFilter(Object[] btree, FiltrationTracker<V> function)
+1:     {
+1:         Object[] result = btree;
+1:         boolean isLeaf = isLeaf(btree);
+1:         int childOffset = isLeaf ? Integer.MAX_VALUE : getChildStart(btree);
+1:         int limit = isLeaf ? getLeafKeyEnd(btree) : btree.length - 1;
+1:         for (int i = 0 ; i < limit ; i++)
+1:         {
+1:             // we want to visit in iteration order, so we visit our key nodes inbetween our children
+1:             int idx = isLeaf ? i : (i / 2) + (i % 2 == 0 ? childOffset : 0);
+1:             Object current = btree[idx];
+1:             Object updated = idx < childOffset ? function.apply((V) current) : transformAndFilter((Object[]) current, function);
+1:             if (updated != current)
+1:             {
+1:                 if (result == btree)
+1:                     result = btree.clone();
+1:                 result[idx] = updated;
+1:             }
+1:             if (function.failed)
+1:                 return result;
+1:         }
+1:         return result;
+1:     }
+1: 
+1:     public static boolean equals(Object[] a, Object[] b)
+1:     {
+0:         return Iterators.elementsEqual(iterator(a), iterator(b));
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         public static interface Resolver
+1:         {
+1:             // can return a different output type to input, so long as sort order is maintained
+1:             // if a resolver is present, this method will be called for every sequence of equal inputs
+1:             // even those with only one item
+1:             Object resolve(Object[] array, int lb, int ub);
+1:         }
+1:         Comparator<? super V> comparator;
+0:         boolean detected; // true if we have managed to cheaply ensure sorted (+ filtered, if resolver == null) as we have added
+1:         boolean auto = true; // false if the user has promised to enforce the sort order and resolve any duplicates
+0:         public void reuse()
+1:         {
+0:             reuse(comparator);
+1:         }
+1: 
+0:         public void reuse(Comparator<? super V> comparator)
+1:         {
+0:             this.comparator = comparator;
+1:             count = 0;
+1:             detected = true;
+1:         }
+1: 
+1:         public Builder<V> auto(boolean auto)
+1:         {
+1:             this.auto = auto;
+1:             return this;
+1:         }
+1: 
+0:             if (auto && detected && count > 1)
+1:                 if (c == 0 && auto)
+1:                 {
+0:                     count--;
+1:                 }
+1:                 else if (c > 0)
+1:                 {
+1:                     detected = false;
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+1:             if (auto && add instanceof SortedSet && equalComparators(comparator, ((SortedSet) add).comparator()))
+1:                 // if we collect all duplicates, don't bother as merge will necessarily be more expensive than sorting at end
+/////////////////////////////////////////////////////////////////////////
+1:         private Builder<V> mergeAll(Iterable<V> add, int addCount)
+1:             assert auto;
+1:             autoEnforce();
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:             // save time in cases where we already have a subset, by skipping dir
+1:                 V ai = (V) a[i], aj = (V) a[j];
+1:                 // in some cases, such as Columns, we may have identity supersets, so perform a cheap object-identity check
+1:                 int c = ai == aj ? 0 : comparator.compare(ai, aj);
+/////////////////////////////////////////////////////////////////////////
+1:         public Builder<V> sort()
+1:         {
+1:             Arrays.sort((V[]) values, 0, count, comparator);
+1:             return this;
+1:         }
+1: 
+1:         // automatically enforce sorted+filtered
+1:         private void autoEnforce()
+1:                 sort();
+/////////////////////////////////////////////////////////////////////////
+1:         public Builder<V> resolve(Resolver resolver)
+1:         {
+1:             if (count > 0)
+1:             {
+1:                 int c = 0;
+1:                 int prev = 0;
+1:                 for (int i = 1 ; i < count ; i++)
+1:                 {
+1:                     if (comparator.compare((V) values[i], (V) values[prev]) != 0)
+1:                     {
+1:                         values[c++] = resolver.resolve((V[]) values, prev, i);
+1:                         prev = i;
+1:                     }
+1:                 }
+1:                 values[c++] = resolver.resolve((V[]) values, prev, count);
+1:                 count = c;
+1:             }
+1:             return this;
+1:         }
+1: 
+0:             if (auto)
+0:                 autoEnforce();
+commit:5250d7f
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.*;
+1: 
+1: import com.google.common.collect.Ordering;
+1: import static java.lang.Math.max;
+1: import static java.lang.Math.min;
+1: 
+1:      * Branch Nodes: Object[V1, V2, ..., child[&lt;V1.key], child[&lt;V2.key], ..., child[&lt; Inf], size], where
+1:      * first half of the array (minus one).  In our implementation, each value must include its own key;
+1:      * So we can quickly distinguish between leaves and branches, we require that leaf nodes are always an odd number
+1:      * of elements (padded with a null, if necessary), and branches are always an even number of elements.
+/////////////////////////////////////////////////////////////////////////
+1:     static final Object[] EMPTY_LEAF = new Object[1];
+1:     static final Object[] EMPTY_BRANCH = new Object[] { null, new int[0] };
+/////////////////////////////////////////////////////////////////////////
+1:     public static Object[] singleton(Object value)
+1:     {
+1:         return new Object[] { value };
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:      * @param source  the items to build the tree with. MUST BE IN STRICTLY ASCENDING ORDER.
+1:      * @return        a btree representing the contents of the provided iterable
+1:             if (size == 0)
+1:                 return EMPTY_LEAF;
+1:             // pad to odd length to match contract that all leaf nodes are odd
+1:             V[] values = (V[]) new Object[size | 1];
+/////////////////////////////////////////////////////////////////////////
+0:         Queue<TreeBuilder> queue = modifier.get();
+0:         TreeBuilder builder = queue.poll();
+0:             builder = new TreeBuilder();
+/////////////////////////////////////////////////////////////////////////
+1:      * Returns a new BTree with the provided collection inserting/replacing as necessary any equal items
+1:      * @param updateWith         the items to either insert / update. MUST BE IN STRICTLY ASCENDING ORDER.
+/////////////////////////////////////////////////////////////////////////
+1:         if (isEmpty(btree))
+0:         Queue<TreeBuilder> queue = modifier.get();
+0:         TreeBuilder builder = queue.poll();
+0:             builder = new TreeBuilder();
+0:     public static <K> Object[] merge(Object[] tree1, Object[] tree2, Comparator<K> comparator)
+1:     {
+1:         if (size(tree1) < size(tree2))
+1:         {
+1:             Object[] tmp = tree1;
+1:             tree1 = tree2;
+1:             tree2 = tmp;
+1:         }
+0:         return update(tree1, comparator, new BTreeSet<K>(tree2, comparator), UpdateFunction.<K>noOp());
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:     public static <V> BTreeSearchIterator<V, V> slice(Object[] btree, Comparator<? super V> comparator, boolean forwards)
+0:         return new BTreeSearchIterator<>(btree, comparator, forwards);
+1:      * @param start      the beginning of the range to return, inclusive (in ascending order)
+1:      * @param end        the end of the range to return, exclusive (in ascending order)
+0:      * @param forwards   if false, the iterator will start at the last item and move backwards
+1:      * @return           an Iterator over the defined sub-range of the tree
+0:     public static <K, V extends K> BTreeSearchIterator<K, V> slice(Object[] btree, Comparator<? super K> comparator, K start, K end, boolean forwards)
+0:         return slice(btree, comparator, start, true, end, false, forwards);
+1:      * @param btree          the tree to iterate over
+1:      * @param comparator     the comparator that defines the ordering over the items in the tree
+1:      * @param start          low bound of the range
+1:      * @param startInclusive inclusivity of lower bound
+1:      * @param end            high bound of the range
+1:      * @param endInclusive   inclusivity of higher bound
+0:      * @param forwards       if false, the iterator will start at end and move backwards
+1:      * @return           an Iterator over the defined sub-range of the tree
+0:     public static <K, V extends K> BTreeSearchIterator<K, V> slice(Object[] btree, Comparator<? super K> comparator, K start, boolean startInclusive, K end, boolean endInclusive, boolean forwards)
+1:         int inclusiveLowerBound = max(0,
+1:                                       start == null ? Integer.MIN_VALUE
+1:                                                     : startInclusive ? ceilIndex(btree, comparator, start)
+1:                                                                      : higherIndex(btree, comparator, start));
+1:         int inclusiveUpperBound = min(size(btree) - 1,
+1:                                       end == null ? Integer.MAX_VALUE
+1:                                                   : endInclusive ? floorIndex(btree, comparator, end)
+1:                                                                  : lowerIndex(btree, comparator, end));
+0:         return new BTreeSearchIterator<>(btree, comparator, forwards, inclusiveLowerBound, inclusiveUpperBound);
+1:     /**
+1:      * Honours result semantics of {@link Arrays#binarySearch}, as though it were performed on the tree flattened into an array
+1:      * @return index of item in tree, or <tt>(-(<i>insertion point</i>) - 1)</tt> if not present
+1:      */
+0:     public static <V> int findIndex(Object[] node, Comparator<V> comparator, V find)
+1:         int lb = 0;
+1:             int i = Arrays.binarySearch((V[]) node, 0, keyEnd, find, comparator);
+1:             boolean exact = i >= 0;
+1: 
+1:             if (isLeaf(node))
+1:                 return exact ? lb + i : i - lb;
+1: 
+1:             if (!exact)
+1:                 i = -1 - i;
+1: 
+1:             int[] sizeMap = getSizeMap(node);
+1:             if (exact)
+1:                 return lb + sizeMap[i];
+1:             else if (i > 0)
+1:                 lb += sizeMap[i - 1] + 1;
+1: 
+1:             node = (Object[]) node[keyEnd + i];
+1:     /**
+1:      * @return the value at the index'th position in the tree, in tree order
+1:      */
+1:     public static <V> V findByIndex(Object[] tree, int index)
+1:     {
+1:         // WARNING: if semantics change, see also InternalCursor.seekTo, which mirrors this implementation
+1:         if ((index < 0) | (index >= size(tree)))
+1:             throw new IndexOutOfBoundsException(index + " not in range [0.." + size(tree) + ")");
+1: 
+1:         Object[] node = tree;
+1:         while (true)
+1:         {
+1:             if (isLeaf(node))
+1:             {
+1:                 int keyEnd = getLeafKeyEnd(node);
+1:                 assert index < keyEnd;
+1:                 return (V) node[index];
+1:             }
+1: 
+1:             int[] sizeMap = getSizeMap(node);
+1:             int boundary = Arrays.binarySearch(sizeMap, index);
+1:             if (boundary >= 0)
+1:             {
+1:                 // exact match, in this branch node
+1:                 assert boundary < sizeMap.length - 1;
+1:                 return (V) node[boundary];
+1:             }
+1: 
+1:             boundary = -1 -boundary;
+1:             if (boundary > 0)
+1:             {
+1:                 assert boundary < sizeMap.length;
+1:                 index -= (1 + sizeMap[boundary - 1]);
+1:             }
+1:             node = (Object[]) node[getChildStart(node) + boundary];
+1:         }
+1:     }
+1: 
+1:     /* since we have access to binarySearch semantics within indexOf(), we can use this to implement
+1:      * lower/upper/floor/higher very trivially
+1:      *
+1:      * this implementation is *not* optimal; it requires two logarithmic traversals, although the second is much cheaper
+1:      * (having less height, and operating over only primitive arrays), and the clarity is compelling
+1:      */
+1: 
+1: 
+1:     public static <V> int lowerIndex(Object[] btree, Comparator<? super V> comparator, V find)
+1:     {
+1:         int i = findIndex(btree, comparator, find);
+1:         if (i < 0)
+1:             i = -1 -i;
+1:         return i - 1;
+1:     }
+1: 
+1:     public static <V> V lower(Object[] btree, Comparator<? super V> comparator, V find)
+1:     {
+1:         int i = lowerIndex(btree, comparator, find);
+1:         return i >= 0 ? findByIndex(btree, i) : null;
+1:     }
+1: 
+1:     public static <V> int floorIndex(Object[] btree, Comparator<? super V> comparator, V find)
+1:     {
+1:         int i = findIndex(btree, comparator, find);
+1:         if (i < 0)
+1:             i = -2 -i;
+1:         return i;
+1:     }
+1: 
+1:     public static <V> V floor(Object[] btree, Comparator<? super V> comparator, V find)
+1:     {
+1:         int i = floorIndex(btree, comparator, find);
+1:         return i >= 0 ? findByIndex(btree, i) : null;
+1:     }
+1: 
+1:     public static <V> int higherIndex(Object[] btree, Comparator<? super V> comparator, V find)
+1:     {
+1:         int i = findIndex(btree, comparator, find);
+1:         if (i < 0) i = -1 -i;
+1:         else i++;
+1:         return i;
+1:     }
+1: 
+1:     public static <V> V higher(Object[] btree, Comparator<? super V> comparator, V find)
+1:     {
+1:         int i = higherIndex(btree, comparator, find);
+1:         return i < size(btree) ? findByIndex(btree, i) : null;
+1:     }
+1: 
+1:     public static <V> int ceilIndex(Object[] btree, Comparator<? super V> comparator, V find)
+1:     {
+1:         int i = findIndex(btree, comparator, find);
+1:         if (i < 0)
+1:             i = -1 -i;
+1:         return i;
+1:     }
+1: 
+1:     public static <V> V ceil(Object[] btree, Comparator<? super V> comparator, V find)
+1:     {
+1:         int i = ceilIndex(btree, comparator, find);
+1:         return i < size(btree) ? findByIndex(btree, i) : null;
+1:     }
+/////////////////////////////////////////////////////////////////////////
+1:         return node[len - 1] == null ? len - 1 : len;
+1:     // == number of keys, as they are indexed from zero
+1:     static int getBranchKeyEnd(Object[] branchNode)
+1:         return (branchNode.length / 2) - 1;
+1:     }
+1: 
+1:     /**
+1:      * @return first index in a branch node containing child nodes
+1:      */
+1:     static int getChildStart(Object[] branchNode)
+1:     {
+1:         return getBranchKeyEnd(branchNode);
+1:     }
+1: 
+1:     /**
+1:      * @return last index + 1 in a branch node containing child nodes
+1:      */
+1:     static int getChildEnd(Object[] branchNode)
+1:     {
+1:         return branchNode.length - 1;
+1:     }
+1: 
+1:     /**
+1:      * @return number of children in a branch node
+1:      */
+1:     static int getChildCount(Object[] branchNode)
+1:     {
+1:         return branchNode.length / 2;
+1:     }
+1: 
+1:     /**
+1:      * @return the size map for the branch node
+1:      */
+1:     static int[] getSizeMap(Object[] branchNode)
+1:     {
+1:         return (int[]) branchNode[getChildEnd(branchNode)];
+1:     }
+1: 
+1:     /**
+1:      * @return the size map for the branch node
+1:      */
+1:     static int lookupSizeMap(Object[] branchNode, int index)
+1:     {
+1:         return getSizeMap(branchNode)[index];
+1:     }
+1: 
+1:     // get the size from the btree's index (fails if not present)
+1:     public static int size(Object[] tree)
+1:     {
+1:         if (isLeaf(tree))
+1:             return getLeafKeyEnd(tree);
+1:         int length = tree.length;
+1:         // length - 1 == getChildEnd == getPositionOfSizeMap
+1:         // (length / 2) - 1 == getChildCount - 1 == position of full tree size
+1:         // hard code this, as will be used often;
+1:         return ((int[]) tree[length - 1])[(length / 2) - 1];
+1:         return (node.length & 1) == 1;
+1:         return tree == EMPTY_LEAF;
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Fill the target array with the contents of the provided subtree, in ascending order, starting at targetOffset
+1:      * @param tree source
+1:      * @param target array
+1:      * @param targetOffset offset in target array
+1:      * @return number of items copied (size of tree)
+1:      */
+1:     public static int toArray(Object[] tree, Object[] target, int targetOffset)
+1:         return toArray(tree, 0, size(tree), target, targetOffset);
+1:     }
+1:     public static int toArray(Object[] tree, int treeStart, int treeEnd, Object[] target, int targetOffset)
+1:         if (isLeaf(tree))
+1:             int count = treeEnd - treeStart;
+1:             System.arraycopy(tree, treeStart, target, targetOffset, count);
+1:             return count;
+1:         int newTargetOffset = targetOffset;
+1:         int childCount = getChildCount(tree);
+1:         int childOffset = getChildStart(tree);
+1:         for (int i = 0 ; i < childCount ; i++)
+1:         {
+1:             int childStart = treeIndexOffsetOfChild(tree, i);
+1:             int childEnd = treeIndexOfBranchKey(tree, i);
+1:             if (childStart <= treeEnd && childEnd >= treeStart)
+1:             {
+1:                 newTargetOffset += toArray((Object[]) tree[childOffset + i], max(0, treeStart - childStart), min(childEnd, treeEnd) - childStart,
+1:                                            target, newTargetOffset);
+1:                 if (treeStart <= childEnd && treeEnd > childEnd) // this check will always fail for the non-existent key
+1:                     target[newTargetOffset++] = tree[i];
+1:             }
+1:         }
+1:         return newTargetOffset - targetOffset;
+1:     }
+1: 
+1:     /**
+1:      * tree index => index of key wrt all items in the tree laid out serially
+1:      *
+1:      * This version of the method permits requesting out-of-bounds indexes, -1 and size
+1:      * @param root to calculate tree index within
+1:      * @param keyIndex root-local index of key to calculate tree-index
+1:      * @return the number of items preceding the key in the whole tree of root
+1:      */
+1:     public static int treeIndexOfKey(Object[] root, int keyIndex)
+1:     {
+1:         if (isLeaf(root))
+1:             return keyIndex;
+1:         int[] sizeMap = getSizeMap(root);
+1:         if ((keyIndex >= 0) & (keyIndex < sizeMap.length))
+1:             return sizeMap[keyIndex];
+1:         // we support asking for -1 or size, so that we can easily use this for iterator bounds checking
+1:         if (keyIndex < 0)
+1:             return -1;
+1:         return sizeMap[keyIndex - 1] + 1;
+1:     }
+1: 
+1:     /**
+1:      * @param keyIndex node-local index of the key to calculate index of
+1:      * @return keyIndex; this method is here only for symmetry and clarity
+1:      */
+1:     public static int treeIndexOfLeafKey(int keyIndex)
+1:     {
+1:         return keyIndex;
+1:     }
+1: 
+1:     /**
+1:      * @param root to calculate tree-index within
+1:      * @param keyIndex root-local index of key to calculate tree-index of
+1:      * @return the number of items preceding the key in the whole tree of root
+1:      */
+1:     public static int treeIndexOfBranchKey(Object[] root, int keyIndex)
+1:     {
+1:         return lookupSizeMap(root, keyIndex);
+1:     }
+1: 
+1:     /**
+1:      * @param root to calculate tree-index within
+1:      * @param childIndex root-local index of *child* to calculate tree-index of
+1:      * @return the number of items preceding the child in the whole tree of root
+1:      */
+1:     public static int treeIndexOffsetOfChild(Object[] root, int childIndex)
+1:     {
+1:         if (childIndex == 0)
+1:             return 0;
+1:         return 1 + lookupSizeMap(root, childIndex - 1);
+1:     }
+1: 
+0:     private static final ThreadLocal<Queue<TreeBuilder>> modifier = new ThreadLocal<Queue<TreeBuilder>>()
+0:         protected Queue<TreeBuilder> initialValue()
+1:     public static <V> Builder<V> builder(Comparator<? super V> comparator)
+1:     {
+0:         return new Builder<>(comparator);
+1:     }
+1: 
+1:     public static class Builder<V>
+1:     {
+1: 
+0:         final Comparator<? super V> comparator;
+0:         Object[] values = new Object[10];
+1:         int count;
+0:         boolean detected; // true if we have managed to cheaply ensure sorted + filtered as we have added
+1: 
+0:         protected Builder(Comparator<? super V> comparator)
+1:         {
+0:             this.comparator = comparator;
+1:         }
+1: 
+1:         public Builder<V> add(V v)
+1:         {
+1:             if (count == values.length)
+1:                 values = Arrays.copyOf(values, count * 2);
+1:             values[count++] = v;
+1: 
+0:             if (detected && count > 1)
+1:             {
+0:                 int c = comparator.compare((V) values[count - 2], (V) values[count - 1]);
+0:                 if (c == 0) count--;
+0:                 else if (c > 0) detected = false;
+1:             }
+1: 
+1:             return this;
+1:         }
+1: 
+1:         public Builder<V> addAll(Collection<V> add)
+1:         {
+0:             if (add instanceof SortedSet && equalComparators(comparator, ((SortedSet) add).comparator()))
+1:             {
+1:                 // if we're a SortedSet, permit quick order-preserving addition of items
+1:                 return mergeAll(add, add.size());
+1:             }
+1:             detected = false;
+1:             if (values.length < count + add.size())
+1:                 values = Arrays.copyOf(values, max(count + add.size(), count * 2));
+1:             for (V v : add)
+1:                 values[count++] = v;
+1:             return this;
+1:         }
+1: 
+1:         private static boolean equalComparators(Comparator<?> a, Comparator<?> b)
+1:         {
+1:             return a == b || (isNaturalComparator(a) && isNaturalComparator(b));
+1:         }
+1: 
+1:         private static boolean isNaturalComparator(Comparator<?> a)
+1:         {
+1:             return a == null || a == Comparator.naturalOrder() || a == Ordering.natural();
+1:         }
+1: 
+1:         // iter must be in sorted order!
+0:         public Builder<V> mergeAll(Iterable<V> add, int addCount)
+1:         {
+1:             // ensure the existing contents are in order
+0:             sortAndFilter();
+1: 
+1:             int curCount = count;
+1:             // we make room for curCount * 2 + addCount, so that we can copy the current values to the end
+1:             // if necessary for continuing the merge, and have the new values directly after the current value range
+0:             // i.e. []
+1:             if (values.length < curCount * 2 + addCount)
+1:                 values = Arrays.copyOf(values, max(curCount * 2 + addCount, curCount * 3));
+1: 
+1:             if (add instanceof BTreeSet)
+1:             {
+1:                 // use btree set's fast toArray method, to append directly
+1:                 ((BTreeSet) add).toArray(values, curCount);
+1:             }
+1:             else
+1:             {
+1:                 // consider calling toArray() and System.arraycopy
+1:                 int i = curCount;
+1:                 for (V v : add)
+1:                     values[i++] = v;
+1:             }
+1:             return mergeAll(addCount);
+1:         }
+1: 
+1:         // iter must be in sorted order!
+1:         private Builder<V> mergeAll(int addCount)
+1:         {
+0:             // start optimistically by assuming new values are superset of current, and just run until this fails to hold
+1:             Object[] a = values;
+1:             int addOffset = count;
+1: 
+1:             int i = 0, j = addOffset;
+1:             int curEnd = addOffset, addEnd = addOffset + addCount;
+1:             while (i < curEnd && j < addEnd)
+1:             {
+0:                 int c = comparator.compare((V) a[i], (V) a[j]);
+1:                 if (c > 0)
+1:                     break;
+1:                 else if (c == 0)
+1:                     j++;
+1:                 i++;
+1:             }
+1: 
+1:             if (j == addEnd)
+1:                 return this; // already a superset of the new values
+1: 
+1:             // otherwise, copy the remaining existing values to the very end, freeing up space for merge result
+1:             int newCount = i;
+1:             System.arraycopy(a, i, a, addEnd, count - i);
+1:             curEnd = addEnd + (count - i);
+1:             i = addEnd;
+1: 
+1:             while (i < curEnd && j < addEnd)
+1:             {
+1:                 // could avoid one comparison if we cared, but would make this ugly
+0:                 int c = comparator.compare((V) a[i], (V) a[j]);
+1:                 if (c == 0)
+1:                 {
+0:                     a[newCount++] = a[i];
+1:                     i++;
+1:                     j++;
+1:                 }
+1:                 else
+1:                 {
+1:                     a[newCount++] =  c < 0 ? a[i++] : a[j++];
+1:                 }
+1:             }
+1: 
+1:             // exhausted one of the inputs; fill in remainder of the other
+1:             if (i < curEnd)
+1:             {
+1:                 System.arraycopy(a, i, a, newCount, curEnd - i);
+1:                 newCount += curEnd - i;
+1:             }
+1:             else if (j < addEnd)
+1:             {
+1:                 if (j != newCount)
+1:                     System.arraycopy(a, j, a, newCount, addEnd - j);
+1:                 newCount += addEnd - j;
+1:             }
+1:             count = newCount;
+1:             return this;
+1:         }
+1: 
+1:         public boolean isEmpty()
+1:         {
+1:             return count == 0;
+1:         }
+1: 
+0:         private void sortAndFilter()
+1:         {
+1:             if (!detected && count > 1)
+1:             {
+0:                 Arrays.sort((V[]) values, 0, count, comparator);
+0:                 int c = 1;
+1:                 for (int i = 1 ; i < count ; i++)
+0:                     if (comparator.compare((V) values[i], (V) values[i - 1]) != 0)
+0:                         values[c++] = values[i];
+0:                 count = c;
+1:             }
+1:             detected = true;
+1:         }
+1: 
+1:         public Object[] build()
+1:         {
+0:             sortAndFilter();
+0:             return BTree.build(Arrays.asList(values).subList(0, count), UpdateFunction.noOp());
+1:         }
+1:     }
+1: 
+1:         if (a == b)
+1:             return 0;
+1:         if (a == NEGATIVE_INFINITY | b == POSITIVE_INFINITY)
+1:             return -1;
+1:         if (b == NEGATIVE_INFINITY | a == POSITIVE_INFINITY)
+1:             return 1;
+1:     static Object POSITIVE_INFINITY = new Object();
+1:     static Object NEGATIVE_INFINITY = new Object();
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 return node.length <= FAN_FACTOR + 1;
+1:             return node.length >= FAN_FACTOR / 2 && node.length <= FAN_FACTOR + 1;
+1:         for (int i = getChildStart(node); i < getChildEnd(node) ; i++)
+1:             Object localmax = i < node.length - 2 ? node[i - getChildStart(node)] : max;
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:a991b64
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     public static <C, K extends C, V extends C> Object[] build(Collection<K> source, UpdateFunction<K, V> updateF)
+0:         return build(source, source.size(), updateF);
+1:     public static <C, K extends C, V extends C> Object[] build(Iterable<K> source, int size, UpdateFunction<K, V> updateF)
+/////////////////////////////////////////////////////////////////////////
+1:                 for (K k : source)
+1:                     values[i++] = updateF.apply(k);
+0:             updateF.allocated(ObjectSizes.sizeOfArray(values));
+/////////////////////////////////////////////////////////////////////////
+1:     public static <C, K extends C, V extends C> Object[] update(Object[] btree,
+1:                                                                 Comparator<C> comparator,
+1:                                                                 Collection<K> updateWith,
+1:                                                                 UpdateFunction<K, V> updateF)
+1:         return update(btree, comparator, updateWith, updateWith.size(), updateF);
+/////////////////////////////////////////////////////////////////////////
+1:      * @param updateWithLength   then number of elements in updateWith
+1:     public static <C, K extends C, V extends C> Object[] update(Object[] btree,
+1:                                                                 Comparator<C> comparator,
+1:                                                                 Iterable<K> updateWith,
+1:                                                                 int updateWithLength,
+1:                                                                 UpdateFunction<K, V> updateF)
+1:             return build(updateWith, updateWithLength, updateF);
+/////////////////////////////////////////////////////////////////////////
+commit:9f14856
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *   http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing,
+1:  * software distributed under the License is distributed on an
+1:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+1:  * KIND, either express or implied.  See the License for the
+1:  * specific language governing permissions and limitations
+1:  * under the License.
+1:  */
+commit:2fd2d89
+/////////////////////////////////////////////////////////////////////////
+0: import com.google.common.collect.Collections2;
+/////////////////////////////////////////////////////////////////////////
+1:         {
+0:             if (replaceF != null)
+0:                 updateWith = Collections2.transform(updateWith, replaceF);
+1:         }
+/////////////////////////////////////////////////////////////////////////
+0:                     v = replaceF.apply(v);
+author:belliottsmith
+-------------------------------------------------------------------------------
+commit:9881ea6
+/////////////////////////////////////////////////////////////////////////
+0:     public static <V> Cursor<V, V> slice(Object[] btree, boolean forwards)
+0:         Cursor<V, V> r = new Cursor<>();
+/////////////////////////////////////////////////////////////////////////
+0:     public static <K, V extends K> Cursor<K, V> slice(Object[] btree, Comparator<K> comparator, K start, K end, boolean forwards)
+0:         Cursor<K, V> r = new Cursor<>();
+/////////////////////////////////////////////////////////////////////////
+0:     public static <K, V extends K> Cursor<K, V> slice(Object[] btree, Comparator<K> comparator, K start, boolean startInclusive, K end, boolean endInclusive, boolean forwards)
+0:         Cursor<K, V> r = new Cursor<>();
+commit:acf1b18
+/////////////////////////////////////////////////////////////////////////
+0:         int low = fromIndex;
+0:             int cmp = comparator.compare((V) key, (V) a[mid]);
+/////////////////////////////////////////////////////////////////////////
+0:     static interface Special extends Comparable<Object> { }
+/////////////////////////////////////////////////////////////////////////
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:e6e596d
+/////////////////////////////////////////////////////////////////////////
+0: import static org.apache.cassandra.utils.btree.UpdateFunction.NoOp;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         return update(btree, comparator, updateWith, updateWithIsSorted, NoOp.<V>instance());
+commit:948964b
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         Cursor<V> r = new Cursor<>();
+/////////////////////////////////////////////////////////////////////////
+0:         Cursor<V> r = new Cursor<>();
+/////////////////////////////////////////////////////////////////////////
+0:         Cursor<V> r = new Cursor<>();
+/////////////////////////////////////////////////////////////////////////
+1:     public static int depth(Object[] tree)
+1:     {
+1:         int depth = 1;
+1:         while (!isLeaf(tree))
+1:         {
+1:             depth++;
+1:             tree = (Object[]) tree[getKeyEnd(tree)];
+1:         }
+1:         return depth;
+1:     }
+1: 
+commit:0cb1e3d
+/////////////////////////////////////////////////////////////////////////
+0:     public static <V> Object[] build(Collection<V> source, Comparator<V> comparator, boolean sorted, UpdateFunction<V> updateF)
+1:     {
+0:         return build(source, source.size(), comparator, sorted, updateF);
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:     public static <V> Object[] build(Iterable<V> source, int size, Comparator<V> comparator, boolean sorted, UpdateFunction<V> updateF)
+0:             V[] values = (V[]) new Object[size + (size & 1)];
+1:             {
+1:                 int i = 0;
+0:                 for (V v : source)
+0:                     values[i++] = v;
+1:             }
+1: 
+1: 
+0:             // if updateF is specified
+/////////////////////////////////////////////////////////////////////////
+1:         Object[] btree = builder.build(source, updateF, size);
+/////////////////////////////////////////////////////////////////////////
+0:     public static <V> Object[] update(Object[] btree,
+0:                                       Comparator<V> comparator,
+0:                                       Collection<V> updateWith,
+0:                                       boolean updateWithIsSorted,
+0:                                       UpdateFunction<V> updateF)
+1:     {
+0:         return update(btree, comparator, updateWith, updateWith.size(), updateWithIsSorted, updateF);
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:                                       Iterable<V> updateWith,
+0:                                       int updateWithLength,
+0:             return build(updateWith, updateWithLength, comparator, updateWithIsSorted, updateF);
+0:             updateWith = sorted(updateWith, comparator, updateWithLength);
+/////////////////////////////////////////////////////////////////////////
+1:     public static boolean isEmpty(Object[] tree)
+1:     {
+0:         return tree.length == 0;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:     private static <V> Collection<V> sorted(Iterable<V> source, Comparator<V> comparator, int size)
+0:         V[] vs = (V[]) new Object[size];
+0:         int i = 0;
+0:         for (V v : source)
+0:             vs[i++] = v;
+commit:5223c47
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.ArrayDeque;
+0: import java.util.Queue;
+/////////////////////////////////////////////////////////////////////////
+0:         Queue<Builder> queue = modifier.get();
+0:         Builder builder = queue.poll();
+0:         if (builder == null)
+0:             builder = new Builder();
+0:         Object[] btree = builder.build(source, size);
+0:         queue.add(builder);
+1:         return btree;
+/////////////////////////////////////////////////////////////////////////
+0:         Queue<Builder> queue = modifier.get();
+0:         Builder builder = queue.poll();
+0:         if (builder == null)
+0:             builder = new Builder();
+1:         btree = builder.update(btree, comparator, updateWith, updateF);
+0:         queue.add(builder);
+1:         return btree;
+/////////////////////////////////////////////////////////////////////////
+0:     private static final ThreadLocal<Queue<Builder>> modifier = new ThreadLocal<Queue<Builder>>()
+0:         protected Queue<Builder> initialValue()
+0:             return new ArrayDeque<>();
+commit:5f82aa3
+/////////////////////////////////////////////////////////////////////////
+0:         return update(btree, comparator, updateWith, updateWithIsSorted, UpdateFunction.NoOp.<V>instance());
+/////////////////////////////////////////////////////////////////////////
+commit:4b54b8a
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.ObjectSizes;
+/////////////////////////////////////////////////////////////////////////
+0:     public static <V> Object[] build(Collection<V> source, Comparator<V> comparator, boolean sorted, UpdateFunction<V> updateF)
+/////////////////////////////////////////////////////////////////////////
+0:             if (updateF != null)
+1:             {
+0:                 for (int i = 0 ; i < size ; i++)
+0:                     values[i] = updateF.apply(values[i]);
+0:                 updateF.allocated(ObjectSizes.sizeOfArray(values));
+1:             }
+/////////////////////////////////////////////////////////////////////////
+0:         return update(btree, comparator, updateWith, updateWithIsSorted, null);
+/////////////////////////////////////////////////////////////////////////
+1:      * @param updateF            the update function to apply to any pairs we are swapping, and maybe abort early
+/////////////////////////////////////////////////////////////////////////
+0:                                       UpdateFunction<V> updateF)
+0:             return build(updateWith, comparator, updateWithIsSorted, updateF);
+/////////////////////////////////////////////////////////////////////////
+0:                     if (updateF != null)
+0:                         v = updateF.apply((V) btree[i], v);
+0:                 else if (updateF != null)
+0:                     v = updateF.apply(v);
+/////////////////////////////////////////////////////////////////////////
+0:             assert mergedCount <= FAN_FACTOR;
+0:             Object[] r = Arrays.copyOfRange(merged, 0, mergedCount + (mergedCount & 1));
+0:             if (updateF != null)
+0:                 updateF.allocated(ObjectSizes.sizeOfArray(r) - (btree.length == 0 ? 0 : ObjectSizes.sizeOfArray(btree)));
+0:             return r;
+0:         return modifier.get().update(btree, comparator, updateWith, updateF);
+commit:412b053
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.cassandra.utils.btree;
+1: 
+0: import java.util.Arrays;
+0: import java.util.Collection;
+0: import java.util.Comparator;
+1: 
+0: import com.google.common.base.Function;
+1: 
+1: public class BTree
+1: {
+1:     /**
+1:      * Leaf Nodes are a raw array of values: Object[V1, V1, ...,].
+1:      *
+0:      * Branch Nodes: Object[V1, V2, ..., child[&lt;V1.key], child[&lt;V2.key], ..., child[&lt; Inf]], where
+1:      * each child is another node, i.e., an Object[].  Thus, the value elements in a branch node are the
+0:      * first half of the array, rounding down.  In our implementation, each value must include its own key;
+1:      * we access these via Comparator, rather than directly. 
+1:      *
+0:      * So we can quickly distinguish between leaves and branches, we require that leaf nodes are always even number
+0:      * of elements (padded with a null, if necessary), and branches are always an odd number of elements.
+1:      *
+1:      * BTrees are immutable; updating one returns a new tree that reuses unmodified nodes.
+1:      *
+1:      * There are no references back to a parent node from its children.  (This would make it impossible to re-use
+1:      * subtrees when modifying the tree, since the modified tree would need new parent references.)
+1:      * Instead, we store these references in a Path as needed when navigating the tree.
+1:      */
+1: 
+1:     // The maximum fan factor used for B-Trees
+1:     static final int FAN_SHIFT;
+1:     static
+1:     {
+1:         int fanfactor = 32;
+1:         if (System.getProperty("cassandra.btree.fanfactor") != null)
+1:             fanfactor = Integer.parseInt(System.getProperty("cassandra.btree.fanfactor"));
+1:         int shift = 1;
+1:         while (1 << shift < fanfactor)
+1:             shift += 1;
+1:         FAN_SHIFT = shift;
+1:     }
+1:     // NB we encode Path indexes as Bytes, so this needs to be less than Byte.MAX_VALUE / 2
+1:     static final int FAN_FACTOR = 1 << FAN_SHIFT;
+0:     static final int QUICK_MERGE_LIMIT = Math.min(FAN_FACTOR, 16) * 2;
+1: 
+0:     // Maximum depth of any B-Tree. In reality this is just an arbitrary limit, and is currently imposed on iterators only,
+0:     // but a maximum depth sufficient to store at worst Integer.MAX_VALUE items seems reasonable
+0:     // 2^n = (2^k).(2^(n/k)) => 2^31 <= 2^(FAN_SHIFT-1) . 2^ceil(31 / (FAN_SHIFT - 1))
+0:     static final int MAX_DEPTH = (int) Math.ceil(31d / (FAN_SHIFT - 1));
+1: 
+1:     // An empty BTree Leaf - which is the same as an empty BTree
+0:     static final Object[] EMPTY_LEAF = new Object[0];
+1: 
+1:     // An empty BTree branch - used only for internal purposes in Modifier
+0:     static final Object[] EMPTY_BRANCH = new Object[1];
+1: 
+1:     /**
+0:      * Returns an empty BTree
+1:      *
+1:      * @return
+1:      */
+1:     public static Object[] empty()
+1:     {
+1:         return EMPTY_LEAF;
+1:     }
+1: 
+1:     /**
+1:      * Creates a BTree containing all of the objects in the provided collection
+1:      *
+0:      * @param source     the items to build the tree with
+1:      * @param comparator the comparator that defines the ordering over the items in the tree
+0:      * @param sorted     if false, the collection will be copied and sorted to facilitate construction
+1:      * @param <V>
+1:      * @return
+1:      */
+0:     public static <V> Object[] build(Collection<V> source, Comparator<V> comparator, boolean sorted)
+1:     {
+0:         int size = source.size();
+1: 
+0:         if (size < FAN_FACTOR)
+1:         {
+0:             // pad to even length to match contract that all leaf nodes are even
+0:             V[] values = source.toArray((V[]) new Object[size + (size & 1)]);
+0:             // inline sorting since we're already calling toArray
+0:             if (!sorted)
+0:                 Arrays.sort(values, 0, size, comparator);
+1:             return values;
+1:         }
+1: 
+0:         if (!sorted)
+0:             source = sorted(source, comparator, size);
+1: 
+0:         return modifier.get().build(source, size);
+1:     }
+1: 
+1:     /**
+0:      * Returns a new BTree with the provided set inserting/replacing as necessary any equal items
+1:      *
+1:      * @param btree              the tree to update
+1:      * @param comparator         the comparator that defines the ordering over the items in the tree
+0:      * @param updateWith         the items to either insert / update
+0:      * @param updateWithIsSorted if false, updateWith will be copied and sorted to facilitate construction
+1:      * @param <V>
+1:      * @return
+1:      */
+0:     public static <V> Object[] update(Object[] btree, Comparator<V> comparator, Collection<V> updateWith, boolean updateWithIsSorted)
+1:     {
+0:         return update(btree, comparator, updateWith, updateWithIsSorted, null, null);
+1:     }
+1: 
+1:     /**
+0:      * Returns a new BTree with the provided set inserting/replacing as necessary any equal items
+1:      *
+1:      * @param btree              the tree to update
+1:      * @param comparator         the comparator that defines the ordering over the items in the tree
+0:      * @param updateWith         the items to either insert / update
+0:      * @param updateWithIsSorted if false, updateWith will be copied and sorted to facilitate construction
+0:      * @param replaceF           a function to apply to a pair we are swapping
+0:      * @param terminateEarly     a function that returns Boolean.TRUE if we should terminate before finishing our work.
+0:      *                           the argument to terminateEarly is ignored.
+1:      * @param <V>
+1:      * @return
+1:      */
+0:     public static <V> Object[] update(Object[] btree,
+0:                                       Comparator<V> comparator,
+0:                                       Collection<V> updateWith,
+0:                                       boolean updateWithIsSorted,
+0:                                       ReplaceFunction<V> replaceF,
+0:                                       Function<?, Boolean> terminateEarly)
+1:     {
+0:         if (btree.length == 0)
+0:             return build(updateWith, comparator, updateWithIsSorted);
+1: 
+0:         if (!updateWithIsSorted)
+0:             updateWith = sorted(updateWith, comparator, updateWith.size());
+1: 
+0:         // if the b-tree is just a single root node, we can try a quick in-place merge
+0:         if (isLeaf(btree) && btree.length + updateWith.size() < QUICK_MERGE_LIMIT)
+1:         {
+0:             // since updateWith is sorted, we can skip elements from earlier iterations tracked by this offset
+0:             int btreeOffset = 0;
+0:             int keyEnd = getLeafKeyEnd(btree);
+0:             Object[] merged = new Object[QUICK_MERGE_LIMIT];
+0:             int mergedCount = 0;
+0:             for (V v : updateWith)
+1:             {
+0:                 // find the index i where v would belong in the original btree
+0:                 int i = find(comparator, v, btree, btreeOffset, keyEnd);
+0:                 boolean found = i >= 0;
+0:                 if (!found)
+0:                     i = -i - 1;
+1: 
+0:                 // copy original elements up to i into the merged array
+0:                 int count = i - btreeOffset;
+0:                 if (count > 0)
+1:                 {
+0:                     System.arraycopy(btree, btreeOffset, merged, mergedCount, count);
+0:                     mergedCount += count;
+0:                     btreeOffset = i;
+1:                 }
+1: 
+0:                 if (found)
+1:                 {
+0:                     // apply replaceF if it matches an existing element
+0:                     btreeOffset++;
+0:                     if (replaceF != null)
+0:                         v = replaceF.apply((V) btree[i], v);
+1:                 }
+0:                 else if (replaceF != null)
+1:                 {
+0:                     // new element but still need to apply replaceF to handle indexing and size-tracking
+0:                     v = replaceF.apply(null, v);
+1:                 }
+1: 
+0:                 merged[mergedCount++] = v;
+1:             }
+1: 
+0:             // copy any remaining original elements
+0:             if (btreeOffset < keyEnd)
+1:             {
+0:                 int count = keyEnd - btreeOffset;
+0:                 System.arraycopy(btree, btreeOffset, merged, mergedCount, count);
+0:                 mergedCount += count;
+1:             }
+1: 
+0:             if (mergedCount > FAN_FACTOR)
+1:             {
+0:                 // TODO this code will never execute since QUICK_MERGE_LIMIT == FAN_FACTOR
+0:                 int mid = (mergedCount >> 1) & ~1; // divide by two, rounding down to an even number
+0:                 return new Object[] { merged[mid],
+0:                                       Arrays.copyOfRange(merged, 0, mid),
+0:                                       Arrays.copyOfRange(merged, 1 + mid, mergedCount + ((mergedCount + 1) & 1)), };
+1:             }
+1: 
+0:             return Arrays.copyOfRange(merged, 0, mergedCount + (mergedCount & 1));
+1:         }
+1: 
+0:         return modifier.get().update(btree, comparator, updateWith, replaceF, terminateEarly);
+1:     }
+1: 
+1:     /**
+1:      * Returns an Iterator over the entire tree
+1:      *
+0:      * @param btree    the tree to iterate over
+0:      * @param forwards if false, the iterator will start at the end and move backwards
+1:      * @param <V>
+1:      * @return
+1:      */
+0:     public static <V> Cursor<V> slice(Object[] btree, boolean forwards)
+1:     {
+0:         Cursor<V> r = Cursor.newCursor();
+0:         r.reset(btree, forwards);
+0:         return r;
+1:     }
+1: 
+1:     /**
+0:      * Returns an Iterator over a sub-range of the tree
+1:      *
+1:      * @param btree      the tree to iterate over
+1:      * @param comparator the comparator that defines the ordering over the items in the tree
+0:      * @param start      the first item to include
+0:      * @param end        the last item to include
+0:      * @param forwards   if false, the iterator will start at end and move backwards
+1:      * @param <V>
+1:      * @return
+1:      */
+0:     public static <V> Cursor<V> slice(Object[] btree, Comparator<V> comparator, V start, V end, boolean forwards)
+1:     {
+0:         Cursor<V> r = Cursor.newCursor();
+0:         r.reset(btree, comparator, start, end, forwards);
+0:         return r;
+1:     }
+1: 
+1:     /**
+0:      * Returns an Iterator over a sub-range of the tree
+1:      *
+1:      * @param btree      the tree to iterate over
+1:      * @param comparator the comparator that defines the ordering over the items in the tree
+0:      * @param start      the first item to include
+0:      * @param end        the last item to include
+0:      * @param forwards   if false, the iterator will start at end and move backwards
+1:      * @param <V>
+1:      * @return
+1:      */
+0:     public static <V> Cursor<V> slice(Object[] btree, Comparator<V> comparator, V start, boolean startInclusive, V end, boolean endInclusive, boolean forwards)
+1:     {
+0:         Cursor<V> r = Cursor.newCursor();
+0:         r.reset(btree, comparator, start, startInclusive, end, endInclusive, forwards);
+0:         return r;
+1:     }
+1: 
+0:     public static <V> V find(Object[] node, Comparator<V> comparator, V find)
+1:     {
+1:         while (true)
+1:         {
+1:             int keyEnd = getKeyEnd(node);
+0:             int i = BTree.find(comparator, find, node, 0, keyEnd);
+0:             if (i >= 0)
+1:             {
+0:                 return (V) node[i];
+1:             }
+0:             else if (!isLeaf(node))
+1:             {
+0:                 i = -i - 1;
+0:                 node = (Object[]) node[keyEnd + i];
+1:             }
+1:             else
+1:             {
+0:                 return null;
+1:             }
+1:         }
+1:     }
+1: 
+1: 
+1:     // UTILITY METHODS
+1: 
+0:     // same basic semantics as Arrays.binarySearch, but delegates to compare() method to avoid
+0:     // wrapping generic Comparator with support for Special +/- infinity sentinels
+0:     static <V> int find(Comparator<V> comparator, Object key, Object[] a, final int fromIndex, final int toIndex)
+1:     {
+0:         // attempt to terminate quickly by checking the first element,
+0:         // as many uses of this class will (probably) be updating identical sets
+0:         if (fromIndex >= toIndex)
+0:             return -(fromIndex + 1);
+1: 
+0:         int c = compare(comparator, key, a[fromIndex]);
+0:         if (c <= 0)
+1:         {
+0:             if (c == 0)
+0:                 return fromIndex;
+1:             else
+0:                 return -(fromIndex + 1);
+1:         }
+1: 
+0:         int low = fromIndex + 1;
+0:         int high = toIndex - 1;
+1: 
+0:         while (low <= high)
+1:         {
+0:             int mid = (low + high) / 2;
+0:             int cmp = compare(comparator, key, a[mid]);
+1: 
+0:             if (cmp > 0)
+0:                 low = mid + 1;
+0:             else if (cmp < 0)
+0:                 high = mid - 1;
+1:             else
+0:                 return mid; // key found
+1:         }
+0:         return -(low + 1);  // key not found.
+1:     }
+1: 
+1:     // get the upper bound we should search in for keys in the node
+1:     static int getKeyEnd(Object[] node)
+1:     {
+1:         if (isLeaf(node))
+1:             return getLeafKeyEnd(node);
+1:         else
+1:             return getBranchKeyEnd(node);
+1:     }
+1: 
+1:     // get the last index that is non-null in the leaf node
+1:     static int getLeafKeyEnd(Object[] node)
+1:     {
+1:         int len = node.length;
+0:         if (len == 0)
+0:             return 0;
+0:         else if (node[len - 1] == null)
+0:             return len - 1;
+1:         else
+0:             return len;
+1:     }
+1: 
+1:     // return the boundary position between keys/children for the branch node
+0:     static int getBranchKeyEnd(Object[] node)
+1:     {
+0:         return node.length / 2;
+1:     }
+1: 
+1:     // returns true if the provided node is a leaf, false if it is a branch
+1:     static boolean isLeaf(Object[] node)
+1:     {
+0:         return (node.length & 1) == 0;
+1:     }
+1: 
+0:     // Special class for making certain operations easier, so we can define a +/- Inf
+0:     private static interface Special extends Comparable<Object> { }
+0:     static final Special POSITIVE_INFINITY = new Special()
+1:     {
+0:         public int compareTo(Object o)
+1:         {
+0:             return o == this ? 0 : 1;
+1:         }
+1:     };
+0:     static final Special NEGATIVE_INFINITY = new Special()
+1:     {
+0:         public int compareTo(Object o)
+1:         {
+0:             return o == this ? 0 : -1;
+1:         }
+1:     };
+1: 
+0:     private static final ThreadLocal<Builder> modifier = new ThreadLocal<Builder>()
+1:     {
+0:         @Override
+0:         protected Builder initialValue()
+1:         {
+0:             return new Builder();
+1:         }
+1:     };
+1: 
+0:     // return a sorted collection
+0:     private static <V> Collection<V> sorted(Collection<V> collection, Comparator<V> comparator, int size)
+1:     {
+0:         V[] vs = collection.toArray((V[]) new Object[size]);
+0:         Arrays.sort(vs, comparator);
+0:         return Arrays.asList(vs);
+1:     }
+1: 
+1:     /** simple static wrapper to calls to cmp.compare() which checks if either a or b are Special (i.e. represent an infinity) */
+0:     // TODO : cheaper to check for POSITIVE/NEGATIVE infinity in callers, rather than here
+1:     static <V> int compare(Comparator<V> cmp, Object a, Object b)
+1:     {
+0:         if (a instanceof Special)
+0:             return ((Special) a).compareTo(b);
+0:         if (b instanceof Special)
+0:             return -((Special) b).compareTo(a);
+1:         return cmp.compare((V) a, (V) b);
+1:     }
+1: 
+0:     public static boolean isWellFormed(Object[] btree)
+1:     {
+0:         return isWellFormed(null, btree, true, NEGATIVE_INFINITY, POSITIVE_INFINITY);
+1:     }
+1: 
+1:     public static boolean isWellFormed(Object[] btree, Comparator<? extends Object> cmp)
+1:     {
+1:         return isWellFormed(cmp, btree, true, NEGATIVE_INFINITY, POSITIVE_INFINITY);
+1:     }
+1: 
+1:     private static boolean isWellFormed(Comparator<?> cmp, Object[] node, boolean isRoot, Object min, Object max)
+1:     {
+1:         if (cmp != null && !isNodeWellFormed(cmp, node, min, max))
+1:             return false;
+1: 
+1:         if (isLeaf(node))
+1:         {
+1:             if (isRoot)
+0:                 return node.length <= FAN_FACTOR;
+0:             return node.length >= FAN_FACTOR / 2 && node.length <= FAN_FACTOR;
+1:         }
+1: 
+1:         int type = 0;
+0:         int childOffset = getBranchKeyEnd(node);
+1:         // compare each child node with the branch element at the head of this node it corresponds with
+0:         for (int i = childOffset; i < node.length; i++)
+1:         {
+1:             Object[] child = (Object[]) node[i];
+0:             Object localmax = i < node.length - 1 ? node[i - childOffset] : max;
+1:             if (!isWellFormed(cmp, child, false, min, localmax))
+1:                 return false;
+1:             type |= isLeaf(child) ? 1 : 2;
+1:             min = localmax;
+1:         }
+1:         return type < 3; // either all leaves or all branches but not a mix
+1:     }
+1: 
+1:     private static boolean isNodeWellFormed(Comparator<?> cmp, Object[] node, Object min, Object max)
+1:     {
+1:         Object previous = min;
+1:         int end = getKeyEnd(node);
+1:         for (int i = 0; i < end; i++)
+1:         {
+1:             Object current = node[i];
+1:             if (compare(cmp, previous, current) >= 0)
+1:                 return false;
+1:             previous = current;
+1:         }
+1:         return compare(cmp, previous, max) < 0;
+1:     }
+1: }
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:02fb218
+/////////////////////////////////////////////////////////////////////////
+============================================================================

@@ -1,0 +1,1129 @@
+1:9f14856: /*
+1:9f14856:  * Licensed to the Apache Software Foundation (ASF) under one
+1:9f14856:  * or more contributor license agreements.  See the NOTICE file
+1:9f14856:  * distributed with this work for additional information
+1:9f14856:  * regarding copyright ownership.  The ASF licenses this file
+1:9f14856:  * to you under the Apache License, Version 2.0 (the
+1:9f14856:  * "License"); you may not use this file except in compliance
+1:9f14856:  * with the License.  You may obtain a copy of the License at
+1:9f14856:  *
+1:9f14856:  *   http://www.apache.org/licenses/LICENSE-2.0
+1:9f14856:  *
+1:9f14856:  * Unless required by applicable law or agreed to in writing,
+1:9f14856:  * software distributed under the License is distributed on an
+1:9f14856:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+1:9f14856:  * KIND, either express or implied.  See the License for the
+1:9f14856:  * specific language governing permissions and limitations
+1:9f14856:  * under the License.
+1:9f14856:  */
+1:4b54b8a: package org.apache.cassandra.utils.concurrent;
+4:4b54b8a: 
+1:4b54b8a: import java.util.Iterator;
+1:5420b7a: import java.util.concurrent.ConcurrentLinkedQueue;
+1:4b54b8a: import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+1:4b54b8a: import java.util.concurrent.locks.LockSupport;
+1:4b54b8a: 
+1:8896a70: import com.codahale.metrics.Timer;
+1:8896a70: 
+1:4b54b8a: /**
+1:4b54b8a:  * <p>A relatively easy to use utility for general purpose thread signalling.</p>
+1:4b54b8a:  * <p>Usage on a thread awaiting a state change using a WaitQueue q is:</p>
+1:4b54b8a:  * <pre>
+1:4b54b8a:  * {@code
+1:4b54b8a:  *      while (!conditionMet())
+1:4b54b8a:  *          Signal s = q.register();
+1:4b54b8a:  *              if (!conditionMet())    // or, perhaps more correctly, !conditionChanged()
+1:4b54b8a:  *                  s.await();
+1:4b54b8a:  *              else
+1:4b54b8a:  *                  s.cancel();
+1:4b54b8a:  * }
+1:4b54b8a:  * </pre>
+1:4b54b8a:  * A signalling thread, AFTER changing the state, then calls q.signal() to wake up one, or q.signalAll()
+1:4b54b8a:  * to wake up all, waiting threads.
+1:4b54b8a:  * <p>To understand intuitively how this class works, the idea is simply that a thread, once it considers itself
+1:4b54b8a:  * incapable of making progress, registers to be awoken once that changes. Since this could have changed between
+1:4b54b8a:  * checking and registering (in which case the thread that made this change would have been unable to signal it),
+1:4b54b8a:  * it checks the condition again, sleeping only if it hasn't changed/still is not met.</p>
+1:4b54b8a:  * <p>This thread synchronisation scheme has some advantages over Condition objects and Object.wait/notify in that no monitor
+1:4b54b8a:  * acquisition is necessary and, in fact, besides the actual waiting on a signal, all operations are non-blocking.
+1:4b54b8a:  * As a result consumers can never block producers, nor each other, or vice versa, from making progress.
+1:4b54b8a:  * Threads that are signalled are also put into a RUNNABLE state almost simultaneously, so they can all immediately make
+1:4b54b8a:  * progress without having to serially acquire the monitor/lock, reducing scheduler delay incurred.</p>
+1:4b54b8a:  *
+1:4b54b8a:  * <p>A few notes on utilisation:</p>
+1:4b54b8a:  * <p>1. A thread will only exit await() when it has been signalled, but this does not guarantee the condition has not
+1:4b54b8a:  * been altered since it was signalled, and depending on your design it is likely the outer condition will need to be
+1:4b54b8a:  * checked in a loop, though this is not always the case.</p>
+1:4b54b8a:  * <p>2. Each signal is single use, so must be re-registered after each await(). This is true even if it times out.</p>
+1:4b54b8a:  * <p>3. If you choose not to wait on the signal (because the condition has been met before you waited on it)
+1:4b54b8a:  * you must cancel() the signal if the signalling thread uses signal() to awake waiters; otherwise signals will be
+1:4b54b8a:  * lost. If signalAll() is used but infrequent, and register() is frequent, cancel() should still be used to prevent the
+1:4b54b8a:  * queue growing unboundedly. Similarly, if you provide a TimerContext, cancel should be used to ensure it is not erroneously
+1:4b54b8a:  * counted towards wait time.</p>
+1:4b54b8a:  * <p>4. Care must be taken when selecting conditionMet() to ensure we are waiting on the condition that actually
+1:4b54b8a:  * indicates progress is possible. In some complex cases it may be tempting to wait on a condition that is only indicative
+1:4b54b8a:  * of local progress, not progress on the task we are aiming to complete, and a race may leave us waiting for a condition
+1:4b54b8a:  * to be met that we no longer need.
+1:4b54b8a:  * <p>5. This scheme is not fair</p>
+1:4b54b8a:  * <p>6. Only the thread that calls register() may call await()</p>
+1:4b54b8a:  */
+1:4b54b8a: public final class WaitQueue
+1:4b54b8a: {
+1:4b54b8a: 
+1:4b54b8a:     private static final int CANCELLED = -1;
+1:4b54b8a:     private static final int SIGNALLED = 1;
+1:4b54b8a:     private static final int NOT_SET = 0;
+1:4b54b8a: 
+1:4b54b8a:     private static final AtomicIntegerFieldUpdater signalledUpdater = AtomicIntegerFieldUpdater.newUpdater(RegisteredSignal.class, "state");
+1:4b54b8a: 
+1:4b54b8a:     // the waiting signals
+1:5420b7a:     private final ConcurrentLinkedQueue<RegisteredSignal> queue = new ConcurrentLinkedQueue<>();
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:4b54b8a:      * The calling thread MUST be the thread that uses the signal
+1:5420b7a:      * @return                                x
+1:4b54b8a:      */
+1:4b54b8a:     public Signal register()
+1:4b54b8a:     {
+1:4b54b8a:         RegisteredSignal signal = new RegisteredSignal();
+1:4b54b8a:         queue.add(signal);
+1:4b54b8a:         return signal;
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:4b54b8a:      * The calling thread MUST be the thread that uses the signal.
+1:4b54b8a:      * If the Signal is waited on, context.stop() will be called when the wait times out, the Signal is signalled,
+1:4b54b8a:      * or the waiting thread is interrupted.
+2:4b54b8a:      * @return
+1:4b54b8a:      */
+1:8896a70:     public Signal register(Timer.Context context)
+1:4b54b8a:     {
+1:4b54b8a:         assert context != null;
+1:4b54b8a:         RegisteredSignal signal = new TimedSignal(context);
+1:4b54b8a:         queue.add(signal);
+1:4b54b8a:         return signal;
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:4b54b8a:      * Signal one waiting thread
+1:4b54b8a:      */
+1:4b54b8a:     public boolean signal()
+1:4b54b8a:     {
+2:4b54b8a:         if (!hasWaiters())
+2:4b54b8a:             return false;
+1:4b54b8a:         while (true)
+1:4b54b8a:         {
+1:4b54b8a:             RegisteredSignal s = queue.poll();
+1:5420b7a:             if (s == null || s.signal() != null)
+1:4b54b8a:                 return s != null;
+1:4b54b8a:         }
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:4b54b8a:      * Signal all waiting threads
+1:4b54b8a:      */
+1:4b54b8a:     public void signalAll()
+1:4b54b8a:     {
+1:5420b7a:         if (!hasWaiters())
+1:4b54b8a:             return;
+1:5420b7a: 
+1:5420b7a:         // to avoid a race where the condition is not met and the woken thread managed to wait on the queue before
+1:5420b7a:         // we finish signalling it all, we pick a random thread we have woken-up and hold onto it, so that if we encounter
+1:5420b7a:         // it again we know we're looping. We reselect a random thread periodically, progressively less often.
+1:5420b7a:         // the "correct" solution to this problem is to use a queue that permits snapshot iteration, but this solution is sufficient
+1:5420b7a:         int i = 0, s = 5;
+1:5420b7a:         Thread randomThread = null;
+1:4b54b8a:         Iterator<RegisteredSignal> iter = queue.iterator();
+1:4b54b8a:         while (iter.hasNext())
+1:4b54b8a:         {
+1:4b54b8a:             RegisteredSignal signal = iter.next();
+1:5420b7a:             Thread signalled = signal.signal();
+1:5420b7a: 
+1:5420b7a:             if (signalled != null)
+1:4b54b8a:             {
+1:5420b7a:                 if (signalled == randomThread)
+1:5420b7a:                     break;
+1:5420b7a: 
+1:5420b7a:                 if (++i == s)
+1:5420b7a:                 {
+1:5420b7a:                     randomThread = signalled;
+1:5420b7a:                     s <<= 1;
+1:5420b7a:                 }
+1:4b54b8a:             }
+1:4b54b8a: 
+1:4b54b8a:             iter.remove();
+1:4b54b8a:         }
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     private void cleanUpCancelled()
+1:4b54b8a:     {
+1:5420b7a:         // TODO: attempt to remove the cancelled from the beginning only (need atomic cas of head)
+1:4b54b8a:         Iterator<RegisteredSignal> iter = queue.iterator();
+1:4b54b8a:         while (iter.hasNext())
+1:4b54b8a:         {
+1:4b54b8a:             RegisteredSignal s = iter.next();
+1:4b54b8a:             if (s.isCancelled())
+1:4b54b8a:                 iter.remove();
+1:4b54b8a:         }
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     public boolean hasWaiters()
+1:4b54b8a:     {
+1:4b54b8a:         return !queue.isEmpty();
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:4b54b8a:      * Return how many threads are waiting
+1:4b54b8a:      * @return
+1:4b54b8a:      */
+1:4b54b8a:     public int getWaiting()
+1:4b54b8a:     {
+1:5420b7a:         if (!hasWaiters())
+1:4b54b8a:             return 0;
+1:4b54b8a:         Iterator<RegisteredSignal> iter = queue.iterator();
+1:4b54b8a:         int count = 0;
+1:4b54b8a:         while (iter.hasNext())
+1:4b54b8a:         {
+1:4b54b8a:             Signal next = iter.next();
+1:4b54b8a:             if (!next.isCancelled())
+1:4b54b8a:                 count++;
+1:4b54b8a:         }
+1:4b54b8a:         return count;
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:4b54b8a:      * A Signal is a one-time-use mechanism for a thread to wait for notification that some condition
+1:4b54b8a:      * state has transitioned that it may be interested in (and hence should check if it is).
+1:4b54b8a:      * It is potentially transient, i.e. the state can change in the meantime, it only indicates
+1:4b54b8a:      * that it should be checked, not necessarily anything about what the expected state should be.
+1:4b54b8a:      *
+1:4b54b8a:      * Signal implementations should never wake up spuriously, they are always woken up by a
+1:4b54b8a:      * signal() or signalAll().
+1:4b54b8a:      *
+1:4b54b8a:      * This abstract definition of Signal does not need to be tied to a WaitQueue.
+1:4b54b8a:      * Whilst RegisteredSignal is the main building block of Signals, this abstract
+1:4b54b8a:      * definition allows us to compose Signals in useful ways. The Signal is 'owned' by the
+1:4b54b8a:      * thread that registered itself with WaitQueue(s) to obtain the underlying RegisteredSignal(s);
+1:4b54b8a:      * only the owning thread should use a Signal.
+1:4b54b8a:      */
+1:4b54b8a:     public static interface Signal
+1:4b54b8a:     {
+1:4b54b8a: 
+1:4b54b8a:         /**
+1:4b54b8a:          * @return true if signalled; once true, must be discarded by the owning thread.
+1:4b54b8a:          */
+1:4b54b8a:         public boolean isSignalled();
+1:4b54b8a: 
+1:4b54b8a:         /**
+1:4b54b8a:          * @return true if cancelled; once cancelled, must be discarded by the owning thread.
+1:4b54b8a:          */
+1:4b54b8a:         public boolean isCancelled();
+1:4b54b8a: 
+1:4b54b8a:         /**
+1:4b54b8a:          * @return isSignalled() || isCancelled(). Once true, the state is fixed and the Signal should be discarded
+1:4b54b8a:          * by the owning thread.
+1:4b54b8a:          */
+1:4b54b8a:         public boolean isSet();
+1:4b54b8a: 
+1:4b54b8a:         /**
+1:4b54b8a:          * atomically: cancels the Signal if !isSet(), or returns true if isSignalled()
+1:4b54b8a:          *
+1:4b54b8a:          * @return true if isSignalled()
+1:4b54b8a:          */
+1:4b54b8a:         public boolean checkAndClear();
+1:4b54b8a: 
+1:4b54b8a:         /**
+1:4b54b8a:          * Should only be called by the owning thread. Indicates the signal can be retired,
+1:4b54b8a:          * and if signalled propagates the signal to another waiting thread
+1:4b54b8a:          */
+1:4b54b8a:         public abstract void cancel();
+1:4b54b8a: 
+1:4b54b8a:         /**
+1:4b54b8a:          * Wait, without throwing InterruptedException, until signalled. On exit isSignalled() must be true.
+1:4b54b8a:          * If the thread is interrupted in the meantime, the interrupted flag will be set.
+1:4b54b8a:          */
+1:4b54b8a:         public void awaitUninterruptibly();
+1:4b54b8a: 
+1:4b54b8a:         /**
+1:4b54b8a:          * Wait until signalled, or throw an InterruptedException if interrupted before this happens.
+1:4b54b8a:          * On normal exit isSignalled() must be true; however if InterruptedException is thrown isCancelled()
+1:4b54b8a:          * will be true.
+1:4b54b8a:          * @throws InterruptedException
+1:4b54b8a:          */
+1:4b54b8a:         public void await() throws InterruptedException;
+1:4b54b8a: 
+1:4b54b8a:         /**
+1:4b54b8a:          * Wait until signalled, or the provided time is reached, or the thread is interrupted. If signalled,
+1:4b54b8a:          * isSignalled() will be true on exit, and the method will return true; if timedout, the method will return
+1:4b54b8a:          * false and isCancelled() will be true; if interrupted an InterruptedException will be thrown and isCancelled()
+1:4b54b8a:          * will be true.
+1:5420b7a:          * @param nanos System.nanoTime() to wait until
+1:4b54b8a:          * @return true if signalled, false if timed out
+1:4b54b8a:          * @throws InterruptedException
+1:4b54b8a:          */
+1:5420b7a:         public boolean awaitUntil(long nanos) throws InterruptedException;
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:4b54b8a:      * An abstract signal implementation
+1:4b54b8a:      */
+1:4b54b8a:     public static abstract class AbstractSignal implements Signal
+1:4b54b8a:     {
+1:4b54b8a:         public void awaitUninterruptibly()
+1:4b54b8a:         {
+1:4b54b8a:             boolean interrupted = false;
+1:4b54b8a:             while (!isSignalled())
+1:4b54b8a:             {
+1:02fb218:                 if (Thread.interrupted())
+1:4b54b8a:                     interrupted = true;
+1:4b54b8a:                 LockSupport.park();
+1:4b54b8a:             }
+1:4b54b8a:             if (interrupted)
+1:4b54b8a:                 Thread.currentThread().interrupt();
+1:4b54b8a:             checkAndClear();
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         public void await() throws InterruptedException
+1:4b54b8a:         {
+1:4b54b8a:             while (!isSignalled())
+1:4b54b8a:             {
+1:4b54b8a:                 checkInterrupted();
+1:4b54b8a:                 LockSupport.park();
+1:4b54b8a:             }
+1:4b54b8a:             checkAndClear();
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         public boolean awaitUntil(long until) throws InterruptedException
+1:4b54b8a:         {
+1:5420b7a:             long now;
+1:5420b7a:             while (until > (now = System.nanoTime()) && !isSignalled())
+1:4b54b8a:             {
+1:4b54b8a:                 checkInterrupted();
+1:5420b7a:                 long delta = until - now;
+1:5420b7a:                 LockSupport.parkNanos(delta);
+1:4b54b8a:             }
+1:4b54b8a:             return checkAndClear();
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         private void checkInterrupted() throws InterruptedException
+1:4b54b8a:         {
+1:4b54b8a:             if (Thread.interrupted())
+1:4b54b8a:             {
+1:4b54b8a:                 cancel();
+1:4b54b8a:                 throw new InterruptedException();
+1:4b54b8a:             }
+1:4b54b8a:         }
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:4b54b8a:      * A signal registered with this WaitQueue
+1:4b54b8a:      */
+1:4b54b8a:     private class RegisteredSignal extends AbstractSignal
+1:4b54b8a:     {
+1:4b54b8a:         private volatile Thread thread = Thread.currentThread();
+1:4b54b8a:         volatile int state;
+1:4b54b8a: 
+1:4b54b8a:         public boolean isSignalled()
+1:4b54b8a:         {
+1:4b54b8a:             return state == SIGNALLED;
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         public boolean isCancelled()
+1:4b54b8a:         {
+1:4b54b8a:             return state == CANCELLED;
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         public boolean isSet()
+1:4b54b8a:         {
+1:4b54b8a:             return state != NOT_SET;
+1:4b54b8a:         }
+1:4b54b8a: 
+1:5420b7a:         private Thread signal()
+1:4b54b8a:         {
+1:4b54b8a:             if (!isSet() && signalledUpdater.compareAndSet(this, NOT_SET, SIGNALLED))
+1:4b54b8a:             {
+1:5420b7a:                 Thread thread = this.thread;
+1:4b54b8a:                 LockSupport.unpark(thread);
+1:5420b7a:                 this.thread = null;
+1:5420b7a:                 return thread;
+1:4b54b8a:             }
+1:5420b7a:             return null;
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         public boolean checkAndClear()
+1:4b54b8a:         {
+1:4b54b8a:             if (!isSet() && signalledUpdater.compareAndSet(this, NOT_SET, CANCELLED))
+1:4b54b8a:             {
+2:4b54b8a:                 thread = null;
+1:4b54b8a:                 cleanUpCancelled();
+1:4b54b8a:                 return false;
+1:4b54b8a:             }
+1:4b54b8a:             // must now be signalled assuming correct API usage
+2:4b54b8a:             return true;
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         /**
+1:4b54b8a:          * Should only be called by the registered thread. Indicates the signal can be retired,
+1:4b54b8a:          * and if signalled propagates the signal to another waiting thread
+1:4b54b8a:          */
+1:4b54b8a:         public void cancel()
+1:4b54b8a:         {
+1:4b54b8a:             if (isCancelled())
+1:4b54b8a:                 return;
+1:4b54b8a:             if (!signalledUpdater.compareAndSet(this, NOT_SET, CANCELLED))
+1:4b54b8a:             {
+1:4b54b8a:                 // must already be signalled - switch to cancelled and
+1:4b54b8a:                 state = CANCELLED;
+1:4b54b8a:                 // propagate the signal
+1:4b54b8a:                 WaitQueue.this.signal();
+1:4b54b8a:             }
+1:4b54b8a:             thread = null;
+1:4b54b8a:             cleanUpCancelled();
+1:4b54b8a:         }
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:4b54b8a:      * A RegisteredSignal that stores a TimerContext, and stops the timer when either cancelled or
+1:4b54b8a:      * finished waiting. i.e. if the timer is started when the signal is registered it tracks the
+1:4b54b8a:      * time in between registering and invalidating the signal.
+1:4b54b8a:      */
+1:4b54b8a:     private final class TimedSignal extends RegisteredSignal
+1:4b54b8a:     {
+1:8896a70:         private final Timer.Context context;
+1:4b54b8a: 
+1:8896a70:         private TimedSignal(Timer.Context context)
+1:4b54b8a:         {
+1:4b54b8a:             this.context = context;
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         @Override
+1:4b54b8a:         public boolean checkAndClear()
+1:4b54b8a:         {
+1:4b54b8a:             context.stop();
+1:4b54b8a:             return super.checkAndClear();
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         @Override
+1:4b54b8a:         public void cancel()
+1:4b54b8a:         {
+1:4b54b8a:             if (!isCancelled())
+1:4b54b8a:             {
+1:4b54b8a:                 context.stop();
+1:4b54b8a:                 super.cancel();
+1:4b54b8a:             }
+1:4b54b8a:         }
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:4b54b8a:      * An abstract signal wrapping multiple delegate signals
+1:4b54b8a:      */
+1:4b54b8a:     private abstract static class MultiSignal extends AbstractSignal
+1:4b54b8a:     {
+1:4b54b8a:         final Signal[] signals;
+1:4b54b8a:         protected MultiSignal(Signal[] signals)
+1:4b54b8a:         {
+1:4b54b8a:             this.signals = signals;
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         public boolean isCancelled()
+1:4b54b8a:         {
+1:4b54b8a:             for (Signal signal : signals)
+1:4b54b8a:                 if (!signal.isCancelled())
+1:4b54b8a:                     return false;
+1:4b54b8a:             return true;
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         public boolean checkAndClear()
+1:4b54b8a:         {
+1:4b54b8a:             for (Signal signal : signals)
+1:4b54b8a:                 signal.checkAndClear();
+1:4b54b8a:             return isSignalled();
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         public void cancel()
+1:4b54b8a:         {
+1:4b54b8a:             for (Signal signal : signals)
+1:4b54b8a:                 signal.cancel();
+1:4b54b8a:         }
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:4b54b8a:      * A Signal that wraps multiple Signals and returns when any single one of them would have returned
+1:4b54b8a:      */
+1:4b54b8a:     private static class AnySignal extends MultiSignal
+1:4b54b8a:     {
+1:4b54b8a:         protected AnySignal(Signal ... signals)
+1:4b54b8a:         {
+1:4b54b8a:             super(signals);
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         public boolean isSignalled()
+1:4b54b8a:         {
+1:4b54b8a:             for (Signal signal : signals)
+1:4b54b8a:                 if (signal.isSignalled())
+1:4b54b8a:                     return true;
+1:4b54b8a:             return false;
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         public boolean isSet()
+1:4b54b8a:         {
+1:4b54b8a:             for (Signal signal : signals)
+1:4b54b8a:                 if (signal.isSet())
+1:4b54b8a:                     return true;
+1:4b54b8a:             return false;
+1:4b54b8a:         }
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:4b54b8a:      * A Signal that wraps multiple Signals and returns when all of them would have finished returning
+1:4b54b8a:      */
+1:4b54b8a:     private static class AllSignal extends MultiSignal
+1:4b54b8a:     {
+1:4b54b8a:         protected AllSignal(Signal ... signals)
+1:4b54b8a:         {
+1:4b54b8a:             super(signals);
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         public boolean isSignalled()
+1:4b54b8a:         {
+1:4b54b8a:             for (Signal signal : signals)
+1:4b54b8a:                 if (!signal.isSignalled())
+1:4b54b8a:                     return false;
+1:4b54b8a:             return true;
+1:4b54b8a:         }
+1:4b54b8a: 
+1:4b54b8a:         public boolean isSet()
+1:4b54b8a:         {
+1:4b54b8a:             for (Signal signal : signals)
+1:4b54b8a:                 if (!signal.isSet())
+1:4b54b8a:                     return false;
+1:4b54b8a:             return true;
+1:4b54b8a:         }
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:4b54b8a:      * @param signals
+1:4b54b8a:      * @return a signal that returns only when any of the provided signals would have returned
+1:4b54b8a:      */
+1:4b54b8a:     public static Signal any(Signal ... signals)
+1:4b54b8a:     {
+1:4b54b8a:         return new AnySignal(signals);
+1:4b54b8a:     }
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:4b54b8a:      * @param signals
+1:4b54b8a:      * @return a signal that returns only when all provided signals would have returned
+1:4b54b8a:      */
+1:4b54b8a:     public static Signal all(Signal ... signals)
+1:4b54b8a:     {
+1:4b54b8a:         return new AllSignal(signals);
+1:4b54b8a:     }
+1:4b54b8a: }
+============================================================================
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:8896a70
+/////////////////////////////////////////////////////////////////////////
+1: import com.codahale.metrics.Timer;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     public Signal register(Timer.Context context)
+/////////////////////////////////////////////////////////////////////////
+1:         private final Timer.Context context;
+1:         private TimedSignal(Timer.Context context)
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:1def02f
+/////////////////////////////////////////////////////////////////////////
+commit:02fb218
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:                 if (Thread.interrupted())
+author:belliottsmith
+-------------------------------------------------------------------------------
+commit:5420b7a
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.ConcurrentLinkedQueue;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private final ConcurrentLinkedQueue<RegisteredSignal> queue = new ConcurrentLinkedQueue<>();
+1:      * @return                                x
+/////////////////////////////////////////////////////////////////////////
+1:             if (s == null || s.signal() != null)
+/////////////////////////////////////////////////////////////////////////
+1:         if (!hasWaiters())
+1: 
+1:         // to avoid a race where the condition is not met and the woken thread managed to wait on the queue before
+1:         // we finish signalling it all, we pick a random thread we have woken-up and hold onto it, so that if we encounter
+1:         // it again we know we're looping. We reselect a random thread periodically, progressively less often.
+1:         // the "correct" solution to this problem is to use a queue that permits snapshot iteration, but this solution is sufficient
+1:         int i = 0, s = 5;
+1:         Thread randomThread = null;
+1:             Thread signalled = signal.signal();
+1: 
+1:             if (signalled != null)
+1:                 if (signalled == randomThread)
+1:                     break;
+1: 
+1:                 if (++i == s)
+1:                 {
+1:                     randomThread = signalled;
+1:                     s <<= 1;
+1:                 }
+1:         // TODO: attempt to remove the cancelled from the beginning only (need atomic cas of head)
+/////////////////////////////////////////////////////////////////////////
+1:         if (!hasWaiters())
+/////////////////////////////////////////////////////////////////////////
+1:          * @param nanos System.nanoTime() to wait until
+1:         public boolean awaitUntil(long nanos) throws InterruptedException;
+/////////////////////////////////////////////////////////////////////////
+1:             long now;
+1:             while (until > (now = System.nanoTime()) && !isSignalled())
+1:                 long delta = until - now;
+1:                 LockSupport.parkNanos(delta);
+/////////////////////////////////////////////////////////////////////////
+1:         private Thread signal()
+1:                 Thread thread = this.thread;
+1:                 this.thread = null;
+1:                 return thread;
+1:             return null;
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:9f14856
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *   http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing,
+1:  * software distributed under the License is distributed on an
+1:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+1:  * KIND, either express or implied.  See the License for the
+1:  * specific language governing permissions and limitations
+1:  * under the License.
+1:  */
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:5fe0600
+/////////////////////////////////////////////////////////////////////////
+0:         RegisteredSignal last = queue.peekLast();
+0:         if (last == null)
+/////////////////////////////////////////////////////////////////////////
+commit:4b54b8a
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.cassandra.utils.concurrent;
+1: 
+0: import com.yammer.metrics.core.TimerContext;
+0: import org.slf4j.*;
+1: 
+0: import java.util.ArrayList;
+1: import java.util.Iterator;
+0: import java.util.List;
+0: import java.util.concurrent.ConcurrentLinkedDeque;
+0: import java.util.concurrent.ConcurrentLinkedQueue;
+1: import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+1: import java.util.concurrent.locks.LockSupport;
+1: 
+1: /**
+1:  * <p>A relatively easy to use utility for general purpose thread signalling.</p>
+1:  * <p>Usage on a thread awaiting a state change using a WaitQueue q is:</p>
+1:  * <pre>
+1:  * {@code
+1:  *      while (!conditionMet())
+1:  *          Signal s = q.register();
+1:  *              if (!conditionMet())    // or, perhaps more correctly, !conditionChanged()
+1:  *                  s.await();
+1:  *              else
+1:  *                  s.cancel();
+1:  * }
+1:  * </pre>
+1:  * A signalling thread, AFTER changing the state, then calls q.signal() to wake up one, or q.signalAll()
+1:  * to wake up all, waiting threads.
+1:  * <p>To understand intuitively how this class works, the idea is simply that a thread, once it considers itself
+1:  * incapable of making progress, registers to be awoken once that changes. Since this could have changed between
+1:  * checking and registering (in which case the thread that made this change would have been unable to signal it),
+1:  * it checks the condition again, sleeping only if it hasn't changed/still is not met.</p>
+1:  * <p>This thread synchronisation scheme has some advantages over Condition objects and Object.wait/notify in that no monitor
+1:  * acquisition is necessary and, in fact, besides the actual waiting on a signal, all operations are non-blocking.
+1:  * As a result consumers can never block producers, nor each other, or vice versa, from making progress.
+1:  * Threads that are signalled are also put into a RUNNABLE state almost simultaneously, so they can all immediately make
+1:  * progress without having to serially acquire the monitor/lock, reducing scheduler delay incurred.</p>
+1:  *
+1:  * <p>A few notes on utilisation:</p>
+1:  * <p>1. A thread will only exit await() when it has been signalled, but this does not guarantee the condition has not
+1:  * been altered since it was signalled, and depending on your design it is likely the outer condition will need to be
+1:  * checked in a loop, though this is not always the case.</p>
+1:  * <p>2. Each signal is single use, so must be re-registered after each await(). This is true even if it times out.</p>
+1:  * <p>3. If you choose not to wait on the signal (because the condition has been met before you waited on it)
+1:  * you must cancel() the signal if the signalling thread uses signal() to awake waiters; otherwise signals will be
+1:  * lost. If signalAll() is used but infrequent, and register() is frequent, cancel() should still be used to prevent the
+1:  * queue growing unboundedly. Similarly, if you provide a TimerContext, cancel should be used to ensure it is not erroneously
+1:  * counted towards wait time.</p>
+1:  * <p>4. Care must be taken when selecting conditionMet() to ensure we are waiting on the condition that actually
+1:  * indicates progress is possible. In some complex cases it may be tempting to wait on a condition that is only indicative
+1:  * of local progress, not progress on the task we are aiming to complete, and a race may leave us waiting for a condition
+1:  * to be met that we no longer need.
+1:  * <p>5. This scheme is not fair</p>
+1:  * <p>6. Only the thread that calls register() may call await()</p>
+1:  */
+1: public final class WaitQueue
+1: {
+1: 
+0:     private static final Logger logger = LoggerFactory.getLogger(WaitQueue.class);
+1: 
+1:     private static final int CANCELLED = -1;
+1:     private static final int SIGNALLED = 1;
+1:     private static final int NOT_SET = 0;
+1: 
+1:     private static final AtomicIntegerFieldUpdater signalledUpdater = AtomicIntegerFieldUpdater.newUpdater(RegisteredSignal.class, "state");
+1: 
+1:     // the waiting signals
+0:     private final ConcurrentLinkedDeque<RegisteredSignal> queue = new ConcurrentLinkedDeque<>();
+1: 
+1:     /**
+1:      * The calling thread MUST be the thread that uses the signal
+1:      * @return
+1:      */
+1:     public Signal register()
+1:     {
+1:         RegisteredSignal signal = new RegisteredSignal();
+1:         queue.add(signal);
+1:         return signal;
+1:     }
+1: 
+1:     /**
+1:      * The calling thread MUST be the thread that uses the signal.
+1:      * If the Signal is waited on, context.stop() will be called when the wait times out, the Signal is signalled,
+1:      * or the waiting thread is interrupted.
+1:      * @return
+1:      */
+0:     public Signal register(TimerContext context)
+1:     {
+1:         assert context != null;
+1:         RegisteredSignal signal = new TimedSignal(context);
+1:         queue.add(signal);
+1:         return signal;
+1:     }
+1: 
+1:     /**
+1:      * Signal one waiting thread
+1:      */
+1:     public boolean signal()
+1:     {
+1:         if (!hasWaiters())
+1:             return false;
+1:         while (true)
+1:         {
+1:             RegisteredSignal s = queue.poll();
+0:             if (s == null || s.signal())
+1:                 return s != null;
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Signal all waiting threads
+1:      */
+1:     public void signalAll()
+1:     {
+1:         if (!hasWaiters())
+1:             return;
+0:         List<Thread> woke = null;
+0:         if (logger.isTraceEnabled())
+0:             woke = new ArrayList<>();
+0:         long start = System.nanoTime();
+0:         // we wake up only a snapshot of the queue, to avoid a race where the condition is not met and the woken thread
+0:         // immediately waits on the queue again
+0:         RegisteredSignal last = queue.getLast();
+1:         Iterator<RegisteredSignal> iter = queue.iterator();
+1:         while (iter.hasNext())
+1:         {
+1:             RegisteredSignal signal = iter.next();
+0:             if (logger.isTraceEnabled())
+1:             {
+0:                 Thread thread = signal.thread;
+0:                 if (signal.signal())
+0:                     woke.add(thread);
+1:             }
+0:             else
+0:                 signal.signal();
+1: 
+1:             iter.remove();
+1: 
+0:             if (signal == last)
+0:                 break;
+1:         }
+0:         long end = System.nanoTime();
+0:         if (woke != null)
+0:             logger.trace("Woke up {} in {}ms from {}", woke, (end - start) * 0.000001d, Thread.currentThread().getStackTrace()[2]);
+1:     }
+1: 
+1:     private void cleanUpCancelled()
+1:     {
+0:         // attempt to remove the cancelled from the beginning only, but if we fail to remove any proceed to cover
+0:         // the whole list
+1:         Iterator<RegisteredSignal> iter = queue.iterator();
+1:         while (iter.hasNext())
+1:         {
+1:             RegisteredSignal s = iter.next();
+1:             if (s.isCancelled())
+1:                 iter.remove();
+1:         }
+1:     }
+1: 
+1:     public boolean hasWaiters()
+1:     {
+1:         return !queue.isEmpty();
+1:     }
+1: 
+1:     /**
+1:      * Return how many threads are waiting
+1:      * @return
+1:      */
+1:     public int getWaiting()
+1:     {
+0:         if (queue.isEmpty())
+1:             return 0;
+1:         Iterator<RegisteredSignal> iter = queue.iterator();
+1:         int count = 0;
+1:         while (iter.hasNext())
+1:         {
+1:             Signal next = iter.next();
+1:             if (!next.isCancelled())
+1:                 count++;
+1:         }
+1:         return count;
+1:     }
+1: 
+1:     /**
+1:      * A Signal is a one-time-use mechanism for a thread to wait for notification that some condition
+1:      * state has transitioned that it may be interested in (and hence should check if it is).
+1:      * It is potentially transient, i.e. the state can change in the meantime, it only indicates
+1:      * that it should be checked, not necessarily anything about what the expected state should be.
+1:      *
+1:      * Signal implementations should never wake up spuriously, they are always woken up by a
+1:      * signal() or signalAll().
+1:      *
+1:      * This abstract definition of Signal does not need to be tied to a WaitQueue.
+1:      * Whilst RegisteredSignal is the main building block of Signals, this abstract
+1:      * definition allows us to compose Signals in useful ways. The Signal is 'owned' by the
+1:      * thread that registered itself with WaitQueue(s) to obtain the underlying RegisteredSignal(s);
+1:      * only the owning thread should use a Signal.
+1:      */
+1:     public static interface Signal
+1:     {
+1: 
+1:         /**
+1:          * @return true if signalled; once true, must be discarded by the owning thread.
+1:          */
+1:         public boolean isSignalled();
+1: 
+1:         /**
+1:          * @return true if cancelled; once cancelled, must be discarded by the owning thread.
+1:          */
+1:         public boolean isCancelled();
+1: 
+1:         /**
+1:          * @return isSignalled() || isCancelled(). Once true, the state is fixed and the Signal should be discarded
+1:          * by the owning thread.
+1:          */
+1:         public boolean isSet();
+1: 
+1:         /**
+1:          * atomically: cancels the Signal if !isSet(), or returns true if isSignalled()
+1:          *
+1:          * @return true if isSignalled()
+1:          */
+1:         public boolean checkAndClear();
+1: 
+1:         /**
+1:          * Should only be called by the owning thread. Indicates the signal can be retired,
+1:          * and if signalled propagates the signal to another waiting thread
+1:          */
+1:         public abstract void cancel();
+1: 
+1:         /**
+1:          * Wait, without throwing InterruptedException, until signalled. On exit isSignalled() must be true.
+1:          * If the thread is interrupted in the meantime, the interrupted flag will be set.
+1:          */
+1:         public void awaitUninterruptibly();
+1: 
+1:         /**
+1:          * Wait until signalled, or throw an InterruptedException if interrupted before this happens.
+1:          * On normal exit isSignalled() must be true; however if InterruptedException is thrown isCancelled()
+1:          * will be true.
+1:          * @throws InterruptedException
+1:          */
+1:         public void await() throws InterruptedException;
+1: 
+1:         /**
+1:          * Wait until signalled, or the provided time is reached, or the thread is interrupted. If signalled,
+1:          * isSignalled() will be true on exit, and the method will return true; if timedout, the method will return
+1:          * false and isCancelled() will be true; if interrupted an InterruptedException will be thrown and isCancelled()
+1:          * will be true.
+0:          * @param until System.currentTimeMillis() to wait until
+1:          * @return true if signalled, false if timed out
+1:          * @throws InterruptedException
+1:          */
+0:         public boolean awaitUntil(long until) throws InterruptedException;
+1:     }
+1: 
+1:     /**
+1:      * An abstract signal implementation
+1:      */
+1:     public static abstract class AbstractSignal implements Signal
+1:     {
+1:         public void awaitUninterruptibly()
+1:         {
+1:             boolean interrupted = false;
+1:             while (!isSignalled())
+1:             {
+0:                 if (Thread.currentThread().interrupted())
+1:                     interrupted = true;
+1:                 LockSupport.park();
+1:             }
+1:             if (interrupted)
+1:                 Thread.currentThread().interrupt();
+1:             checkAndClear();
+1:         }
+1: 
+1:         public void await() throws InterruptedException
+1:         {
+1:             while (!isSignalled())
+1:             {
+1:                 checkInterrupted();
+1:                 LockSupport.park();
+1:             }
+1:             checkAndClear();
+1:         }
+1: 
+1:         public boolean awaitUntil(long until) throws InterruptedException
+1:         {
+0:             while (until < System.currentTimeMillis() && !isSignalled())
+1:             {
+1:                 checkInterrupted();
+0:                 LockSupport.parkUntil(until);
+1:             }
+1:             return checkAndClear();
+1:         }
+1: 
+1:         private void checkInterrupted() throws InterruptedException
+1:         {
+1:             if (Thread.interrupted())
+1:             {
+1:                 cancel();
+1:                 throw new InterruptedException();
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * A signal registered with this WaitQueue
+1:      */
+1:     private class RegisteredSignal extends AbstractSignal
+1:     {
+1:         private volatile Thread thread = Thread.currentThread();
+1:         volatile int state;
+1: 
+1:         public boolean isSignalled()
+1:         {
+1:             return state == SIGNALLED;
+1:         }
+1: 
+1:         public boolean isCancelled()
+1:         {
+1:             return state == CANCELLED;
+1:         }
+1: 
+1:         public boolean isSet()
+1:         {
+1:             return state != NOT_SET;
+1:         }
+1: 
+0:         private boolean signal()
+1:         {
+1:             if (!isSet() && signalledUpdater.compareAndSet(this, NOT_SET, SIGNALLED))
+1:             {
+1:                 LockSupport.unpark(thread);
+1:                 thread = null;
+1:                 return true;
+1:             }
+1:             return false;
+1:         }
+1: 
+1:         public boolean checkAndClear()
+1:         {
+1:             if (!isSet() && signalledUpdater.compareAndSet(this, NOT_SET, CANCELLED))
+1:             {
+1:                 thread = null;
+1:                 cleanUpCancelled();
+1:                 return false;
+1:             }
+1:             // must now be signalled assuming correct API usage
+1:             return true;
+1:         }
+1: 
+1:         /**
+1:          * Should only be called by the registered thread. Indicates the signal can be retired,
+1:          * and if signalled propagates the signal to another waiting thread
+1:          */
+1:         public void cancel()
+1:         {
+1:             if (isCancelled())
+1:                 return;
+1:             if (!signalledUpdater.compareAndSet(this, NOT_SET, CANCELLED))
+1:             {
+1:                 // must already be signalled - switch to cancelled and
+1:                 state = CANCELLED;
+1:                 // propagate the signal
+1:                 WaitQueue.this.signal();
+1:             }
+1:             thread = null;
+1:             cleanUpCancelled();
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * A RegisteredSignal that stores a TimerContext, and stops the timer when either cancelled or
+1:      * finished waiting. i.e. if the timer is started when the signal is registered it tracks the
+1:      * time in between registering and invalidating the signal.
+1:      */
+1:     private final class TimedSignal extends RegisteredSignal
+1:     {
+0:         private final TimerContext context;
+1: 
+0:         private TimedSignal(TimerContext context)
+1:         {
+1:             this.context = context;
+1:         }
+1: 
+1:         @Override
+1:         public boolean checkAndClear()
+1:         {
+1:             context.stop();
+1:             return super.checkAndClear();
+1:         }
+1: 
+1:         @Override
+1:         public void cancel()
+1:         {
+1:             if (!isCancelled())
+1:             {
+1:                 context.stop();
+1:                 super.cancel();
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * An abstract signal wrapping multiple delegate signals
+1:      */
+1:     private abstract static class MultiSignal extends AbstractSignal
+1:     {
+1:         final Signal[] signals;
+1:         protected MultiSignal(Signal[] signals)
+1:         {
+1:             this.signals = signals;
+1:         }
+1: 
+1:         public boolean isCancelled()
+1:         {
+1:             for (Signal signal : signals)
+1:                 if (!signal.isCancelled())
+1:                     return false;
+1:             return true;
+1:         }
+1: 
+1:         public boolean checkAndClear()
+1:         {
+1:             for (Signal signal : signals)
+1:                 signal.checkAndClear();
+1:             return isSignalled();
+1:         }
+1: 
+1:         public void cancel()
+1:         {
+1:             for (Signal signal : signals)
+1:                 signal.cancel();
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * A Signal that wraps multiple Signals and returns when any single one of them would have returned
+1:      */
+1:     private static class AnySignal extends MultiSignal
+1:     {
+1:         protected AnySignal(Signal ... signals)
+1:         {
+1:             super(signals);
+1:         }
+1: 
+1:         public boolean isSignalled()
+1:         {
+1:             for (Signal signal : signals)
+1:                 if (signal.isSignalled())
+1:                     return true;
+1:             return false;
+1:         }
+1: 
+1:         public boolean isSet()
+1:         {
+1:             for (Signal signal : signals)
+1:                 if (signal.isSet())
+1:                     return true;
+1:             return false;
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * A Signal that wraps multiple Signals and returns when all of them would have finished returning
+1:      */
+1:     private static class AllSignal extends MultiSignal
+1:     {
+1:         protected AllSignal(Signal ... signals)
+1:         {
+1:             super(signals);
+1:         }
+1: 
+1:         public boolean isSignalled()
+1:         {
+1:             for (Signal signal : signals)
+1:                 if (!signal.isSignalled())
+1:                     return false;
+1:             return true;
+1:         }
+1: 
+1:         public boolean isSet()
+1:         {
+1:             for (Signal signal : signals)
+1:                 if (!signal.isSet())
+1:                     return false;
+1:             return true;
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * @param signals
+1:      * @return a signal that returns only when any of the provided signals would have returned
+1:      */
+1:     public static Signal any(Signal ... signals)
+1:     {
+1:         return new AnySignal(signals);
+1:     }
+1: 
+1:     /**
+1:      * @param signals
+1:      * @return a signal that returns only when all provided signals would have returned
+1:      */
+1:     public static Signal all(Signal ... signals)
+1:     {
+1:         return new AllSignal(signals);
+1:     }
+1: }
+============================================================================

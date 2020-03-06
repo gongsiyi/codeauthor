@@ -1,0 +1,3546 @@
+1:456a2ba: /**
+1:456a2ba:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:456a2ba:  * contributor license agreements.  See the NOTICE file distributed with
+1:456a2ba:  * this work for additional information regarding copyright ownership.
+1:456a2ba:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:456a2ba:  * (the "License"); you may not use this file except in compliance with
+1:456a2ba:  * the License.  You may obtain a copy of the License at
+3:456a2ba:  *
+1:456a2ba:  *      http://www.apache.org/licenses/LICENSE-2.0
+1:0bbc0ac:  *
+1:456a2ba:  * Unless required by applicable law or agreed to in writing, software
+1:456a2ba:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:456a2ba:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:456a2ba:  * See the License for the specific language governing permissions and
+1:456a2ba:  * limitations under the License.
+1:456a2ba:  */
+1:1aab71b: package org.apache.activemq.store.kahadb.disk.journal;
+1:76d3b46: 
+1:9b64e18: import java.io.EOFException;
+1:e89b7a5: import java.io.File;
+1:e89b7a5: import java.io.FileNotFoundException;
+1:e89b7a5: import java.io.FilenameFilter;
+1:e89b7a5: import java.io.IOException;
+1:e89b7a5: import java.io.RandomAccessFile;
+1:e89b7a5: import java.io.UnsupportedEncodingException;
+1:45e59e6: import java.nio.ByteBuffer;
+1:62bdbb0: import java.nio.channels.ClosedByInterruptException;
+1:45e59e6: import java.nio.channels.FileChannel;
+1:dd0ed17: import java.util.Collections;
+1:dd0ed17: import java.util.HashMap;
+1:dd0ed17: import java.util.Iterator;
+1:dd0ed17: import java.util.LinkedHashMap;
+1:dd0ed17: import java.util.LinkedList;
+1:dd0ed17: import java.util.Map;
+1:dd0ed17: import java.util.Set;
+1:dd0ed17: import java.util.TreeMap;
+1:456a2ba: import java.util.concurrent.ConcurrentHashMap;
+1:62bdbb0: import java.util.concurrent.Executors;
+1:62bdbb0: import java.util.concurrent.Future;
+1:62bdbb0: import java.util.concurrent.ScheduledExecutorService;
+1:62bdbb0: import java.util.concurrent.ScheduledFuture;
+1:62bdbb0: import java.util.concurrent.ThreadFactory;
+1:62bdbb0: import java.util.concurrent.TimeUnit;
+1:456a2ba: import java.util.concurrent.atomic.AtomicLong;
+1:456a2ba: import java.util.concurrent.atomic.AtomicReference;
+1:f73b622: import java.util.zip.Adler32;
+1:f73b622: import java.util.zip.Checksum;
+1:edfc23e: 
+1:1aab71b: import org.apache.activemq.store.kahadb.disk.util.LinkedNode;
+1:1aab71b: import org.apache.activemq.store.kahadb.disk.util.LinkedNodeList;
+1:1aab71b: import org.apache.activemq.store.kahadb.disk.util.Sequence;
+1:e89b7a5: import org.apache.activemq.util.ByteSequence;
+1:e89b7a5: import org.apache.activemq.util.DataByteArrayInputStream;
+1:e89b7a5: import org.apache.activemq.util.DataByteArrayOutputStream;
+1:e89b7a5: import org.apache.activemq.util.IOHelper;
+1:e89b7a5: import org.apache.activemq.util.RecoverableRandomAccessFile;
+1:62bdbb0: import org.apache.activemq.util.ThreadPoolUtils;
+1:e89b7a5: import org.slf4j.Logger;
+1:e89b7a5: import org.slf4j.LoggerFactory;
+1:e89b7a5: 
+1:456a2ba: /**
+1:456a2ba:  * Manages DataFiles
+1:456a2ba:  */
+1:456a2ba: public class Journal {
+1:bb4a2f7:     public static final String CALLER_BUFFER_APPENDER = "org.apache.kahadb.journal.CALLER_BUFFER_APPENDER";
+1:bb4a2f7:     public static final boolean callerBufferAppender = Boolean.parseBoolean(System.getProperty(CALLER_BUFFER_APPENDER, "false"));
+1:f73b622: 
+1:930a74c:     private static final int PREALLOC_CHUNK_SIZE = 1024*1024;
+1:f73b622: 
+1:f73b622:     // ITEM_HEAD_SPACE = length + type+ reserved space + SOR
+1:f73b622:     public static final int RECORD_HEAD_SPACE = 4 + 1;
+1:f73b622: 
+1:f73b622:     public static final byte USER_RECORD_TYPE = 1;
+1:f73b622:     public static final byte BATCH_CONTROL_RECORD_TYPE = 2;
+1:f73b622:     // Batch Control Item holds a 4 byte size of the batch and a 8 byte checksum of the batch.
+1:f73b622:     public static final byte[] BATCH_CONTROL_RECORD_MAGIC = bytes("WRITE BATCH");
+1:edfc23e:     public static final int BATCH_CONTROL_RECORD_SIZE = RECORD_HEAD_SPACE + BATCH_CONTROL_RECORD_MAGIC.length + 4 + 8;
+1:76d3b46:     public static final byte[] BATCH_CONTROL_RECORD_HEADER = createBatchControlRecordHeader();
+1:62bdbb0:     public static final byte[] EMPTY_BATCH_CONTROL_RECORD = createEmptyBatchControlRecordHeader();
+1:62bdbb0:     public static final int EOF_INT = ByteBuffer.wrap(new byte[]{'-', 'q', 'M', 'a'}).getInt();
+1:62bdbb0:     public static final byte EOF_EOT = '4';
+1:62bdbb0:     public static final byte[] EOF_RECORD = createEofBatchAndLocationRecord();
+1:62bdbb0: 
+1:62bdbb0:     private ScheduledExecutorService scheduler;
+1:73db4d2: 
+1:edfc23e:     // tackle corruption when checksum is disabled or corrupt with zeros, minimize data loss
+1:73db4d2:     public void corruptRecoveryLocation(Location recoveryPosition) throws IOException {
+1:73db4d2:         DataFile dataFile = getDataFile(recoveryPosition);
+1:73db4d2:         // with corruption on recovery we have no faith in the content - slip to the next batch record or eof
+1:73db4d2:         DataFileAccessor reader = accessorPool.openDataFileAccessor(dataFile);
+1:73db4d2:         try {
+1:8c218ee:             RandomAccessFile randomAccessFile = reader.getRaf().getRaf();
+1:8c218ee:             randomAccessFile.seek(recoveryPosition.getOffset() + 1);
+1:8c218ee:             byte[] data = new byte[getWriteBatchSize()];
+1:8c218ee:             ByteSequence bs = new ByteSequence(data, 0, randomAccessFile.read(data));
+1:8c218ee:             int nextOffset = 0;
+1:8c218ee:             if (findNextBatchRecord(bs, randomAccessFile) >= 0) {
+1:8c218ee:                 nextOffset = Math.toIntExact(randomAccessFile.getFilePointer() - bs.remaining());
+1:8c218ee:             } else {
+1:8c218ee:                 nextOffset = Math.toIntExact(randomAccessFile.length());
+1:8c218ee:             }
+1:8c218ee:             Sequence sequence = new Sequence(recoveryPosition.getOffset(), nextOffset - 1);
+1:e725451:             LOG.warn("Corrupt journal records found in '{}' between offsets: {}", dataFile.getFile(), sequence);
+1:62bdbb0: 
+1:73db4d2:             // skip corruption on getNextLocation
+1:8c218ee:             recoveryPosition.setOffset(nextOffset);
+1:73db4d2:             recoveryPosition.setSize(-1);
+1:73db4d2: 
+1:73db4d2:             dataFile.corruptedBlocks.add(sequence);
+1:73db4d2:         } catch (IOException e) {
+1:73db4d2:         } finally {
+1:73db4d2:             accessorPool.closeDataFileAccessor(reader);
+1:62bdbb0:         }
+1:73db4d2:     }
+1:73db4d2: 
+1:d427952:     public DataFileAccessorPool getAccessorPool() {
+1:d427952:         return accessorPool;
+1:d427952:     }
+1:d427952: 
+1:c5a8b2c:     public void allowIOResumption() {
+1:c5a8b2c:         if (appender instanceof DataFileAppender) {
+1:c5a8b2c:             DataFileAppender dataFileAppender = (DataFileAppender)appender;
+1:c5a8b2c:             dataFileAppender.shutdown = false;
+1:c5a8b2c:         }
+1:c5a8b2c:     }
+1:c5a8b2c: 
+1:45e59e6:     public enum PreallocationStrategy {
+1:45e59e6:         SPARSE_FILE,
+1:45e59e6:         OS_KERNEL_COPY,
+1:edfc23e:         ZEROS,
+1:edfc23e:         CHUNKED_ZEROS;
+1:73db4d2:     }
+1:73db4d2: 
+1:45e59e6:     public enum PreallocationScope {
+1:62bdbb0:         ENTIRE_JOURNAL,
+1:62bdbb0:         ENTIRE_JOURNAL_ASYNC,
+1:62bdbb0:         NONE;
+1:dd0ed17:     }
+1:946e62d: 
+1:dd0ed17:     public enum JournalDiskSyncStrategy {
+1:dd0ed17:         ALWAYS,
+1:dd0ed17:         PERIODIC,
+1:dd0ed17:         NEVER;
+1:dd0ed17:     }
+1:dd0ed17: 
+1:76d3b46:     private static byte[] createBatchControlRecordHeader() {
+1:e89b7a5:         try (DataByteArrayOutputStream os = new DataByteArrayOutputStream();) {
+1:76d3b46:             os.writeInt(BATCH_CONTROL_RECORD_SIZE);
+1:76d3b46:             os.writeByte(BATCH_CONTROL_RECORD_TYPE);
+1:76d3b46:             os.write(BATCH_CONTROL_RECORD_MAGIC);
+1:76d3b46:             ByteSequence sequence = os.toByteSequence();
+1:76d3b46:             sequence.compact();
+1:76d3b46:             return sequence.getData();
+1:76d3b46:         } catch (IOException e) {
+1:cdba931:             throw new RuntimeException("Could not create batch control record header.", e);
+1:dd0ed17:         }
+1:023b2ac:     }
+1:023b2ac: 
+1:62bdbb0:     private static byte[] createEmptyBatchControlRecordHeader() {
+1:62bdbb0:         try (DataByteArrayOutputStream os = new DataByteArrayOutputStream();) {
+1:62bdbb0:             os.writeInt(BATCH_CONTROL_RECORD_SIZE);
+1:62bdbb0:             os.writeByte(BATCH_CONTROL_RECORD_TYPE);
+1:62bdbb0:             os.write(BATCH_CONTROL_RECORD_MAGIC);
+1:62bdbb0:             os.writeInt(0);
+1:62bdbb0:             os.writeLong(0l);
+1:62bdbb0:             ByteSequence sequence = os.toByteSequence();
+1:62bdbb0:             sequence.compact();
+1:62bdbb0:             return sequence.getData();
+1:62bdbb0:         } catch (IOException e) {
+1:62bdbb0:             throw new RuntimeException("Could not create empty batch control record header.", e);
+1:62bdbb0:         }
+1:62bdbb0:     }
+1:62bdbb0: 
+1:62bdbb0:     private static byte[] createEofBatchAndLocationRecord() {
+1:62bdbb0:         try (DataByteArrayOutputStream os = new DataByteArrayOutputStream();) {
+1:62bdbb0:             os.writeInt(EOF_INT);
+1:62bdbb0:             os.writeByte(EOF_EOT);
+1:62bdbb0:             ByteSequence sequence = os.toByteSequence();
+1:62bdbb0:             sequence.compact();
+1:62bdbb0:             return sequence.getData();
+1:62bdbb0:         } catch (IOException e) {
+1:62bdbb0:             throw new RuntimeException("Could not create eof header.", e);
+1:62bdbb0:         }
+1:62bdbb0:     }
+1:62bdbb0: 
+1:456a2ba:     public static final String DEFAULT_DIRECTORY = ".";
+1:456a2ba:     public static final String DEFAULT_ARCHIVE_DIRECTORY = "data-archive";
+1:456a2ba:     public static final String DEFAULT_FILE_PREFIX = "db-";
+1:456a2ba:     public static final String DEFAULT_FILE_SUFFIX = ".log";
+1:456a2ba:     public static final int DEFAULT_MAX_FILE_LENGTH = 1024 * 1024 * 32;
+1:456a2ba:     public static final int DEFAULT_CLEANUP_INTERVAL = 1000 * 30;
+1:561cda1:     public static final int DEFAULT_MAX_WRITE_BATCH_SIZE = 1024 * 1024 * 4;
+1:45e59e6: 
+1:8bf987b:     private static final Logger LOG = LoggerFactory.getLogger(Journal.class);
+1:45e59e6: 
+1:456a2ba:     protected final Map<WriteKey, WriteCommand> inflightWrites = new ConcurrentHashMap<WriteKey, WriteCommand>();
+1:45e59e6: 
+1:456a2ba:     protected File directory = new File(DEFAULT_DIRECTORY);
+1:802e527:     protected File directoryArchive;
+1:802e527:     private boolean directoryArchiveOverridden = false;
+1:45e59e6: 
+1:456a2ba:     protected String filePrefix = DEFAULT_FILE_PREFIX;
+1:456a2ba:     protected String fileSuffix = DEFAULT_FILE_SUFFIX;
+1:456a2ba:     protected boolean started;
+1:45e59e6: 
+1:456a2ba:     protected int maxFileLength = DEFAULT_MAX_FILE_LENGTH;
+1:561cda1:     protected int writeBatchSize = DEFAULT_MAX_WRITE_BATCH_SIZE;
+1:802e527: 
+1:bb4a2f7:     protected FileAppender appender;
+1:456a2ba:     protected DataFileAccessorPool accessorPool;
+1:76d3b46: 
+1:456a2ba:     protected Map<Integer, DataFile> fileMap = new HashMap<Integer, DataFile>();
+1:456a2ba:     protected Map<File, DataFile> fileByFileMap = new LinkedHashMap<File, DataFile>();
+1:456a2ba:     protected LinkedNodeList<DataFile> dataFiles = new LinkedNodeList<DataFile>();
+1:76d3b46: 
+1:456a2ba:     protected final AtomicReference<Location> lastAppendLocation = new AtomicReference<Location>();
+1:62bdbb0:     protected ScheduledFuture cleanupTask;
+1:5763561:     protected AtomicLong totalLength = new AtomicLong();
+1:456a2ba:     protected boolean archiveDataLogs;
+1:456a2ba:     private ReplicationTarget replicationTarget;
+1:f73b622:     protected boolean checksum;
+1:76d3b46:     protected boolean checkForCorruptionOnStartup;
+1:89f22da:     protected boolean enableAsyncDiskSync = true;
+1:946e62d:     private int nextDataFileId = 1;
+1:62bdbb0:     private Object dataFileIdLock = new Object();
+1:dd0ed17:     private final AtomicReference<DataFile> currentDataFile = new AtomicReference<>(null);
+1:62bdbb0:     private volatile DataFile nextDataFile;
+1:76d3b46: 
+1:65cef69:     protected PreallocationScope preallocationScope = PreallocationScope.ENTIRE_JOURNAL;
+1:45e59e6:     protected PreallocationStrategy preallocationStrategy = PreallocationStrategy.SPARSE_FILE;
+1:62bdbb0:     private File osKernelCopyTemplateFile = null;
+1:3b7613d:     private ByteBuffer preAllocateDirectBuffer = null;
+1:3b7613d: 
+1:dd0ed17:     protected JournalDiskSyncStrategy journalDiskSyncStrategy = JournalDiskSyncStrategy.ALWAYS;
+1:45e59e6: 
+1:802e527:     public interface DataFileRemovedListener {
+1:802e527:         void fileRemoved(DataFile datafile);
+1:45e59e6:     }
+1:802e527: 
+1:802e527:     private DataFileRemovedListener dataFileRemovedListener;
+1:802e527: 
+1:456a2ba:     public synchronized void start() throws IOException {
+1:456a2ba:         if (started) {
+2:456a2ba:             return;
+1:45e59e6:         }
+1:76d3b46: 
+1:456a2ba:         long start = System.currentTimeMillis();
+1:456a2ba:         accessorPool = new DataFileAccessorPool(this);
+1:456a2ba:         started = true;
+1:76d3b46: 
+1:bb4a2f7:         appender = callerBufferAppender ? new CallerBufferingDataFileAppender(this) : new DataFileAppender(this);
+1:f73b622: 
+1:456a2ba:         File[] files = directory.listFiles(new FilenameFilter() {
+1:e89b7a5:             @Override
+1:456a2ba:             public boolean accept(File dir, String n) {
+1:456a2ba:                 return dir.equals(directory) && n.startsWith(filePrefix) && n.endsWith(fileSuffix);
+1:802e527:             }
+1:456a2ba:         });
+1:f73b622: 
+1:456a2ba:         if (files != null) {
+1:cdba931:             for (File file : files) {
+1:dd0ed17:                 try {
+1:456a2ba:                     String n = file.getName();
+1:456a2ba:                     String numStr = n.substring(filePrefix.length(), n.length()-fileSuffix.length());
+1:456a2ba:                     int num = Integer.parseInt(numStr);
+1:95f7262:                     DataFile dataFile = new DataFile(file, num);
+2:456a2ba:                     fileMap.put(dataFile.getDataFileId(), dataFile);
+1:456a2ba:                     totalLength.addAndGet(dataFile.getLength());
+1:456a2ba:                 } catch (NumberFormatException e) {
+1:456a2ba:                     // Ignore file that do not match the pattern.
+1:76d3b46:                 }
+1:76d3b46:             }
+1:f73b622: 
+1:456a2ba:             // Sort the list so that we can link the DataFiles together in the
+1:456a2ba:             // right order.
+1:62bdbb0:             LinkedList<DataFile> l = new LinkedList<>(fileMap.values());
+1:456a2ba:             Collections.sort(l);
+1:456a2ba:             for (DataFile df : l) {
+1:9e40b91:                 if (df.getLength() == 0) {
+1:9e40b91:                     // possibly the result of a previous failed write
+1:9e40b91:                     LOG.info("ignoring zero length, partially initialised journal data file: " + df);
+2:456a2ba:                     continue;
+1:62bdbb0:                 } else if (l.getLast().equals(df) && isUnusedPreallocated(df)) {
+1:62bdbb0:                     continue;
+1:f73b622:                 }
+1:456a2ba:                 dataFiles.addLast(df);
+1:456a2ba:                 fileByFileMap.put(df.getFile(), df);
+1:76d3b46: 
+1:76d3b46:                 if( isCheckForCorruptionOnStartup() ) {
+1:76d3b46:                     lastAppendLocation.set(recoveryCheck(df));
+1:76d3b46:                 }
+1:f73b622:             }
+1:f73b622:         }
+1:76d3b46: 
+1:3b7613d:         if (preallocationScope != PreallocationScope.NONE) {
+1:3b7613d:             switch (preallocationStrategy) {
+1:3b7613d:                 case SPARSE_FILE:
+1:3b7613d:                     break;
+1:3b7613d:                 case OS_KERNEL_COPY: {
+1:3b7613d:                     osKernelCopyTemplateFile = createJournalTemplateFile();
+1:3b7613d:                 }
+1:3b7613d:                 break;
+1:3b7613d:                 case CHUNKED_ZEROS: {
+1:3b7613d:                     preAllocateDirectBuffer = allocateDirectBuffer(PREALLOC_CHUNK_SIZE);
+1:3b7613d:                 }
+1:3b7613d:                 break;
+1:3b7613d:                 case ZEROS: {
+1:3b7613d:                     preAllocateDirectBuffer = allocateDirectBuffer(getMaxFileLength());
+1:3b7613d:                 }
+1:3b7613d:                 break;
+1:62bdbb0:             }
+1:62bdbb0:         }
+1:62bdbb0:         scheduler = Executors.newScheduledThreadPool(1, new ThreadFactory() {
+1:62bdbb0:             @Override
+1:62bdbb0:             public Thread newThread(Runnable r) {
+1:62bdbb0:                 Thread schedulerThread = new Thread(r);
+1:62bdbb0:                 schedulerThread.setName("ActiveMQ Journal Scheduled executor");
+1:62bdbb0:                 schedulerThread.setDaemon(true);
+1:62bdbb0:                 return schedulerThread;
+1:62bdbb0:             }
+1:62bdbb0:         });
+1:62bdbb0: 
+1:62bdbb0:         // init current write file
+1:62bdbb0:         if (dataFiles.isEmpty()) {
+1:62bdbb0:             nextDataFileId = 1;
+1:62bdbb0:             rotateWriteFile();
+1:62bdbb0:         } else {
+1:62bdbb0:             currentDataFile.set(dataFiles.getTail());
+1:62bdbb0:             nextDataFileId = currentDataFile.get().dataFileId + 1;
+1:62bdbb0:         }
+1:946e62d: 
+1:76d3b46:         if( lastAppendLocation.get()==null ) {
+1:76d3b46:             DataFile df = dataFiles.getTail();
+1:76d3b46:             lastAppendLocation.set(recoveryCheck(df));
+1:946e62d:         }
+1:946e62d: 
+1:95f7262:         // ensure we don't report unused space of last journal file in size metric
+1:0ad62f7:         int lastFileLength = dataFiles.getTail().getLength();
+1:0ad62f7:         if (totalLength.get() > lastFileLength && lastAppendLocation.get().getOffset() > 0) {
+1:0ad62f7:             totalLength.addAndGet(lastAppendLocation.get().getOffset() - lastFileLength);
+1:95f7262:         }
+1:95f7262: 
+1:62bdbb0:         cleanupTask = scheduler.scheduleAtFixedRate(new Runnable() {
+1:e89b7a5:             @Override
+1:456a2ba:             public void run() {
+1:456a2ba:                 cleanup();
+1:946e62d:             }
+1:62bdbb0:         }, DEFAULT_CLEANUP_INTERVAL, DEFAULT_CLEANUP_INTERVAL, TimeUnit.MILLISECONDS);
+1:946e62d: 
+1:456a2ba:         long end = System.currentTimeMillis();
+1:456a2ba:         LOG.trace("Startup took: "+(end-start)+" ms");
+1:45e59e6:     }
+1:45e59e6: 
+1:3b7613d:     private ByteBuffer allocateDirectBuffer(int size) {
+1:3b7613d:         ByteBuffer buffer = ByteBuffer.allocateDirect(size);
+1:3b7613d:         buffer.put(EOF_RECORD);
+1:3b7613d:         return buffer;
+1:3b7613d:     }
+1:3b7613d: 
+1:45e59e6:     public void preallocateEntireJournalDataFile(RecoverableRandomAccessFile file) {
+1:45e59e6: 
+1:62bdbb0:         if (PreallocationScope.NONE != preallocationScope) {
+1:45e59e6: 
+1:3b7613d:             try {
+1:3b7613d:                 if (PreallocationStrategy.OS_KERNEL_COPY == preallocationStrategy) {
+1:3b7613d:                     doPreallocationKernelCopy(file);
+1:3b7613d:                 } else if (PreallocationStrategy.ZEROS == preallocationStrategy) {
+1:3b7613d:                     doPreallocationZeros(file);
+1:3b7613d:                 } else if (PreallocationStrategy.CHUNKED_ZEROS == preallocationStrategy) {
+1:3b7613d:                     doPreallocationChunkedZeros(file);
+1:3b7613d:                 } else {
+1:3b7613d:                     doPreallocationSparseFile(file);
+1:3b7613d:                 }
+1:3b7613d:             } catch (Throwable continueWithNoPrealloc) {
+1:3b7613d:                 // error on preallocation is non fatal, and we don't want to leak the journal handle
+1:3b7613d:                 LOG.error("cound not preallocate journal data file", continueWithNoPrealloc);
+1:45e59e6:             }
+1:45e59e6:         }
+1:45e59e6:     }
+1:45e59e6: 
+1:45e59e6:     private void doPreallocationSparseFile(RecoverableRandomAccessFile file) {
+1:62bdbb0:         final ByteBuffer journalEof = ByteBuffer.wrap(EOF_RECORD);
+1:45e59e6:         try {
+1:62bdbb0:             FileChannel channel = file.getChannel();
+1:62bdbb0:             channel.position(0);
+1:62bdbb0:             channel.write(journalEof);
+1:62bdbb0:             channel.position(maxFileLength - 5);
+1:62bdbb0:             journalEof.rewind();
+1:62bdbb0:             channel.write(journalEof);
+1:62bdbb0:             channel.force(false);
+1:62bdbb0:             channel.position(0);
+1:555cd2b:         } catch (ClosedByInterruptException ignored) {
+1:62bdbb0:             LOG.trace("Could not preallocate journal file with sparse file", ignored);
+1:45e59e6:         } catch (IOException e) {
+1:62bdbb0:             LOG.error("Could not preallocate journal file with sparse file", e);
+1:45e59e6:         }
+1:45e59e6:     }
+1:edfc23e: 
+1:45e59e6:     private void doPreallocationZeros(RecoverableRandomAccessFile file) {
+1:3b7613d:         preAllocateDirectBuffer.rewind();
+1:45e59e6:         try {
+1:45e59e6:             FileChannel channel = file.getChannel();
+1:3b7613d:             channel.write(preAllocateDirectBuffer);
+1:45e59e6:             channel.force(false);
+1:45e59e6:             channel.position(0);
+1:62bdbb0:         } catch (ClosedByInterruptException ignored) {
+1:555cd2b:             LOG.trace("Could not preallocate journal file with zeros", ignored);
+1:45e59e6:         } catch (IOException e) {
+1:62bdbb0:             LOG.error("Could not preallocate journal file with zeros", e);
+1:e8f44a2:         }
+1:45e59e6:     }
+1:45e59e6: 
+1:45e59e6:     private void doPreallocationKernelCopy(RecoverableRandomAccessFile file) {
+1:351faf2:         try (RandomAccessFile templateRaf = new RandomAccessFile(osKernelCopyTemplateFile, "rw");){
+1:45e59e6:             templateRaf.getChannel().transferTo(0, getMaxFileLength(), file.getChannel());
+1:62bdbb0:         } catch (ClosedByInterruptException ignored) {
+1:62bdbb0:             LOG.trace("Could not preallocate journal file with kernel copy", ignored);
+1:45e59e6:         } catch (FileNotFoundException e) {
+1:62bdbb0:             LOG.error("Could not find the template file on disk at " + osKernelCopyTemplateFile.getAbsolutePath(), e);
+1:45e59e6:         } catch (IOException e) {
+1:62bdbb0:             LOG.error("Could not transfer the template file to journal, transferFile=" + osKernelCopyTemplateFile.getAbsolutePath(), e);
+1:45e59e6:         }
+1:45e59e6:     }
+1:45e59e6: 
+1:45e59e6:     private File createJournalTemplateFile() {
+1:45e59e6:         String fileName = "db-log.template";
+1:be4ad3d:         File rc = new File(directory, fileName);
+1:62bdbb0:         try (RandomAccessFile templateRaf = new RandomAccessFile(rc, "rw");) {
+1:62bdbb0:             templateRaf.getChannel().write(ByteBuffer.wrap(EOF_RECORD));
+1:62bdbb0:             templateRaf.setLength(maxFileLength);
+1:62bdbb0:             templateRaf.getChannel().force(true);
+1:62bdbb0:         } catch (FileNotFoundException e) {
+1:62bdbb0:             LOG.error("Could not find the template file on disk at " + osKernelCopyTemplateFile.getAbsolutePath(), e);
+1:62bdbb0:         } catch (IOException e) {
+1:62bdbb0:             LOG.error("Could not transfer the template file to journal, transferFile=" + osKernelCopyTemplateFile.getAbsolutePath(), e);
+1:45e59e6:         }
+1:45e59e6:         return rc;
+1:45e59e6:     }
+1:edfc23e: 
+1:edfc23e:     private void doPreallocationChunkedZeros(RecoverableRandomAccessFile file) {
+1:3b7613d:         preAllocateDirectBuffer.limit(preAllocateDirectBuffer.capacity());
+1:3b7613d:         preAllocateDirectBuffer.rewind();
+1:edfc23e:         try {
+1:edfc23e:             FileChannel channel = file.getChannel();
+1:edfc23e: 
+1:edfc23e:             int remLen = maxFileLength;
+1:edfc23e:             while (remLen > 0) {
+1:3b7613d:                 if (remLen < preAllocateDirectBuffer.remaining()) {
+1:3b7613d:                     preAllocateDirectBuffer.limit(remLen);
+1:edfc23e:                 }
+1:3b7613d:                 int writeLen = channel.write(preAllocateDirectBuffer);
+1:edfc23e:                 remLen -= writeLen;
+1:3b7613d:                 preAllocateDirectBuffer.rewind();
+1:edfc23e:             }
+1:edfc23e: 
+1:edfc23e:             channel.force(false);
+1:edfc23e:             channel.position(0);
+1:62bdbb0:         } catch (ClosedByInterruptException ignored) {
+1:62bdbb0:             LOG.trace("Could not preallocate journal file with zeros", ignored);
+1:edfc23e:         } catch (IOException e) {
+1:edfc23e:             LOG.error("Could not preallocate journal file with zeros! Will continue without preallocation", e);
+1:edfc23e:         }
+1:edfc23e:     }
+1:946e62d: 
+1:f73b622:     private static byte[] bytes(String string) {
+1:45e59e6:         try {
+1:f73b622:             return string.getBytes("UTF-8");
+1:f73b622:         } catch (UnsupportedEncodingException e) {
+1:f73b622:             throw new RuntimeException(e);
+1:45e59e6:         }
+1:45e59e6:     }
+1:45e59e6: 
+1:62bdbb0:     public boolean isUnusedPreallocated(DataFile dataFile) throws IOException {
+1:62bdbb0:         if (preallocationScope == PreallocationScope.ENTIRE_JOURNAL_ASYNC) {
+1:62bdbb0:             DataFileAccessor reader = accessorPool.openDataFileAccessor(dataFile);
+1:62bdbb0:             try {
+1:8c218ee:                 byte[] firstFewBytes = new byte[BATCH_CONTROL_RECORD_HEADER.length];
+1:8c218ee:                 reader.readFully(0, firstFewBytes);
+1:8c218ee:                 ByteSequence bs = new ByteSequence(firstFewBytes);
+1:8c218ee:                 return bs.startsWith(EOF_RECORD);
+1:62bdbb0:             } catch (Exception ignored) {
+1:62bdbb0:             } finally {
+1:62bdbb0:                 accessorPool.closeDataFileAccessor(reader);
+1:62bdbb0:             }
+1:62bdbb0:         }
+1:8c218ee:         return false;
+1:62bdbb0:     }
+1:62bdbb0: 
+1:f73b622:     protected Location recoveryCheck(DataFile dataFile) throws IOException {
+1:62bdbb0:         Location location = new Location();
+1:62bdbb0:         location.setDataFileId(dataFile.getDataFileId());
+1:62bdbb0:         location.setOffset(0);
+1:62bdbb0: 
+1:f73b622:         DataFileAccessor reader = accessorPool.openDataFileAccessor(dataFile);
+1:76d3b46:         try {
+1:8c218ee:             RandomAccessFile randomAccessFile = reader.getRaf().getRaf();
+1:8c218ee:             randomAccessFile.seek(0);
+1:8c218ee:             final long totalFileLength = randomAccessFile.length();
+1:8c218ee:             byte[] data = new byte[getWriteBatchSize()];
+1:8c218ee:             ByteSequence bs = new ByteSequence(data, 0, randomAccessFile.read(data));
+1:8c218ee: 
+1:946e62d:             while (true) {
+1:8c218ee:                 int size = checkBatchRecord(bs, randomAccessFile);
+1:8c218ee:                 if (size >= 0 && location.getOffset() + BATCH_CONTROL_RECORD_SIZE + size <= totalFileLength) {
+1:62bdbb0:                     if (size == 0) {
+1:62bdbb0:                         // eof batch record
+1:62bdbb0:                         break;
+1:62bdbb0:                     }
+1:946e62d:                     location.setOffset(location.getOffset() + BATCH_CONTROL_RECORD_SIZE + size);
+1:946e62d:                 } else {
+1:45e59e6: 
+1:946e62d:                     // Perhaps it's just some corruption... scan through the
+1:946e62d:                     // file to find the next valid batch record. We
+1:76d3b46:                     // may have subsequent valid batch records.
+1:8c218ee:                     if (findNextBatchRecord(bs, randomAccessFile) >= 0) {
+1:8c218ee:                         int nextOffset = Math.toIntExact(randomAccessFile.getFilePointer() - bs.remaining());
+1:76d3b46:                         Sequence sequence = new Sequence(location.getOffset(), nextOffset - 1);
+1:e725451:                         LOG.warn("Corrupt journal records found in '{}' between offsets: {}", dataFile.getFile(), sequence);
+1:76d3b46:                         dataFile.corruptedBlocks.add(sequence);
+1:76d3b46:                         location.setOffset(nextOffset);
+1:e89b7a5:                     } else {
+1:76d3b46:                         break;
+1:76d3b46:                     }
+1:76d3b46:                 }
+1:f73b622:             }
+1:45e59e6: 
+1:f73b622:         } catch (IOException e) {
+1:dd0ed17:         } finally {
+2:456a2ba:             accessorPool.closeDataFileAccessor(reader);
+1:f73b622:         }
+1:45e59e6: 
+1:5763561:         int existingLen = dataFile.getLength();
+1:456a2ba:         dataFile.setLength(location.getOffset());
+1:5763561:         if (existingLen > dataFile.getLength()) {
+1:5763561:             totalLength.addAndGet(dataFile.getLength() - existingLen);
+1:f73b622:         }
+1:45e59e6: 
+1:946e62d:         if (!dataFile.corruptedBlocks.isEmpty()) {
+1:76d3b46:             // Is the end of the data file corrupted?
+1:946e62d:             if (dataFile.corruptedBlocks.getTail().getLast() + 1 == location.getOffset()) {
+1:76d3b46:                 dataFile.setLength((int) dataFile.corruptedBlocks.removeLastSequence().getFirst());
+1:76d3b46:             }
+1:76d3b46:         }
+1:76d3b46: 
+1:456a2ba:         return location;
+1:76d3b46:     }
+1:76d3b46: 
+1:8c218ee:     private int findNextBatchRecord(ByteSequence bs, RandomAccessFile reader) throws IOException {
+1:8c218ee:         final ByteSequence header = new ByteSequence(BATCH_CONTROL_RECORD_HEADER);
+1:76d3b46:         int pos = 0;
+1:946e62d:         while (true) {
+1:8c218ee:             pos = bs.indexOf(header, 0);
+1:946e62d:             if (pos >= 0) {
+1:8c218ee:                 bs.setOffset(bs.offset + pos);
+1:8c218ee:                 return pos;
+1:e89b7a5:             } else {
+1:76d3b46:                 // need to load the next data chunck in..
+1:8c218ee:                 if (bs.length != bs.data.length) {
+1:76d3b46:                     // If we had a short read then we were at EOF
+1:e89b7a5:                     return -1;
+1:e89b7a5:                 }
+1:8c218ee:                 bs.setOffset(bs.length - BATCH_CONTROL_RECORD_HEADER.length);
+1:8c218ee:                 bs.reset();
+1:8c218ee:                 bs.setLength(bs.length + reader.read(bs.data, bs.length, bs.data.length - BATCH_CONTROL_RECORD_HEADER.length));
+1:76d3b46:             }
+1:76d3b46:         }
+1:76d3b46:     }
+1:e89b7a5: 
+1:8c218ee:     private int checkBatchRecord(ByteSequence bs, RandomAccessFile reader) throws IOException {
+1:f989992:         ensureAvailable(bs, reader, EOF_RECORD.length);
+1:8c218ee:         if (bs.startsWith(EOF_RECORD)) {
+1:8c218ee:             return 0; // eof
+1:8c218ee:         }
+1:f989992:         ensureAvailable(bs, reader, BATCH_CONTROL_RECORD_SIZE);
+1:8c218ee:         try (DataByteArrayInputStream controlIs = new DataByteArrayInputStream(bs)) {
+1:76d3b46: 
+1:946e62d:             // Assert that it's a batch record.
+1:946e62d:             for (int i = 0; i < BATCH_CONTROL_RECORD_HEADER.length; i++) {
+1:946e62d:                 if (controlIs.readByte() != BATCH_CONTROL_RECORD_HEADER[i]) {
+1:e89b7a5:                     return -1;
+1:76d3b46:                 }
+1:76d3b46:             }
+1:76d3b46: 
+1:e89b7a5:             int size = controlIs.readInt();
+1:dad629e:             if (size < 0 || size > Integer.MAX_VALUE - (BATCH_CONTROL_RECORD_SIZE + EOF_RECORD.length)) {
+1:8c218ee:                 return -2;
+1:76d3b46:             }
+1:76d3b46: 
+1:8c218ee:             long expectedChecksum = controlIs.readLong();
+1:8c218ee:             Checksum checksum = null;
+1:8c218ee:             if (isChecksum() && expectedChecksum > 0) {
+1:8c218ee:                 checksum = new Adler32();
+1:8c218ee:             }
+1:e89b7a5: 
+1:8c218ee:             // revert to bs to consume data
+1:8c218ee:             bs.setOffset(controlIs.position());
+1:8c218ee:             int toRead = size;
+1:8c218ee:             while (toRead > 0) {
+1:8c218ee:                 if (bs.remaining() >= toRead) {
+1:8c218ee:                     if (checksum != null) {
+1:8c218ee:                         checksum.update(bs.getData(), bs.getOffset(), toRead);
+1:8c218ee:                     }
+1:8c218ee:                     bs.setOffset(bs.offset + toRead);
+1:8c218ee:                     toRead = 0;
+1:8c218ee:                 } else {
+1:8c218ee:                     if (bs.length != bs.data.length) {
+1:8c218ee:                         // buffer exhausted
+1:8c218ee:                         return  -3;
+1:8c218ee:                     }
+1:e89b7a5: 
+1:8c218ee:                     toRead -= bs.remaining();
+1:8c218ee:                     if (checksum != null) {
+1:8c218ee:                         checksum.update(bs.getData(), bs.getOffset(), bs.remaining());
+1:8c218ee:                     }
+1:8c218ee:                     bs.setLength(reader.read(bs.data));
+1:8c218ee:                     bs.setOffset(0);
+1:e89b7a5:                 }
+1:e89b7a5:             }
+1:8c218ee:             if (checksum != null && expectedChecksum != checksum.getValue()) {
+1:8c218ee:                 return -4;
+1:8c218ee:             }
+1:8c218ee: 
+2:e89b7a5:             return size;
+1:e89b7a5:         }
+1:76d3b46:     }
+1:e89b7a5: 
+1:f989992:     private void ensureAvailable(ByteSequence bs, RandomAccessFile reader, int required) throws IOException {
+1:f989992:         if (bs.remaining() < required) {
+1:f989992:             bs.reset();
+1:e793260:             int read = reader.read(bs.data, bs.length, bs.data.length - bs.length);
+1:e793260:             if (read < 0) {
+1:e793260:                 if (bs.remaining() == 0) {
+1:e793260:                     throw new EOFException("request for " + required + " bytes reached EOF");
+1:e793260:                 }
+1:e793260:             }
+1:e793260:             bs.setLength(bs.length + read);
+1:f989992:         }
+1:f989992:     }
+1:f989992: 
+1:f73b622:     void addToTotalLength(int size) {
+1:f73b622:         totalLength.addAndGet(size);
+1:76d3b46:     }
+1:76d3b46: 
+1:323eeda:     public long length() {
+1:323eeda:         return totalLength.get();
+1:946e62d:     }
+1:946e62d: 
+1:62bdbb0:     private void rotateWriteFile() throws IOException {
+1:62bdbb0:        synchronized (dataFileIdLock) {
+1:62bdbb0:             DataFile dataFile = nextDataFile;
+1:62bdbb0:             if (dataFile == null) {
+1:62bdbb0:                 dataFile = newDataFile();
+1:62bdbb0:             }
+1:62bdbb0:             synchronized (currentDataFile) {
+1:62bdbb0:                 fileMap.put(dataFile.getDataFileId(), dataFile);
+1:62bdbb0:                 fileByFileMap.put(dataFile.getFile(), dataFile);
+1:62bdbb0:                 dataFiles.addLast(dataFile);
+1:62bdbb0:                 currentDataFile.set(dataFile);
+1:62bdbb0:             }
+1:62bdbb0:             nextDataFile = null;
+1:dd0ed17:         }
+1:62bdbb0:         if (PreallocationScope.ENTIRE_JOURNAL_ASYNC == preallocationScope) {
+1:62bdbb0:             preAllocateNextDataFileFuture = scheduler.submit(preAllocateNextDataFileTask);
+1:dd0ed17:         }
+1:dd0ed17:     }
+1:dd0ed17: 
+1:62bdbb0:     private Runnable preAllocateNextDataFileTask = new Runnable() {
+1:62bdbb0:         @Override
+1:62bdbb0:         public void run() {
+1:62bdbb0:             if (nextDataFile == null) {
+1:62bdbb0:                 synchronized (dataFileIdLock){
+1:62bdbb0:                     try {
+1:62bdbb0:                         nextDataFile = newDataFile();
+1:62bdbb0:                     } catch (IOException e) {
+1:62bdbb0:                         LOG.warn("Failed to proactively allocate data file", e);
+1:62bdbb0:                     }
+1:62bdbb0:                 }
+1:62bdbb0:             }
+1:62bdbb0:         }
+1:62bdbb0:     };
+1:62bdbb0: 
+1:62bdbb0:     private volatile Future preAllocateNextDataFileFuture;
+1:62bdbb0: 
+1:62bdbb0:     private DataFile newDataFile() throws IOException {
+1:946e62d:         int nextNum = nextDataFileId++;
+1:946e62d:         File file = getFile(nextNum);
+1:95f7262:         DataFile nextWriteFile = new DataFile(file, nextNum);
+1:62bdbb0:         preallocateEntireJournalDataFile(nextWriteFile.appendRandomAccessFile());
+1:f73b622:         return nextWriteFile;
+1:76d3b46:     }
+1:62bdbb0: 
+1:e89b7a5: 
+1:62bdbb0:     public DataFile reserveDataFile() {
+1:62bdbb0:         synchronized (dataFileIdLock) {
+1:62bdbb0:             int nextNum = nextDataFileId++;
+1:62bdbb0:             File file = getFile(nextNum);
+1:62bdbb0:             DataFile reservedDataFile = new DataFile(file, nextNum);
+1:62bdbb0:             synchronized (currentDataFile) {
+1:62bdbb0:                 fileMap.put(reservedDataFile.getDataFileId(), reservedDataFile);
+1:62bdbb0:                 fileByFileMap.put(file, reservedDataFile);
+1:62bdbb0:                 if (dataFiles.isEmpty()) {
+1:62bdbb0:                     dataFiles.addLast(reservedDataFile);
+1:62bdbb0:                 } else {
+1:62bdbb0:                     dataFiles.getTail().linkBefore(reservedDataFile);
+1:62bdbb0:                 }
+1:62bdbb0:             }
+1:62bdbb0:             return reservedDataFile;
+1:946e62d:         }
+1:946e62d:     }
+1:946e62d: 
+1:456a2ba:     public File getFile(int nextNum) {
+1:456a2ba:         String fileName = filePrefix + nextNum + fileSuffix;
+1:456a2ba:         File file = new File(directory, fileName);
+1:456a2ba:         return file;
+1:76d3b46:     }
+1:76d3b46: 
+1:62bdbb0:     DataFile getDataFile(Location item) throws IOException {
+2:456a2ba:         Integer key = Integer.valueOf(item.getDataFileId());
+1:62bdbb0:         DataFile dataFile = null;
+1:62bdbb0:         synchronized (currentDataFile) {
+1:62bdbb0:             dataFile = fileMap.get(key);
+1:62bdbb0:         }
+3:456a2ba:         if (dataFile == null) {
+2:456a2ba:             LOG.error("Looking for key " + key + " but not found in fileMap: " + fileMap);
+2:456a2ba:             throw new IOException("Could not locate data file " + getFile(item.getDataFileId()));
+1:f73b622:         }
+1:456a2ba:         return dataFile;
+1:f73b622:     }
+1:76d3b46: 
+1:260e28e:     public void close() throws IOException {
+2:260e28e:         synchronized (this) {
+1:260e28e:             if (!started) {
+1:260e28e:                 return;
+1:260e28e:             }
+1:62bdbb0:             cleanupTask.cancel(true);
+1:62bdbb0:             if (preAllocateNextDataFileFuture != null) {
+1:62bdbb0:                 preAllocateNextDataFileFuture.cancel(true);
+1:260e28e:             }
+1:62bdbb0:             ThreadPoolUtils.shutdownGraceful(scheduler, 4000);
+1:260e28e:             accessorPool.close();
+1:f73b622:         }
+1:260e28e:         // the appender can be calling back to to the journal blocking a close AMQ-5620
+1:456a2ba:         appender.close();
+1:62bdbb0:         synchronized (currentDataFile) {
+1:260e28e:             fileMap.clear();
+1:260e28e:             fileByFileMap.clear();
+1:260e28e:             dataFiles.clear();
+1:260e28e:             lastAppendLocation.set(null);
+1:260e28e:             started = false;
+1:260e28e:         }
+1:f73b622:     }
+1:76d3b46: 
+1:d427952:     public synchronized void cleanup() {
+1:456a2ba:         if (accessorPool != null) {
+1:456a2ba:             accessorPool.disposeUnused();
+1:f73b622:         }
+38:456a2ba:     }
+1:76d3b46: 
+1:456a2ba:     public synchronized boolean delete() throws IOException {
+1:76d3b46: 
+1:456a2ba:         // Close all open file handles...
+1:456a2ba:         appender.close();
+2:456a2ba:         accessorPool.close();
+1:76d3b46: 
+1:456a2ba:         boolean result = true;
+1:456a2ba:         for (Iterator<DataFile> i = fileMap.values().iterator(); i.hasNext();) {
+1:456a2ba:             DataFile dataFile = i.next();
+1:456a2ba:             result &= dataFile.delete();
+1:62bdbb0:         }
+1:946e62d: 
+1:62bdbb0:         if (preAllocateNextDataFileFuture != null) {
+1:62bdbb0:             preAllocateNextDataFileFuture.cancel(true);
+1:456a2ba:         }
+1:62bdbb0:         synchronized (dataFileIdLock) {
+1:62bdbb0:             if (nextDataFile != null) {
+1:62bdbb0:                 nextDataFile.delete();
+1:62bdbb0:                 nextDataFile = null;
+1:62bdbb0:             }
+1:62bdbb0:         }
+1:76d3b46: 
+1:62bdbb0:         totalLength.set(0);
+1:62bdbb0:         synchronized (currentDataFile) {
+1:62bdbb0:             fileMap.clear();
+1:62bdbb0:             fileByFileMap.clear();
+1:62bdbb0:             lastAppendLocation.set(null);
+1:62bdbb0:             dataFiles = new LinkedNodeList<DataFile>();
+1:62bdbb0:         }
+1:456a2ba:         // reopen open file handles...
+1:456a2ba:         accessorPool = new DataFileAccessorPool(this);
+1:f73b622:         appender = new DataFileAppender(this);
+1:456a2ba:         return result;
+1:456a2ba:     }
+1:76d3b46: 
+1:62bdbb0:     public void removeDataFiles(Set<Integer> files) throws IOException {
+1:8262ef7:         for (Integer key : files) {
+1:789ea7c:             // Can't remove the data file (or subsequent files) that is currently being written to.
+1:946e62d:             if (key >= lastAppendLocation.get().getDataFileId()) {
+1:789ea7c:                 continue;
+1:789ea7c:             }
+1:62bdbb0:             DataFile dataFile = null;
+1:62bdbb0:             synchronized (currentDataFile) {
+1:62bdbb0:                 dataFile = fileMap.remove(key);
+1:62bdbb0:                 if (dataFile != null) {
+1:62bdbb0:                     fileByFileMap.remove(dataFile.getFile());
+1:62bdbb0:                     dataFile.unlink();
+1:62bdbb0:                 }
+1:62bdbb0:             }
+1:946e62d:             if (dataFile != null) {
+1:789ea7c:                 forceRemoveDataFile(dataFile);
+1:456a2ba:             }
+1:456a2ba:         }
+1:456a2ba:     }
+1:76d3b46: 
+1:62bdbb0:     private void forceRemoveDataFile(DataFile dataFile) throws IOException {
+1:456a2ba:         accessorPool.disposeDataFileAccessors(dataFile);
+2:456a2ba:         totalLength.addAndGet(-dataFile.getLength());
+1:456a2ba:         if (archiveDataLogs) {
+1:802e527:             File directoryArchive = getDirectoryArchive();
+1:802e527:             if (directoryArchive.exists()) {
+1:802e527:                 LOG.debug("Archive directory exists: {}", directoryArchive);
+1:946e62d:             } else {
+1:802e527:                 if (directoryArchive.isAbsolute())
+1:802e527:                 if (LOG.isDebugEnabled()) {
+1:802e527:                     LOG.debug("Archive directory [{}] does not exist - creating it now",
+1:802e527:                             directoryArchive.getAbsolutePath());
+1:802e527:                 }
+1:802e527:                 IOHelper.mkdirs(directoryArchive);
+1:456a2ba:             }
+1:802e527:             LOG.debug("Moving data file {} to {} ", dataFile, directoryArchive.getCanonicalPath());
+1:802e527:             dataFile.move(directoryArchive);
+1:802e527:             LOG.debug("Successfully moved data file");
+1:802e527:         } else {
+1:802e527:             LOG.debug("Deleting data file: {}", dataFile);
+1:946e62d:             if (dataFile.delete()) {
+1:802e527:                 LOG.debug("Discarded data file: {}", dataFile);
+1:802e527:             } else {
+1:802e527:                 LOG.warn("Failed to discard data file : {}", dataFile.getFile());
+1:802e527:             }
+1:802e527:         }
+1:802e527:         if (dataFileRemovedListener != null) {
+1:802e527:             dataFileRemovedListener.fileRemoved(dataFile);
+1:456a2ba:         }
+1:456a2ba:     }
+1:f73b622: 
+1:456a2ba:     /**
+1:456a2ba:      * @return the maxFileLength
+1:456a2ba:      */
+1:456a2ba:     public int getMaxFileLength() {
+1:456a2ba:         return maxFileLength;
+1:456a2ba:     }
+1:f73b622: 
+1:456a2ba:     /**
+1:456a2ba:      * @param maxFileLength the maxFileLength to set
+1:456a2ba:      */
+1:456a2ba:     public void setMaxFileLength(int maxFileLength) {
+1:456a2ba:         this.maxFileLength = maxFileLength;
+1:456a2ba:     }
+1:f73b622: 
+1:54a00fe:     @Override
+1:456a2ba:     public String toString() {
+1:456a2ba:         return directory.toString();
+1:456a2ba:     }
+1:f73b622: 
+1:62bdbb0:     public Location getNextLocation(Location location) throws IOException, IllegalStateException {
+1:9b64e18:         return getNextLocation(location, null);
+1:9b64e18:     }
+1:9b64e18: 
+1:9b64e18:     public Location getNextLocation(Location location, Location limit) throws IOException, IllegalStateException {
+2:456a2ba:         Location cur = null;
+2:456a2ba:         while (true) {
+2:456a2ba:             if (cur == null) {
+2:456a2ba:                 if (location == null) {
+1:62bdbb0:                     DataFile head = null;
+1:62bdbb0:                     synchronized (currentDataFile) {
+1:62bdbb0:                         head = dataFiles.getHead();
+1:62bdbb0:                     }
+1:946e62d:                     if (head == null) {
+2:946e62d:                         return null;
+1:946e62d:                     }
+2:456a2ba:                     cur = new Location();
+2:456a2ba:                     cur.setDataFileId(head.getDataFileId());
+3:456a2ba:                     cur.setOffset(0);
+1:946e62d:                 } else {
+2:456a2ba:                     // Set to the next offset..
+1:456a2ba:                     if (location.getSize() == -1) {
+1:456a2ba:                         cur = new Location(location);
+1:946e62d:                     } else {
+1:456a2ba:                         cur = new Location(location);
+1:456a2ba:                         cur.setOffset(location.getOffset() + location.getSize());
+1:946e62d:                     }
+1:946e62d:                 }
+2:76d3b46:             } else {
+3:456a2ba:                 cur.setOffset(cur.getOffset() + cur.getSize());
+1:456a2ba:             }
+1:946e62d: 
+1:456a2ba:             DataFile dataFile = getDataFile(cur);
+1:946e62d: 
+2:456a2ba:             // Did it go into the next file??
+2:456a2ba:             if (dataFile.getLength() <= cur.getOffset()) {
+1:62bdbb0:                 synchronized (currentDataFile) {
+1:62bdbb0:                     dataFile = dataFile.getNext();
+1:62bdbb0:                 }
+1:456a2ba:                 if (dataFile == null) {
+1:946e62d:                     return null;
+1:76d3b46:                 } else {
+2:456a2ba:                     cur.setDataFileId(dataFile.getDataFileId().intValue());
+1:456a2ba:                     cur.setOffset(0);
+1:9b64e18:                     if (limit != null && cur.compareTo(limit) >= 0) {
+1:9b64e18:                         LOG.trace("reached limit: {} at: {}", limit, cur);
+1:9b64e18:                         return null;
+1:9b64e18:                     }
+1:456a2ba:                 }
+1:456a2ba:             }
+1:f73b622: 
+2:456a2ba:             // Load in location size and type.
+3:456a2ba:             DataFileAccessor reader = accessorPool.openDataFileAccessor(dataFile);
+1:f73b622:             try {
+2:456a2ba:                 reader.readLocationDetails(cur);
+1:9b64e18:             } catch (EOFException eof) {
+1:9b64e18:                 LOG.trace("EOF on next: " + location + ", cur: " + cur);
+1:9b64e18:                 throw eof;
+1:f73b622:             } finally {
+1:456a2ba:                 accessorPool.closeDataFileAccessor(reader);
+1:456a2ba:             }
+1:f73b622: 
+1:a7178a4:             Sequence corruptedRange = dataFile.corruptedBlocks.get(cur.getOffset());
+1:a7178a4:             if (corruptedRange != null) {
+1:a7178a4:                 // skip corruption
+1:a7178a4:                 cur.setSize((int) corruptedRange.range());
+1:62bdbb0:             } else if (cur.getSize() == EOF_INT && cur.getType() == EOF_EOT ||
+1:62bdbb0:                     (cur.getType() == 0 && cur.getSize() == 0)) {
+1:a7178a4:                 // eof - jump to next datafile
+1:62bdbb0:                 // EOF_INT and EOF_EOT replace 0,0 - we need to react to both for
+1:62bdbb0:                 // replay of existing journals
+1:62bdbb0:                 // possibly journal is larger than maxFileLength after config change
+1:62bdbb0:                 cur.setSize(EOF_RECORD.length);
+1:62bdbb0:                 cur.setOffset(Math.max(maxFileLength, dataFile.getLength()));
+1:f73b622:             } else if (cur.getType() == USER_RECORD_TYPE) {
+2:456a2ba:                 // Only return user records.
+2:456a2ba:                 return cur;
+1:456a2ba:             }
+1:456a2ba:         }
+1:456a2ba:     }
+1:f73b622: 
+1:62bdbb0:     public ByteSequence read(Location location) throws IOException, IllegalStateException {
+1:456a2ba:         DataFile dataFile = getDataFile(location);
+1:456a2ba:         DataFileAccessor reader = accessorPool.openDataFileAccessor(dataFile);
+1:456a2ba:         ByteSequence rc = null;
+1:f73b622:         try {
+1:456a2ba:             rc = reader.readRecord(location);
+4:456a2ba:         } finally {
+1:456a2ba:             accessorPool.closeDataFileAccessor(reader);
+1:456a2ba:         }
+2:456a2ba:         return rc;
+1:456a2ba:     }
+1:f73b622: 
+1:e1389a6:     public Location write(ByteSequence data, boolean sync) throws IOException, IllegalStateException {
+1:456a2ba:         Location loc = appender.storeItem(data, Location.USER_TYPE, sync);
+1:456a2ba:         return loc;
+1:456a2ba:     }
+1:f73b622: 
+1:e1389a6:     public Location write(ByteSequence data, Runnable onComplete) throws IOException, IllegalStateException {
+1:456a2ba:         Location loc = appender.storeItem(data, Location.USER_TYPE, onComplete);
+1:456a2ba:         return loc;
+1:456a2ba:     }
+1:f73b622: 
+1:456a2ba:     public void update(Location location, ByteSequence data, boolean sync) throws IOException {
+1:456a2ba:         DataFile dataFile = getDataFile(location);
+1:456a2ba:         DataFileAccessor updater = accessorPool.openDataFileAccessor(dataFile);
+7:456a2ba:         try {
+1:456a2ba:             updater.updateRecord(location, data, sync);
+1:456a2ba:         } finally {
+1:456a2ba:             accessorPool.closeDataFileAccessor(updater);
+1:456a2ba:         }
+1:456a2ba:     }
+1:f73b622: 
+1:45e59e6:     public PreallocationStrategy getPreallocationStrategy() {
+1:45e59e6:         return preallocationStrategy;
+1:45e59e6:     }
+1:45e59e6: 
+1:45e59e6:     public void setPreallocationStrategy(PreallocationStrategy preallocationStrategy) {
+1:45e59e6:         this.preallocationStrategy = preallocationStrategy;
+1:45e59e6:     }
+1:45e59e6: 
+1:45e59e6:     public PreallocationScope getPreallocationScope() {
+1:45e59e6:         return preallocationScope;
+1:45e59e6:     }
+1:45e59e6: 
+1:45e59e6:     public void setPreallocationScope(PreallocationScope preallocationScope) {
+1:45e59e6:         this.preallocationScope = preallocationScope;
+1:45e59e6:     }
+1:45e59e6: 
+1:456a2ba:     public File getDirectory() {
+1:456a2ba:         return directory;
+1:45e59e6:     }
+1:45e59e6: 
+1:456a2ba:     public void setDirectory(File directory) {
+1:456a2ba:         this.directory = directory;
+1:45e59e6:     }
+1:45e59e6: 
+1:456a2ba:     public String getFilePrefix() {
+1:456a2ba:         return filePrefix;
+1:456a2ba:     }
+1:f73b622: 
+1:456a2ba:     public void setFilePrefix(String filePrefix) {
+1:456a2ba:         this.filePrefix = filePrefix;
+1:456a2ba:     }
+1:f73b622: 
+1:456a2ba:     public Map<WriteKey, WriteCommand> getInflightWrites() {
+1:456a2ba:         return inflightWrites;
+1:456a2ba:     }
+1:f73b622: 
+1:456a2ba:     public Location getLastAppendLocation() {
+1:456a2ba:         return lastAppendLocation.get();
+1:456a2ba:     }
+1:f73b622: 
+1:456a2ba:     public void setLastAppendLocation(Location lastSyncedLocation) {
+1:456a2ba:         this.lastAppendLocation.set(lastSyncedLocation);
+1:456a2ba:     }
+1:f73b622: 
+1:456a2ba:     public File getDirectoryArchive() {
+1:802e527:         if (!directoryArchiveOverridden && (directoryArchive == null)) {
+1:802e527:             // create the directoryArchive relative to the journal location
+1:802e527:             directoryArchive = new File(directory.getAbsolutePath() +
+1:802e527:                     File.separator + DEFAULT_ARCHIVE_DIRECTORY);
+1:802e527:         }
+1:456a2ba:         return directoryArchive;
+1:456a2ba:     }
+63:456a2ba: 
+1:456a2ba:     public void setDirectoryArchive(File directoryArchive) {
+1:802e527:         directoryArchiveOverridden = true;
+1:456a2ba:         this.directoryArchive = directoryArchive;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public boolean isArchiveDataLogs() {
+1:456a2ba:         return archiveDataLogs;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public void setArchiveDataLogs(boolean archiveDataLogs) {
+1:456a2ba:         this.archiveDataLogs = archiveDataLogs;
+1:456a2ba:     }
+1:456a2ba: 
+1:62bdbb0:     public DataFile getDataFileById(int dataFileId) {
+1:62bdbb0:         synchronized (currentDataFile) {
+1:62bdbb0:             return fileMap.get(Integer.valueOf(dataFileId));
+1:946e62d:         }
+1:456a2ba:     }
+1:946e62d: 
+1:62bdbb0:     public DataFile getCurrentDataFile(int capacity) throws IOException {
+1:5fd63a0:         //First just acquire the currentDataFile lock and return if no rotation needed
+1:62bdbb0:         synchronized (currentDataFile) {
+1:5fd63a0:             if (currentDataFile.get().getLength() + capacity < maxFileLength) {
+2:5fd63a0:                 return currentDataFile.get();
+1:62bdbb0:             }
+1:5fd63a0:         }
+1:5fd63a0: 
+1:5fd63a0:         //AMQ-6545 - if rotation needed, acquire dataFileIdLock first to prevent deadlocks
+1:5fd63a0:         //then re-check if rotation is needed
+1:5fd63a0:         synchronized (dataFileIdLock) {
+1:5fd63a0:             synchronized (currentDataFile) {
+1:62bdbb0:                 if (currentDataFile.get().getLength() + capacity >= maxFileLength) {
+1:62bdbb0:                     rotateWriteFile();
+1:62bdbb0:                 }
+1:62bdbb0:                 return currentDataFile.get();
+1:62bdbb0:             }
+1:5fd63a0:         }
+1:5fd63a0:     }
+1:62bdbb0: 
+1:62bdbb0:     public Integer getCurrentDataFileId() {
+1:62bdbb0:         synchronized (currentDataFile) {
+1:62bdbb0:             return currentDataFile.get().getDataFileId();
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     /**
+1:456a2ba:      * Get a set of files - only valid after start()
+1:456a2ba:      *
+1:456a2ba:      * @return files currently being used
+1:456a2ba:      */
+1:456a2ba:     public Set<File> getFiles() {
+1:62bdbb0:         synchronized (currentDataFile) {
+1:62bdbb0:             return fileByFileMap.keySet();
+1:62bdbb0:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:62bdbb0:     public Map<Integer, DataFile> getFileMap() {
+1:62bdbb0:         synchronized (currentDataFile) {
+1:62bdbb0:             return new TreeMap<Integer, DataFile>(fileMap);
+1:62bdbb0:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public long getDiskSize() {
+1:95f7262:         return totalLength.get();
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public void setReplicationTarget(ReplicationTarget replicationTarget) {
+1:456a2ba:         this.replicationTarget = replicationTarget;
+1:456a2ba:     }
+1:e89b7a5: 
+1:456a2ba:     public ReplicationTarget getReplicationTarget() {
+1:456a2ba:         return replicationTarget;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public String getFileSuffix() {
+1:456a2ba:         return fileSuffix;
+1:456a2ba:     }
+1:456a2ba: 
+1:456a2ba:     public void setFileSuffix(String fileSuffix) {
+1:456a2ba:         this.fileSuffix = fileSuffix;
+1:456a2ba:     }
+1:456a2ba: 
+1:f73b622:     public boolean isChecksum() {
+1:f73b622:         return checksum;
+1:f73b622:     }
+1:f73b622: 
+1:f73b622:     public void setChecksum(boolean checksumWrites) {
+1:f73b622:         this.checksum = checksumWrites;
+1:f73b622:     }
+1:f73b622: 
+1:76d3b46:     public boolean isCheckForCorruptionOnStartup() {
+1:76d3b46:         return checkForCorruptionOnStartup;
+1:76d3b46:     }
+1:456a2ba: 
+1:76d3b46:     public void setCheckForCorruptionOnStartup(boolean checkForCorruptionOnStartup) {
+1:76d3b46:         this.checkForCorruptionOnStartup = checkForCorruptionOnStartup;
+1:76d3b46:     }
+1:456a2ba: 
+1:561cda1:     public void setWriteBatchSize(int writeBatchSize) {
+1:561cda1:         this.writeBatchSize = writeBatchSize;
+1:456a2ba:     }
+1:456a2ba: 
+1:561cda1:     public int getWriteBatchSize() {
+1:561cda1:         return writeBatchSize;
+1:456a2ba:     }
+1:456a2ba: 
+1:5763561:     public void setSizeAccumulator(AtomicLong storeSizeAccumulator) {
+1:5763561:        this.totalLength = storeSizeAccumulator;
+1:456a2ba:     }
+1:456a2ba: 
+1:89f22da:     public void setEnableAsyncDiskSync(boolean val) {
+1:89f22da:         this.enableAsyncDiskSync = val;
+1:456a2ba:     }
+1:456a2ba: 
+1:89f22da:     public boolean isEnableAsyncDiskSync() {
+1:89f22da:         return enableAsyncDiskSync;
+1:456a2ba:     }
+1:456a2ba: 
+1:dd0ed17:     public JournalDiskSyncStrategy getJournalDiskSyncStrategy() {
+1:dd0ed17:         return journalDiskSyncStrategy;
+1:dd0ed17:     }
+1:dd0ed17: 
+1:dd0ed17:     public void setJournalDiskSyncStrategy(JournalDiskSyncStrategy journalDiskSyncStrategy) {
+1:dd0ed17:         this.journalDiskSyncStrategy = journalDiskSyncStrategy;
+1:dd0ed17:     }
+1:dd0ed17: 
+1:dd0ed17:     public boolean isJournalDiskSyncPeriodic() {
+1:dd0ed17:         return JournalDiskSyncStrategy.PERIODIC.equals(journalDiskSyncStrategy);
+1:dd0ed17:     }
+1:dd0ed17: 
+1:802e527:     public void setDataFileRemovedListener(DataFileRemovedListener dataFileRemovedListener) {
+1:802e527:         this.dataFileRemovedListener = dataFileRemovedListener;
+1:802e527:     }
+1:802e527: 
+1:bb4a2f7:     public static class WriteCommand extends LinkedNode<WriteCommand> {
+1:bb4a2f7:         public final Location location;
+1:bb4a2f7:         public final ByteSequence data;
+1:bb4a2f7:         final boolean sync;
+1:bb4a2f7:         public final Runnable onComplete;
+1:456a2ba: 
+1:bb4a2f7:         public WriteCommand(Location location, ByteSequence data, boolean sync) {
+1:bb4a2f7:             this.location = location;
+1:bb4a2f7:             this.data = data;
+1:bb4a2f7:             this.sync = sync;
+1:bb4a2f7:             this.onComplete = null;
+1:456a2ba:         }
+1:456a2ba: 
+1:bb4a2f7:         public WriteCommand(Location location, ByteSequence data, Runnable onComplete) {
+1:bb4a2f7:             this.location = location;
+1:bb4a2f7:             this.data = data;
+1:bb4a2f7:             this.onComplete = onComplete;
+1:bb4a2f7:             this.sync = false;
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: 
+1:bb4a2f7:     public static class WriteKey {
+1:bb4a2f7:         private final int file;
+1:bb4a2f7:         private final long offset;
+1:bb4a2f7:         private final int hash;
+1:456a2ba: 
+1:bb4a2f7:         public WriteKey(Location item) {
+1:bb4a2f7:             file = item.getDataFileId();
+1:bb4a2f7:             offset = item.getOffset();
+1:bb4a2f7:             // TODO: see if we can build a better hash
+1:bb4a2f7:             hash = (int)(file ^ offset);
+1:456a2ba:         }
+1:456a2ba: 
+1:e89b7a5:         @Override
+1:bb4a2f7:         public int hashCode() {
+1:bb4a2f7:             return hash;
+1:456a2ba:         }
+1:456a2ba: 
+1:e89b7a5:         @Override
+1:bb4a2f7:         public boolean equals(Object obj) {
+1:bb4a2f7:             if (obj instanceof WriteKey) {
+1:bb4a2f7:                 WriteKey di = (WriteKey)obj;
+1:bb4a2f7:                 return di.file == file && di.offset == offset;
+1:456a2ba:             }
+1:bb4a2f7:             return false;
+1:456a2ba:         }
+1:456a2ba:     }
+1:456a2ba: }
+============================================================================
+author:gtully
+-------------------------------------------------------------------------------
+commit:e793260
+/////////////////////////////////////////////////////////////////////////
+1:             int read = reader.read(bs.data, bs.length, bs.data.length - bs.length);
+1:             if (read < 0) {
+1:                 if (bs.remaining() == 0) {
+1:                     throw new EOFException("request for " + required + " bytes reached EOF");
+1:                 }
+1:             }
+1:             bs.setLength(bs.length + read);
+commit:f989992
+/////////////////////////////////////////////////////////////////////////
+1:         ensureAvailable(bs, reader, EOF_RECORD.length);
+1:         ensureAvailable(bs, reader, BATCH_CONTROL_RECORD_SIZE);
+/////////////////////////////////////////////////////////////////////////
+1:     private void ensureAvailable(ByteSequence bs, RandomAccessFile reader, int required) throws IOException {
+1:         if (bs.remaining() < required) {
+1:             bs.reset();
+0:             bs.setLength(bs.length + reader.read(bs.data, bs.length, bs.data.length - bs.length));
+1:         }
+1:     }
+1: 
+commit:8c218ee
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:             RandomAccessFile randomAccessFile = reader.getRaf().getRaf();
+1:             randomAccessFile.seek(recoveryPosition.getOffset() + 1);
+1:             byte[] data = new byte[getWriteBatchSize()];
+1:             ByteSequence bs = new ByteSequence(data, 0, randomAccessFile.read(data));
+1:             int nextOffset = 0;
+1:             if (findNextBatchRecord(bs, randomAccessFile) >= 0) {
+1:                 nextOffset = Math.toIntExact(randomAccessFile.getFilePointer() - bs.remaining());
+1:             } else {
+1:                 nextOffset = Math.toIntExact(randomAccessFile.length());
+1:             }
+1:             Sequence sequence = new Sequence(recoveryPosition.getOffset(), nextOffset - 1);
+1:             recoveryPosition.setOffset(nextOffset);
+/////////////////////////////////////////////////////////////////////////
+1:                 byte[] firstFewBytes = new byte[BATCH_CONTROL_RECORD_HEADER.length];
+1:                 reader.readFully(0, firstFewBytes);
+1:                 ByteSequence bs = new ByteSequence(firstFewBytes);
+1:                 return bs.startsWith(EOF_RECORD);
+1:         return false;
+/////////////////////////////////////////////////////////////////////////
+1:             RandomAccessFile randomAccessFile = reader.getRaf().getRaf();
+1:             randomAccessFile.seek(0);
+1:             final long totalFileLength = randomAccessFile.length();
+1:             byte[] data = new byte[getWriteBatchSize()];
+1:             ByteSequence bs = new ByteSequence(data, 0, randomAccessFile.read(data));
+1: 
+1:                 int size = checkBatchRecord(bs, randomAccessFile);
+1:                 if (size >= 0 && location.getOffset() + BATCH_CONTROL_RECORD_SIZE + size <= totalFileLength) {
+/////////////////////////////////////////////////////////////////////////
+1:                     if (findNextBatchRecord(bs, randomAccessFile) >= 0) {
+1:                         int nextOffset = Math.toIntExact(randomAccessFile.getFilePointer() - bs.remaining());
+/////////////////////////////////////////////////////////////////////////
+1:     private int findNextBatchRecord(ByteSequence bs, RandomAccessFile reader) throws IOException {
+1:         final ByteSequence header = new ByteSequence(BATCH_CONTROL_RECORD_HEADER);
+1:             pos = bs.indexOf(header, 0);
+1:                 bs.setOffset(bs.offset + pos);
+1:                 return pos;
+1:                 if (bs.length != bs.data.length) {
+1:                 bs.setOffset(bs.length - BATCH_CONTROL_RECORD_HEADER.length);
+1:                 bs.reset();
+1:                 bs.setLength(bs.length + reader.read(bs.data, bs.length, bs.data.length - BATCH_CONTROL_RECORD_HEADER.length));
+1:     private int checkBatchRecord(ByteSequence bs, RandomAccessFile reader) throws IOException {
+1:         if (bs.startsWith(EOF_RECORD)) {
+1:             return 0; // eof
+1:         }
+1:         try (DataByteArrayInputStream controlIs = new DataByteArrayInputStream(bs)) {
+/////////////////////////////////////////////////////////////////////////
+1:                 return -2;
+1:             long expectedChecksum = controlIs.readLong();
+1:             Checksum checksum = null;
+1:             if (isChecksum() && expectedChecksum > 0) {
+1:                 checksum = new Adler32();
+1:             }
+1:             // revert to bs to consume data
+1:             bs.setOffset(controlIs.position());
+1:             int toRead = size;
+1:             while (toRead > 0) {
+1:                 if (bs.remaining() >= toRead) {
+1:                     if (checksum != null) {
+1:                         checksum.update(bs.getData(), bs.getOffset(), toRead);
+1:                     }
+1:                     bs.setOffset(bs.offset + toRead);
+1:                     toRead = 0;
+1:                 } else {
+1:                     if (bs.length != bs.data.length) {
+1:                         // buffer exhausted
+1:                         return  -3;
+1:                     }
+1:                     toRead -= bs.remaining();
+1:                     if (checksum != null) {
+1:                         checksum.update(bs.getData(), bs.getOffset(), bs.remaining());
+1:                     }
+1:                     bs.setLength(reader.read(bs.data));
+1:                     bs.setOffset(0);
+1:             if (checksum != null && expectedChecksum != checksum.getValue()) {
+1:                 return -4;
+1:             }
+1: 
+commit:c5a8b2c
+/////////////////////////////////////////////////////////////////////////
+1:     public void allowIOResumption() {
+1:         if (appender instanceof DataFileAppender) {
+1:             DataFileAppender dataFileAppender = (DataFileAppender)appender;
+1:             dataFileAppender.shutdown = false;
+1:         }
+1:     }
+1: 
+commit:9b64e18
+/////////////////////////////////////////////////////////////////////////
+1: import java.io.EOFException;
+/////////////////////////////////////////////////////////////////////////
+1:         return getNextLocation(location, null);
+1:     }
+1: 
+1:     public Location getNextLocation(Location location, Location limit) throws IOException, IllegalStateException {
+/////////////////////////////////////////////////////////////////////////
+1:                     if (limit != null && cur.compareTo(limit) >= 0) {
+1:                         LOG.trace("reached limit: {} at: {}", limit, cur);
+1:                         return null;
+1:                     }
+/////////////////////////////////////////////////////////////////////////
+1:             } catch (EOFException eof) {
+1:                 LOG.trace("EOF on next: " + location + ", cur: " + cur);
+1:                 throw eof;
+commit:dad629e
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:             if (size < 0 || size > Integer.MAX_VALUE - (BATCH_CONTROL_RECORD_SIZE + EOF_RECORD.length)) {
+commit:3b7613d
+/////////////////////////////////////////////////////////////////////////
+1:     private ByteBuffer preAllocateDirectBuffer = null;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         if (preallocationScope != PreallocationScope.NONE) {
+1:             switch (preallocationStrategy) {
+1:                 case SPARSE_FILE:
+1:                     break;
+1:                 case OS_KERNEL_COPY: {
+1:                     osKernelCopyTemplateFile = createJournalTemplateFile();
+1:                 }
+1:                 break;
+1:                 case CHUNKED_ZEROS: {
+1:                     preAllocateDirectBuffer = allocateDirectBuffer(PREALLOC_CHUNK_SIZE);
+1:                 }
+1:                 break;
+1:                 case ZEROS: {
+1:                     preAllocateDirectBuffer = allocateDirectBuffer(getMaxFileLength());
+1:                 }
+1:                 break;
+/////////////////////////////////////////////////////////////////////////
+1:     private ByteBuffer allocateDirectBuffer(int size) {
+1:         ByteBuffer buffer = ByteBuffer.allocateDirect(size);
+1:         buffer.put(EOF_RECORD);
+1:         return buffer;
+1:     }
+1: 
+1:             try {
+1:                 if (PreallocationStrategy.OS_KERNEL_COPY == preallocationStrategy) {
+1:                     doPreallocationKernelCopy(file);
+1:                 } else if (PreallocationStrategy.ZEROS == preallocationStrategy) {
+1:                     doPreallocationZeros(file);
+1:                 } else if (PreallocationStrategy.CHUNKED_ZEROS == preallocationStrategy) {
+1:                     doPreallocationChunkedZeros(file);
+1:                 } else {
+1:                     doPreallocationSparseFile(file);
+1:                 }
+1:             } catch (Throwable continueWithNoPrealloc) {
+1:                 // error on preallocation is non fatal, and we don't want to leak the journal handle
+1:                 LOG.error("cound not preallocate journal data file", continueWithNoPrealloc);
+/////////////////////////////////////////////////////////////////////////
+1:         preAllocateDirectBuffer.rewind();
+1:             channel.write(preAllocateDirectBuffer);
+/////////////////////////////////////////////////////////////////////////
+1:         preAllocateDirectBuffer.limit(preAllocateDirectBuffer.capacity());
+1:         preAllocateDirectBuffer.rewind();
+1:                 if (remLen < preAllocateDirectBuffer.remaining()) {
+1:                     preAllocateDirectBuffer.limit(remLen);
+1:                 int writeLen = channel.write(preAllocateDirectBuffer);
+1:                 preAllocateDirectBuffer.rewind();
+commit:d427952
+/////////////////////////////////////////////////////////////////////////
+1:     public DataFileAccessorPool getAccessorPool() {
+1:         return accessorPool;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     public synchronized void cleanup() {
+commit:65cef69
+/////////////////////////////////////////////////////////////////////////
+1:     protected PreallocationScope preallocationScope = PreallocationScope.ENTIRE_JOURNAL;
+/////////////////////////////////////////////////////////////////////////
+commit:555cd2b
+/////////////////////////////////////////////////////////////////////////
+1:         } catch (ClosedByInterruptException ignored) {
+1:             LOG.trace("Could not preallocate journal file with zeros", ignored);
+commit:62bdbb0
+/////////////////////////////////////////////////////////////////////////
+1: import java.nio.channels.ClosedByInterruptException;
+0: import java.util.*;
+1: import java.util.concurrent.Executors;
+1: import java.util.concurrent.Future;
+1: import java.util.concurrent.ScheduledExecutorService;
+1: import java.util.concurrent.ScheduledFuture;
+1: import java.util.concurrent.ThreadFactory;
+1: import java.util.concurrent.TimeUnit;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.activemq.util.ThreadPoolUtils;
+/////////////////////////////////////////////////////////////////////////
+1:     public static final byte[] EMPTY_BATCH_CONTROL_RECORD = createEmptyBatchControlRecordHeader();
+1:     public static final int EOF_INT = ByteBuffer.wrap(new byte[]{'-', 'q', 'M', 'a'}).getInt();
+1:     public static final byte EOF_EOT = '4';
+1:     public static final byte[] EOF_RECORD = createEofBatchAndLocationRecord();
+1: 
+1:     private ScheduledExecutorService scheduler;
+/////////////////////////////////////////////////////////////////////////
+1:         ENTIRE_JOURNAL,
+1:         ENTIRE_JOURNAL_ASYNC,
+1:         NONE;
+/////////////////////////////////////////////////////////////////////////
+1:     private static byte[] createEmptyBatchControlRecordHeader() {
+1:         try (DataByteArrayOutputStream os = new DataByteArrayOutputStream();) {
+1:             os.writeInt(BATCH_CONTROL_RECORD_SIZE);
+1:             os.writeByte(BATCH_CONTROL_RECORD_TYPE);
+1:             os.write(BATCH_CONTROL_RECORD_MAGIC);
+1:             os.writeInt(0);
+1:             os.writeLong(0l);
+1:             ByteSequence sequence = os.toByteSequence();
+1:             sequence.compact();
+1:             return sequence.getData();
+1:         } catch (IOException e) {
+1:             throw new RuntimeException("Could not create empty batch control record header.", e);
+1:         }
+1:     }
+1: 
+1:     private static byte[] createEofBatchAndLocationRecord() {
+1:         try (DataByteArrayOutputStream os = new DataByteArrayOutputStream();) {
+1:             os.writeInt(EOF_INT);
+1:             os.writeByte(EOF_EOT);
+1:             ByteSequence sequence = os.toByteSequence();
+1:             sequence.compact();
+1:             return sequence.getData();
+1:         } catch (IOException e) {
+1:             throw new RuntimeException("Could not create eof header.", e);
+1:         }
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     protected ScheduledFuture cleanupTask;
+1:     private Object dataFileIdLock = new Object();
+0:     private  final AtomicReference<DataFile> currentDataFile = new AtomicReference<>(null);
+1:     private volatile DataFile nextDataFile;
+0:     protected PreallocationScope preallocationScope = PreallocationScope.ENTIRE_JOURNAL_ASYNC;
+1:     private File osKernelCopyTemplateFile = null;
+/////////////////////////////////////////////////////////////////////////
+1:             LinkedList<DataFile> l = new LinkedList<>(fileMap.values());
+1:                 } else if (l.getLast().equals(df) && isUnusedPreallocated(df)) {
+1:                     continue;
+/////////////////////////////////////////////////////////////////////////
+0:         if (preallocationScope != PreallocationScope.NONE && preallocationStrategy == PreallocationStrategy.OS_KERNEL_COPY) {
+0:             // create a template file that will be used to pre-allocate the journal files
+0:             if (osKernelCopyTemplateFile == null) {
+0:                 osKernelCopyTemplateFile = createJournalTemplateFile();
+1:             }
+1:         }
+1:         scheduler = Executors.newScheduledThreadPool(1, new ThreadFactory() {
+1:             @Override
+1:             public Thread newThread(Runnable r) {
+1:                 Thread schedulerThread = new Thread(r);
+1:                 schedulerThread.setName("ActiveMQ Journal Scheduled executor");
+1:                 schedulerThread.setDaemon(true);
+1:                 return schedulerThread;
+1:             }
+1:         });
+1: 
+1:         // init current write file
+1:         if (dataFiles.isEmpty()) {
+1:             nextDataFileId = 1;
+1:             rotateWriteFile();
+1:         } else {
+1:             currentDataFile.set(dataFiles.getTail());
+1:             nextDataFileId = currentDataFile.get().dataFileId + 1;
+1:         }
+/////////////////////////////////////////////////////////////////////////
+1:         cleanupTask = scheduler.scheduleAtFixedRate(new Runnable() {
+1:         }, DEFAULT_CLEANUP_INTERVAL, DEFAULT_CLEANUP_INTERVAL, TimeUnit.MILLISECONDS);
+1:         if (PreallocationScope.NONE != preallocationScope) {
+/////////////////////////////////////////////////////////////////////////
+1:         final ByteBuffer journalEof = ByteBuffer.wrap(EOF_RECORD);
+1:             FileChannel channel = file.getChannel();
+1:             channel.position(0);
+1:             channel.write(journalEof);
+1:             channel.position(maxFileLength - 5);
+1:             journalEof.rewind();
+1:             channel.write(journalEof);
+1:             channel.force(false);
+1:             channel.position(0);
+1:         } catch (ClosedByInterruptException ignored) {
+1:             LOG.trace("Could not preallocate journal file with sparse file", ignored);
+1:             LOG.error("Could not preallocate journal file with sparse file", e);
+0:         buffer.put(EOF_RECORD);
+0:         buffer.rewind();
+1:         } catch (ClosedByInterruptException ignored) {
+1:             LOG.trace("Could not preallocate journal file with zeros", ignored);
+1:             LOG.error("Could not preallocate journal file with zeros", e);
+0:             RandomAccessFile templateRaf = new RandomAccessFile(osKernelCopyTemplateFile, "rw");
+1:         } catch (ClosedByInterruptException ignored) {
+1:             LOG.trace("Could not preallocate journal file with kernel copy", ignored);
+1:             LOG.error("Could not find the template file on disk at " + osKernelCopyTemplateFile.getAbsolutePath(), e);
+1:             LOG.error("Could not transfer the template file to journal, transferFile=" + osKernelCopyTemplateFile.getAbsolutePath(), e);
+1:         try (RandomAccessFile templateRaf = new RandomAccessFile(rc, "rw");) {
+1:             templateRaf.getChannel().write(ByteBuffer.wrap(EOF_RECORD));
+1:             templateRaf.setLength(maxFileLength);
+1:             templateRaf.getChannel().force(true);
+1:         } catch (FileNotFoundException e) {
+1:             LOG.error("Could not find the template file on disk at " + osKernelCopyTemplateFile.getAbsolutePath(), e);
+1:         } catch (IOException e) {
+1:             LOG.error("Could not transfer the template file to journal, transferFile=" + osKernelCopyTemplateFile.getAbsolutePath(), e);
+/////////////////////////////////////////////////////////////////////////
+0:         buffer.put(EOF_RECORD);
+0:         buffer.rewind();
+/////////////////////////////////////////////////////////////////////////
+1:     public boolean isUnusedPreallocated(DataFile dataFile) throws IOException {
+0:         int firstBatchRecordSize = -1;
+1:         if (preallocationScope == PreallocationScope.ENTIRE_JOURNAL_ASYNC) {
+1:             Location location = new Location();
+1:             location.setDataFileId(dataFile.getDataFileId());
+1:             location.setOffset(0);
+1: 
+1:             DataFileAccessor reader = accessorPool.openDataFileAccessor(dataFile);
+1:             try {
+0:                 firstBatchRecordSize = checkBatchRecord(reader, location.getOffset());
+1:             } catch (Exception ignored) {
+1:             } finally {
+1:                 accessorPool.closeDataFileAccessor(reader);
+1:             }
+1:         }
+0:         return firstBatchRecordSize == 0;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                     if (size == 0) {
+1:                         // eof batch record
+1:                         break;
+1:                     }
+/////////////////////////////////////////////////////////////////////////
+0:             // check for journal eof
+0:             if (Arrays.equals(EOF_RECORD, Arrays.copyOfRange(controlRecord, 0, EOF_RECORD.length))) {
+0:                 // eof batch
+0:                 return 0;
+1:             }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     private void rotateWriteFile() throws IOException {
+1:        synchronized (dataFileIdLock) {
+1:             DataFile dataFile = nextDataFile;
+1:             if (dataFile == null) {
+1:                 dataFile = newDataFile();
+1:             }
+1:             synchronized (currentDataFile) {
+1:                 fileMap.put(dataFile.getDataFileId(), dataFile);
+1:                 fileByFileMap.put(dataFile.getFile(), dataFile);
+1:                 dataFiles.addLast(dataFile);
+1:                 currentDataFile.set(dataFile);
+1:             }
+1:             nextDataFile = null;
+1:         if (PreallocationScope.ENTIRE_JOURNAL_ASYNC == preallocationScope) {
+1:             preAllocateNextDataFileFuture = scheduler.submit(preAllocateNextDataFileTask);
+1:     private Runnable preAllocateNextDataFileTask = new Runnable() {
+1:         @Override
+1:         public void run() {
+1:             if (nextDataFile == null) {
+1:                 synchronized (dataFileIdLock){
+1:                     try {
+1:                         nextDataFile = newDataFile();
+1:                     } catch (IOException e) {
+1:                         LOG.warn("Failed to proactively allocate data file", e);
+1:                     }
+1:                 }
+1:             }
+1:         }
+1:     };
+1: 
+1:     private volatile Future preAllocateNextDataFileFuture;
+1: 
+1:     private DataFile newDataFile() throws IOException {
+1:         preallocateEntireJournalDataFile(nextWriteFile.appendRandomAccessFile());
+1: 
+1:     public DataFile reserveDataFile() {
+1:         synchronized (dataFileIdLock) {
+1:             int nextNum = nextDataFileId++;
+1:             File file = getFile(nextNum);
+1:             DataFile reservedDataFile = new DataFile(file, nextNum);
+1:             synchronized (currentDataFile) {
+1:                 fileMap.put(reservedDataFile.getDataFileId(), reservedDataFile);
+1:                 fileByFileMap.put(file, reservedDataFile);
+1:                 if (dataFiles.isEmpty()) {
+1:                     dataFiles.addLast(reservedDataFile);
+1:                 } else {
+1:                     dataFiles.getTail().linkBefore(reservedDataFile);
+1:                 }
+1:             }
+1:             return reservedDataFile;
+/////////////////////////////////////////////////////////////////////////
+1:     DataFile getDataFile(Location item) throws IOException {
+1:         DataFile dataFile = null;
+1:         synchronized (currentDataFile) {
+1:             dataFile = fileMap.get(key);
+1:         }
+/////////////////////////////////////////////////////////////////////////
+1:             cleanupTask.cancel(true);
+1:             if (preAllocateNextDataFileFuture != null) {
+1:                 preAllocateNextDataFileFuture.cancel(true);
+1:             ThreadPoolUtils.shutdownGraceful(scheduler, 4000);
+1:         synchronized (currentDataFile) {
+/////////////////////////////////////////////////////////////////////////
+1:         if (preAllocateNextDataFileFuture != null) {
+1:             preAllocateNextDataFileFuture.cancel(true);
+1:         }
+1:         synchronized (dataFileIdLock) {
+1:             if (nextDataFile != null) {
+1:                 nextDataFile.delete();
+1:                 nextDataFile = null;
+1:             }
+1:         }
+1:         totalLength.set(0);
+1:         synchronized (currentDataFile) {
+1:             fileMap.clear();
+1:             fileByFileMap.clear();
+1:             lastAppendLocation.set(null);
+1:             dataFiles = new LinkedNodeList<DataFile>();
+1:         }
+1:     public void removeDataFiles(Set<Integer> files) throws IOException {
+1:             DataFile dataFile = null;
+1:             synchronized (currentDataFile) {
+1:                 dataFile = fileMap.remove(key);
+1:                 if (dataFile != null) {
+1:                     fileByFileMap.remove(dataFile.getFile());
+1:                     dataFile.unlink();
+1:                 }
+1:             }
+1:     private void forceRemoveDataFile(DataFile dataFile) throws IOException {
+/////////////////////////////////////////////////////////////////////////
+1:     public Location getNextLocation(Location location) throws IOException, IllegalStateException {
+1:                     DataFile head = null;
+1:                     synchronized (currentDataFile) {
+1:                         head = dataFiles.getHead();
+1:                     }
+/////////////////////////////////////////////////////////////////////////
+1:                 synchronized (currentDataFile) {
+1:                     dataFile = dataFile.getNext();
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+1:             } else if (cur.getSize() == EOF_INT && cur.getType() == EOF_EOT ||
+1:                     (cur.getType() == 0 && cur.getSize() == 0)) {
+1:                 // EOF_INT and EOF_EOT replace 0,0 - we need to react to both for
+1:                 // replay of existing journals
+1:                 // possibly journal is larger than maxFileLength after config change
+1:                 cur.setSize(EOF_RECORD.length);
+1:                 cur.setOffset(Math.max(maxFileLength, dataFile.getLength()));
+/////////////////////////////////////////////////////////////////////////
+1:     public ByteSequence read(Location location) throws IOException, IllegalStateException {
+/////////////////////////////////////////////////////////////////////////
+1:     public DataFile getDataFileById(int dataFileId) {
+1:         synchronized (currentDataFile) {
+1:             return fileMap.get(Integer.valueOf(dataFileId));
+1:     public DataFile getCurrentDataFile(int capacity) throws IOException {
+1:         synchronized (currentDataFile) {
+1:             if (currentDataFile.get().getLength() + capacity >= maxFileLength) {
+1:                 rotateWriteFile();
+1:             }
+1:             return currentDataFile.get();
+1:         }
+1:     }
+1: 
+1:     public Integer getCurrentDataFileId() {
+1:         synchronized (currentDataFile) {
+1:             return currentDataFile.get().getDataFileId();
+/////////////////////////////////////////////////////////////////////////
+1:         synchronized (currentDataFile) {
+1:             return fileByFileMap.keySet();
+1:         }
+1:     public Map<Integer, DataFile> getFileMap() {
+1:         synchronized (currentDataFile) {
+1:             return new TreeMap<Integer, DataFile>(fileMap);
+1:         }
+commit:930a74c
+/////////////////////////////////////////////////////////////////////////
+1:     private static final int PREALLOC_CHUNK_SIZE = 1024*1024;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+commit:73db4d2
+/////////////////////////////////////////////////////////////////////////
+0:     // tackle corruption when checksum is disabled or corrupt with zeros, minimise data loss
+1:     public void corruptRecoveryLocation(Location recoveryPosition) throws IOException {
+1:         DataFile dataFile = getDataFile(recoveryPosition);
+1:         // with corruption on recovery we have no faith in the content - slip to the next batch record or eof
+1:         DataFileAccessor reader = accessorPool.openDataFileAccessor(dataFile);
+1:         try {
+0:             int nextOffset = findNextBatchRecord(reader, recoveryPosition.getOffset() + 1);
+0:             Sequence sequence = new Sequence(recoveryPosition.getOffset(), nextOffset >= 0 ? nextOffset - 1 : dataFile.getLength() - 1);
+0:             LOG.info("Corrupt journal records found in '" + dataFile.getFile() + "' between offsets: " + sequence);
+1: 
+1:             // skip corruption on getNextLocation
+0:             recoveryPosition.setOffset((int) sequence.getLast() + 1);
+1:             recoveryPosition.setSize(-1);
+1: 
+1:             dataFile.corruptedBlocks.add(sequence);
+1: 
+1:         } catch (IOException e) {
+1:         } finally {
+1:             accessorPool.closeDataFileAccessor(reader);
+1:         }
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:                 if ( size>=0 && location.getOffset()+BATCH_CONTROL_RECORD_SIZE+size <= dataFile.getLength()) {
+commit:a7178a4
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.activemq.store.kahadb.disk.util.SequenceSet;
+/////////////////////////////////////////////////////////////////////////
+1:             Sequence corruptedRange = dataFile.corruptedBlocks.get(cur.getOffset());
+1:             if (corruptedRange != null) {
+1:                 // skip corruption
+1:                 cur.setSize((int) corruptedRange.range());
+0:             } else if (cur.getType() == 0) {
+1:                 // eof - jump to next datafile
+commit:260e28e
+/////////////////////////////////////////////////////////////////////////
+1:     public void close() throws IOException {
+1:         synchronized (this) {
+1:             if (!started) {
+1:                 return;
+1:             }
+0:             if (this.timer != null) {
+0:                 this.timer.cancel();
+1:             }
+1:             accessorPool.close();
+1:         // the appender can be calling back to to the journal blocking a close AMQ-5620
+1:         synchronized (this) {
+1:             fileMap.clear();
+1:             fileByFileMap.clear();
+1:             dataFiles.clear();
+1:             lastAppendLocation.set(null);
+1:             started = false;
+1:         }
+commit:95f7262
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:                     DataFile dataFile = new DataFile(file, num);
+/////////////////////////////////////////////////////////////////////////
+1:         // ensure we don't report unused space of last journal file in size metric
+0:         if (totalLength.get() > maxFileLength && lastAppendLocation.get().getOffset() > 0) {
+0:             totalLength.addAndGet(lastAppendLocation.get().getOffset() - maxFileLength);
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         DataFile nextWriteFile = new DataFile(file, nextNum);
+/////////////////////////////////////////////////////////////////////////
+0:         totalLength.set(0);
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:                 // invalid offset - jump to next datafile
+0:                 cur.setOffset(maxFileLength);
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         return totalLength.get();
+author:Christopher L. Shannon (cshannon)
+-------------------------------------------------------------------------------
+commit:0ad62f7
+/////////////////////////////////////////////////////////////////////////
+1:         int lastFileLength = dataFiles.getTail().getLength();
+1:         if (totalLength.get() > lastFileLength && lastAppendLocation.get().getOffset() > 0) {
+1:             totalLength.addAndGet(lastAppendLocation.get().getOffset() - lastFileLength);
+commit:5fd63a0
+/////////////////////////////////////////////////////////////////////////
+1:         //First just acquire the currentDataFile lock and return if no rotation needed
+1:             if (currentDataFile.get().getLength() + capacity < maxFileLength) {
+1:                 return currentDataFile.get();
+1:         }
+1: 
+1:         //AMQ-6545 - if rotation needed, acquire dataFileIdLock first to prevent deadlocks
+1:         //then re-check if rotation is needed
+1:         synchronized (dataFileIdLock) {
+1:             synchronized (currentDataFile) {
+0:                 if (currentDataFile.get().getLength() + capacity >= maxFileLength) {
+0:                     rotateWriteFile();
+1:                 }
+1:                 return currentDataFile.get();
+1:             }
+commit:351faf2
+/////////////////////////////////////////////////////////////////////////
+1:         try (RandomAccessFile templateRaf = new RandomAccessFile(osKernelCopyTemplateFile, "rw");){
+commit:1a59827
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+commit:dd0ed17
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.Arrays;
+1: import java.util.Collections;
+1: import java.util.HashMap;
+1: import java.util.Iterator;
+1: import java.util.LinkedHashMap;
+1: import java.util.LinkedList;
+1: import java.util.Map;
+1: import java.util.Set;
+1: import java.util.TreeMap;
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.concurrent.atomic.AtomicBoolean;
+/////////////////////////////////////////////////////////////////////////
+0:     protected final AtomicBoolean currentFileNeedSync = new AtomicBoolean();
+/////////////////////////////////////////////////////////////////////////
+1:     public enum JournalDiskSyncStrategy {
+1:         ALWAYS,
+1:         PERIODIC,
+1:         NEVER;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     private final AtomicReference<DataFile> currentDataFile = new AtomicReference<>(null);
+1:     protected JournalDiskSyncStrategy journalDiskSyncStrategy = JournalDiskSyncStrategy.ALWAYS;
+/////////////////////////////////////////////////////////////////////////
+0:                 syncCurrentDataFile();
+/////////////////////////////////////////////////////////////////////////
+0:     public void syncCurrentDataFile() throws IOException {
+0:         synchronized (currentDataFile) {
+0:             DataFile dataFile = currentDataFile.get();
+0:             if (dataFile != null && isJournalDiskSyncPeriodic()) {
+0:                 if (currentFileNeedSync.compareAndSet(true, false)) {
+0:                     LOG.trace("Syncing Journal file: {}", dataFile.getFile().getName());
+0:                     RecoverableRandomAccessFile file = dataFile.openRandomAccessFile();
+1:                     try {
+0:                         file.sync();
+1:                     } finally {
+0:                         file.close();
+1:                     }
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:             syncCurrentDataFile();
+/////////////////////////////////////////////////////////////////////////
+1:     public JournalDiskSyncStrategy getJournalDiskSyncStrategy() {
+1:         return journalDiskSyncStrategy;
+1:     }
+1: 
+1:     public void setJournalDiskSyncStrategy(JournalDiskSyncStrategy journalDiskSyncStrategy) {
+1:         this.journalDiskSyncStrategy = journalDiskSyncStrategy;
+1:     }
+1: 
+1:     public boolean isJournalDiskSyncPeriodic() {
+1:         return JournalDiskSyncStrategy.PERIODIC.equals(journalDiskSyncStrategy);
+1:     }
+1: 
+author:Hadrian Zbarcea
+-------------------------------------------------------------------------------
+commit:e725451
+/////////////////////////////////////////////////////////////////////////
+1:             LOG.warn("Corrupt journal records found in '{}' between offsets: {}", dataFile.getFile(), sequence);
+/////////////////////////////////////////////////////////////////////////
+1:                         LOG.warn("Corrupt journal records found in '{}' between offsets: {}", dataFile.getFile(), sequence);
+author:Timothy Bish
+-------------------------------------------------------------------------------
+commit:946e62d
+/////////////////////////////////////////////////////////////////////////
+1:     private int nextDataFileId = 1;
+/////////////////////////////////////////////////////////////////////////
+0:         nextDataFileId = !dataFiles.isEmpty() ? dataFiles.getTail().getDataFileId().intValue() + 1 : 1;
+1: 
+0:         getOrCreateCurrentWriteFile();
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             while (true) {
+0:                 if (size >= 0 && location.getOffset() + BATCH_CONTROL_RECORD_SIZE + size <= dataFile.getLength()) {
+1:                     location.setOffset(location.getOffset() + BATCH_CONTROL_RECORD_SIZE + size);
+1:                     // Perhaps it's just some corruption... scan through the
+1:                     // file to find the next valid batch record. We
+0:                     int nextOffset = findNextBatchRecord(reader, location.getOffset() + 1);
+0:                     if (nextOffset >= 0) {
+/////////////////////////////////////////////////////////////////////////
+1:         if (!dataFile.corruptedBlocks.isEmpty()) {
+1:             if (dataFile.corruptedBlocks.getTail().getLast() + 1 == location.getOffset()) {
+/////////////////////////////////////////////////////////////////////////
+1:         while (true) {
+1:             if (pos >= 0) {
+0:                 return offset + pos;
+0:                 if (bs.length != data.length) {
+0:                 offset += bs.length - BATCH_CONTROL_RECORD_HEADER.length;
+0:                 pos = 0;
+/////////////////////////////////////////////////////////////////////////
+1:             // Assert that it's a batch record.
+1:             for (int i = 0; i < BATCH_CONTROL_RECORD_HEADER.length; i++) {
+1:                 if (controlIs.readByte() != BATCH_CONTROL_RECORD_HEADER[i]) {
+0:             if (size > MAX_BATCH_SIZE) {
+0:             if (isChecksum()) {
+0:                 if (expectedChecksum == 0) {
+0:                 reader.readFully(offset + BATCH_CONTROL_RECORD_SIZE, data);
+0:                 if (expectedChecksum != checksum.getValue()) {
+/////////////////////////////////////////////////////////////////////////
+0:     synchronized DataFile getOrCreateCurrentWriteFile() throws IOException {
+1: 
+0:         DataFile current = dataFiles.getTail();
+1: 
+0:         if (current != null) {
+0:             return current;
+1:         } else {
+0:             return rotateWriteFile();
+1:         }
+1:         int nextNum = nextDataFileId++;
+/////////////////////////////////////////////////////////////////////////
+0:     public synchronized DataFile reserveDataFile() {
+0:         int nextNum = nextDataFileId++;
+1:         File file = getFile(nextNum);
+0:         DataFile reservedDataFile = new DataFile(file, nextNum);
+0:         fileMap.put(reservedDataFile.getDataFileId(), reservedDataFile);
+0:         fileByFileMap.put(file, reservedDataFile);
+0:         if (dataFiles.isEmpty()) {
+0:             dataFiles.addLast(reservedDataFile);
+1:         } else {
+0:             dataFiles.getTail().linkBefore(reservedDataFile);
+1:         }
+0:         return reservedDataFile;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             if (key >= lastAppendLocation.get().getDataFileId()) {
+1:             if (dataFile != null) {
+/////////////////////////////////////////////////////////////////////////
+1:             if (dataFile.delete()) {
+/////////////////////////////////////////////////////////////////////////
+1:                     if (head == null) {
+/////////////////////////////////////////////////////////////////////////
+0:                 dataFile = dataFile.getNext();
+/////////////////////////////////////////////////////////////////////////
+0:     public synchronized DataFile getDataFileById(int dataFileId) {
+0:         if (dataFiles.isEmpty()) {
+1:         }
+1: 
+0:         return fileMap.get(Integer.valueOf(dataFileId));
+1:     }
+1: 
+0:     public synchronized DataFile getCurrentDataFile() {
+0:         if (dataFiles.isEmpty()) {
+1:             return null;
+1:         }
+1: 
+0:         DataFile current = dataFiles.getTail();
+1: 
+0:         if (current != null) {
+0:             return current;
+1:         } else {
+1:             return null;
+1:         }
+1:     }
+1: 
+0:     public synchronized Integer getCurrentDataFileId() {
+0:         DataFile current = getCurrentDataFile();
+0:         if (current != null) {
+0:             return current.getDataFileId();
+1:         } else {
+1:             return null;
+1:         }
+commit:5e0f493
+/////////////////////////////////////////////////////////////////////////
+0:         buffer.limit(maxFileLength);
+commit:edfc23e
+/////////////////////////////////////////////////////////////////////////
+0:     private static final int PREALLOC_CHUNK_SIZE = 1 << 20;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     public static final int BATCH_CONTROL_RECORD_SIZE = RECORD_HEAD_SPACE + BATCH_CONTROL_RECORD_MAGIC.length + 4 + 8;
+1:     // tackle corruption when checksum is disabled or corrupt with zeros, minimize data loss
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         ZEROS,
+1:         CHUNKED_ZEROS;
+/////////////////////////////////////////////////////////////////////////
+0:             } else if (PreallocationStrategy.CHUNKED_ZEROS == preallocationStrategy) {
+0:                 doPreallocationChunkedZeros(file);
+/////////////////////////////////////////////////////////////////////////
+1:     private void doPreallocationChunkedZeros(RecoverableRandomAccessFile file) {
+1: 
+0:         ByteBuffer buffer = ByteBuffer.allocate(PREALLOC_CHUNK_SIZE);
+0:         buffer.position(0);
+0:         buffer.limit(PREALLOC_CHUNK_SIZE);
+1: 
+1:         try {
+1:             FileChannel channel = file.getChannel();
+1: 
+1:             int remLen = maxFileLength;
+1:             while (remLen > 0) {
+0:                 if (remLen < buffer.remaining()) {
+0:                     buffer.limit(remLen);
+1:                 }
+0:                 int writeLen = channel.write(buffer);
+1:                 remLen -= writeLen;
+0:                 buffer.rewind();
+1:             }
+1: 
+1:             channel.force(false);
+1:             channel.position(0);
+1:         } catch (IOException e) {
+1:             LOG.error("Could not preallocate journal file with zeros! Will continue without preallocation", e);
+1:         }
+1:     }
+commit:be4ad3d
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         File rc = new File(directory, fileName);
+0:             LOG.trace("deleting journal template file because it already exists...");
+commit:e8f44a2
+/////////////////////////////////////////////////////////////////////////
+0:         // intentional double initialization due to interaction with the OS level
+0:         // file allocation mechanics.
+0:         for (int i = 0; i < maxFileLength; i++) {
+0:             buffer.put((byte) 0x00);
+1:         }
+0:         buffer.flip();
+commit:e89b7a5
+/////////////////////////////////////////////////////////////////////////
+1: import java.io.File;
+1: import java.io.FileNotFoundException;
+1: import java.io.FilenameFilter;
+1: import java.io.IOException;
+1: import java.io.RandomAccessFile;
+1: import java.io.UnsupportedEncodingException;
+0: import java.util.ArrayList;
+0: import java.util.Collections;
+0: import java.util.HashMap;
+0: import java.util.Iterator;
+0: import java.util.LinkedHashMap;
+0: import java.util.List;
+0: import java.util.Map;
+0: import java.util.Set;
+0: import java.util.Timer;
+0: import java.util.TimerTask;
+0: import java.util.TreeMap;
+1: 
+1: import org.apache.activemq.util.ByteSequence;
+1: import org.apache.activemq.util.DataByteArrayInputStream;
+1: import org.apache.activemq.util.DataByteArrayOutputStream;
+1: import org.apache.activemq.util.IOHelper;
+1: import org.apache.activemq.util.RecoverableRandomAccessFile;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+/////////////////////////////////////////////////////////////////////////
+1:         try (DataByteArrayOutputStream os = new DataByteArrayOutputStream();) {
+/////////////////////////////////////////////////////////////////////////
+1:             @Override
+/////////////////////////////////////////////////////////////////////////
+1:             @Override
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:             } else if (PreallocationStrategy.ZEROS == preallocationStrategy) {
+1:             } else {
+1:         } else {
+/////////////////////////////////////////////////////////////////////////
+0:         buffer.limit(maxFileLength);
+/////////////////////////////////////////////////////////////////////////
+0:         try (DataByteArrayInputStream controlIs = new DataByteArrayInputStream(controlRecord);) {
+0:             reader.readFully(offset, controlRecord);
+0:             // Assert that it's  a batch record.
+0:             for( int i=0; i < BATCH_CONTROL_RECORD_HEADER.length; i++ ) {
+0:                 if( controlIs.readByte() != BATCH_CONTROL_RECORD_HEADER[i] ) {
+1:                     return -1;
+1:                 }
+1:             int size = controlIs.readInt();
+0:             if( size > MAX_BATCH_SIZE ) {
+0:             if( isChecksum() ) {
+1: 
+0:                 long expectedChecksum = controlIs.readLong();
+0:                 if( expectedChecksum == 0 ) {
+0:                     // Checksuming was not enabled when the record was stored.
+0:                     // we can't validate the record :(
+1:                     return size;
+1:                 }
+1: 
+0:                 byte data[] = new byte[size];
+0:                 reader.readFully(offset+BATCH_CONTROL_RECORD_SIZE, data);
+1: 
+0:                 Checksum checksum = new Adler32();
+0:                 checksum.update(data, 0, data.length);
+1: 
+0:                 if( expectedChecksum!=checksum.getValue() ) {
+1:                     return -1;
+1:                 }
+1:             }
+1:             return size;
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         @Override
+1:         @Override
+author:Torsten Mielke
+-------------------------------------------------------------------------------
+commit:66c348b
+/////////////////////////////////////////////////////////////////////////
+0:             LOG.warn("Corrupt journal records found in '" + dataFile.getFile() + "' between offsets: " + sequence);
+/////////////////////////////////////////////////////////////////////////
+0:                         LOG.warn("Corrupt journal records found in '" + dataFile.getFile() + "' between offsets: " + sequence);
+author:Christian Posta
+-------------------------------------------------------------------------------
+commit:8e551b4
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+commit:023b2ac
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         if (preallocationStrategy != PreallocationStrategy.SPARSE_FILE && maxFileLength != DEFAULT_MAX_FILE_LENGTH) {
+0:             LOG.warn("You are using a preallocation strategy and journal maxFileLength which should be benchmarked accordingly to not introduce unexpected latencies.");
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+commit:45e59e6
+/////////////////////////////////////////////////////////////////////////
+0: import java.io.*;
+1: import java.nio.ByteBuffer;
+1: import java.nio.channels.FileChannel;
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.activemq.util.*;
+/////////////////////////////////////////////////////////////////////////
+1:     public enum PreallocationStrategy {
+1:         SPARSE_FILE,
+1:         OS_KERNEL_COPY,
+0:         ZEROS;
+1:     }
+1: 
+1:     public enum PreallocationScope {
+0:         BATCH,
+0:         ENTIRE_JOURNAL;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:     public static final int DEFAULT_PREALLOCATION_BATCH_SIZE = 1024 * 1024 * 1;
+/////////////////////////////////////////////////////////////////////////
+0:     protected PreallocationScope preallocationScope = PreallocationScope.ENTIRE_JOURNAL;
+1:     protected PreallocationStrategy preallocationStrategy = PreallocationStrategy.SPARSE_FILE;
+0:     protected int preallocationBatchSize = DEFAULT_PREALLOCATION_BATCH_SIZE;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     public void preallocateEntireJournalDataFile(RecoverableRandomAccessFile file) {
+1: 
+0:         if (PreallocationScope.ENTIRE_JOURNAL == preallocationScope) {
+1: 
+0:             if (PreallocationStrategy.OS_KERNEL_COPY == preallocationStrategy) {
+0:                 doPreallocationKernelCopy(file);
+1: 
+0:             }else if (PreallocationStrategy.ZEROS == preallocationStrategy) {
+0:                 doPreallocationZeros(file);
+1:             }
+0:             else {
+0:                 doPreallocationSparseFile(file);
+1:             }
+0:         }else {
+0:             LOG.info("Using journal preallocation scope of batch allocation");
+1:         }
+1:     }
+1: 
+1:     private void doPreallocationSparseFile(RecoverableRandomAccessFile file) {
+0:         LOG.info("Preallocate journal file with sparse file");
+1:         try {
+0:             file.seek(maxFileLength - 1);
+0:             file.write((byte)0x00);
+1:         } catch (IOException e) {
+0:             LOG.error("Could not preallocate journal file with sparse file! Will continue without preallocation", e);
+1:         }
+1:     }
+1: 
+1:     private void doPreallocationZeros(RecoverableRandomAccessFile file) {
+0:         LOG.info("Preallocate journal file with zeros");
+0:         ByteBuffer buffer = ByteBuffer.allocate(maxFileLength);
+0:         for (int i = 0; i < maxFileLength; i++) {
+0:             buffer.put((byte) 0x00);
+1:         }
+0:         buffer.flip();
+1: 
+1:         try {
+1:             FileChannel channel = file.getChannel();
+0:             channel.write(buffer);
+1:             channel.force(false);
+1:             channel.position(0);
+1:         } catch (IOException e) {
+0:             LOG.error("Could not preallocate journal file with zeros! Will continue without preallocation", e);
+1:         }
+1:     }
+1: 
+1:     private void doPreallocationKernelCopy(RecoverableRandomAccessFile file) {
+0:         LOG.info("Preallocate journal file with kernel file copying");
+1: 
+0:         // create a template file that will be used to pre-allocate the journal files
+0:         File templateFile = createJournalTemplateFile();
+1: 
+0:         RandomAccessFile templateRaf = null;
+1:         try {
+0:             templateRaf = new RandomAccessFile(templateFile, "rw");
+0:             templateRaf.setLength(maxFileLength);
+0:             templateRaf.getChannel().force(true);
+1:             templateRaf.getChannel().transferTo(0, getMaxFileLength(), file.getChannel());
+0:             templateRaf.close();
+0:             templateFile.delete();
+1:         } catch (FileNotFoundException e) {
+0:             LOG.error("Could not find the template file on disk at " + templateFile.getAbsolutePath(), e);
+1:         } catch (IOException e) {
+0:             LOG.error("Could not transfer the template file to journal, transferFile=" + templateFile.getAbsolutePath(), e);
+1:         }
+1:     }
+1: 
+1:     private File createJournalTemplateFile() {
+1:         String fileName = "db-log.template";
+0:         File rc  = new File(directory, fileName);
+0:         if (rc.exists()) {
+0:             System.out.println("deleting file because it already exists...");
+0:             rc.delete();
+1: 
+1:         }
+1:         return rc;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     public PreallocationStrategy getPreallocationStrategy() {
+1:         return preallocationStrategy;
+1:     }
+1: 
+1:     public void setPreallocationStrategy(PreallocationStrategy preallocationStrategy) {
+1:         this.preallocationStrategy = preallocationStrategy;
+1:     }
+1: 
+1:     public PreallocationScope getPreallocationScope() {
+1:         return preallocationScope;
+1:     }
+1: 
+1:     public void setPreallocationScope(PreallocationScope preallocationScope) {
+1:         this.preallocationScope = preallocationScope;
+1:     }
+1: 
+0:     public int getPreallocationBatchSize() {
+0:         return preallocationBatchSize;
+1:     }
+1: 
+0:     public void setPreallocationBatchSize(int preallocationBatchSize) {
+0:         this.preallocationBatchSize = preallocationBatchSize;
+1:     }
+1: 
+author:Dejan Bosanac
+-------------------------------------------------------------------------------
+commit:802e527
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.*;
+0: import org.apache.activemq.util.IOHelper;
+/////////////////////////////////////////////////////////////////////////
+1:     protected File directoryArchive;
+1:     private boolean directoryArchiveOverridden = false;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     public interface DataFileRemovedListener {
+1:         void fileRemoved(DataFile datafile);
+1:     }
+1: 
+1:     private DataFileRemovedListener dataFileRemovedListener;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             File directoryArchive = getDirectoryArchive();
+1:             if (directoryArchive.exists()) {
+1:                 LOG.debug("Archive directory exists: {}", directoryArchive);
+1:                 if (directoryArchive.isAbsolute())
+1:                 if (LOG.isDebugEnabled()) {
+1:                     LOG.debug("Archive directory [{}] does not exist - creating it now",
+1:                             directoryArchive.getAbsolutePath());
+1:                 }
+1:                 IOHelper.mkdirs(directoryArchive);
+1:             LOG.debug("Moving data file {} to {} ", dataFile, directoryArchive.getCanonicalPath());
+1:             dataFile.move(directoryArchive);
+1:             LOG.debug("Successfully moved data file");
+1:         } else {
+1:             LOG.debug("Deleting data file: {}", dataFile);
+0:             if ( dataFile.delete() ) {
+1:                 LOG.debug("Discarded data file: {}", dataFile);
+1:             } else {
+1:                 LOG.warn("Failed to discard data file : {}", dataFile.getFile());
+1:             }
+1:         }
+1:         if (dataFileRemovedListener != null) {
+1:             dataFileRemovedListener.fileRemoved(dataFile);
+/////////////////////////////////////////////////////////////////////////
+1:         if (!directoryArchiveOverridden && (directoryArchive == null)) {
+1:             // create the directoryArchive relative to the journal location
+1:             directoryArchive = new File(directory.getAbsolutePath() +
+1:                     File.separator + DEFAULT_ARCHIVE_DIRECTORY);
+1:         }
+1:         directoryArchiveOverridden = true;
+/////////////////////////////////////////////////////////////////////////
+1:     public void setDataFileRemovedListener(DataFileRemovedListener dataFileRemovedListener) {
+1:         this.dataFileRemovedListener = dataFileRemovedListener;
+1:     }
+1: 
+author:Hiram R. Chirino
+-------------------------------------------------------------------------------
+commit:c5cf038
+commit:1aab71b
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.activemq.store.kahadb.disk.journal;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.activemq.store.kahadb.disk.util.LinkedNode;
+0: import org.apache.activemq.util.ByteSequence;
+0: import org.apache.activemq.util.DataByteArrayInputStream;
+0: import org.apache.activemq.util.DataByteArrayOutputStream;
+1: import org.apache.activemq.store.kahadb.disk.util.LinkedNodeList;
+0: import org.apache.activemq.store.kahadb.disk.util.SchedulerTimerTask;
+1: import org.apache.activemq.store.kahadb.disk.util.Sequence;
+commit:715010a
+commit:0bbc0ac
+/////////////////////////////////////////////////////////////////////////
+1:  * 
+commit:76d3b46
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.*;
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.kahadb.util.*;
+/////////////////////////////////////////////////////////////////////////
+1:     public static final byte[] BATCH_CONTROL_RECORD_HEADER = createBatchControlRecordHeader();
+1: 
+1:     private static byte[] createBatchControlRecordHeader() {
+1:         try {
+0:             DataByteArrayOutputStream os = new DataByteArrayOutputStream();
+1:             os.writeInt(BATCH_CONTROL_RECORD_SIZE);
+1:             os.writeByte(BATCH_CONTROL_RECORD_TYPE);
+1:             os.write(BATCH_CONTROL_RECORD_MAGIC);
+1:             ByteSequence sequence = os.toByteSequence();
+1:             sequence.compact();
+1:             return sequence.getData();
+1:         } catch (IOException e) {
+0:             throw new RuntimeException("Could not create batch control record header.");
+1:         }
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     protected boolean checkForCorruptionOnStartup;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:                 if( isCheckForCorruptionOnStartup() ) {
+1:                     lastAppendLocation.set(recoveryCheck(df));
+1:                 }
+1: 
+1:         if( lastAppendLocation.get()==null ) {
+1:             DataFile df = dataFiles.getTail();
+1:             lastAppendLocation.set(recoveryCheck(df));
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:                 int size = checkBatchRecord(reader, location.getOffset());
+0:                 if ( size>=0 ) {
+0:                     location.setOffset(location.getOffset()+BATCH_CONTROL_RECORD_SIZE+size);
+1:                 } else {
+1: 
+0:                     // Perhaps it's just some corruption... scan through the file to find the next valid batch record.  We
+1:                     // may have subsequent valid batch records.
+0:                     int nextOffset = findNextBatchRecord(reader, location.getOffset()+1);
+0:                     if( nextOffset >=0 ) {
+1:                         Sequence sequence = new Sequence(location.getOffset(), nextOffset - 1);
+0:                         LOG.info("Corrupt journal records found in '"+dataFile.getFile()+"' between offsets: "+sequence);
+1:                         dataFile.corruptedBlocks.add(sequence);
+1:                         location.setOffset(nextOffset);
+1:                     } else {
+1:                         break;
+1:                     }
+1:                 }
+1: 
+1: 
+0:         if( !dataFile.corruptedBlocks.isEmpty() ) {
+1:             // Is the end of the data file corrupted?
+0:             if( dataFile.corruptedBlocks.getTail().getLast()+1 == location.getOffset() ) {
+1:                 dataFile.setLength((int) dataFile.corruptedBlocks.removeLastSequence().getFirst());
+1:             }
+1:         }
+1: 
+0:     private int findNextBatchRecord(DataFileAccessor reader, int offset) throws IOException {
+0:         ByteSequence header = new ByteSequence(BATCH_CONTROL_RECORD_HEADER);
+0:         byte data[] = new byte[1024*4];
+0:         ByteSequence bs = new ByteSequence(data, 0, reader.read(offset, data));
+1: 
+1:         int pos = 0;
+0:         while( true ) {
+0:             pos = bs.indexOf(header, pos);
+0:             if( pos >= 0 ) {
+0:                 return offset+pos;
+1:             } else {
+1:                 // need to load the next data chunck in..
+0:                 if( bs.length != data.length ) {
+1:                     // If we had a short read then we were at EOF
+0:                     return -1;
+1:                 }
+0:                 offset += bs.length-BATCH_CONTROL_RECORD_HEADER.length;
+0:                 bs = new ByteSequence(data, 0, reader.read(offset, data));
+0:                 pos=0;
+1:             }
+1:         }
+1:     }
+1: 
+1: 
+0:     public int checkBatchRecord(DataFileAccessor reader, int offset) throws IOException {
+0:         byte controlRecord[] = new byte[BATCH_CONTROL_RECORD_SIZE];
+0:         DataByteArrayInputStream controlIs = new DataByteArrayInputStream(controlRecord);
+1: 
+0:         reader.readFully(offset, controlRecord);
+1: 
+0:         // Assert that it's  a batch record.
+0:         for( int i=0; i < BATCH_CONTROL_RECORD_HEADER.length; i++ ) {
+0:             if( controlIs.readByte() != BATCH_CONTROL_RECORD_HEADER[i] ) {
+0:                 return -1;
+1:             }
+1:         }
+1: 
+0:         int size = controlIs.readInt();
+0:         if( size > MAX_BATCH_SIZE ) {
+0:             return -1;
+1:         }
+1: 
+0:         if( isChecksum() ) {
+1: 
+0:             long expectedChecksum = controlIs.readLong();
+0:             if( expectedChecksum == 0 ) {
+0:                 // Checksuming was not enabled when the record was stored.
+0:                 // we can't validate the record :(
+0:                 return size;
+1:             }
+1: 
+0:             byte data[] = new byte[size];
+0:             reader.readFully(offset+BATCH_CONTROL_RECORD_SIZE, data);
+1: 
+0:             Checksum checksum = new Adler32();
+0:             checksum.update(data, 0, data.length);
+1: 
+0:             if( expectedChecksum!=checksum.getValue() ) {
+0:                 return -1;
+1:             }
+1: 
+1:         }
+0:         return size;
+1:     }
+1: 
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     public boolean isCheckForCorruptionOnStartup() {
+1:         return checkForCorruptionOnStartup;
+1:     }
+1:     public void setCheckForCorruptionOnStartup(boolean checkForCorruptionOnStartup) {
+1:         this.checkForCorruptionOnStartup = checkForCorruptionOnStartup;
+1:     }
+commit:f73b622
+/////////////////////////////////////////////////////////////////////////
+0: import java.io.UnsupportedEncodingException;
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.zip.Adler32;
+1: import java.util.zip.Checksum;
+0: import org.apache.kahadb.util.DataByteArrayInputStream;
+/////////////////////////////////////////////////////////////////////////
+0:     private static final int MAX_BATCH_SIZE = 32*1024*1024;
+1: 	// ITEM_HEAD_SPACE = length + type+ reserved space + SOR
+1:     public static final int RECORD_HEAD_SPACE = 4 + 1;
+1:     
+1:     public static final byte USER_RECORD_TYPE = 1;
+1:     public static final byte BATCH_CONTROL_RECORD_TYPE = 2;
+1:     // Batch Control Item holds a 4 byte size of the batch and a 8 byte checksum of the batch. 
+1:     public static final byte[] BATCH_CONTROL_RECORD_MAGIC = bytes("WRITE BATCH");
+0:     public static final int BATCH_CONTROL_RECORD_SIZE = RECORD_HEAD_SPACE+BATCH_CONTROL_RECORD_MAGIC.length+4+8;
+1:     
+/////////////////////////////////////////////////////////////////////////
+1:     
+/////////////////////////////////////////////////////////////////////////
+1:     protected boolean checksum;
+/////////////////////////////////////////////////////////////////////////
+1:         appender = new DataFileAppender(this);
+/////////////////////////////////////////////////////////////////////////
+0:     	getCurrentWriteFile();
+1:         try {
+0:         	Location l = recoveryCheck(dataFiles.getTail());
+0:             lastAppendLocation.set(l);
+1:         } catch (IOException e) {
+0:             LOG.warn("recovery check failed", e);
+1:         
+/////////////////////////////////////////////////////////////////////////
+1:     private static byte[] bytes(String string) {
+1:     	try {
+1: 			return string.getBytes("UTF-8");
+1: 		} catch (UnsupportedEncodingException e) {
+1: 			throw new RuntimeException(e);
+1: 		}
+1: 	}
+1: 
+1: 	protected Location recoveryCheck(DataFile dataFile) throws IOException {
+0:     	byte controlRecord[] = new byte[BATCH_CONTROL_RECORD_SIZE];
+0:     	DataByteArrayInputStream controlIs = new DataByteArrayInputStream(controlRecord);
+1:     	
+0:         Location location = new Location();
+0:         location.setDataFileId(dataFile.getDataFileId());
+0:         location.setOffset(0);
+1: 
+1:     	DataFileAccessor reader = accessorPool.openDataFileAccessor(dataFile);
+0:             while( true ) {
+0: 	        	reader.read(location.getOffset(), controlRecord);
+0: 	        	controlIs.restart();
+1: 	        	
+0: 	        	// Assert that it's  a batch record.
+0: 	        	if( controlIs.readInt() != BATCH_CONTROL_RECORD_SIZE ) {
+0: 	        		break;
+1: 	        	}
+0: 	        	if( controlIs.readByte() != BATCH_CONTROL_RECORD_TYPE ) {
+0: 	        		break;
+1: 	        	}
+0: 	        	for( int i=0; i < BATCH_CONTROL_RECORD_MAGIC.length; i++ ) {
+0: 	        		if( controlIs.readByte() != BATCH_CONTROL_RECORD_MAGIC[i] ) {
+0: 	        			break;
+1: 	        		}
+1: 	        	}
+1: 	        	
+0: 	        	int size = controlIs.readInt();
+0: 	        	if( size > MAX_BATCH_SIZE ) {
+0: 	        		break;
+1: 	        	}
+1: 	        	
+0: 	        	if( isChecksum() ) {
+1: 		        	
+0: 	        		long expectedChecksum = controlIs.readLong();	        	
+1: 		        	
+0: 	        		byte data[] = new byte[size];
+0: 		        	reader.read(location.getOffset()+BATCH_CONTROL_RECORD_SIZE, data);
+1: 		        	
+0: 		        	Checksum checksum = new Adler32();
+0: 	                checksum.update(data, 0, data.length);
+1: 	                
+0: 	                if( expectedChecksum!=checksum.getValue() ) {
+0: 	                	break;
+1: 	                }
+1: 	                
+1: 	        	}
+1:                 
+1: 	        	
+0:                 location.setOffset(location.getOffset()+BATCH_CONTROL_RECORD_SIZE+size);
+1:             
+0:         } catch (IOException e) {
+1: 		} finally {
+1:         
+1: 	void addToTotalLength(int size) {
+1: 		totalLength.addAndGet(size);
+1: 	}
+1:     
+1:     
+0:     synchronized DataFile getCurrentWriteFile() throws IOException {
+0:         if (dataFiles.isEmpty()) {
+0:             rotateWriteFile();
+0:         return dataFiles.getTail();
+0:     synchronized DataFile rotateWriteFile() {
+0: 		int nextNum = !dataFiles.isEmpty() ? dataFiles.getTail().getDataFileId().intValue() + 1 : 1;
+0: 		File file = getFile(nextNum);
+0: 		DataFile nextWriteFile = new DataFile(file, nextNum, preferedFileLength);
+0: 		// actually allocate the disk space
+0: 		fileMap.put(nextWriteFile.getDataFileId(), nextWriteFile);
+0: 		fileByFileMap.put(file, nextWriteFile);
+0: 		dataFiles.addLast(nextWriteFile);
+1: 		return nextWriteFile;
+1: 	}
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         appender = new DataFileAppender(this);
+/////////////////////////////////////////////////////////////////////////
+1:             } else if (cur.getType() == USER_RECORD_TYPE) {
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: 	public boolean isChecksum() {
+1: 		return checksum;
+1: 	}
+1: 
+1: 	public void setChecksum(boolean checksumWrites) {
+1: 		this.checksum = checksumWrites;
+1: 	}
+1: 
+commit:789ea7c
+/////////////////////////////////////////////////////////////////////////
+1:             // Can't remove the data file (or subsequent files) that is currently being written to.
+0:         	if( key >= lastAppendLocation.get().getDataFileId() ) {
+1:         		continue;
+1:         	}
+0:             if( dataFile!=null ) {
+1:             	forceRemoveDataFile(dataFile);
+commit:8262ef7
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     public synchronized void removeDataFiles(Set<Integer> files) throws IOException {
+1:         for (Integer key : files) {
+0:             // Can't remove the last file.
+commit:456a2ba
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+1:  *
+1:  *      http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+0: package org.apache.kahadb.journal;
+1: 
+0: import java.io.ByteArrayInputStream;
+0: import java.io.ByteArrayOutputStream;
+0: import java.io.DataInputStream;
+0: import java.io.DataOutputStream;
+0: import java.io.File;
+0: import java.io.FilenameFilter;
+0: import java.io.IOException;
+0: import java.util.ArrayList;
+0: import java.util.Collections;
+0: import java.util.HashMap;
+0: import java.util.HashSet;
+0: import java.util.Iterator;
+0: import java.util.LinkedHashMap;
+0: import java.util.List;
+0: import java.util.Map;
+0: import java.util.Set;
+0: import java.util.TreeMap;
+1: import java.util.concurrent.ConcurrentHashMap;
+1: import java.util.concurrent.atomic.AtomicLong;
+1: import java.util.concurrent.atomic.AtomicReference;
+1: 
+0: import org.apache.commons.logging.Log;
+0: import org.apache.commons.logging.LogFactory;
+0: import org.apache.kahadb.journal.DataFileAppender.WriteCommand;
+0: import org.apache.kahadb.journal.DataFileAppender.WriteKey;
+0: import org.apache.kahadb.util.ByteSequence;
+0: import org.apache.kahadb.util.IOHelper;
+0: import org.apache.kahadb.util.LinkedNodeList;
+0: import org.apache.kahadb.util.Scheduler;
+1: 
+1: /**
+1:  * Manages DataFiles
+1:  * 
+0:  * @version $Revision$
+1:  */
+1: public class Journal {
+1: 
+0:     public static final int CONTROL_RECORD_MAX_LENGTH = 1024;
+0:     public static final int ITEM_HEAD_RESERVED_SPACE = 21;
+0:     // ITEM_HEAD_SPACE = length + type+ reserved space + SOR
+0:     public static final int ITEM_HEAD_SPACE = 4 + 1 + ITEM_HEAD_RESERVED_SPACE + 3;
+0:     public static final int ITEM_HEAD_OFFSET_TO_SOR = ITEM_HEAD_SPACE - 3;
+0:     public static final int ITEM_FOOT_SPACE = 3; // EOR
+1: 
+0:     public static final int ITEM_HEAD_FOOT_SPACE = ITEM_HEAD_SPACE + ITEM_FOOT_SPACE;
+1: 
+0:     public static final byte[] ITEM_HEAD_SOR = new byte[] {
+0:         'S', 'O', 'R'
+0:     }; // 
+0:     public static final byte[] ITEM_HEAD_EOR = new byte[] {
+0:         'E', 'O', 'R'
+0:     }; // 
+1: 
+0:     public static final byte DATA_ITEM_TYPE = 1;
+0:     public static final byte REDO_ITEM_TYPE = 2;
+1:     public static final String DEFAULT_DIRECTORY = ".";
+1:     public static final String DEFAULT_ARCHIVE_DIRECTORY = "data-archive";
+1:     public static final String DEFAULT_FILE_PREFIX = "db-";
+1:     public static final String DEFAULT_FILE_SUFFIX = ".log";
+1:     public static final int DEFAULT_MAX_FILE_LENGTH = 1024 * 1024 * 32;
+1:     public static final int DEFAULT_CLEANUP_INTERVAL = 1000 * 30;
+0:     public static final int PREFERED_DIFF = 1024 * 512;
+1: 
+0:     private static final Log LOG = LogFactory.getLog(Journal.class);
+1: 
+1:     protected final Map<WriteKey, WriteCommand> inflightWrites = new ConcurrentHashMap<WriteKey, WriteCommand>();
+1: 
+1:     protected File directory = new File(DEFAULT_DIRECTORY);
+0:     protected File directoryArchive = new File(DEFAULT_ARCHIVE_DIRECTORY);
+1:     protected String filePrefix = DEFAULT_FILE_PREFIX;
+1:     protected String fileSuffix = DEFAULT_FILE_SUFFIX;
+1:     protected boolean started;
+0:     protected boolean useNio = true;
+1: 
+1:     protected int maxFileLength = DEFAULT_MAX_FILE_LENGTH;
+0:     protected int preferedFileLength = DEFAULT_MAX_FILE_LENGTH - PREFERED_DIFF;
+1: 
+0:     protected DataFileAppender appender;
+1:     protected DataFileAccessorPool accessorPool;
+1: 
+1:     protected Map<Integer, DataFile> fileMap = new HashMap<Integer, DataFile>();
+1:     protected Map<File, DataFile> fileByFileMap = new LinkedHashMap<File, DataFile>();
+1:     protected LinkedNodeList<DataFile> dataFiles = new LinkedNodeList<DataFile>();
+1: 
+1:     protected final AtomicReference<Location> lastAppendLocation = new AtomicReference<Location>();
+0:     protected Runnable cleanupTask;
+0:     protected final AtomicLong totalLength = new AtomicLong();
+1:     protected boolean archiveDataLogs;
+1: 	private ReplicationTarget replicationTarget;
+1: 
+0:     @SuppressWarnings("unchecked")
+1:     public synchronized void start() throws IOException {
+1:         if (started) {
+1:             return;
+1:         }
+1:         
+1:         long start = System.currentTimeMillis();
+1:         accessorPool = new DataFileAccessorPool(this);
+1:         started = true;
+0:         preferedFileLength = Math.max(PREFERED_DIFF, getMaxFileLength() - PREFERED_DIFF);
+1: 
+0:         if (useNio) {
+0:             appender = new NIODataFileAppender(this);
+0:         } else {
+0:             appender = new DataFileAppender(this);
+1:         }
+1: 
+1:         File[] files = directory.listFiles(new FilenameFilter() {
+1:             public boolean accept(File dir, String n) {
+1:                 return dir.equals(directory) && n.startsWith(filePrefix) && n.endsWith(fileSuffix);
+1:             }
+1:         });
+1: 
+1:         if (files != null) {
+0:             for (int i = 0; i < files.length; i++) {
+1:                 try {
+0:                     File file = files[i];
+1:                     String n = file.getName();
+1:                     String numStr = n.substring(filePrefix.length(), n.length()-fileSuffix.length());
+1:                     int num = Integer.parseInt(numStr);
+0:                     DataFile dataFile = new DataFile(file, num, preferedFileLength);
+1:                     fileMap.put(dataFile.getDataFileId(), dataFile);
+1:                     totalLength.addAndGet(dataFile.getLength());
+1:                 } catch (NumberFormatException e) {
+1:                     // Ignore file that do not match the pattern.
+1:                 }
+1:             }
+1: 
+1:             // Sort the list so that we can link the DataFiles together in the
+1:             // right order.
+0:             List<DataFile> l = new ArrayList<DataFile>(fileMap.values());
+1:             Collections.sort(l);
+1:             for (DataFile df : l) {
+1:                 dataFiles.addLast(df);
+1:                 fileByFileMap.put(df.getFile(), df);
+1:             }
+1:         }
+1: 
+0:         // Need to check the current Write File to see if there was a partial
+0:         // write to it.
+0:         if (!dataFiles.isEmpty()) {
+1: 
+0:             // See if the lastSyncedLocation is valid..
+0:             Location l = lastAppendLocation.get();
+0:             if (l != null && l.getDataFileId() != dataFiles.getTail().getDataFileId()) {
+0:                 l = null;
+1:             }
+1: 
+0:             // If we know the last location that was ok.. then we can skip lots
+0:             // of checking
+1:             try {
+0:                 l = recoveryCheck(dataFiles.getTail(), l);
+0:                 lastAppendLocation.set(l);
+0:             } catch (IOException e) {
+0:                 LOG.warn("recovery check failed", e);
+1:             }
+1:         }
+1: 
+0:         cleanupTask = new Runnable() {
+1:             public void run() {
+1:                 cleanup();
+1:             }
+0:         };
+0:         Scheduler.executePeriodically(cleanupTask, DEFAULT_CLEANUP_INTERVAL);
+1:         long end = System.currentTimeMillis();
+1:         LOG.trace("Startup took: "+(end-start)+" ms");
+1:     }
+1: 
+0:     protected Location recoveryCheck(DataFile dataFile, Location location) throws IOException {
+1:         if (location == null) {
+0:             location = new Location();
+0:             location.setDataFileId(dataFile.getDataFileId());
+0:             location.setOffset(0);
+1:         }
+1:         DataFileAccessor reader = accessorPool.openDataFileAccessor(dataFile);
+1:         try {
+0:             while (reader.readLocationDetailsAndValidate(location)) {
+0:                 location.setOffset(location.getOffset() + location.getSize());
+1:             }
+1:         } finally {
+1:             accessorPool.closeDataFileAccessor(reader);
+1:         }
+1:         dataFile.setLength(location.getOffset());
+1:         return location;
+1:     }
+1: 
+0:     synchronized DataFile allocateLocation(Location location) throws IOException {
+0:         if (dataFiles.isEmpty()|| ((dataFiles.getTail().getLength() + location.getSize()) > maxFileLength)) {
+0:             int nextNum = !dataFiles.isEmpty() ? dataFiles.getTail().getDataFileId().intValue() + 1 : 1;
+1: 
+0:             File file = getFile(nextNum);
+0:             DataFile nextWriteFile = new DataFile(file, nextNum, preferedFileLength);
+0:             // actually allocate the disk space
+0:             fileMap.put(nextWriteFile.getDataFileId(), nextWriteFile);
+0:             fileByFileMap.put(file, nextWriteFile);
+0:             dataFiles.addLast(nextWriteFile);
+1:         }
+0:         DataFile currentWriteFile = dataFiles.getTail();
+0:         location.setOffset(currentWriteFile.getLength());
+0:         location.setDataFileId(currentWriteFile.getDataFileId().intValue());
+0:         int size = location.getSize();
+0:         currentWriteFile.incrementLength(size);
+0:         totalLength.addAndGet(size);
+0:         return currentWriteFile;
+1:     }
+1: 
+1: 	public File getFile(int nextNum) {
+1: 		String fileName = filePrefix + nextNum + fileSuffix;
+1: 		File file = new File(directory, fileName);
+1: 		return file;
+1: 	}
+1: 
+0:     synchronized DataFile getDataFile(Location item) throws IOException {
+1:         Integer key = Integer.valueOf(item.getDataFileId());
+0:         DataFile dataFile = fileMap.get(key);
+1:         if (dataFile == null) {
+1:             LOG.error("Looking for key " + key + " but not found in fileMap: " + fileMap);
+1:             throw new IOException("Could not locate data file " + getFile(item.getDataFileId()));
+1:         }
+1:         return dataFile;
+1:     }
+1: 
+0:     synchronized File getFile(Location item) throws IOException {
+1:         Integer key = Integer.valueOf(item.getDataFileId());
+0:         DataFile dataFile = fileMap.get(key);
+1:         if (dataFile == null) {
+1:             LOG.error("Looking for key " + key + " but not found in fileMap: " + fileMap);
+1:             throw new IOException("Could not locate data file " + getFile(item.getDataFileId()));
+1:         }
+0:         return dataFile.getFile();
+1:     }
+1: 
+0:     private DataFile getNextDataFile(DataFile dataFile) {
+0:         return dataFile.getNext();
+1:     }
+1: 
+0:     public synchronized void close() throws IOException {
+0:         if (!started) {
+1:             return;
+1:         }
+0:         Scheduler.cancel(cleanupTask);
+1:         accessorPool.close();
+1:         appender.close();
+0:         fileMap.clear();
+0:         fileByFileMap.clear();
+0:         dataFiles.clear();
+0:         lastAppendLocation.set(null);
+0:         started = false;
+1:     }
+1: 
+0:     synchronized void cleanup() {
+1:         if (accessorPool != null) {
+1:             accessorPool.disposeUnused();
+1:         }
+1:     }
+1: 
+1:     public synchronized boolean delete() throws IOException {
+1: 
+1:         // Close all open file handles...
+1:         appender.close();
+1:         accessorPool.close();
+1: 
+1:         boolean result = true;
+1:         for (Iterator<DataFile> i = fileMap.values().iterator(); i.hasNext();) {
+1:             DataFile dataFile = i.next();
+1:             totalLength.addAndGet(-dataFile.getLength());
+1:             result &= dataFile.delete();
+1:         }
+0:         fileMap.clear();
+0:         fileByFileMap.clear();
+0:         lastAppendLocation.set(null);
+0:         dataFiles = new LinkedNodeList<DataFile>();
+1: 
+1:         // reopen open file handles...
+1:         accessorPool = new DataFileAccessorPool(this);
+0:         if (useNio) {
+0:             appender = new NIODataFileAppender(this);
+0:         } else {
+0:             appender = new DataFileAppender(this);
+1:         }
+1:         return result;
+1:     }
+1: 
+0:     public synchronized void consolidateDataFilesNotIn(Set<Integer> inUse, Integer lastFile) throws IOException {
+0:         Set<Integer> unUsed = new HashSet<Integer>(fileMap.keySet());
+0:         unUsed.removeAll(inUse);
+1: 
+0:         for (Integer key : unUsed) {
+0:             // Don't remove files that come after the lastFile
+0:             if (lastFile !=null && key >= lastFile ) {
+1:                 continue;
+1:             }
+0:             DataFile dataFile = fileMap.get(key);
+1:             
+0:             // Can't remove the last file either.
+0:             if( dataFile == dataFiles.getTail() ) {
+1:                 continue;
+1:             }
+0:             forceRemoveDataFile(dataFile);
+1:         }
+1:     }
+1: 
+0:     private synchronized void forceRemoveDataFile(DataFile dataFile) throws IOException {
+1:         accessorPool.disposeDataFileAccessors(dataFile);
+0:         fileByFileMap.remove(dataFile.getFile());
+0:         fileMap.remove(dataFile.getDataFileId());
+1:         totalLength.addAndGet(-dataFile.getLength());
+0:         dataFile.unlink();
+1:         if (archiveDataLogs) {
+0:             dataFile.move(getDirectoryArchive());
+0:             LOG.debug("moved data file " + dataFile + " to " + getDirectoryArchive());
+0:         } else {
+0:             if ( dataFile.delete() ) {
+0:             	LOG.debug("Discarded data file " + dataFile);
+0:             } else {
+0:             	LOG.warn("Failed to discard data file " + dataFile.getFile());
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * @return the maxFileLength
+1:      */
+1:     public int getMaxFileLength() {
+1:         return maxFileLength;
+1:     }
+1: 
+1:     /**
+1:      * @param maxFileLength the maxFileLength to set
+1:      */
+1:     public void setMaxFileLength(int maxFileLength) {
+1:         this.maxFileLength = maxFileLength;
+1:     }
+1: 
+1:     public String toString() {
+1:         return directory.toString();
+1:     }
+1: 
+0: 	public synchronized void appendedExternally(Location loc, int length) throws IOException {
+0: 		DataFile dataFile = null;
+0: 		if( dataFiles.getTail().getDataFileId() == loc.getDataFileId() ) {
+0: 			// It's an update to the current log file..
+0: 			dataFile = dataFiles.getTail();
+0: 			dataFile.incrementLength(length);
+0: 		} else if( dataFiles.getTail().getDataFileId()+1 == loc.getDataFileId() ) {
+0: 			// It's an update to the next log file.
+0:             int nextNum = loc.getDataFileId();
+0:             File file = getFile(nextNum);
+0:             dataFile = new DataFile(file, nextNum, preferedFileLength);
+0:             // actually allocate the disk space
+1:             fileMap.put(dataFile.getDataFileId(), dataFile);
+0:             fileByFileMap.put(file, dataFile);
+0:             dataFiles.addLast(dataFile);
+0: 		} else {
+0: 			throw new IOException("Invalid external append.");
+1: 		}
+1: 	}
+1: 
+0:     public synchronized Location getNextLocation(Location location) throws IOException, IllegalStateException {
+1: 
+1:         Location cur = null;
+1:         while (true) {
+1:             if (cur == null) {
+1:                 if (location == null) {
+0:                     DataFile head = dataFiles.getHead();
+0:                     if( head == null ) {
+0:                     	return null;
+1:                     }
+1:                     cur = new Location();
+1:                     cur.setDataFileId(head.getDataFileId());
+1:                     cur.setOffset(0);
+0:                 } else {
+1:                     // Set to the next offset..
+1:                     if (location.getSize() == -1) {
+1:                         cur = new Location(location);
+0:                     } else {
+1:                         cur = new Location(location);
+1:                         cur.setOffset(location.getOffset() + location.getSize());
+1:                     }
+1:                 }
+0:             } else {
+1:                 cur.setOffset(cur.getOffset() + cur.getSize());
+1:             }
+1: 
+1:             DataFile dataFile = getDataFile(cur);
+1: 
+1:             // Did it go into the next file??
+1:             if (dataFile.getLength() <= cur.getOffset()) {
+0:                 dataFile = getNextDataFile(dataFile);
+1:                 if (dataFile == null) {
+0:                     return null;
+0:                 } else {
+1:                     cur.setDataFileId(dataFile.getDataFileId().intValue());
+1:                     cur.setOffset(0);
+1:                 }
+1:             }
+1: 
+1:             // Load in location size and type.
+1:             DataFileAccessor reader = accessorPool.openDataFileAccessor(dataFile);
+1:             try {
+1: 				reader.readLocationDetails(cur);
+1:             } finally {
+1:                 accessorPool.closeDataFileAccessor(reader);
+1:             }
+1: 
+0:             if (cur.getType() == 0) {
+0:                 return null;
+0:             } else if (cur.getType() > 0) {
+1:                 // Only return user records.
+1:                 return cur;
+1:             }
+1:         }
+1:     }
+1: 
+0:     public synchronized Location getNextLocation(File file, Location lastLocation, boolean thisFileOnly) throws IllegalStateException, IOException {
+0:         DataFile df = fileByFileMap.get(file);
+0:         return getNextLocation(df, lastLocation, thisFileOnly);
+1:     }
+1: 
+0:     public synchronized Location getNextLocation(DataFile dataFile, Location lastLocation, boolean thisFileOnly) throws IOException, IllegalStateException {
+1: 
+1:         Location cur = null;
+1:         while (true) {
+1:             if (cur == null) {
+0:                 if (lastLocation == null) {
+0:                     DataFile head = dataFile.getHeadNode();
+1:                     cur = new Location();
+1:                     cur.setDataFileId(head.getDataFileId());
+1:                     cur.setOffset(0);
+0:                 } else {
+1:                     // Set to the next offset..
+0:                     cur = new Location(lastLocation);
+1:                     cur.setOffset(cur.getOffset() + cur.getSize());
+1:                 }
+0:             } else {
+1:                 cur.setOffset(cur.getOffset() + cur.getSize());
+1:             }
+1: 
+1:             // Did it go into the next file??
+1:             if (dataFile.getLength() <= cur.getOffset()) {
+0:                 if (thisFileOnly) {
+0:                     return null;
+0:                 } else {
+0:                     dataFile = getNextDataFile(dataFile);
+1:                     if (dataFile == null) {
+0:                         return null;
+0:                     } else {
+1:                         cur.setDataFileId(dataFile.getDataFileId().intValue());
+1:                         cur.setOffset(0);
+1:                     }
+1:                 }
+1:             }
+1: 
+1:             // Load in location size and type.
+1:             DataFileAccessor reader = accessorPool.openDataFileAccessor(dataFile);
+1:             try {
+1:                 reader.readLocationDetails(cur);
+1:             } finally {
+1:                 accessorPool.closeDataFileAccessor(reader);
+1:             }
+1: 
+0:             if (cur.getType() == 0) {
+0:                 return null;
+0:             } else if (cur.getType() > 0) {
+1:                 // Only return user records.
+1:                 return cur;
+1:             }
+1:         }
+1:     }
+1: 
+0:     public synchronized ByteSequence read(Location location) throws IOException, IllegalStateException {
+1:         DataFile dataFile = getDataFile(location);
+1:         DataFileAccessor reader = accessorPool.openDataFileAccessor(dataFile);
+1:         ByteSequence rc = null;
+1:         try {
+1:             rc = reader.readRecord(location);
+1:         } finally {
+1:             accessorPool.closeDataFileAccessor(reader);
+1:         }
+1:         return rc;
+1:     }
+1: 
+0:     public synchronized Location write(ByteSequence data, boolean sync) throws IOException, IllegalStateException {
+1:         Location loc = appender.storeItem(data, Location.USER_TYPE, sync);
+1:         return loc;
+1:     }
+1: 
+0:     public synchronized Location write(ByteSequence data, Runnable onComplete) throws IOException, IllegalStateException {
+1:         Location loc = appender.storeItem(data, Location.USER_TYPE, onComplete);
+1:         return loc;
+1:     }
+1: 
+0:     public synchronized Location write(ByteSequence data, byte type, boolean sync) throws IOException, IllegalStateException {
+0:         return appender.storeItem(data, type, sync);
+1:     }
+1: 
+1:     public void update(Location location, ByteSequence data, boolean sync) throws IOException {
+1:         DataFile dataFile = getDataFile(location);
+1:         DataFileAccessor updater = accessorPool.openDataFileAccessor(dataFile);
+1:         try {
+1:             updater.updateRecord(location, data, sync);
+1:         } finally {
+1:             accessorPool.closeDataFileAccessor(updater);
+1:         }
+1:     }
+1: 
+1:     public File getDirectory() {
+1:         return directory;
+1:     }
+1: 
+1:     public void setDirectory(File directory) {
+1:         this.directory = directory;
+1:     }
+1: 
+1:     public String getFilePrefix() {
+1:         return filePrefix;
+1:     }
+1: 
+1:     public void setFilePrefix(String filePrefix) {
+1:         this.filePrefix = filePrefix;
+1:     }
+1: 
+1:     public Map<WriteKey, WriteCommand> getInflightWrites() {
+1:         return inflightWrites;
+1:     }
+1: 
+1:     public Location getLastAppendLocation() {
+1:         return lastAppendLocation.get();
+1:     }
+1: 
+1:     public void setLastAppendLocation(Location lastSyncedLocation) {
+1:         this.lastAppendLocation.set(lastSyncedLocation);
+1:     }
+1: 
+0:     public boolean isUseNio() {
+0:         return useNio;
+1:     }
+1: 
+0:     public void setUseNio(boolean useNio) {
+0:         this.useNio = useNio;
+1:     }
+1: 
+1:     public File getDirectoryArchive() {
+1:         return directoryArchive;
+1:     }
+1: 
+1:     public void setDirectoryArchive(File directoryArchive) {
+1:         this.directoryArchive = directoryArchive;
+1:     }
+1: 
+1:     public boolean isArchiveDataLogs() {
+1:         return archiveDataLogs;
+1:     }
+1: 
+1:     public void setArchiveDataLogs(boolean archiveDataLogs) {
+1:         this.archiveDataLogs = archiveDataLogs;
+1:     }
+1: 
+0:     synchronized public Integer getCurrentDataFileId() {
+0:         if (dataFiles.isEmpty())
+0:             return null;
+0:         return dataFiles.getTail().getDataFileId();
+1:     }
+1: 
+1:     /**
+1:      * Get a set of files - only valid after start()
+1:      * 
+1:      * @return files currently being used
+1:      */
+1:     public Set<File> getFiles() {
+0:         return fileByFileMap.keySet();
+1:     }
+1: 
+0:     public Map<Integer, DataFile> getFileMap() {
+0:         return new TreeMap<Integer, DataFile>(fileMap);
+1:     }
+1:     
+1:     public long getDiskSize() {
+0:         long tailLength=0;
+0:         synchronized( this ) {
+0:             if( !dataFiles.isEmpty() ) {
+0:                 tailLength = dataFiles.getTail().getLength();
+1:             }
+1:         }
+1:         
+0:         long rc = totalLength.get();
+1:         
+0:         // The last file is actually at a minimum preferedFileLength big.
+0:         if( tailLength < preferedFileLength ) {
+0:             rc -= tailLength;
+0:             rc += preferedFileLength;
+1:         }
+1:         return rc;
+1:     }
+1: 
+1: 	public void setReplicationTarget(ReplicationTarget replicationTarget) {
+1: 		this.replicationTarget = replicationTarget;
+1: 	}
+1: 	public ReplicationTarget getReplicationTarget() {
+1: 		return replicationTarget;
+1: 	}
+1: 
+1:     public String getFileSuffix() {
+1:         return fileSuffix;
+1:     }
+1: 
+1:     public void setFileSuffix(String fileSuffix) {
+1:         this.fileSuffix = fileSuffix;
+1:     }
+1: 
+1: 
+1: }
+author:Timothy A. Bish
+-------------------------------------------------------------------------------
+commit:cdba931
+/////////////////////////////////////////////////////////////////////////
+0:  *
+0:  *
+/////////////////////////////////////////////////////////////////////////
+0:     // ITEM_HEAD_SPACE = length + type+ reserved space + SOR
+0: 
+0:     // Batch Control Item holds a 4 byte size of the batch and a 8 byte checksum of the batch.
+/////////////////////////////////////////////////////////////////////////
+1:             throw new RuntimeException("Could not create batch control record header.", e);
+/////////////////////////////////////////////////////////////////////////
+0: 
+/////////////////////////////////////////////////////////////////////////
+0: 
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:     private ReplicationTarget replicationTarget;
+0: 
+/////////////////////////////////////////////////////////////////////////
+1:             for (File file : files) {
+/////////////////////////////////////////////////////////////////////////
+0:         getCurrentWriteFile();
+/////////////////////////////////////////////////////////////////////////
+0:         try {
+0:             return string.getBytes("UTF-8");
+0:         } catch (UnsupportedEncodingException e) {
+0:             throw new RuntimeException(e);
+0:         }
+0:     }
+0:     protected Location recoveryCheck(DataFile dataFile) throws IOException {
+0:         DataFileAccessor reader = accessorPool.openDataFileAccessor(dataFile);
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:         } finally {
+/////////////////////////////////////////////////////////////////////////
+0:     void addToTotalLength(int size) {
+0:         totalLength.addAndGet(size);
+0:     }
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:         int nextNum = !dataFiles.isEmpty() ? dataFiles.getTail().getDataFileId().intValue() + 1 : 1;
+0:         File file = getFile(nextNum);
+0:         DataFile nextWriteFile = new DataFile(file, nextNum, preferedFileLength);
+0:         // actually allocate the disk space
+0:         fileMap.put(nextWriteFile.getDataFileId(), nextWriteFile);
+0:         fileByFileMap.put(file, nextWriteFile);
+0:         dataFiles.addLast(nextWriteFile);
+0:         return nextWriteFile;
+0:     }
+0:     public File getFile(int nextNum) {
+0:         String fileName = filePrefix + nextNum + fileSuffix;
+0:         File file = new File(directory, fileName);
+0:         return file;
+0:     }
+/////////////////////////////////////////////////////////////////////////
+0:             if( key >= lastAppendLocation.get().getDataFileId() ) {
+0:                 continue;
+0:             }
+0:                 forceRemoveDataFile(dataFile);
+/////////////////////////////////////////////////////////////////////////
+0:                 LOG.debug("Discarded data file " + dataFile);
+0:                 LOG.warn("Failed to discard data file " + dataFile.getFile());
+/////////////////////////////////////////////////////////////////////////
+0:     public synchronized void appendedExternally(Location loc, int length) throws IOException {
+0:         DataFile dataFile = null;
+0:         if( dataFiles.getTail().getDataFileId() == loc.getDataFileId() ) {
+0:             // It's an update to the current log file..
+0:             dataFile = dataFiles.getTail();
+0:             dataFile.incrementLength(length);
+0:         } else if( dataFiles.getTail().getDataFileId()+1 == loc.getDataFileId() ) {
+0:             // It's an update to the next log file.
+/////////////////////////////////////////////////////////////////////////
+0:         } else {
+0:             throw new IOException("Invalid external append.");
+0:         }
+0:     }
+/////////////////////////////////////////////////////////////////////////
+0:                         return null;
+/////////////////////////////////////////////////////////////////////////
+0:                 reader.readLocationDetails(cur);
+/////////////////////////////////////////////////////////////////////////
+0:      *
+/////////////////////////////////////////////////////////////////////////
+0: 
+/////////////////////////////////////////////////////////////////////////
+0: 
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:     public void setReplicationTarget(ReplicationTarget replicationTarget) {
+0:         this.replicationTarget = replicationTarget;
+0:     }
+0:     public ReplicationTarget getReplicationTarget() {
+0:         return replicationTarget;
+0:     }
+/////////////////////////////////////////////////////////////////////////
+0:     public boolean isChecksum() {
+0:         return checksum;
+0:     }
+0:     public void setChecksum(boolean checksumWrites) {
+0:         this.checksum = checksumWrites;
+0:     }
+/////////////////////////////////////////////////////////////////////////
+0: 
+author:Gary Tully
+-------------------------------------------------------------------------------
+commit:89f22da
+/////////////////////////////////////////////////////////////////////////
+1:     protected boolean enableAsyncDiskSync = true;
+/////////////////////////////////////////////////////////////////////////
+1:     public void setEnableAsyncDiskSync(boolean val) {
+1:         this.enableAsyncDiskSync = val;
+0:     }
+0: 
+1:     public boolean isEnableAsyncDiskSync() {
+1:         return enableAsyncDiskSync;
+0:     }
+0: 
+commit:bb4a2f7
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.kahadb.util.LinkedNode;
+/////////////////////////////////////////////////////////////////////////
+1:     public static final String CALLER_BUFFER_APPENDER = "org.apache.kahadb.journal.CALLER_BUFFER_APPENDER";
+1:     public static final boolean callerBufferAppender = Boolean.parseBoolean(System.getProperty(CALLER_BUFFER_APPENDER, "false"));
+/////////////////////////////////////////////////////////////////////////
+1:     protected FileAppender appender;
+/////////////////////////////////////////////////////////////////////////
+1:         appender = callerBufferAppender ? new CallerBufferingDataFileAppender(this) : new DataFileAppender(this);
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:     public static class WriteCommand extends LinkedNode<WriteCommand> {
+1:         public final Location location;
+1:         public final ByteSequence data;
+1:         final boolean sync;
+1:         public final Runnable onComplete;
+0: 
+1:         public WriteCommand(Location location, ByteSequence data, boolean sync) {
+1:             this.location = location;
+1:             this.data = data;
+1:             this.sync = sync;
+1:             this.onComplete = null;
+0:         }
+0: 
+1:         public WriteCommand(Location location, ByteSequence data, Runnable onComplete) {
+1:             this.location = location;
+1:             this.data = data;
+1:             this.onComplete = onComplete;
+1:             this.sync = false;
+0:         }
+0:     }
+0: 
+1:     public static class WriteKey {
+1:         private final int file;
+1:         private final long offset;
+1:         private final int hash;
+0: 
+1:         public WriteKey(Location item) {
+1:             file = item.getDataFileId();
+1:             offset = item.getOffset();
+1:             // TODO: see if we can build a better hash
+1:             hash = (int)(file ^ offset);
+0:         }
+0: 
+1:         public int hashCode() {
+1:             return hash;
+0:         }
+0: 
+1:         public boolean equals(Object obj) {
+1:             if (obj instanceof WriteKey) {
+1:                 WriteKey di = (WriteKey)obj;
+1:                 return di.file == file && di.offset == offset;
+0:             }
+1:             return false;
+0:         }
+0:     }
+commit:323eeda
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:     public long length() {
+1:         return totalLength.get();
+0:     }
+commit:1595378
+/////////////////////////////////////////////////////////////////////////
+0:     protected synchronized void cleanup() {
+commit:029c1e3
+/////////////////////////////////////////////////////////////////////////
+0:     public synchronized Map<Integer, DataFile> getFileMap() {
+commit:9e40b91
+/////////////////////////////////////////////////////////////////////////
+1:                 if (df.getLength() == 0) {
+1:                     // possibly the result of a previous failed write
+1:                     LOG.info("ignoring zero length, partially initialised journal data file: " + df);
+0:                     continue;
+0:                 }
+commit:ccd2e94
+/////////////////////////////////////////////////////////////////////////
+0:     private Timer timer;
+commit:5763561
+/////////////////////////////////////////////////////////////////////////
+1:     protected AtomicLong totalLength = new AtomicLong();
+/////////////////////////////////////////////////////////////////////////
+1:         int existingLen = dataFile.getLength();
+1:         if (existingLen > dataFile.getLength()) {
+1:             totalLength.addAndGet(dataFile.getLength() - existingLen);
+0:         }
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:     public void setSizeAccumulator(AtomicLong storeSizeAccumulator) {
+1:        this.totalLength = storeSizeAccumulator;
+0:     }
+commit:e1389a6
+/////////////////////////////////////////////////////////////////////////
+1:     public Location write(ByteSequence data, boolean sync) throws IOException, IllegalStateException {
+1:     public Location write(ByteSequence data, Runnable onComplete) throws IOException, IllegalStateException {
+commit:561cda1
+/////////////////////////////////////////////////////////////////////////
+1:     public static final int DEFAULT_MAX_WRITE_BATCH_SIZE = 1024 * 1024 * 4;
+0:     
+/////////////////////////////////////////////////////////////////////////
+1:     protected int writeBatchSize = DEFAULT_MAX_WRITE_BATCH_SIZE;
+0:     
+/////////////////////////////////////////////////////////////////////////
+0:    
+0: 
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:     public void setWriteBatchSize(int writeBatchSize) {
+1:         this.writeBatchSize = writeBatchSize;
+0:     }
+0:     
+1:     public int getWriteBatchSize() {
+1:         return writeBatchSize;
+0:     }
+commit:c42d980
+/////////////////////////////////////////////////////////////////////////
+0:     protected int maxFileLength = DEFAULT_MAX_FILE_LENGTH;
+0:     protected int preferedFileLength = DEFAULT_MAX_FILE_LENGTH - PREFERED_DIFF;
+/////////////////////////////////////////////////////////////////////////
+0:     public int getMaxFileLength() {
+0:     public void setMaxFileLength(int maxFileLength) {
+commit:880f3d6
+/////////////////////////////////////////////////////////////////////////
+0:     protected long maxFileLength = DEFAULT_MAX_FILE_LENGTH;
+0:     protected long preferedFileLength = DEFAULT_MAX_FILE_LENGTH - PREFERED_DIFF;
+/////////////////////////////////////////////////////////////////////////
+0:     public long getMaxFileLength() {
+0:     public void setMaxFileLength(long maxFileLength) {
+author:Bosanac Dejan
+-------------------------------------------------------------------------------
+commit:8bf987b
+/////////////////////////////////////////////////////////////////////////
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+/////////////////////////////////////////////////////////////////////////
+1:     private static final Logger LOG = LoggerFactory.getLogger(Journal.class);
+author:Robert Davies
+-------------------------------------------------------------------------------
+commit:54a00fe
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.ArrayList;
+0: import java.util.Collections;
+0: import java.util.HashMap;
+0: import java.util.Iterator;
+0: import java.util.LinkedHashMap;
+0: import java.util.List;
+0: import java.util.Map;
+0: import java.util.Set;
+0: import java.util.Timer;
+0: import java.util.TimerTask;
+0: import java.util.TreeMap;
+0: import org.apache.kahadb.util.ByteSequence;
+0: import org.apache.kahadb.util.DataByteArrayInputStream;
+0: import org.apache.kahadb.util.DataByteArrayOutputStream;
+0: import org.apache.kahadb.util.LinkedNodeList;
+0: import org.apache.kahadb.util.SchedulerTimerTask;
+0: import org.apache.kahadb.util.Sequence;
+/////////////////////////////////////////////////////////////////////////
+0:     private Timer timer = new Timer("KahaDB Scheduler", true);
+/////////////////////////////////////////////////////////////////////////
+0:         this.timer = new Timer("KahaDB Scheduler", true);
+0:         TimerTask task = new SchedulerTimerTask(cleanupTask);
+0:         this.timer.scheduleAtFixedRate(task, DEFAULT_CLEANUP_INTERVAL,DEFAULT_CLEANUP_INTERVAL);
+/////////////////////////////////////////////////////////////////////////
+0:         if (this.timer != null) {
+0:             this.timer.cancel();
+0:         }
+/////////////////////////////////////////////////////////////////////////
+1:     @Override
+============================================================================

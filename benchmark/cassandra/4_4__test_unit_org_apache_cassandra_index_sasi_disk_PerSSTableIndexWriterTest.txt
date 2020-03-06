@@ -1,0 +1,674 @@
+1:72790dc: /*
+1:72790dc:  * Licensed to the Apache Software Foundation (ASF) under one
+1:72790dc:  * or more contributor license agreements.  See the NOTICE file
+1:72790dc:  * distributed with this work for additional information
+1:72790dc:  * regarding copyright ownership.  The ASF licenses this file
+1:72790dc:  * to you under the Apache License, Version 2.0 (the
+1:72790dc:  * "License"); you may not use this file except in compliance
+1:72790dc:  * with the License.  You may obtain a copy of the License at
+1:72790dc:  *
+1:72790dc:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:72790dc:  *
+1:72790dc:  * Unless required by applicable law or agreed to in writing, software
+1:72790dc:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:72790dc:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:72790dc:  * See the License for the specific language governing permissions and
+1:72790dc:  * limitations under the License.
+1:72790dc:  */
+1:72790dc: package org.apache.cassandra.index.sasi.disk;
+1:72790dc: 
+1:72790dc: import java.io.File;
+1:72790dc: import java.nio.ByteBuffer;
+1:72790dc: import java.util.*;
+1:5c4d5c7: import java.util.concurrent.Callable;
+1:5c4d5c7: import java.util.concurrent.ThreadLocalRandom;
+1:7d857b4: import java.util.function.Supplier;
+1:72790dc: 
+1:7d857b4: import com.carrotsearch.hppc.cursors.LongObjectCursor;
+1:72790dc: import org.apache.cassandra.SchemaLoader;
+1:5c4d5c7: import org.apache.cassandra.config.CFMetaData;
+1:72790dc: import org.apache.cassandra.config.ColumnDefinition;
+1:72790dc: import org.apache.cassandra.db.Clustering;
+1:7d857b4: import org.apache.cassandra.db.ClusteringComparator;
+1:72790dc: import org.apache.cassandra.db.ColumnFamilyStore;
+1:72790dc: import org.apache.cassandra.db.DecoratedKey;
+1:72790dc: import org.apache.cassandra.db.Keyspace;
+1:72790dc: import org.apache.cassandra.db.compaction.OperationType;
+1:5c4d5c7: import org.apache.cassandra.db.marshal.LongType;
+1:72790dc: import org.apache.cassandra.db.rows.BTreeRow;
+1:72790dc: import org.apache.cassandra.db.rows.BufferCell;
+1:72790dc: import org.apache.cassandra.db.rows.Row;
+1:7d857b4: import org.apache.cassandra.dht.IPartitioner;
+1:7d857b4: import org.apache.cassandra.dht.Murmur3Partitioner;
+1:7d857b4: import org.apache.cassandra.index.sasi.KeyFetcher;
+1:72790dc: import org.apache.cassandra.index.sasi.SASIIndex;
+1:72790dc: import org.apache.cassandra.index.sasi.utils.RangeIterator;
+1:72790dc: import org.apache.cassandra.db.marshal.Int32Type;
+1:72790dc: import org.apache.cassandra.db.marshal.UTF8Type;
+1:72790dc: import org.apache.cassandra.exceptions.ConfigurationException;
+1:5c4d5c7: import org.apache.cassandra.io.FSError;
+1:72790dc: import org.apache.cassandra.io.sstable.Descriptor;
+1:72790dc: import org.apache.cassandra.io.util.FileUtils;
+1:72790dc: import org.apache.cassandra.schema.KeyspaceMetadata;
+1:72790dc: import org.apache.cassandra.schema.KeyspaceParams;
+1:72790dc: import org.apache.cassandra.schema.Tables;
+1:72790dc: import org.apache.cassandra.service.MigrationManager;
+1:72790dc: import org.apache.cassandra.utils.ByteBufferUtil;
+1:72790dc: 
+1:72790dc: import com.google.common.util.concurrent.Futures;
+1:72790dc: 
+1:72790dc: import org.junit.Assert;
+1:72790dc: import org.junit.BeforeClass;
+1:72790dc: import org.junit.Test;
+1:72790dc: 
+1:72790dc: public class PerSSTableIndexWriterTest extends SchemaLoader
+1:72790dc: {
+1:72790dc:     private static final String KS_NAME = "sasi";
+1:72790dc:     private static final String CF_NAME = "test_cf";
+1:72790dc: 
+1:72790dc:     @BeforeClass
+1:72790dc:     public static void loadSchema() throws ConfigurationException
+1:72790dc:     {
+1:72790dc:         System.setProperty("cassandra.config", "cassandra-murmur.yaml");
+1:72790dc:         SchemaLoader.loadSchema();
+1:72790dc:         MigrationManager.announceNewKeyspace(KeyspaceMetadata.create(KS_NAME,
+1:72790dc:                                                                      KeyspaceParams.simpleTransient(1),
+1:72790dc:                                                                      Tables.of(SchemaLoader.sasiCFMD(KS_NAME, CF_NAME))));
+1:72790dc:     }
+1:72790dc: 
+1:7d857b4:     private static final ClusteringComparator CLUSTERING_COMPARATOR = new ClusteringComparator(LongType.instance);
+1:7d857b4: 
+1:72790dc:     @Test
+1:72790dc:     public void testPartialIndexWrites() throws Exception
+1:72790dc:     {
+1:72790dc:         final int maxKeys = 100000, numParts = 4, partSize = maxKeys / numParts;
+1:72790dc:         final String keyFormat = "key%06d";
+1:72790dc:         final long timestamp = System.currentTimeMillis();
+1:72790dc: 
+1:72790dc:         ColumnFamilyStore cfs = Keyspace.open(KS_NAME).getColumnFamilyStore(CF_NAME);
+1:72790dc:         ColumnDefinition column = cfs.metadata.getColumnDefinition(UTF8Type.instance.decompose("age"));
+1:72790dc: 
+1:72790dc:         SASIIndex sasi = (SASIIndex) cfs.indexManager.getIndexByName("age");
+1:72790dc: 
+1:72790dc:         File directory = cfs.getDirectories().getDirectoryForNewSSTables();
+1:72790dc:         Descriptor descriptor = Descriptor.fromFilename(cfs.getSSTablePath(directory));
+1:72790dc:         PerSSTableIndexWriter indexWriter = (PerSSTableIndexWriter) sasi.getFlushObserver(descriptor, OperationType.FLUSH);
+1:72790dc: 
+1:7d857b4:         SortedMap<RowKey, Row> expectedKeys = new TreeMap<>();
+1:72790dc: 
+1:72790dc:         for (int i = 0; i < maxKeys; i++)
+1:72790dc:         {
+1:72790dc:             ByteBuffer key = ByteBufferUtil.bytes(String.format(keyFormat, i));
+1:7d857b4:             Clustering clustering = Clustering.make(ByteBufferUtil.bytes(i * 1L));
+1:7d857b4:             expectedKeys.put(new RowKey(cfs.metadata.partitioner.decorateKey(key), clustering, CLUSTERING_COMPARATOR),
+1:7d857b4:                              BTreeRow.singleCellRow(clustering,
+1:e017f94:                                                     BufferCell.live(column, timestamp, Int32Type.instance.decompose(i))));
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         indexWriter.begin();
+1:72790dc: 
+1:7d857b4:         Iterator<Map.Entry<RowKey, Row>> keyIterator = expectedKeys.entrySet().iterator();
+1:72790dc:         long position = 0;
+1:72790dc: 
+1:72790dc:         Set<String> segments = new HashSet<>();
+1:72790dc:         outer:
+1:72790dc:         for (;;)
+1:72790dc:         {
+1:72790dc:             for (int i = 0; i < partSize; i++)
+1:72790dc:             {
+1:72790dc:                 if (!keyIterator.hasNext())
+1:72790dc:                     break outer;
+1:72790dc: 
+1:7d857b4:                 Map.Entry<RowKey, Row> key = keyIterator.next();
+1:72790dc: 
+1:7d857b4:                 indexWriter.startPartition(key.getKey().decoratedKey, position);
+1:7d857b4:                 indexWriter.nextUnfilteredCluster(key.getValue(), position);
+1:7d857b4:                 position++;
+1:72790dc:             }
+1:72790dc: 
+1:72790dc:             PerSSTableIndexWriter.Index index = indexWriter.getIndex(column);
+1:72790dc: 
+1:72790dc:             OnDiskIndex segment = index.scheduleSegmentFlush(false).call();
+1:72790dc:             index.segments.add(Futures.immediateFuture(segment));
+1:72790dc:             segments.add(segment.getIndexPath());
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         for (String segment : segments)
+1:72790dc:             Assert.assertTrue(new File(segment).exists());
+1:72790dc: 
+1:72790dc:         String indexFile = indexWriter.indexes.get(column).filename(true);
+1:72790dc: 
+1:72790dc:         // final flush
+1:72790dc:         indexWriter.complete();
+1:72790dc: 
+1:72790dc:         for (String segment : segments)
+1:72790dc:             Assert.assertFalse(new File(segment).exists());
+1:72790dc: 
+1:7d857b4:         OnDiskIndex index = new OnDiskIndex(new File(indexFile), Int32Type.instance, new FakeKeyFetcher(cfs, keyFormat));
+1:72790dc: 
+1:72790dc:         Assert.assertEquals(0, UTF8Type.instance.compare(index.minKey(), ByteBufferUtil.bytes(String.format(keyFormat, 0))));
+1:72790dc:         Assert.assertEquals(0, UTF8Type.instance.compare(index.maxKey(), ByteBufferUtil.bytes(String.format(keyFormat, maxKeys - 1))));
+1:72790dc: 
+1:7d857b4:         Set<RowKey> actualKeys = new HashSet<>();
+1:72790dc:         int count = 0;
+1:72790dc:         for (OnDiskIndex.DataTerm term : index)
+1:72790dc:         {
+1:72790dc:             RangeIterator<Long, Token> tokens = term.getTokens();
+1:72790dc: 
+1:72790dc:             while (tokens.hasNext())
+1:72790dc:             {
+1:7d857b4:                 for (RowKey key : tokens.next())
+1:72790dc:                     actualKeys.add(key);
+1:72790dc:             }
+1:72790dc: 
+1:72790dc:             Assert.assertEquals(count++, (int) Int32Type.instance.compose(term.getTerm()));
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         Assert.assertEquals(expectedKeys.size(), actualKeys.size());
+1:7d857b4:         for (RowKey key : expectedKeys.keySet())
+1:7d857b4:             Assert.assertTrue("Key was not present : " + key, actualKeys.contains(key));
+1:72790dc: 
+1:72790dc:         FileUtils.closeQuietly(index);
+1:72790dc:     }
+1:5c4d5c7: 
+1:5c4d5c7:     @Test
+1:5c4d5c7:     public void testSparse() throws Exception
+1:5c4d5c7:     {
+1:5c4d5c7:         final String columnName = "timestamp";
+1:5c4d5c7: 
+1:5c4d5c7:         ColumnFamilyStore cfs = Keyspace.open(KS_NAME).getColumnFamilyStore(CF_NAME);
+1:5c4d5c7:         ColumnDefinition column = cfs.metadata.getColumnDefinition(UTF8Type.instance.decompose(columnName));
+1:5c4d5c7: 
+1:5c4d5c7:         SASIIndex sasi = (SASIIndex) cfs.indexManager.getIndexByName(columnName);
+1:5c4d5c7: 
+1:5c4d5c7:         File directory = cfs.getDirectories().getDirectoryForNewSSTables();
+1:5c4d5c7:         Descriptor descriptor = Descriptor.fromFilename(cfs.getSSTablePath(directory));
+1:5c4d5c7:         PerSSTableIndexWriter indexWriter = (PerSSTableIndexWriter) sasi.getFlushObserver(descriptor, OperationType.FLUSH);
+1:5c4d5c7: 
+1:5c4d5c7:         final long now = System.currentTimeMillis();
+1:5c4d5c7: 
+1:5c4d5c7:         indexWriter.begin();
+1:5c4d5c7:         indexWriter.indexes.put(column, indexWriter.newIndex(sasi.getIndex()));
+1:5c4d5c7: 
+1:7d857b4:         populateSegment(cfs.metadata, indexWriter.getIndex(column), new HashMap<Long, KeyOffsets>()
+1:5c4d5c7:         {{
+1:7d857b4:             put(now,     new KeyOffsets() {{ put(0, 0); put(1, 1); }});
+1:7d857b4:             put(now + 1, new KeyOffsets() {{ put(2, 2); put(3, 3); }});
+1:7d857b4:             put(now + 2, new KeyOffsets() {{
+1:7d857b4:                 put(4, 4); put(5, 5); put(6, 6);
+1:7d857b4:                 put(7, 7); put(8, 8); put(9, 9);
+1:7d857b4:             }});
+1:5c4d5c7:         }});
+1:5c4d5c7: 
+1:5c4d5c7:         Callable<OnDiskIndex> segmentBuilder = indexWriter.getIndex(column).scheduleSegmentFlush(false);
+1:5c4d5c7: 
+1:5c4d5c7:         Assert.assertNull(segmentBuilder.call());
+1:5c4d5c7: 
+1:5c4d5c7:         PerSSTableIndexWriter.Index index = indexWriter.getIndex(column);
+1:5c4d5c7:         Random random = ThreadLocalRandom.current();
+1:5c4d5c7: 
+1:7d857b4:         Supplier<KeyOffsets> offsetSupplier = () -> new KeyOffsets() {{
+1:7d857b4:             put(random.nextInt(), random.nextInt());
+1:7d857b4:             put(random.nextInt(), random.nextInt());
+1:7d857b4:             put(random.nextInt(), random.nextInt());
+1:7d857b4:         }};
+1:7d857b4: 
+1:5c4d5c7:         Set<String> segments = new HashSet<>();
+1:5c4d5c7:         // now let's test multiple correct segments with yield incorrect final segment
+1:5c4d5c7:         for (int i = 0; i < 3; i++)
+1:5c4d5c7:         {
+1:7d857b4:             populateSegment(cfs.metadata, index, new HashMap<Long, KeyOffsets>()
+1:5c4d5c7:             {{
+1:7d857b4:                 put(now,     offsetSupplier.get());
+1:7d857b4:                 put(now + 1, offsetSupplier.get());
+1:7d857b4:                 put(now + 2, offsetSupplier.get());
+1:5c4d5c7:             }});
+1:5c4d5c7: 
+1:5c4d5c7:             try
+1:5c4d5c7:             {
+1:5c4d5c7:                 // flush each of the new segments, they should all succeed
+1:5c4d5c7:                 OnDiskIndex segment = index.scheduleSegmentFlush(false).call();
+1:5c4d5c7:                 index.segments.add(Futures.immediateFuture(segment));
+1:5c4d5c7:                 segments.add(segment.getIndexPath());
+1:5c4d5c7:             }
+1:5c4d5c7:             catch (Exception | FSError e)
+1:5c4d5c7:             {
+1:5c4d5c7:                 e.printStackTrace();
+1:5c4d5c7:                 Assert.fail();
+1:5c4d5c7:             }
+1:5c4d5c7:         }
+1:5c4d5c7: 
+1:5c4d5c7:         // make sure that all of the segments are present of the filesystem
+1:5c4d5c7:         for (String segment : segments)
+1:5c4d5c7:             Assert.assertTrue(new File(segment).exists());
+1:5c4d5c7: 
+1:5c4d5c7:         indexWriter.complete();
+1:5c4d5c7: 
+1:5c4d5c7:         // make sure that individual segments have been cleaned up
+1:5c4d5c7:         for (String segment : segments)
+1:5c4d5c7:             Assert.assertFalse(new File(segment).exists());
+1:5c4d5c7: 
+1:5c4d5c7:         // and combined index doesn't exist either
+1:5c4d5c7:         Assert.assertFalse(new File(index.outputFile).exists());
+1:5c4d5c7:     }
+1:5c4d5c7: 
+1:7d857b4:     private static void populateSegment(CFMetaData metadata, PerSSTableIndexWriter.Index index, Map<Long, KeyOffsets> data)
+1:5c4d5c7:     {
+1:7d857b4:         for (Map.Entry<Long, KeyOffsets> value : data.entrySet())
+1:5c4d5c7:         {
+1:5c4d5c7:             ByteBuffer term = LongType.instance.decompose(value.getKey());
+1:7d857b4:             for (LongObjectCursor<long[]> cursor : value.getValue())
+1:5c4d5c7:             {
+1:7d857b4:                 ByteBuffer key = ByteBufferUtil.bytes(String.format("key%06d", cursor.key));
+1:7d857b4:                 for (long rowOffset : cursor.value)
+1:7d857b4:                 {
+1:7d857b4:                     index.add(term,
+1:7d857b4:                               metadata.partitioner.decorateKey(key),
+1:7d857b4:                               ThreadLocalRandom.current().nextInt(Integer.MAX_VALUE - 1),
+1:7d857b4:                               ThreadLocalRandom.current().nextInt(Integer.MAX_VALUE - 1));
+1:7d857b4:                 }
+1:5c4d5c7:             }
+1:5c4d5c7:         }
+1:5c4d5c7:     }
+1:7d857b4: 
+1:7d857b4:     private final class FakeKeyFetcher implements KeyFetcher
+1:7d857b4:     {
+1:7d857b4:         private final ColumnFamilyStore cfs;
+1:7d857b4:         private final String keyFormat;
+1:7d857b4: 
+1:7d857b4:         public FakeKeyFetcher(ColumnFamilyStore cfs, String keyFormat)
+1:7d857b4:         {
+1:7d857b4:             this.cfs = cfs;
+1:7d857b4:             this.keyFormat = keyFormat;
+1:7d857b4:         }
+1:7d857b4: 
+1:7d857b4:         public DecoratedKey getPartitionKey(long keyPosition)
+1:7d857b4:         {
+1:7d857b4:             ByteBuffer key = ByteBufferUtil.bytes(String.format(keyFormat, keyPosition));
+1:7d857b4:             return cfs.metadata.partitioner.decorateKey(key);
+1:7d857b4:         }
+1:7d857b4: 
+1:7d857b4:         public Clustering getClustering(long offset)
+1:7d857b4:         {
+1:7d857b4:             return Clustering.make(ByteBufferUtil.bytes(offset));
+1:7d857b4:         }
+1:7d857b4: 
+1:7d857b4:         public RowKey getRowKey(long partitionOffset, long rowOffset)
+1:7d857b4:         {
+1:7d857b4:             return new RowKey(getPartitionKey(partitionOffset), getClustering(rowOffset), CLUSTERING_COMPARATOR);
+1:7d857b4:         }
+1:7d857b4:     }
+1:7d857b4: 
+1:7d857b4:     public IPartitioner getPartitioner()
+1:7d857b4:     {
+1:7d857b4:         return Murmur3Partitioner.instance;
+1:7d857b4:     }
+1:7d857b4: 
+1:72790dc: }
+============================================================================
+author:Alex Petrov
+-------------------------------------------------------------------------------
+commit:7d857b4
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.function.Supplier;
+1: import com.carrotsearch.hppc.cursors.LongObjectCursor;
+1: import org.apache.cassandra.db.ClusteringComparator;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.dht.IPartitioner;
+1: import org.apache.cassandra.dht.Murmur3Partitioner;
+1: import org.apache.cassandra.index.sasi.KeyFetcher;
+/////////////////////////////////////////////////////////////////////////
+1:     private static final ClusteringComparator CLUSTERING_COMPARATOR = new ClusteringComparator(LongType.instance);
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         SortedMap<RowKey, Row> expectedKeys = new TreeMap<>();
+1:             Clustering clustering = Clustering.make(ByteBufferUtil.bytes(i * 1L));
+1:             expectedKeys.put(new RowKey(cfs.metadata.partitioner.decorateKey(key), clustering, CLUSTERING_COMPARATOR),
+1:                              BTreeRow.singleCellRow(clustering,
+1:         Iterator<Map.Entry<RowKey, Row>> keyIterator = expectedKeys.entrySet().iterator();
+/////////////////////////////////////////////////////////////////////////
+1:                 Map.Entry<RowKey, Row> key = keyIterator.next();
+1:                 indexWriter.startPartition(key.getKey().decoratedKey, position);
+1:                 indexWriter.nextUnfilteredCluster(key.getValue(), position);
+1:                 position++;
+/////////////////////////////////////////////////////////////////////////
+1:         OnDiskIndex index = new OnDiskIndex(new File(indexFile), Int32Type.instance, new FakeKeyFetcher(cfs, keyFormat));
+1:         Set<RowKey> actualKeys = new HashSet<>();
+/////////////////////////////////////////////////////////////////////////
+1:                 for (RowKey key : tokens.next())
+/////////////////////////////////////////////////////////////////////////
+1:         for (RowKey key : expectedKeys.keySet())
+1:             Assert.assertTrue("Key was not present : " + key, actualKeys.contains(key));
+/////////////////////////////////////////////////////////////////////////
+1:         populateSegment(cfs.metadata, indexWriter.getIndex(column), new HashMap<Long, KeyOffsets>()
+1:             put(now,     new KeyOffsets() {{ put(0, 0); put(1, 1); }});
+1:             put(now + 1, new KeyOffsets() {{ put(2, 2); put(3, 3); }});
+1:             put(now + 2, new KeyOffsets() {{
+1:                 put(4, 4); put(5, 5); put(6, 6);
+1:                 put(7, 7); put(8, 8); put(9, 9);
+1:             }});
+/////////////////////////////////////////////////////////////////////////
+1:         Supplier<KeyOffsets> offsetSupplier = () -> new KeyOffsets() {{
+1:             put(random.nextInt(), random.nextInt());
+1:             put(random.nextInt(), random.nextInt());
+1:             put(random.nextInt(), random.nextInt());
+1:         }};
+1: 
+1:             populateSegment(cfs.metadata, index, new HashMap<Long, KeyOffsets>()
+1:                 put(now,     offsetSupplier.get());
+1:                 put(now + 1, offsetSupplier.get());
+1:                 put(now + 2, offsetSupplier.get());
+/////////////////////////////////////////////////////////////////////////
+1:     private static void populateSegment(CFMetaData metadata, PerSSTableIndexWriter.Index index, Map<Long, KeyOffsets> data)
+1:         for (Map.Entry<Long, KeyOffsets> value : data.entrySet())
+1:             for (LongObjectCursor<long[]> cursor : value.getValue())
+1:                 ByteBuffer key = ByteBufferUtil.bytes(String.format("key%06d", cursor.key));
+1:                 for (long rowOffset : cursor.value)
+1:                 {
+1:                     index.add(term,
+1:                               metadata.partitioner.decorateKey(key),
+1:                               ThreadLocalRandom.current().nextInt(Integer.MAX_VALUE - 1),
+1:                               ThreadLocalRandom.current().nextInt(Integer.MAX_VALUE - 1));
+1:                 }
+1: 
+1:     private final class FakeKeyFetcher implements KeyFetcher
+1:     {
+1:         private final ColumnFamilyStore cfs;
+1:         private final String keyFormat;
+1: 
+1:         public FakeKeyFetcher(ColumnFamilyStore cfs, String keyFormat)
+1:         {
+1:             this.cfs = cfs;
+1:             this.keyFormat = keyFormat;
+1:         }
+1: 
+1:         public DecoratedKey getPartitionKey(long keyPosition)
+1:         {
+1:             ByteBuffer key = ByteBufferUtil.bytes(String.format(keyFormat, keyPosition));
+1:             return cfs.metadata.partitioner.decorateKey(key);
+1:         }
+1: 
+1:         public Clustering getClustering(long offset)
+1:         {
+1:             return Clustering.make(ByteBufferUtil.bytes(offset));
+1:         }
+1: 
+1:         public RowKey getRowKey(long partitionOffset, long rowOffset)
+1:         {
+1:             return new RowKey(getPartitionKey(partitionOffset), getClustering(rowOffset), CLUSTERING_COMPARATOR);
+1:         }
+1:     }
+1: 
+1:     public IPartitioner getPartitioner()
+1:     {
+1:         return Murmur3Partitioner.instance;
+1:     }
+1: 
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:b6ff7f6
+commit:72790dc
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.index.sasi.disk;
+1: 
+1: import java.io.File;
+1: import java.nio.ByteBuffer;
+1: import java.util.*;
+1: 
+1: import org.apache.cassandra.SchemaLoader;
+1: import org.apache.cassandra.config.ColumnDefinition;
+1: import org.apache.cassandra.db.Clustering;
+1: import org.apache.cassandra.db.ColumnFamilyStore;
+1: import org.apache.cassandra.db.DecoratedKey;
+1: import org.apache.cassandra.db.Keyspace;
+1: import org.apache.cassandra.db.compaction.OperationType;
+1: import org.apache.cassandra.db.rows.BTreeRow;
+1: import org.apache.cassandra.db.rows.BufferCell;
+1: import org.apache.cassandra.db.rows.Row;
+1: import org.apache.cassandra.index.sasi.SASIIndex;
+1: import org.apache.cassandra.index.sasi.utils.RangeIterator;
+1: import org.apache.cassandra.db.marshal.Int32Type;
+1: import org.apache.cassandra.db.marshal.UTF8Type;
+1: import org.apache.cassandra.exceptions.ConfigurationException;
+1: import org.apache.cassandra.io.sstable.Descriptor;
+1: import org.apache.cassandra.io.util.FileUtils;
+1: import org.apache.cassandra.schema.KeyspaceMetadata;
+1: import org.apache.cassandra.schema.KeyspaceParams;
+1: import org.apache.cassandra.schema.Tables;
+1: import org.apache.cassandra.service.MigrationManager;
+1: import org.apache.cassandra.utils.ByteBufferUtil;
+1: 
+1: import com.google.common.util.concurrent.Futures;
+1: 
+1: import org.junit.Assert;
+1: import org.junit.BeforeClass;
+1: import org.junit.Test;
+1: 
+1: public class PerSSTableIndexWriterTest extends SchemaLoader
+1: {
+1:     private static final String KS_NAME = "sasi";
+1:     private static final String CF_NAME = "test_cf";
+1: 
+1:     @BeforeClass
+1:     public static void loadSchema() throws ConfigurationException
+1:     {
+1:         System.setProperty("cassandra.config", "cassandra-murmur.yaml");
+1:         SchemaLoader.loadSchema();
+1:         MigrationManager.announceNewKeyspace(KeyspaceMetadata.create(KS_NAME,
+1:                                                                      KeyspaceParams.simpleTransient(1),
+1:                                                                      Tables.of(SchemaLoader.sasiCFMD(KS_NAME, CF_NAME))));
+1:     }
+1: 
+1:     @Test
+1:     public void testPartialIndexWrites() throws Exception
+1:     {
+1:         final int maxKeys = 100000, numParts = 4, partSize = maxKeys / numParts;
+1:         final String keyFormat = "key%06d";
+1:         final long timestamp = System.currentTimeMillis();
+1: 
+1:         ColumnFamilyStore cfs = Keyspace.open(KS_NAME).getColumnFamilyStore(CF_NAME);
+1:         ColumnDefinition column = cfs.metadata.getColumnDefinition(UTF8Type.instance.decompose("age"));
+1: 
+1:         SASIIndex sasi = (SASIIndex) cfs.indexManager.getIndexByName("age");
+1: 
+1:         File directory = cfs.getDirectories().getDirectoryForNewSSTables();
+1:         Descriptor descriptor = Descriptor.fromFilename(cfs.getSSTablePath(directory));
+1:         PerSSTableIndexWriter indexWriter = (PerSSTableIndexWriter) sasi.getFlushObserver(descriptor, OperationType.FLUSH);
+1: 
+0:         SortedMap<DecoratedKey, Row> expectedKeys = new TreeMap<>(DecoratedKey.comparator);
+1: 
+1:         for (int i = 0; i < maxKeys; i++)
+1:         {
+1:             ByteBuffer key = ByteBufferUtil.bytes(String.format(keyFormat, i));
+0:             expectedKeys.put(cfs.metadata.partitioner.decorateKey(key),
+0:                              BTreeRow.singleCellRow(Clustering.EMPTY,
+0:                                                     BufferCell.live(cfs.metadata, column, timestamp, Int32Type.instance.decompose(i))));
+1:         }
+1: 
+1:         indexWriter.begin();
+1: 
+0:         Iterator<Map.Entry<DecoratedKey, Row>> keyIterator = expectedKeys.entrySet().iterator();
+1:         long position = 0;
+1: 
+1:         Set<String> segments = new HashSet<>();
+1:         outer:
+1:         for (;;)
+1:         {
+1:             for (int i = 0; i < partSize; i++)
+1:             {
+1:                 if (!keyIterator.hasNext())
+1:                     break outer;
+1: 
+0:                 Map.Entry<DecoratedKey, Row> key = keyIterator.next();
+1: 
+0:                 indexWriter.startPartition(key.getKey(), position++);
+0:                 indexWriter.nextUnfilteredCluster(key.getValue());
+1:             }
+1: 
+1:             PerSSTableIndexWriter.Index index = indexWriter.getIndex(column);
+1: 
+1:             OnDiskIndex segment = index.scheduleSegmentFlush(false).call();
+1:             index.segments.add(Futures.immediateFuture(segment));
+1:             segments.add(segment.getIndexPath());
+1:         }
+1: 
+1:         for (String segment : segments)
+1:             Assert.assertTrue(new File(segment).exists());
+1: 
+1:         String indexFile = indexWriter.indexes.get(column).filename(true);
+1: 
+1:         // final flush
+1:         indexWriter.complete();
+1: 
+1:         for (String segment : segments)
+1:             Assert.assertFalse(new File(segment).exists());
+1: 
+0:         OnDiskIndex index = new OnDiskIndex(new File(indexFile), Int32Type.instance, keyPosition -> {
+0:             ByteBuffer key = ByteBufferUtil.bytes(String.format(keyFormat, keyPosition));
+0:             return cfs.metadata.partitioner.decorateKey(key);
+0:         });
+1: 
+1:         Assert.assertEquals(0, UTF8Type.instance.compare(index.minKey(), ByteBufferUtil.bytes(String.format(keyFormat, 0))));
+1:         Assert.assertEquals(0, UTF8Type.instance.compare(index.maxKey(), ByteBufferUtil.bytes(String.format(keyFormat, maxKeys - 1))));
+1: 
+0:         Set<DecoratedKey> actualKeys = new HashSet<>();
+1:         int count = 0;
+1:         for (OnDiskIndex.DataTerm term : index)
+1:         {
+1:             RangeIterator<Long, Token> tokens = term.getTokens();
+1: 
+1:             while (tokens.hasNext())
+1:             {
+0:                 for (DecoratedKey key : tokens.next())
+1:                     actualKeys.add(key);
+1:             }
+1: 
+1:             Assert.assertEquals(count++, (int) Int32Type.instance.compose(term.getTerm()));
+1:         }
+1: 
+1:         Assert.assertEquals(expectedKeys.size(), actualKeys.size());
+0:         for (DecoratedKey key : expectedKeys.keySet())
+0:             Assert.assertTrue(actualKeys.contains(key));
+1: 
+1:         FileUtils.closeQuietly(index);
+1:     }
+1: }
+author:Jordan West
+-------------------------------------------------------------------------------
+commit:5c4d5c7
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.Callable;
+1: import java.util.concurrent.ThreadLocalRandom;
+1: import org.apache.cassandra.config.CFMetaData;
+1: import org.apache.cassandra.db.marshal.LongType;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.io.FSError;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     @Test
+1:     public void testSparse() throws Exception
+1:     {
+1:         final String columnName = "timestamp";
+1: 
+1:         ColumnFamilyStore cfs = Keyspace.open(KS_NAME).getColumnFamilyStore(CF_NAME);
+1:         ColumnDefinition column = cfs.metadata.getColumnDefinition(UTF8Type.instance.decompose(columnName));
+1: 
+1:         SASIIndex sasi = (SASIIndex) cfs.indexManager.getIndexByName(columnName);
+1: 
+1:         File directory = cfs.getDirectories().getDirectoryForNewSSTables();
+1:         Descriptor descriptor = Descriptor.fromFilename(cfs.getSSTablePath(directory));
+1:         PerSSTableIndexWriter indexWriter = (PerSSTableIndexWriter) sasi.getFlushObserver(descriptor, OperationType.FLUSH);
+1: 
+1:         final long now = System.currentTimeMillis();
+1: 
+1:         indexWriter.begin();
+1:         indexWriter.indexes.put(column, indexWriter.newIndex(sasi.getIndex()));
+1: 
+0:         populateSegment(cfs.metadata, indexWriter.getIndex(column), new HashMap<Long, Set<Integer>>()
+1:         {{
+0:             put(now,     new HashSet<>(Arrays.asList(0, 1)));
+0:             put(now + 1, new HashSet<>(Arrays.asList(2, 3)));
+0:             put(now + 2, new HashSet<>(Arrays.asList(4, 5, 6, 7, 8, 9)));
+1:         }});
+1: 
+1:         Callable<OnDiskIndex> segmentBuilder = indexWriter.getIndex(column).scheduleSegmentFlush(false);
+1: 
+1:         Assert.assertNull(segmentBuilder.call());
+1: 
+1:         PerSSTableIndexWriter.Index index = indexWriter.getIndex(column);
+1:         Random random = ThreadLocalRandom.current();
+1: 
+1:         Set<String> segments = new HashSet<>();
+1:         // now let's test multiple correct segments with yield incorrect final segment
+1:         for (int i = 0; i < 3; i++)
+1:         {
+0:             populateSegment(cfs.metadata, index, new HashMap<Long, Set<Integer>>()
+1:             {{
+0:                 put(now,     new HashSet<>(Arrays.asList(random.nextInt(), random.nextInt(), random.nextInt())));
+0:                 put(now + 1, new HashSet<>(Arrays.asList(random.nextInt(), random.nextInt(), random.nextInt())));
+0:                 put(now + 2, new HashSet<>(Arrays.asList(random.nextInt(), random.nextInt(), random.nextInt())));
+1:             }});
+1: 
+1:             try
+1:             {
+1:                 // flush each of the new segments, they should all succeed
+1:                 OnDiskIndex segment = index.scheduleSegmentFlush(false).call();
+1:                 index.segments.add(Futures.immediateFuture(segment));
+1:                 segments.add(segment.getIndexPath());
+1:             }
+1:             catch (Exception | FSError e)
+1:             {
+1:                 e.printStackTrace();
+1:                 Assert.fail();
+1:             }
+1:         }
+1: 
+1:         // make sure that all of the segments are present of the filesystem
+1:         for (String segment : segments)
+1:             Assert.assertTrue(new File(segment).exists());
+1: 
+1:         indexWriter.complete();
+1: 
+1:         // make sure that individual segments have been cleaned up
+1:         for (String segment : segments)
+1:             Assert.assertFalse(new File(segment).exists());
+1: 
+1:         // and combined index doesn't exist either
+1:         Assert.assertFalse(new File(index.outputFile).exists());
+1:     }
+1: 
+0:     private static void populateSegment(CFMetaData metadata, PerSSTableIndexWriter.Index index, Map<Long, Set<Integer>> data)
+1:     {
+0:         for (Map.Entry<Long, Set<Integer>> value : data.entrySet())
+1:         {
+1:             ByteBuffer term = LongType.instance.decompose(value.getKey());
+0:             for (Integer keyPos : value.getValue())
+1:             {
+0:                 ByteBuffer key = ByteBufferUtil.bytes(String.format("key%06d", keyPos));
+0:                 index.add(term, metadata.partitioner.decorateKey(key), ThreadLocalRandom.current().nextInt(Integer.MAX_VALUE - 1));
+1:             }
+1:         }
+1:     }
+author:Benjamin Lerer
+-------------------------------------------------------------------------------
+commit:e017f94
+/////////////////////////////////////////////////////////////////////////
+1:                                                     BufferCell.live(column, timestamp, Int32Type.instance.decompose(i))));
+============================================================================

@@ -1,0 +1,1655 @@
+1:07cf56f: /*
+1:d389047:  * Licensed to the Apache Software Foundation (ASF) under one
+1:d389047:  * or more contributor license agreements.  See the NOTICE file
+1:d389047:  * distributed with this work for additional information
+1:d389047:  * regarding copyright ownership.  The ASF licenses this file
+1:d389047:  * to you under the Apache License, Version 2.0 (the
+1:d389047:  * "License"); you may not use this file except in compliance
+1:d389047:  * with the License.  You may obtain a copy of the License at
+1:f44110c:  *
+1:07cf56f:  *     http://www.apache.org/licenses/LICENSE-2.0
+4:d389047:  *
+1:07cf56f:  * Unless required by applicable law or agreed to in writing, software
+1:07cf56f:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:07cf56f:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:07cf56f:  * See the License for the specific language governing permissions and
+1:07cf56f:  * limitations under the License.
+1:ecbf0fd:  */
+1:d389047: package org.apache.cassandra.io.util;
+7:75508ec: 
+1:fb22109: import java.io.File;
+1:fb22109: import java.io.IOException;
+1:bc7941c: import java.nio.channels.FileChannel;
+1:bc7941c: import java.nio.file.StandardOpenOption;
+1:3679b1b: 
+1:9ecda72: import org.apache.cassandra.io.FSReadError;
+1:9ecda72: import org.apache.cassandra.io.FSWriteError;
+1:fb22109: import org.apache.cassandra.utils.SyncUtil;
+1:8704006: import org.apache.cassandra.utils.concurrent.Transactional;
+1:8704006: 
+1:8704006: import static org.apache.cassandra.utils.Throwables.merge;
+1:29687a8: 
+1:bc7941c: /**
+1:ecbf0fd:  * Adds buffering, mark, and fsyncing to OutputStream.  We always fsync on close; we may also
+1:ecbf0fd:  * fsync incrementally if Config.trickle_fsync is enabled.
+1:b47233b:  */
+1:29687a8: public class SequentialWriter extends BufferedDataOutputStreamPlus implements Transactional
+1:be31393: {
+1:d389047:     // absolute path to the given file
+1:d389047:     private final String filePath;
+1:3679b1b: 
+1:bc7941c:     // Offset for start of buffer relative to underlying file
+1:bc7941c:     protected long bufferOffset;
+1:b47233b: 
+1:29687a8:     protected final FileChannel fchannel;
+1:1ecabe6: 
+1:ba7b0bd:     // whether to do trickling fsync() to avoid sudden bursts of dirty buffer flushing by kernel causing read
+1:ba7b0bd:     // latency spikes
+1:fb22109:     private final SequentialWriterOption option;
+1:ba7b0bd:     private int bytesSinceTrickleFsync = 0;
+1:1ecabe6: 
+1:4e95953:     protected long lastFlushOffset;
+1:17dd4cc: 
+1:4eb9fa7:     protected Runnable runPostFlush;
+1:8704006: 
+1:8704006:     private final TransactionalProxy txnProxy = txnProxy();
+1:8704006: 
+1:8704006:     // due to lack of multiple-inheritance, we proxy our transactional implementation
+1:8704006:     protected class TransactionalProxy extends AbstractTransactional
+1:8704006:     {
+1:8704006:         @Override
+1:e5a76bd:         protected Throwable doPreCleanup(Throwable accumulate)
+1:8704006:         {
+1:8704006:             // close is idempotent
+1:8704006:             try { channel.close(); }
+2:8704006:             catch (Throwable t) { accumulate = merge(accumulate, t); }
+1:b09e60f: 
+1:8704006:             if (buffer != null)
+1:8704006:             {
+1:8704006:                 try { FileUtils.clean(buffer); }
+1:8704006:                 catch (Throwable t) { accumulate = merge(accumulate, t); }
+1:8704006:                 buffer = null;
+1:be31393:             }
+1:be31393: 
+1:b09e60f:             return accumulate;
+1:b09e60f:         }
+1:b09e60f: 
+1:8704006:         protected void doPrepare()
+1:b09e60f:         {
+1:8704006:             syncInternal();
+1:8704006:         }
+1:8704006: 
+1:8704006:         protected Throwable doCommit(Throwable accumulate)
+1:8704006:         {
+2:8704006:             return accumulate;
+1:8704006:         }
+1:8704006: 
+1:8704006:         protected Throwable doAbort(Throwable accumulate)
+1:8704006:         {
+1:c163d0b:             return accumulate;
+1:8704006:         }
+1:8704006:     }
+1:8704006: 
+1:29687a8:     // TODO: we should specify as a parameter if we permit an existing file or not
+1:fb22109:     private static FileChannel openChannel(File file)
+1:fb22109:     {
+1:8704006:         try
+1:8704006:         {
+1:bc7941c:             if (file.exists())
+1:29687a8:             {
+1:29687a8:                 return FileChannel.open(file.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE);
+1:29687a8:             }
+1:b09e60f:             else
+1:29687a8:             {
+1:29687a8:                 FileChannel channel = FileChannel.open(file.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
+1:29687a8:                 try
+1:29687a8:                 {
+1:29687a8:                     SyncUtil.trySyncDir(file.getParentFile());
+1:29687a8:                 }
+1:29687a8:                 catch (Throwable t)
+1:29687a8:                 {
+1:29687a8:                     try { channel.close(); }
+1:29687a8:                     catch (Throwable t2) { t.addSuppressed(t2); }
+1:29687a8:                 }
+1:29687a8:                 return channel;
+1:29687a8:             }
+1:8704006:         }
+1:8704006:         catch (IOException e)
+1:8704006:         {
+1:b47233b:             throw new RuntimeException(e);
+1:29687a8:         }
+1:8704006:     }
+1:29687a8: 
+1:fb22109:     /**
+1:fb22109:      * Create heap-based, non-compressed SequenialWriter with default buffer size(64k).
+1:fb22109:      *
+1:fb22109:      * @param file File to write
+1:fb22109:      */
+1:fb22109:     public SequentialWriter(File file)
+1:29687a8:     {
+1:fb22109:        this(file, SequentialWriterOption.DEFAULT);
+1:fb22109:     }
+1:fb22109: 
+1:fb22109:     /**
+1:fb22109:      * Create SequentialWriter for given file with specific writer option.
+1:fb22109:      *
+1:fb22109:      * @param file File to write
+1:fb22109:      * @param option Writer option
+1:fb22109:      */
+1:fb22109:     public SequentialWriter(File file, SequentialWriterOption option)
+1:fb22109:     {
+1:fb22109:         super(openChannel(file), option.allocateBuffer());
+1:29687a8:         strictFlushing = true;
+1:29687a8:         fchannel = (FileChannel)channel;
+1:8704006: 
+1:d389047:         filePath = file.getAbsolutePath();
+1:8704006: 
+1:fb22109:         this.option = option;
+1:8704006:     }
+1:8704006: 
+1:72790dc:     public void skipBytes(int numBytes) throws IOException
+1:72790dc:     {
+1:72790dc:         flush();
+1:72790dc:         fchannel.position(fchannel.position() + numBytes);
+1:72790dc:         bufferOffset = fchannel.position();
+1:72790dc:     }
+1:72790dc: 
+1:b47233b:     /**
+1:d389047:      * Synchronize file contents with disk.
+1:b47233b:      */
+1:9ecda72:     public void sync()
+1:8704006:     {
+1:1ecabe6:         syncInternal();
+1:8704006:     }
+1:8704006: 
+1:9ecda72:     protected void syncDataOnlyInternal()
+1:8704006:     {
+1:b47233b:         try
+1:3679b1b:         {
+1:29687a8:             SyncUtil.force(fchannel, false);
+1:3679b1b:         }
+1:bc7941c:         catch (IOException e)
+1:3679b1b:         {
+1:9ecda72:             throw new FSWriteError(e, getPath());
+1:3679b1b:         }
+1:3679b1b:     }
+1:4eb9fa7: 
+1:29687a8:     /*
+1:29687a8:      * This is only safe to call before truncation or close for CompressedSequentialWriter
+1:29687a8:      * Otherwise it will leave a non-uniform size compressed block in the middle of the file
+1:29687a8:      * and the compressed format can't handle that.
+1:29687a8:      */
+1:9ecda72:     protected void syncInternal()
+1:3679b1b:     {
+1:f7aaea0:         doFlush(0);
+1:29687a8:         syncDataOnlyInternal();
+1:a3fc425:     }
+1:3679b1b: 
+1:d389047:     @Override
+1:f7aaea0:     protected void doFlush(int count)
+1:a3fc425:     {
+1:29687a8:         flushData();
+1:3679b1b: 
+1:fb22109:         if (option.trickleFsync())
+1:f60e4ad:         {
+1:29687a8:             bytesSinceTrickleFsync += buffer.position();
+1:fb22109:             if (bytesSinceTrickleFsync >= option.trickleFsyncByteInterval())
+1:b47233b:             {
+1:29687a8:                 syncDataOnlyInternal();
+1:29687a8:                 bytesSinceTrickleFsync = 0;
+1:f60e4ad:             }
+1:b47233b:         }
+1:29687a8: 
+1:29687a8:         // Remember that we wrote, so we don't write it again on next flush().
+1:29687a8:         resetBuffer();
+1:b47233b:     }
+1:3679b1b: 
+1:4eb9fa7:     public void setPostFlushListener(Runnable runPostFlush)
+1:4eb9fa7:     {
+1:4eb9fa7:         assert this.runPostFlush == null;
+1:4eb9fa7:         this.runPostFlush = runPostFlush;
+1:4eb9fa7:     }
+1:4eb9fa7: 
+1:b47233b:     /**
+1:1ecabe6:      * Override this method instead of overriding flush()
+1:9ecda72:      * @throws FSWriteError on any I/O error.
+1:1ecabe6:      */
+1:9ecda72:     protected void flushData()
+1:b47233b:     {
+1:9ecda72:         try
+1:b47233b:         {
+1:bc7941c:             buffer.flip();
+1:bc7941c:             channel.write(buffer);
+1:bc7941c:             lastFlushOffset += buffer.position();
+1:b47233b:         }
+1:9ecda72:         catch (IOException e)
+1:b47233b:         {
+1:9ecda72:             throw new FSWriteError(e, getPath());
+1:b47233b:         }
+1:4eb9fa7:         if (runPostFlush != null)
+1:4eb9fa7:             runPostFlush.run();
+1:1ecabe6:     }
+1:3679b1b: 
+1:753a943:     public boolean hasPosition()
+1:51b1a1c:     {
+1:51b1a1c:         return true;
+1:51b1a1c:     }
+1:51b1a1c: 
+1:753a943:     public long position()
+1:1ecabe6:     {
+1:bc7941c:         return current();
+1:1ecabe6:     }
+1:a3fc425: 
+1:1ecabe6:     /**
+1:f44110c:      * Returns the current file pointer of the underlying on-disk file.
+1:80d7d43:      * Note that since write works by buffering data, the value of this will increase by buffer
+1:80d7d43:      * size and not every write to the writer will modify this value.
+1:80d7d43:      * Furthermore, for compressed files, this value refers to compressed data, while the
+1:80d7d43:      * writer getFilePointer() refers to uncompressedFile
+1:bc7941c:      *
+1:f44110c:      * @return the current file pointer
+1:bc7941c:      */
+1:9ecda72:     public long getOnDiskFilePointer()
+1:1ecabe6:     {
+1:753a943:         return position();
+1:1ecabe6:     }
+1:f60e4ad: 
+1:0f1e838:     public long getEstimatedOnDiskBytesWritten()
+1:0f1e838:     {
+1:0f1e838:         return getOnDiskFilePointer();
+1:0f1e838:     }
+1:0f1e838: 
+1:9ecda72:     public long length()
+1:1ecabe6:     {
+1:9ecda72:         try
+1:bc7941c:         {
+1:29687a8:             return Math.max(current(), fchannel.size());
+1:bc7941c:         }
+1:9ecda72:         catch (IOException e)
+1:75508ec:         {
+1:9ecda72:             throw new FSReadError(e, getPath());
+1:75508ec:         }
+1:75508ec:     }
+1:f60e4ad: 
+1:d389047:     public String getPath()
+1:75508ec:     {
+1:d389047:         return filePath;
+1:75508ec:     }
+1:f60e4ad: 
+1:1ecabe6:     protected void resetBuffer()
+1:75508ec:     {
+1:bc7941c:         bufferOffset = current();
+1:bc7941c:         buffer.clear();
+1:9405ce0:     }
+1:f60e4ad: 
+1:bc7941c:     protected long current()
+1:9405ce0:     {
+1:bc7941c:         return bufferOffset + (buffer == null ? 0 : buffer.position());
+1:9405ce0:     }
+1:b47233b: 
+1:e8651b6:     public DataPosition mark()
+1:9405ce0:     {
+1:bc7941c:         return new BufferedFileWriterMark(current());
+1:9ecda72:     }
+1:b47233b: 
+1:bc7941c:     /**
+1:bc7941c:      * Drops all buffered data that's past the limits of our new file mark + buffer capacity, or syncs and truncates
+1:bc7941c:      * the underlying file to the marked position
+1:bc7941c:      */
+1:e8651b6:     public void resetAndTruncate(DataPosition mark)
+1:9ecda72:     {
+1:d389047:         assert mark instanceof BufferedFileWriterMark;
+1:b47233b: 
+1:bc7941c:         long previous = current();
+1:bc7941c:         long truncateTarget = ((BufferedFileWriterMark) mark).pointer;
+1:1ecabe6: 
+1:bc7941c:         // If we're resetting to a point within our buffered data, just adjust our buffered position to drop bytes to
+1:bc7941c:         // the right of the desired mark.
+1:bc7941c:         if (previous - truncateTarget <= buffer.position())
+1:1ecabe6:         {
+1:bc7941c:             buffer.position(buffer.position() - ((int) (previous - truncateTarget)));
+1:1ecabe6:             return;
+1:1ecabe6:         }
+1:1ecabe6: 
+1:bc7941c:         // synchronize current buffer with disk - we don't want any data loss
+1:1ecabe6:         syncInternal();
+1:1ecabe6: 
+1:d389047:         // truncate file to given position
+1:bc7941c:         truncate(truncateTarget);
+1:1ecabe6: 
+1:9ecda72:         try
+1:9ecda72:         {
+1:29687a8:             fchannel.position(truncateTarget);
+1:9ecda72:         }
+1:9ecda72:         catch (IOException e)
+1:9ecda72:         {
+1:9ecda72:             throw new FSReadError(e, getPath());
+1:9ecda72:         }
+1:bc7941c: 
+1:fb22109:         bufferOffset = truncateTarget;
+3:d389047:         resetBuffer();
+1:9ecda72:     }
+1:bc7941c: 
+1:4e95953:     public long getLastFlushOffset()
+1:4e95953:     {
+1:4e95953:         return lastFlushOffset;
+1:4e95953:     }
+1:bc7941c: 
+1:9ecda72:     public void truncate(long toSize)
+1:9ecda72:     {
+2:9ecda72:         try
+1:9ecda72:         {
+1:29687a8:             fchannel.truncate(toSize);
+1:fb22109:             lastFlushOffset = toSize;
+1:9ecda72:         }
+2:9ecda72:         catch (IOException e)
+1:9ecda72:         {
+1:9ecda72:             throw new FSWriteError(e, getPath());
+1:9ecda72:         }
+1:9ecda72:     }
+1:bc7941c: 
+1:75508ec:     public boolean isOpen()
+1:75508ec:     {
+1:bc7941c:         return channel.isOpen();
+1:75508ec:     }
+1:4e95953: 
+1:8704006:     public final void prepareToCommit()
+1:9ecda72:     {
+1:8704006:         txnProxy.prepareToCommit();
+1:8704006:     }
+1:8704006: 
+1:8704006:     public final Throwable commit(Throwable accumulate)
+1:8704006:     {
+1:8704006:         return txnProxy.commit(accumulate);
+1:8704006:     }
+1:8704006: 
+1:8704006:     public final Throwable abort(Throwable accumulate)
+1:8704006:     {
+1:8704006:         return txnProxy.abort(accumulate);
+1:8704006:     }
+1:8704006: 
+1:d389047:     @Override
+1:8704006:     public final void close()
+1:9ecda72:     {
+1:fb22109:         if (option.finishOnClose())
+1:a3fc425:             txnProxy.finish();
+1:3679b1b:         else
+1:8704006:             txnProxy.close();
+1:9ecda72:     }
+1:75508ec: 
+1:8704006:     public final void finish()
+1:9ecda72:     {
+1:8704006:         txnProxy.finish();
+1:8704006:     }
+1:75508ec: 
+1:8704006:     protected TransactionalProxy txnProxy()
+1:8704006:     {
+1:8704006:         return new TransactionalProxy();
+1:8704006:     }
+1:8704006: 
+1:ecbf0fd:     /**
+1:d389047:      * Class to hold a mark to the position of the file
+1:75508ec:      */
+1:e8651b6:     protected static class BufferedFileWriterMark implements DataPosition
+1:8704006:     {
+1:5a6e2b0:         final long pointer;
+1:75508ec: 
+1:d389047:         public BufferedFileWriterMark(long pointer)
+1:9ecda72:         {
+1:d389047:             this.pointer = pointer;
+1:9ecda72:         }
+1:9ecda72:     }
+2:9ecda72: }
+============================================================================
+author:Yuki Morishita
+-------------------------------------------------------------------------------
+commit:fb22109
+/////////////////////////////////////////////////////////////////////////
+1: import java.io.File;
+1: import java.io.IOException;
+1: import org.apache.cassandra.utils.SyncUtil;
+/////////////////////////////////////////////////////////////////////////
+1:     private final SequentialWriterOption option;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private static FileChannel openChannel(File file)
+1:     {
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Create heap-based, non-compressed SequenialWriter with default buffer size(64k).
+1:      *
+1:      * @param file File to write
+1:      */
+1:     public SequentialWriter(File file)
+1:        this(file, SequentialWriterOption.DEFAULT);
+1:     }
+1: 
+1:     /**
+1:      * Create SequentialWriter for given file with specific writer option.
+1:      *
+1:      * @param file File to write
+1:      * @param option Writer option
+1:      */
+1:     public SequentialWriter(File file, SequentialWriterOption option)
+1:     {
+1:         super(openChannel(file), option.allocateBuffer());
+1:         this.option = option;
+/////////////////////////////////////////////////////////////////////////
+1:         if (option.trickleFsync())
+1:             if (bytesSinceTrickleFsync >= option.trickleFsyncByteInterval())
+/////////////////////////////////////////////////////////////////////////
+1:         bufferOffset = truncateTarget;
+/////////////////////////////////////////////////////////////////////////
+1:             lastFlushOffset = toSize;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         if (option.finishOnClose())
+commit:587773f
+author:Tom Petracca
+-------------------------------------------------------------------------------
+commit:0f1e838
+/////////////////////////////////////////////////////////////////////////
+1:     public long getEstimatedOnDiskBytesWritten()
+1:     {
+1:         return getOnDiskFilePointer();
+1:     }
+1: 
+author:Paulo Motta
+-------------------------------------------------------------------------------
+commit:e8651b6
+/////////////////////////////////////////////////////////////////////////
+1:     public DataPosition mark()
+/////////////////////////////////////////////////////////////////////////
+1:     public void resetAndTruncate(DataPosition mark)
+/////////////////////////////////////////////////////////////////////////
+1:     protected static class BufferedFileWriterMark implements DataPosition
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:72790dc
+/////////////////////////////////////////////////////////////////////////
+1:     public void skipBytes(int numBytes) throws IOException
+1:     {
+1:         flush();
+1:         fchannel.position(fchannel.position() + numBytes);
+1:         bufferOffset = fchannel.position();
+1:     }
+1: 
+commit:be31393
+/////////////////////////////////////////////////////////////////////////
+0:     private final int directoryFD;
+0:     // directory should be synced only after first file sync, in other words, only once per file
+0:     private boolean directorySynced = false;
+/////////////////////////////////////////////////////////////////////////
+0:         directoryFD = CLibrary.tryOpenDirectory(file.getParent());
+/////////////////////////////////////////////////////////////////////////
+0:             if (!directorySynced)
+1:             {
+0:                 CLibrary.trySync(directoryFD);
+0:                 directorySynced = true;
+1:             }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         CLibrary.tryCloseFD(directoryFD);
+author:Ariel Weisberg
+-------------------------------------------------------------------------------
+commit:f7aaea0
+/////////////////////////////////////////////////////////////////////////
+1:         doFlush(0);
+1:     protected void doFlush(int count)
+commit:29687a8
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: public class SequentialWriter extends BufferedDataOutputStreamPlus implements Transactional
+1:     protected final FileChannel fchannel;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     // TODO: we should specify as a parameter if we permit an existing file or not
+0:     private static FileChannel openChannel(File file) {
+1:             {
+1:                 return FileChannel.open(file.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE);
+1:             }
+1:             {
+1:                 FileChannel channel = FileChannel.open(file.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
+1:                 try
+1:                 {
+1:                     SyncUtil.trySyncDir(file.getParentFile());
+1:                 }
+1:                 catch (Throwable t)
+1:                 {
+1:                     try { channel.close(); }
+1:                     catch (Throwable t2) { t.addSuppressed(t2); }
+1:                 }
+1:                 return channel;
+1:             }
+1:     }
+1: 
+0:     public SequentialWriter(File file, int bufferSize, BufferType bufferType)
+1:     {
+0:         super(openChannel(file), bufferType.allocate(bufferSize));
+1:         strictFlushing = true;
+1:         fchannel = (FileChannel)channel;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:             SyncUtil.force(fchannel, false);
+/////////////////////////////////////////////////////////////////////////
+1:     /*
+1:      * This is only safe to call before truncation or close for CompressedSequentialWriter
+1:      * Otherwise it will leave a non-uniform size compressed block in the middle of the file
+1:      * and the compressed format can't handle that.
+1:      */
+0:         doFlush();
+1:         syncDataOnlyInternal();
+0:     protected void doFlush()
+1:         flushData();
+0:         if (trickleFsync)
+1:             bytesSinceTrickleFsync += buffer.position();
+0:             if (bytesSinceTrickleFsync >= trickleFsyncByteInterval)
+1:                 syncDataOnlyInternal();
+1:                 bytesSinceTrickleFsync = 0;
+1: 
+1:         // Remember that we wrote, so we don't write it again on next flush().
+1:         resetBuffer();
+/////////////////////////////////////////////////////////////////////////
+1:             return Math.max(current(), fchannel.size());
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:             fchannel.position(truncateTarget);
+/////////////////////////////////////////////////////////////////////////
+1:             fchannel.truncate(toSize);
+commit:91187b5
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.utils.SyncUtil;
+/////////////////////////////////////////////////////////////////////////
+0:             SyncUtil.force(channel, false);
+/////////////////////////////////////////////////////////////////////////
+0:                 SyncUtil.trySync(directoryFD);
+commit:16499ca
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         stream = new WrappedDataOutputStreamPlus(this, this);
+author:Stefania Alborghetti
+-------------------------------------------------------------------------------
+commit:c163d0b
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:             return accumulate;
+/////////////////////////////////////////////////////////////////////////
+commit:b09e60f
+/////////////////////////////////////////////////////////////////////////
+0:         private boolean deleteFile = true;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:             if (deleteFile)
+0:                 return FileUtils.deleteWithConfirm(filePath, false, accumulate);
+1:             else
+1:                 return accumulate;
+/////////////////////////////////////////////////////////////////////////
+0:     public void deleteFile(boolean val)
+1:     {
+0:         txnProxy.deleteFile = val;
+1:     }
+1: 
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:753a943
+/////////////////////////////////////////////////////////////////////////
+1:     public boolean hasPosition()
+1:     public long position()
+/////////////////////////////////////////////////////////////////////////
+1:         return position();
+commit:51b1a1c
+/////////////////////////////////////////////////////////////////////////
+0:     public boolean hasFilePointer()
+1:     {
+1:         return true;
+1:     }
+1: 
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:1c27abf
+commit:e5a76bd
+/////////////////////////////////////////////////////////////////////////
+1:         protected Throwable doPreCleanup(Throwable accumulate)
+commit:8704006
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.concurrent.Transactional;
+1: 
+1: import static org.apache.cassandra.utils.Throwables.merge;
+0: public class SequentialWriter extends OutputStream implements WritableByteChannel, Transactional
+/////////////////////////////////////////////////////////////////////////
+1:     private final TransactionalProxy txnProxy = txnProxy();
+0:     protected Descriptor descriptor;
+1: 
+1:     // due to lack of multiple-inheritance, we proxy our transactional implementation
+1:     protected class TransactionalProxy extends AbstractTransactional
+1:     {
+1:         @Override
+0:         protected Throwable doCleanup(Throwable accumulate)
+1:         {
+0:             if (directoryFD >= 0)
+1:             {
+0:                 try { CLibrary.tryCloseFD(directoryFD); }
+1:                 catch (Throwable t) { accumulate = merge(accumulate, t); }
+0:                 directoryFD = -1;
+1:             }
+1: 
+1:             // close is idempotent
+1:             try { channel.close(); }
+1:             catch (Throwable t) { accumulate = merge(accumulate, t); }
+1: 
+1:             if (buffer != null)
+1:             {
+1:                 try { FileUtils.clean(buffer); }
+1:                 catch (Throwable t) { accumulate = merge(accumulate, t); }
+1:                 buffer = null;
+1:             }
+1: 
+1:             return accumulate;
+1:         }
+1: 
+1:         protected void doPrepare()
+1:         {
+1:             syncInternal();
+0:             // we must cleanup our file handles during prepareCommit for Windows compatibility as we cannot rename an open file;
+0:             // TODO: once we stop file renaming, remove this for clarity
+0:             releaseFileHandle();
+1:         }
+1: 
+1:         protected Throwable doCommit(Throwable accumulate)
+1:         {
+1:             return accumulate;
+1:         }
+1: 
+1:         protected Throwable doAbort(Throwable accumulate)
+1:         {
+0:             return FileUtils.deleteWithConfirm(filePath, false, accumulate);
+1:         }
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:     public SequentialWriter setDescriptor(Descriptor descriptor)
+1:     {
+0:         this.descriptor = descriptor;
+0:         return this;
+1:     }
+1: 
+1:     public final void prepareToCommit()
+1:     {
+1:         txnProxy.prepareToCommit();
+1:     }
+1: 
+1:     public final Throwable commit(Throwable accumulate)
+1:     {
+1:         return txnProxy.commit(accumulate);
+1:     }
+1: 
+1:     public final Throwable abort(Throwable accumulate)
+1:     {
+1:         return txnProxy.abort(accumulate);
+1:     }
+1: 
+1:     public final void close()
+1:         txnProxy.close();
+1:     public final void finish()
+1:         txnProxy.finish();
+1:     protected TransactionalProxy txnProxy()
+1:         return new TransactionalProxy();
+1:     }
+1: 
+0:     public void releaseFileHandle()
+1:     {
+1:         try
+0:             channel.close();
+1:         catch (IOException e)
+1:         {
+0:             throw new FSWriteError(e, filePath);
+1:         }
+commit:ce76e1e
+commit:4eb9fa7
+/////////////////////////////////////////////////////////////////////////
+1:     protected Runnable runPostFlush;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     public void setPostFlushListener(Runnable runPostFlush)
+1:     {
+1:         assert this.runPostFlush == null;
+1:         this.runPostFlush = runPostFlush;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         if (runPostFlush != null)
+1:             runPostFlush.run();
+commit:729ebe0
+commit:55750e0
+commit:3679b1b
+/////////////////////////////////////////////////////////////////////////
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:     private static final Logger logger = LoggerFactory.getLogger(SequentialWriter.class);
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         cleanup(true);
+1:     }
+0:     public void abort()
+1:     {
+0:         cleanup(false);
+1:     }
+1: 
+0:     private void cleanup(boolean throwExceptions)
+1:     {
+1: 
+0:         try { CLibrary.tryCloseFD(directoryFD); }
+0:         catch (Throwable t) { handle(t, throwExceptions); }
+1: 
+0:         try { out.close(); }
+0:         catch (Throwable t) { handle(t, throwExceptions); }
+1:     }
+1: 
+0:     private void handle(Throwable t, boolean throwExceptions)
+1:     {
+0:         if (!throwExceptions)
+0:             logger.warn("Suppressing exception thrown while aborting writer", t);
+1:         else
+0:             throw new FSWriteError(t, getPath());
+author:Blake Eggleston
+-------------------------------------------------------------------------------
+commit:a3fc425
+/////////////////////////////////////////////////////////////////////////
+0:     private boolean finishOnClose;
+/////////////////////////////////////////////////////////////////////////
+0:     public SequentialWriter finishOnClose()
+1:     {
+0:         finishOnClose = true;
+0:         return this;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         if (finishOnClose)
+1:             txnProxy.finish();
+0:         else
+0:             txnProxy.close();
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:b31845c
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.schema.CompressionParams;
+/////////////////////////////////////////////////////////////////////////
+0:                                                   CompressionParams parameters,
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:05a5fb4
+commit:f60e4ad
+/////////////////////////////////////////////////////////////////////////
+0:         write(buffer, 0, buffer.length);
+0:         if (buffer == null)
+0:             throw new ClosedChannelException();
+1: 
+0:         int position = offset;
+0:         int remaining = length;
+0:         while (remaining > 0)
+1:         {
+0:             if (!buffer.hasRemaining())
+0:                 reBuffer();
+1: 
+0:             int toCopy = Math.min(remaining, buffer.remaining());
+0:             buffer.put(data, position, toCopy);
+1: 
+0:             remaining -= toCopy;
+0:             position += toCopy;
+1: 
+0:             isDirty = true;
+0:             syncNeeded = true;
+1:         }
+commit:5a6e2b0
+/////////////////////////////////////////////////////////////////////////
+1:         final long pointer;
+commit:07cf56f
+/////////////////////////////////////////////////////////////////////////
+1: /*
+/////////////////////////////////////////////////////////////////////////
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+commit:b47233b
+/////////////////////////////////////////////////////////////////////////
+0: import java.security.MessageDigest;
+0: import java.security.NoSuchAlgorithmException;
+/////////////////////////////////////////////////////////////////////////
+0:     private MessageDigest digest;
+/////////////////////////////////////////////////////////////////////////
+0:         if (digest != null)
+0:             digest.update(buffer, 0, validBufferBytes);
+/////////////////////////////////////////////////////////////////////////
+0:      * Turn on digest computation on this writer.
+0:      * This can only be called before any data is written to this write,
+0:      * otherwise an IllegalStateException is thrown.
+1:      */
+0:     public void setComputeDigest()
+1:     {
+0:         if (current != 0)
+0:             throw new IllegalStateException();
+1: 
+1:         try
+1:         {
+0:             digest = MessageDigest.getInstance("SHA-1");
+1:         }
+0:         catch (NoSuchAlgorithmException e)
+1:         {
+0:             // SHA-1 is standard in java 6
+1:             throw new RuntimeException(e);
+1:         }
+1:     }
+1: 
+1:     /**
+0:      * Return the digest associated to this file or null if no digest was
+0:      * created.
+0:      * This can only be called once the file is fully created, i.e. after
+0:      * close() has been called. Otherwise an IllegalStateException is thrown.
+1:      */
+0:     public byte[] digest()
+1:     {
+0:         if (buffer != null)
+0:             throw new IllegalStateException();
+1: 
+0:         return digest == null ? null : digest.digest();
+1:     }
+1: 
+1:     /**
+commit:1ecabe6
+/////////////////////////////////////////////////////////////////////////
+0:     protected boolean isDirty = false, syncNeeded = false;
+/////////////////////////////////////////////////////////////////////////
+0:     protected byte[] buffer;
+0:     protected long current = 0, bufferOffset;
+0:     protected int validBufferBytes;
+0:     protected final RandomAccessFile out;
+/////////////////////////////////////////////////////////////////////////
+1:         syncInternal();
+1:     }
+1: 
+0:     protected void syncInternal() throws IOException
+1:     {
+0:             flushInternal();
+/////////////////////////////////////////////////////////////////////////
+0:         flushInternal();
+1:     }
+1: 
+0:     protected void flushInternal() throws IOException
+1:     {
+0:             flushData();
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Override this method instead of overriding flush()
+0:      * @throws IOException on any I/O error.
+1:      */
+0:     protected void flushData() throws IOException
+1:     {
+0:         out.write(buffer, 0, validBufferBytes);
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:     protected void reBuffer() throws IOException
+0:         flushInternal();
+1:     protected void resetBuffer()
+/////////////////////////////////////////////////////////////////////////
+0:         long previous = current;
+0:         current = ((BufferedFileWriterMark) mark).pointer;
+1: 
+0:         if (previous - current <= validBufferBytes) // current buffer
+1:         {
+0:             validBufferBytes = validBufferBytes - ((int) (previous - current));
+1:             return;
+1:         }
+1: 
+1:         syncInternal();
+/////////////////////////////////////////////////////////////////////////
+0:         if (buffer == null)
+0:             return; // already closed
+1: 
+0:         syncInternal();
+0:         out.close();
+author:stefania
+-------------------------------------------------------------------------------
+commit:17dd4cc
+/////////////////////////////////////////////////////////////////////////
+0:     private static final int DEFAULT_BUFFER_SIZE = 64 * 1024;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         return new SequentialWriter(file, DEFAULT_BUFFER_SIZE, BufferType.ON_HEAP);
+0:         return new ChecksummedSequentialWriter(file, DEFAULT_BUFFER_SIZE, crcPath);
+author:Branimir Lambov
+-------------------------------------------------------------------------------
+commit:3adfd15
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.compress.BufferType;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     public SequentialWriter(File file, int bufferSize, BufferType bufferType)
+/////////////////////////////////////////////////////////////////////////
+0:         buffer = bufferType.allocate(bufferSize);
+/////////////////////////////////////////////////////////////////////////
+0:         return new SequentialWriter(file, RandomAccessReader.DEFAULT_BUFFER_SIZE, BufferType.ON_HEAP);
+author:Joshua McKenzie
+-------------------------------------------------------------------------------
+commit:bc7941c
+/////////////////////////////////////////////////////////////////////////
+1: import java.nio.channels.FileChannel;
+1: import java.nio.file.StandardOpenOption;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     protected ByteBuffer buffer;
+1:     // Offset for start of buffer relative to underlying file
+1:     protected long bufferOffset;
+0:     protected final FileChannel channel;
+/////////////////////////////////////////////////////////////////////////
+0:     public SequentialWriter(File file, int bufferSize, boolean offheap)
+1:             if (file.exists())
+0:                 channel = FileChannel.open(file.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE);
+0:             else
+0:                 channel = FileChannel.open(file.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE);
+1:         catch (IOException e)
+0:         // Allow children to allocate buffer as direct (snappy compression) if necessary
+0:         buffer = offheap ? ByteBuffer.allocateDirect(bufferSize) : ByteBuffer.allocate(bufferSize);
+1: 
+0:         fd = CLibrary.getfd(channel);
+1:     /**
+0:      * Open a heap-based, non-compressed SequentialWriter
+1:      */
+0:         return new SequentialWriter(file, RandomAccessReader.DEFAULT_BUFFER_SIZE, false);
+/////////////////////////////////////////////////////////////////////////
+0:         if (buffer == null)
+0:             throw new ClosedChannelException();
+1: 
+0:         if (!buffer.hasRemaining())
+1:         {
+1:         }
+0:         buffer.put((byte) value);
+0:     public void write(byte[] buffer) throws IOException
+0:         write(ByteBuffer.wrap(buffer, 0, buffer.length));
+0:     public void write(byte[] data, int offset, int length) throws IOException
+0:         write(ByteBuffer.wrap(data, offset, length));
+/////////////////////////////////////////////////////////////////////////
+0:         int finalLimit = src.limit();
+0:         while (src.hasRemaining())
+0:             if (!buffer.hasRemaining())
+0:                 reBuffer();
+1: 
+0:             if (buffer.remaining() < src.remaining())
+0:                 src.limit(src.position() + buffer.remaining());
+0:             buffer.put(src);
+0:             src.limit(finalLimit);
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:             channel.force(false);
+/////////////////////////////////////////////////////////////////////////
+0:                 bytesSinceTrickleFsync += buffer.position();
+/////////////////////////////////////////////////////////////////////////
+1:             buffer.flip();
+1:             channel.write(buffer);
+1:             lastFlushOffset += buffer.position();
+/////////////////////////////////////////////////////////////////////////
+1:         return current();
+/////////////////////////////////////////////////////////////////////////
+1:      *
+/////////////////////////////////////////////////////////////////////////
+0:             return Math.max(current(), channel.size());
+/////////////////////////////////////////////////////////////////////////
+1:         bufferOffset = current();
+1:         buffer.clear();
+1:     protected long current()
+1:         return bufferOffset + (buffer == null ? 0 : buffer.position());
+1:         return new BufferedFileWriterMark(current());
+1:     /**
+1:      * Drops all buffered data that's past the limits of our new file mark + buffer capacity, or syncs and truncates
+1:      * the underlying file to the marked position
+1:      */
+1:         long previous = current();
+1:         long truncateTarget = ((BufferedFileWriterMark) mark).pointer;
+1:         // If we're resetting to a point within our buffered data, just adjust our buffered position to drop bytes to
+1:         // the right of the desired mark.
+1:         if (previous - truncateTarget <= buffer.position())
+1:             buffer.position(buffer.position() - ((int) (previous - truncateTarget)));
+1:         // synchronize current buffer with disk - we don't want any data loss
+1:         truncate(truncateTarget);
+0:             channel.position(truncateTarget);
+/////////////////////////////////////////////////////////////////////////
+0:             channel.truncate(toSize);
+/////////////////////////////////////////////////////////////////////////
+1:         return channel.isOpen();
+/////////////////////////////////////////////////////////////////////////
+0:         try { channel.close(); }
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:f44110c
+/////////////////////////////////////////////////////////////////////////
+1:      * Returns the current file pointer of the underlying on-disk file.
+1:      * 
+1:      * @return the current file pointer
+commit:b460b56
+/////////////////////////////////////////////////////////////////////////
+0:     public void setDataIntegrityWriter(DataIntegrityMetadata.ChecksumWriter writer)
+commit:7588f74
+/////////////////////////////////////////////////////////////////////////
+author:belliottsmith
+-------------------------------------------------------------------------------
+commit:4e95953
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     protected long lastFlushOffset;
+0:     public SequentialWriter(File file, int bufferSize)
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         return open(file, RandomAccessReader.DEFAULT_BUFFER_SIZE);
+0:     public static SequentialWriter open(File file, int bufferSize)
+0:         return new SequentialWriter(file, bufferSize);
+0:     public static ChecksummedSequentialWriter open(File file, File crcPath)
+0:         return new ChecksummedSequentialWriter(file, RandomAccessReader.DEFAULT_BUFFER_SIZE, crcPath);
+0:         return new CompressedSequentialWriter(new File(dataFilePath), offsetsPath, parameters, sstableMetadataCollector);
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:             lastFlushOffset += validBufferBytes;
+/////////////////////////////////////////////////////////////////////////
+1:     public long getLastFlushOffset()
+1:     {
+1:         return lastFlushOffset;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+commit:75508ec
+/////////////////////////////////////////////////////////////////////////
+0: import java.nio.ByteBuffer;
+0: import java.nio.channels.WritableByteChannel;
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.utils.ByteBufferUtil;
+0: public class SequentialWriter extends OutputStream implements WritableByteChannel
+/////////////////////////////////////////////////////////////////////////
+0:     public final DataOutputPlus stream;
+/////////////////////////////////////////////////////////////////////////
+0:         stream = new DataOutputStreamAndChannel(this, this);
+/////////////////////////////////////////////////////////////////////////
+0:     public int write(ByteBuffer src) throws IOException
+1:     {
+0:         if (buffer == null)
+0:             throw new ClosedChannelException();
+1: 
+0:         int length = src.remaining();
+0:         int offset = src.position();
+0:         while (length > 0)
+1:         {
+0:             int n = writeAtMost(src, offset, length);
+0:             offset += n;
+0:             length -= n;
+0:             isDirty = true;
+0:             syncNeeded = true;
+1:         }
+0:         src.position(offset);
+0:         return length;
+1:     }
+1: 
+0:      * Write at most "length" bytes from "data" starting at position "offset", and
+0:      * return the number of bytes written. caller is responsible for setting
+0:      * isDirty.
+1:      */
+0:     private int writeAtMost(ByteBuffer data, int offset, int length)
+1:     {
+0:         if (current >= bufferOffset + buffer.length)
+0:             reBuffer();
+1: 
+0:         assert current < bufferOffset + buffer.length
+0:         : String.format("File (%s) offset %d, buffer offset %d.", getPath(), current, bufferOffset);
+1: 
+1: 
+0:         int toCopy = Math.min(length, buffer.length - bufferCursor());
+1: 
+0:         // copy bytes from external buffer
+0:         ByteBufferUtil.arrayCopy(data, offset, buffer, bufferCursor(), toCopy);
+1: 
+0:         assert current <= bufferOffset + buffer.length
+0:         : String.format("File (%s) offset %d, buffer offset %d.", getPath(), current, bufferOffset);
+1: 
+0:         validBufferBytes = Math.max(validBufferBytes, bufferCursor() + toCopy);
+0:         current += toCopy;
+1: 
+0:         return toCopy;
+1:     }
+1: 
+0:     /*
+0:      * Write at most "length" bytes from "data" starting at position "offset", and
+/////////////////////////////////////////////////////////////////////////
+1:     public boolean isOpen()
+1:     {
+0:         return out.getChannel().isOpen();
+1:     }
+0: 
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:9405ce0
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.compress.CompressedSequentialWriter;
+0: import org.apache.cassandra.io.compress.CompressionParameters;
+0: import org.apache.cassandra.io.sstable.Descriptor;
+0: import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     public static ChecksummedSequentialWriter open(File file, boolean skipIOCache, File crcPath)
+1:     {
+0:         return new ChecksummedSequentialWriter(file, RandomAccessReader.DEFAULT_BUFFER_SIZE, skipIOCache, crcPath);
+1:     }
+0: 
+0:     public static CompressedSequentialWriter open(String dataFilePath,
+0:                                                   String offsetsPath,
+0:                                                   boolean skipIOCache,
+0:                                                   CompressionParameters parameters,
+0:                                                   MetadataCollector sstableMetadataCollector)
+1:     {
+0:         return new CompressedSequentialWriter(new File(dataFilePath), offsetsPath, skipIOCache, parameters, sstableMetadataCollector);
+1:     }
+0: 
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     // hack to make life easier for subclasses
+0:     public void writeFullChecksum(Descriptor descriptor)
+commit:4b54b8a
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         if (current >= bufferOffset + buffer.length)
+0:             reBuffer();
+0: 
+0:         assert current < bufferOffset + buffer.length
+0:                 : String.format("File (%s) offset %d, buffer offset %d.", getPath(), current, bufferOffset);
+0: 
+0:         buffer[bufferCursor()] = (byte) value;
+0: 
+0:         validBufferBytes += 1;
+0:         current += 1;
+0:         isDirty = true;
+0:         syncNeeded = true;
+commit:6a211f4
+commit:ecbf0fd
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  * Adds buffering, mark, and fsyncing to OutputStream.  We always fsync on close; we may also
+1:  * fsync incrementally if Config.trickle_fsync is enabled.
+1:  */
+commit:9ecda72
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.io.FSReadError;
+1: import org.apache.cassandra.io.FSWriteError;
+/////////////////////////////////////////////////////////////////////////
+0:     public void write(int value) throws ClosedChannelException
+0:     public void write(byte[] buffer) throws ClosedChannelException
+0:     public void write(byte[] data, int offset, int length) throws ClosedChannelException
+/////////////////////////////////////////////////////////////////////////
+0:     private int writeAtMost(byte[] data, int offset, int length)
+/////////////////////////////////////////////////////////////////////////
+1:     public void sync()
+1:     protected void syncDataOnlyInternal()
+1:         try
+1:         {
+0:             out.getFD().sync();
+1:         }
+1:         catch (IOException e)
+1:         {
+1:             throw new FSWriteError(e, getPath());
+1:         }
+1:     protected void syncInternal()
+/////////////////////////////////////////////////////////////////////////
+0:     public void flush()
+0:     protected void flushInternal()
+/////////////////////////////////////////////////////////////////////////
+1:      * @throws FSWriteError on any I/O error.
+1:     protected void flushData()
+1:         try
+1:         {
+0:             out.write(buffer, 0, validBufferBytes);
+1:         }
+1:         catch (IOException e)
+1:         {
+1:             throw new FSWriteError(e, getPath());
+1:         }
+0: 
+/////////////////////////////////////////////////////////////////////////
+1:     public long getOnDiskFilePointer()
+1:     public long length()
+1:         try
+1:         {
+0:             return Math.max(Math.max(current, out.length()), bufferOffset + validBufferBytes);
+1:         }
+1:         catch (IOException e)
+1:         {
+1:             throw new FSReadError(e, getPath());
+1:         }
+/////////////////////////////////////////////////////////////////////////
+0:     protected void reBuffer()
+/////////////////////////////////////////////////////////////////////////
+0:     public void resetAndTruncate(FileMark mark)
+/////////////////////////////////////////////////////////////////////////
+1:         try
+1:         {
+0:             out.seek(current);
+1:         }
+1:         catch (IOException e)
+1:         {
+1:             throw new FSReadError(e, getPath());
+1:         }
+1:     public void truncate(long toSize)
+1:         try
+1:         {
+0:             out.getChannel().truncate(toSize);
+1:         }
+1:         catch (IOException e)
+1:         {
+1:             throw new FSWriteError(e, getPath());
+1:         }
+0:     public void close()
+/////////////////////////////////////////////////////////////////////////
+0:         try
+0:         {
+0:             out.close();
+1:         }
+0:         catch (IOException e)
+0:         {
+0:             throw new FSWriteError(e, getPath());
+1:         }
+0: 
+commit:debb15e
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.io.FSWriteError;
+/////////////////////////////////////////////////////////////////////////
+0:     public SequentialWriter(File file, int bufferSize, boolean skipIOCache)
+0:         try
+0:         {
+0:             out = new RandomAccessFile(file, "rw");
+0:         }
+0:         catch (FileNotFoundException e)
+0:         {
+0:             throw new RuntimeException(e);
+0:         }
+/////////////////////////////////////////////////////////////////////////
+0: 
+0:         try
+0:         {
+0:             fd = CLibrary.getfd(out.getFD());
+0:         }
+0:         catch (IOException e)
+0:         {
+0:             throw new RuntimeException(e); // shouldn't happen
+0:         }
+0: 
+0:     public static SequentialWriter open(File file)
+0:     public static SequentialWriter open(File file, boolean skipIOCache)
+0:     public static SequentialWriter open(File file, int bufferSize, boolean skipIOCache)
+commit:80d7d43
+/////////////////////////////////////////////////////////////////////////
+0:     /**
+0:      * Return the current file pointer of the underlying on-disk file.
+1:      * Note that since write works by buffering data, the value of this will increase by buffer
+1:      * size and not every write to the writer will modify this value.
+1:      * Furthermore, for compressed files, this value refers to compressed data, while the
+1:      * writer getFilePointer() refers to uncompressedFile
+0:      */
+0:     public long getOnDiskFilePointer() throws IOException
+0:     {
+0:         return getFilePointer();
+0:     }
+0: 
+commit:2ce8274
+/////////////////////////////////////////////////////////////////////////
+0:     /**
+0:      * Return the current file pointer of the underlying on-disk file.
+0:      * Note that since write works by buffering data, the value of this will increase by buffer
+0:      * size and not every write to the writer will modify this value.
+0:      * Furthermore, for compressed files, this value refers to compressed data, while the
+0:      * writer getFilePointer() refers to uncompressedFile
+0:      */
+0:     public long getOnDiskFilePointer() throws IOException
+0:     {
+0:         return getFilePointer();
+0:     }
+0: 
+commit:a4b1e10
+/////////////////////////////////////////////////////////////////////////
+commit:d389047
+/////////////////////////////////////////////////////////////////////////
+0: /**
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+0:  *   http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+0:  * Unless required by applicable law or agreed to in writing,
+0:  * software distributed under the License is distributed on an
+0:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+0:  * KIND, either express or implied.  See the License for the
+0:  * specific language governing permissions and limitations
+0:  * under the License.
+0:  */
+1: package org.apache.cassandra.io.util;
+0: 
+0: import java.io.*;
+0: import java.nio.channels.ClosedChannelException;
+0: 
+0: import org.apache.cassandra.utils.CLibrary;
+0: 
+0: public class SequentialWriter extends OutputStream
+0: {
+0:     // isDirty - true if this.buffer contains any un-synced bytes
+0:     private boolean isDirty = false, syncNeeded = false;
+0: 
+1:     // absolute path to the given file
+1:     private final String filePath;
+0: 
+0:     // so we can use the write(int) path w/o tons of new byte[] allocations
+0:     private final byte[] singleByteBuffer = new byte[1];
+0: 
+0:     private byte[] buffer;
+0:     private final boolean skipIOCache;
+0:     private final int fd;
+0: 
+0:     private long current = 0, bufferOffset;
+0:     private int validBufferBytes;
+0: 
+0:     private final RandomAccessFile out;
+0: 
+0:     // used if skip I/O cache was enabled
+0:     private long ioCacheStartOffset = 0, bytesSinceCacheFlush = 0;
+0: 
+0:     public final DataOutputStream stream;
+0: 
+0:     public SequentialWriter(File file, int bufferSize, boolean skipIOCache) throws IOException
+0:     {
+0:         out = new RandomAccessFile(file, "rw");
+0: 
+1:         filePath = file.getAbsolutePath();
+0: 
+0:         buffer = new byte[bufferSize];
+0:         this.skipIOCache = skipIOCache;
+0:         fd = CLibrary.getfd(out.getFD());
+0:         stream = new DataOutputStream(this);
+0:     }
+0: 
+0:     public static SequentialWriter open(File file) throws IOException
+0:     {
+0:         return open(file, RandomAccessReader.DEFAULT_BUFFER_SIZE, false);
+0:     }
+0: 
+0:     public static SequentialWriter open(File file, int bufferSize) throws IOException
+0:     {
+0:         return open(file, bufferSize, false);
+0:     }
+0: 
+0:     public static SequentialWriter open(File file, boolean skipIOCache) throws IOException
+0:     {
+0:         return open(file, RandomAccessReader.DEFAULT_BUFFER_SIZE, skipIOCache);
+0:     }
+0: 
+0:     public static SequentialWriter open(File file, int bufferSize, boolean skipIOCache) throws IOException
+0:     {
+0:         return new SequentialWriter(file, bufferSize, skipIOCache);
+0:     }
+0: 
+0:     public void write(int value) throws IOException
+0:     {
+0:         singleByteBuffer[0] = (byte) value;
+0:         write(singleByteBuffer, 0, 1);
+0:     }
+0: 
+0:     public void write(byte[] buffer) throws IOException
+0:     {
+0:         write(buffer, 0, buffer.length);
+0:     }
+0: 
+0:     public void write(byte[] data, int offset, int length) throws IOException
+0:     {
+0:         if (buffer == null)
+0:             throw new ClosedChannelException();
+0: 
+0:         while (length > 0)
+0:         {
+0:             int n = writeAtMost(data, offset, length);
+0:             offset += n;
+0:             length -= n;
+0:             isDirty = true;
+0:             syncNeeded = true;
+0:         }
+0:     }
+0: 
+0:     /*
+0:      * Write at most "length" bytes from "b" starting at position "offset", and
+0:      * return the number of bytes written. caller is responsible for setting
+0:      * isDirty.
+0:      */
+0:     private int writeAtMost(byte[] data, int offset, int length) throws IOException
+0:     {
+0:         if (current >= bufferOffset + buffer.length)
+0:             reBuffer();
+0: 
+0:         assert current < bufferOffset + buffer.length
+0:                 : String.format("File (%s) offset %d, buffer offset %d.", getPath(), current, bufferOffset);
+0: 
+0: 
+0:         int toCopy = Math.min(length, buffer.length - bufferCursor());
+0: 
+0:         // copy bytes from external buffer
+0:         System.arraycopy(data, offset, buffer, bufferCursor(), toCopy);
+0: 
+0:         assert current <= bufferOffset + buffer.length
+0:                 : String.format("File (%s) offset %d, buffer offset %d.", getPath(), current, bufferOffset);
+0: 
+0:         validBufferBytes = Math.max(validBufferBytes, bufferCursor() + toCopy);
+0:         current += toCopy;
+0: 
+0:         return toCopy;
+0:     }
+0: 
+0:     /**
+1:      * Synchronize file contents with disk.
+0:      * @throws java.io.IOException on any I/O error.
+0:      */
+0:     public void sync() throws IOException
+0:     {
+0:         if (syncNeeded)
+0:         {
+0:             flush();
+0:             out.getFD().sync();
+0: 
+0:             syncNeeded = false;
+0:         }
+0:     }
+0: 
+0:     /**
+0:      * If buffer is dirty, flush it's contents to the operating system. Does not imply fsync().
+1:      *
+0:      * Currently, for implementation reasons, this also invalidates the buffer.
+1:      *
+0:      * @throws java.io.IOException on any I/O error.
+0:      */
+1:     @Override
+0:     public void flush() throws IOException
+0:     {
+0:         if (isDirty)
+0:         {
+0:             out.write(buffer, 0, validBufferBytes);
+0: 
+0:             if (skipIOCache)
+0:             {
+0:                 // we don't know when the data reaches disk since we aren't
+0:                 // calling flush
+0:                 // so we continue to clear pages we don't need from the first
+0:                 // offset we see
+0:                 // periodically we update this starting offset
+0:                 bytesSinceCacheFlush += validBufferBytes;
+0: 
+0:                 if (bytesSinceCacheFlush >= RandomAccessReader.MAX_BYTES_IN_PAGE_CACHE)
+0:                 {
+0:                     CLibrary.trySkipCache(this.fd, ioCacheStartOffset, 0);
+0:                     ioCacheStartOffset = bufferOffset;
+0:                     bytesSinceCacheFlush = 0;
+0:                 }
+0:             }
+0: 
+0:             // Remember that we wrote, so we don't write it again on next flush().
+1:             resetBuffer();
+0: 
+0:             isDirty = false;
+0:         }
+0:     }
+0: 
+0:     public long getFilePointer()
+0:     {
+0:         return current;
+0:     }
+0: 
+0:     public long length() throws IOException
+0:     {
+0:         return Math.max(Math.max(current, out.length()), bufferOffset + validBufferBytes);
+0:     }
+0: 
+1:     public String getPath()
+0:     {
+1:         return filePath;
+0:     }
+0: 
+0: 
+0:     private void reBuffer() throws IOException
+0:     {
+0:         flush();
+1:         resetBuffer();
+0:     }
+0: 
+0:     private void resetBuffer()
+0:     {
+0:         bufferOffset = current;
+0:         validBufferBytes = 0;
+0:     }
+0: 
+0:     private int bufferCursor()
+0:     {
+0:         return (int) (current - bufferOffset);
+0:     }
+0: 
+0:     public FileMark mark()
+0:     {
+0:         return new BufferedFileWriterMark(current);
+0:     }
+0: 
+0:     public void resetAndTruncate(FileMark mark) throws IOException
+0:     {
+1:         assert mark instanceof BufferedFileWriterMark;
+0: 
+0:         // synchronize current buffer with disk
+0:         // because we don't want any data loss
+0:         sync();
+0: 
+0:         // setting marker as a current offset
+0:         current = ((BufferedFileWriterMark) mark).pointer;
+0: 
+1:         // truncate file to given position
+0:         truncate(current);
+0: 
+0:         // reset channel position
+0:         out.seek(current);
+0: 
+1:         resetBuffer();
+0:     }
+0: 
+0:     public void truncate(long toSize) throws IOException
+0:     {
+0:         out.getChannel().truncate(toSize);
+0:     }
+0: 
+1:     @Override
+0:     public void close() throws IOException
+0:     {
+0:         sync();
+0: 
+0:         buffer = null;
+0: 
+0:         if (skipIOCache && bytesSinceCacheFlush > 0)
+0:             CLibrary.trySkipCache(fd, 0, 0);
+0: 
+0:         out.close(); // this will also close channel for us
+0:     }
+0: 
+0:     /**
+1:      * Class to hold a mark to the position of the file
+0:      */
+0:     protected static class BufferedFileWriterMark implements FileMark
+0:     {
+0:         long pointer;
+0: 
+1:         public BufferedFileWriterMark(long pointer)
+0:         {
+1:             this.pointer = pointer;
+0:         }
+0:     }
+0: }
+author:Vijay Parthasarathy
+-------------------------------------------------------------------------------
+commit:639b314
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     private DataIntegrityMetadata.ChecksumWriter metadata;
+/////////////////////////////////////////////////////////////////////////
+0:         if (metadata != null)
+0:             metadata.append(buffer, 0, validBufferBytes);
+/////////////////////////////////////////////////////////////////////////
+0:         FileUtils.closeQuietly(metadata);
+/////////////////////////////////////////////////////////////////////////
+0:     public void setDataIntegratyWriter(DataIntegrityMetadata.ChecksumWriter writer)
+0:         metadata = writer;
+0:         metadata.writeChunkSize(buffer.length);
+author:Peter Schuller
+-------------------------------------------------------------------------------
+commit:27fb2bf
+commit:49e134c
+/////////////////////////////////////////////////////////////////////////
+0:                 if (bytesSinceCacheFlush >= RandomAccessReader.CACHE_FLUSH_INTERVAL_IN_BYTES)
+commit:927356e
+commit:ba7b0bd
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.config.DatabaseDescriptor;
+/////////////////////////////////////////////////////////////////////////
+1:     // whether to do trickling fsync() to avoid sudden bursts of dirty buffer flushing by kernel causing read
+1:     // latency spikes
+0:     private boolean trickleFsync;
+0:     private int trickleFsyncByteInterval;
+1:     private int bytesSinceTrickleFsync = 0;
+0: 
+/////////////////////////////////////////////////////////////////////////
+0:         this.trickleFsync = DatabaseDescriptor.getTrickleFsync();
+0:         this.trickleFsyncByteInterval = DatabaseDescriptor.getTrickleFsyncIntervalInKb() * 1024;
+/////////////////////////////////////////////////////////////////////////
+0:     protected void syncDataOnlyInternal() throws IOException
+0:     {
+0:         out.getFD().sync();
+0:     }
+0: 
+0:             syncDataOnlyInternal();
+/////////////////////////////////////////////////////////////////////////
+0:             if (trickleFsync)
+0:             {
+0:                 bytesSinceTrickleFsync += validBufferBytes;
+0:                 if (bytesSinceTrickleFsync >= trickleFsyncByteInterval)
+0:                 {
+0:                     syncDataOnlyInternal();
+0:                     bytesSinceTrickleFsync = 0;
+0:                 }
+0:             }
+0: 
+============================================================================

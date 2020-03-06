@@ -1,0 +1,1666 @@
+1:eac0369: /*
+1:345de35: 
+1:345de35:    Derby - Class org.apache.derby.jdbc.XATransactionState
+1:849dab2: 
+1:2f36947:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:2f36947:    contributor license agreements.  See the NOTICE file distributed with
+1:2f36947:    this work for additional information regarding copyright ownership.
+1:2f36947:    The ASF licenses this file to You under the Apache License, Version 2.0
+1:2f36947:    (the "License"); you may not use this file except in compliance with
+1:2f36947:    the License.  You may obtain a copy of the License at
+1:345de35: 
+1:345de35:       http://www.apache.org/licenses/LICENSE-2.0
+1:345de35: 
+1:345de35:    Unless required by applicable law or agreed to in writing, software
+1:345de35:    distributed under the License is distributed on an "AS IS" BASIS,
+1:345de35:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:345de35:    See the License for the specific language governing permissions and
+1:345de35:    limitations under the License.
+1:345de35: 
+2:eac0369:  */
+17:eac0369: 
+1:eac0369: package org.apache.derby.jdbc;
+1:eac0369: 
+1:eac0369: 
+1:56c1dc2: import java.security.AccessController;
+1:56c1dc2: import java.security.PrivilegedAction;
+1:cccf5dd: import java.sql.SQLException;
+1:cccf5dd: import java.util.TimerTask;
+1:56c1dc2: import org.apache.derby.iapi.services.monitor.ModuleFactory;
+1:cccf5dd: import org.apache.derby.iapi.services.monitor.Monitor;
+1:cccf5dd: import org.apache.derby.iapi.services.timer.TimerFactory;
+1:63d26f5: import org.apache.derby.impl.jdbc.EmbedConnection;
+1:eac0369: import javax.transaction.xa.XAResource;
+1:eac0369: import org.apache.derby.iapi.services.context.ContextImpl;
+1:eac0369: import org.apache.derby.iapi.services.context.ContextManager;
+1:eac0369: import org.apache.derby.iapi.error.ExceptionSeverity;
+1:eac0369: import org.apache.derby.iapi.error.StandardException;
+1:152986e: import org.apache.derby.iapi.store.access.XATransactionController;
+1:eac0369: import org.apache.derby.iapi.store.access.xa.XAXactId;
+1:eac0369: import org.apache.derby.iapi.reference.SQLState;
+1:eac0369: import java.util.HashMap;
+1:eac0369: import javax.transaction.xa.XAException;
+1:0c5bc3a: import org.apache.derby.iapi.error.ExceptionUtil;
+1:bb9f97a: import org.apache.derby.shared.common.reference.MessageId;
+1:eac0369: 
+2:eac0369: /** 
+1:eac0369: */
+1:824ca0b: final class XATransactionState extends ContextImpl {
+1:eac0369: 
+1:cccf5dd:     /** Rollback-only due to timeout */
+1:cccf5dd:     final static int TRO_TIMEOUT                = -3;
+1:eac0369: 	/** Rollback-only due to deadlock */
+1:eac0369: 	final static int TRO_DEADLOCK				= -2;
+1:eac0369: 	/** Rollback-only due to end(TMFAIL) */
+1:eac0369: 	final static int TRO_FAIL					= -1;
+1:eac0369: 	final static int T0_NOT_ASSOCIATED			= 0;
+1:eac0369: 	final static int T1_ASSOCIATED				= 1;
+1:eac0369: 	// final static int T2_ASSOCIATION_SUSPENDED	= 2;
+1:eac0369: 	final static int TC_COMPLETED				= 3; // rollback/commit called
+1:eac0369: 
+1:824ca0b: 	final EmbedConnection	conn;
+1:0076dfb: 	final EmbedXAResource creatingResource;
+1:0076dfb:         // owning XAResource
+1:0076dfb: 	private EmbedXAResource  associatedResource;	
+1:eac0369: 	final XAXactId			xid;	
+1:698bfec:     
+1:698bfec:     /**
+1:698bfec:      * A class used to monitor if the transaction is in the middle of
+1:698bfec:      * cancelling or cleaning up on an error.  
+1:698bfec:      * 
+1:698bfec:      * See DERBY-6879
+1:698bfec:      * 
+1:698bfec:      */
+1:698bfec:     private static class CleanupOrCancelMonitor {
+1:698bfec:         
+1:698bfec:         private Long cancelThreadId;
+1:698bfec:         private Long cleanupThreadId;
+1:698bfec:         
+1:698bfec:         /**
+1:698bfec:          * See if it is ok to cancel.  It is okay to cancel if the transaction
+1:698bfec:          * is not cleaning up from an error.  The assumption is that if the 
+1:698bfec:          * cleanUpOnError is/has been invoked, then there is no reason for
+1:698bfec:          * the cancel to be processed as the transaction is going to end
+1:698bfec:          * (ab)normally.
+1:698bfec:          * 
+1:698bfec:          * @return <code>true</code> if it is okay to cancel.
+1:698bfec:          */
+1:698bfec:         public synchronized boolean okToCancel() {
+1:698bfec:             boolean res = false;
+1:698bfec:             if (null == cancelThreadId && null == cleanupThreadId) {
+1:698bfec:                 cancelThreadId = Thread.currentThread().getId();
+1:698bfec:                 res = true;
+1:698bfec:             }
+1:698bfec:             return res;
+1:698bfec:         }
+1:698bfec:         
+1:698bfec:         /**
+1:698bfec:          * See if it is ok to cleanup.  It is okay to cleanup if the transaction
+1:698bfec:          * is not cancelling.  The assumption is that if the 
+1:698bfec:          * cancel is/has been invoked, then there is no reason to try to
+1:698bfec:          * mark the transaction as being in error.  The transaction will 
+1:698bfec:          * be cancelled in any case.
+1:698bfec:          * 
+1:698bfec:          * @return <code>true</code> if it is okay to cleanup.
+1:698bfec:          */
+1:698bfec:         private synchronized boolean okToCleanup() {
+1:698bfec:             boolean res = false;
+1:698bfec:             if (null == cleanupThreadId && null == cancelThreadId) {
+1:698bfec:                 cleanupThreadId = Thread.currentThread().getId();
+1:698bfec:                 res = true;
+1:698bfec:             }
+1:698bfec:             return res;
+1:698bfec:         }
+1:698bfec:     };
+1:698bfec:     
+1:698bfec:     CleanupOrCancelMonitor cleanupOrCancelMonitor = new CleanupOrCancelMonitor();
+1:698bfec:     
+1:cccf5dd: 	/**
+1:eac0369: 		When an XAResource suspends a transaction (end(TMSUSPEND)) it must be resumed
+1:2c21843: 		using the same XAConnection. This has been the traditional Cloudscape/Derby behaviour,
+1:eac0369: 		though there does not seem to be a specific reference to this behaviour in
+1:eac0369: 		the JTA spec. Note that while the transaction is suspended by this XAResource,
+1:eac0369: 		another XAResource may join the transaction and suspend it after the join.
+1:eac0369: 	*/
+1:850aba4:     HashMap<EmbedXAResource, XATransactionState> suspendedList;
+1:88b727b: 
+1:56c1dc2: 
+1:eac0369: 	/**
+1:eac0369: 		Association state of the transaction.
+1:eac0369: 	*/
+1:eac0369: 	int associationState;
+1:56c1dc2: 
+1:eac0369: 	int rollbackOnlyCode;
+1:bb9f97a: 
+1:bb9f97a: 
+1:eac0369: 	/**
+1:eac0369: 		has this transaction been prepared.
+1:eac0369: 	*/
+1:eac0369: 	boolean isPrepared;
+1:cccf5dd: 
+1:bb9f97a:     /** Indicates whether this transaction is supposed to be rolled back by timeout. */
+1:bb9f97a:     boolean performTimeoutRollback;
+1:eac0369: 
+1:cccf5dd:     /** A timer task scheduled for the time when the transaction will timeout. */
+1:cccf5dd:     CancelXATransactionTask timeoutTask = null;
+1:cccf5dd: 
+1:cccf5dd: 
+1:cccf5dd:     /** The implementation of TimerTask to cancel a global transaction. */
+1:849dab2:     private static class CancelXATransactionTask extends TimerTask {
+1:cccf5dd: 
+1:849dab2:         private XATransactionState xaState; 
+1:cccf5dd: 
+1:849dab2:         /**
+1:849dab2:          * Creates the cancellation task to be passed to a timer.
+1:849dab2:          *
+1:849dab2:          * @param xaState the XA state object for the transaction to cancel
+1:849dab2:          */
+1:849dab2:         public CancelXATransactionTask(XATransactionState xaState) {
+1:849dab2:             this.xaState = xaState;
+1:88b727b:         }
+1:cccf5dd:         
+1:88b727b:         public synchronized boolean cancel() {
+1:849dab2:             // nullify reference to reduce memory footprint of canceled tasks
+1:849dab2:             xaState = null;
+1:849dab2:             return super.cancel();
+1:cccf5dd:         }
+1:849dab2: 
+1:cccf5dd:         /** Runs the cancel task of the global transaction */
+1:88b727b:         public synchronized void run() {
+1:cccf5dd:             try {
+1:88b727b:                 if (null != xaState) {
+1:88b727b:                     xaState.cancel(MessageId.CONN_XA_TRANSACTION_TIMED_OUT);
+1:88b727b:                 }
+1:bb9f97a:             } catch (Throwable th) {
+1:bb9f97a:                 Monitor.logThrowable(th);
+1:cccf5dd:             }
+1:cccf5dd:         }
+1:cccf5dd:     }
+1:cccf5dd: 
+1:13673bd:     private static TimerFactory getTimerFactory() {
+1:56c1dc2:         return getMonitor().getTimerFactory();
+1:13673bd:     }
+1:cccf5dd: 
+1:0076dfb: 	XATransactionState(ContextManager cm, EmbedConnection conn, 
+1:0076dfb:                 EmbedXAResource resource, XAXactId xid) {
+1:eac0369: 
+1:eac0369: 		super(cm, "XATransactionState");
+1:eac0369: 		this.conn = conn;
+1:eac0369: 		this.associatedResource = resource;
+1:eac0369: 		this.creatingResource = resource;
+1:eac0369: 		this.associationState = XATransactionState.T1_ASSOCIATED;
+1:eac0369: 		this.xid = xid;
+1:bb9f97a: 		this.performTimeoutRollback = false; // there is no transaction yet
+1:849dab2: 	}
+1:eac0369: 
+1:eac0369: 	public void cleanupOnError(Throwable t) {
+1:698bfec:         // See if it is okay to cleanup.  This is for DERBY-6879
+1:698bfec:         if (cleanupOrCancelMonitor.okToCleanup()) {
+1:698bfec:             if (t instanceof StandardException) {
+1:eac0369: 
+1:698bfec:                 StandardException se = (StandardException) t;
+1:913815a: 
+1:698bfec:                 if (se.getSeverity() >= ExceptionSeverity.SESSION_SEVERITY) {
+1:698bfec:                     popMe();
+1:698bfec:                     return;
+1:698bfec:                 }
+1:698bfec: 
+1:698bfec:                 if (se.getSeverity() == ExceptionSeverity.TRANSACTION_SEVERITY) {
+1:698bfec: 
+1:698bfec:                     synchronized (this) {
+1:698bfec:                         // prior to the DERBY-5552 fix, we would disable the connection
+1:698bfec:                         // here with conn.setApplicationConnection(null);
+1:698bfec:                         // which could cause a NPE
+1:698bfec:                         notifyAll();
+1:698bfec:                         associationState = TRO_FAIL;
+1:698bfec:                         if (SQLState.DEADLOCK.equals(se.getMessageId()))
+1:698bfec:                             rollbackOnlyCode = XAException.XA_RBDEADLOCK;
+1:698bfec:                         else if (se.isLockTimeout())
+1:698bfec:                             rollbackOnlyCode = XAException.XA_RBTIMEOUT;
+1:698bfec:                         else
+1:698bfec:                             rollbackOnlyCode = XAException.XA_RBOTHER;
+1:698bfec:                     }
+1:698bfec:                 }
+1:698bfec:             }
+1:913815a:         }
+24:eac0369: 	}
+1:eac0369: 
+1:0076dfb: 	void start(EmbedXAResource resource, int flags) throws XAException {
+1:eac0369: 
+1:698bfec:         synchronized (this) {
+1:698bfec:             if (associationState == XATransactionState.TRO_FAIL)
+1:698bfec:                 throw new XAException(rollbackOnlyCode);
+1:eac0369: 
+1:698bfec:             boolean isSuspendedByResource = (suspendedList != null) && (suspendedList.get(resource) != null);
+1:eac0369: 
+1:698bfec:             if (flags == XAResource.TMRESUME) {
+1:698bfec:                 if (!isSuspendedByResource)
+1:698bfec:                     throw new XAException(XAException.XAER_PROTO);
+1:eac0369: 
+1:698bfec:             } else {
+1:698bfec:                 // cannot join a transaction we have suspended.
+1:698bfec:                 if (isSuspendedByResource)
+1:698bfec:                     throw new XAException(XAException.XAER_PROTO);
+1:698bfec:             }
+1:eac0369: 
+1:698bfec:             while (associationState == XATransactionState.T1_ASSOCIATED) {
+1:698bfec: 
+1:698bfec:                 try {
+1:698bfec:                     wait();
+1:698bfec:                 } catch (InterruptedException ie) {
+1:698bfec:                     throw new XAException(XAException.XA_RETRY);
+1:698bfec:                 }
+1:698bfec:             }
+1:eac0369: 
+1:eac0369: 
+1:698bfec:             switch (associationState) {
+1:698bfec:             case XATransactionState.T0_NOT_ASSOCIATED:
+1:698bfec:                 break;
+1:eac0369: 
+1:cccf5dd:             case XATransactionState.TRO_DEADLOCK:
+1:cccf5dd:             case XATransactionState.TRO_TIMEOUT:
+1:698bfec:             case XATransactionState.TRO_FAIL:
+1:698bfec:                 throw new XAException(rollbackOnlyCode);
+1:eac0369: 
+1:698bfec:             default:
+1:698bfec:                 throw new XAException(XAException.XAER_NOTA);
+1:698bfec:             }
+1:eac0369: 
+1:698bfec:             if (isPrepared)
+1:698bfec:                 throw new XAException(XAException.XAER_PROTO);
+1:eac0369: 
+1:698bfec:             if (isSuspendedByResource) {
+1:698bfec:                 suspendedList.remove(resource);
+1:698bfec:             }
+1:eac0369: 
+1:698bfec:             associationState = XATransactionState.T1_ASSOCIATED;
+1:698bfec:             associatedResource = resource;
+1:cccf5dd: 
+1:698bfec:         }
+1:cccf5dd: 	}
+1:eac0369: 
+1:0076dfb: 	boolean end(EmbedXAResource resource, int flags, 
+1:0076dfb:                 boolean endingCurrentXid) throws XAException {
+1:eac0369: 
+1:698bfec:         boolean rollbackOnly = false;
+1:698bfec:         synchronized (this) {
+1:eac0369: 
+1:eac0369: 
+1:698bfec:             boolean isSuspendedByResource = (suspendedList != null) && (suspendedList.get(resource) != null);
+1:eac0369: 
+1:698bfec:             if (!endingCurrentXid) {
+1:698bfec:                 while (associationState == XATransactionState.T1_ASSOCIATED) {
+1:eac0369: 
+1:698bfec:                     try {
+1:698bfec:                         wait();
+1:698bfec:                     } catch (InterruptedException ie) {
+1:698bfec:                         throw new XAException(XAException.XA_RETRY);
+1:698bfec:                     }
+1:698bfec:                 }
+1:698bfec:             }
+1:eac0369: 
+1:698bfec:             switch (associationState) {
+1:698bfec:             case XATransactionState.TC_COMPLETED:
+1:698bfec:                 throw new XAException(XAException.XAER_NOTA);
+1:698bfec:             case XATransactionState.TRO_FAIL:
+1:698bfec:                 if (endingCurrentXid)
+1:698bfec:                     flags = XAResource.TMFAIL;
+1:698bfec:                 else
+1:698bfec:                     throw new XAException(rollbackOnlyCode);
+1:698bfec:             }
+1:eac0369: 
+1:698bfec:             boolean notify = false;
+1:698bfec:             switch (flags) {
+1:698bfec:             case XAResource.TMSUCCESS:
+1:698bfec:                 if (isSuspendedByResource) {
+1:698bfec:                     suspendedList.remove(resource);
+1:698bfec:                 }
+1:698bfec:                 else {
+1:698bfec:                     if (resource != associatedResource)
+1:698bfec:                         throw new XAException(XAException.XAER_PROTO);
+1:eac0369: 
+1:698bfec:                     associationState = XATransactionState.T0_NOT_ASSOCIATED;
+1:698bfec:                     associatedResource = null;
+1:698bfec:                     notify = true;
+1:698bfec:                 }
+1:eac0369: 
+1:698bfec:                 conn.setApplicationConnection(null);
+1:698bfec:                 break;
+1:eac0369: 
+1:698bfec:             case XAResource.TMFAIL:
+1:698bfec: 
+1:698bfec:                 if (isSuspendedByResource) {
+1:698bfec:                     suspendedList.remove(resource);
+1:698bfec:                 } else {
+1:698bfec:                     if (resource != associatedResource)
+1:698bfec:                         throw new XAException(XAException.XAER_PROTO);
+1:698bfec:                     associatedResource = null;
+1:698bfec:                 }
+1:eac0369: 
+1:698bfec:                 if (associationState != XATransactionState.TRO_FAIL) {
+1:698bfec:                     associationState = XATransactionState.TRO_FAIL;
+1:698bfec:                     rollbackOnlyCode = XAException.XA_RBROLLBACK;
+1:698bfec:                 }
+1:698bfec:                 conn.setApplicationConnection(null);
+1:698bfec:                 notify = true;
+1:698bfec:                 rollbackOnly = true;
+1:698bfec:                 break;
+1:698bfec: 
+1:698bfec:             case XAResource.TMSUSPEND:
+1:698bfec:                 if (isSuspendedByResource)
+1:698bfec:                     throw new XAException(XAException.XAER_PROTO);
+1:698bfec: 
+1:698bfec:                 if (resource != associatedResource)
+1:698bfec:                     throw new XAException(XAException.XAER_PROTO);
+1:eac0369: 
+1:850aba4:                 if (suspendedList == null) {
+1:850aba4:                     suspendedList =
+1:850aba4:                         new HashMap<EmbedXAResource, XATransactionState>();
+1:850aba4:                 }
+1:698bfec:                 suspendedList.put(resource, this);
+1:eac0369: 
+1:698bfec:                 associationState = XATransactionState.T0_NOT_ASSOCIATED;
+1:698bfec:                 associatedResource = null;
+1:698bfec:                 conn.setApplicationConnection(null);
+1:698bfec:                 notify = true;
+1:eac0369: 
+1:698bfec:                 break;
+1:eac0369: 
+1:698bfec:             default:
+1:698bfec:                 throw new XAException(XAException.XAER_INVAL);
+1:698bfec:             }
+1:eac0369: 
+1:698bfec:             if (notify)
+1:698bfec:                 notifyAll();
+1:eac0369: 
+1:698bfec:             return rollbackOnly;
+1:698bfec:         }
+1:cccf5dd: 	}
+1:eac0369: 
+1:eac0369:    /**
+1:13673bd:     * Schedule a timeout task which will rollback the global transaction
+1:cccf5dd:     * after the specified time will elapse.
+1:cccf5dd:     *
+1:cccf5dd:     * @param timeoutMillis The number of milliseconds to be elapsed before
+1:cccf5dd:     *                      the transaction will be rolled back.
+1:cccf5dd:     */
+1:cccf5dd:     synchronized void scheduleTimeoutTask(long timeoutMillis) {
+1:bb9f97a:         // Mark the transaction to be rolled back bby timeout
+1:bb9f97a:         performTimeoutRollback = true;
+1:cccf5dd:         // schedule a time out task if the timeout was specified
+1:cccf5dd:         if (timeoutMillis > 0) {
+1:cccf5dd:             // take care of the transaction timeout
+1:849dab2:             timeoutTask = new CancelXATransactionTask(this);
+1:13673bd:             getTimerFactory().schedule(timeoutTask, timeoutMillis);
+1:cccf5dd:         } else {
+1:cccf5dd:             timeoutTask = null;
+1:cccf5dd:         }
+1:cccf5dd:     }
+1:cccf5dd: 
+1:cccf5dd:    /**
+1:cccf5dd:      * Rollback the global transaction and cancel the timeout task.
+1:cccf5dd:      */
+1:cccf5dd:     synchronized void xa_rollback() throws SQLException {
+2:cccf5dd:         conn.xa_rollback();
+1:cccf5dd:         xa_finalize();
+1:cccf5dd:     }
+1:cccf5dd: 
+1:cccf5dd:    /**
+1:cccf5dd:      * Commit the global transaction and cancel the timeout task.
+1:90543a4:      * @param onePhase Indicates whether to use one phase commit protocol.
+1:cccf5dd:      *                Otherwise two phase commit protocol will be used.
+1:cccf5dd:      */
+1:cccf5dd:     synchronized void xa_commit(boolean onePhase) throws SQLException {
+1:cccf5dd:         conn.xa_commit(onePhase);
+1:cccf5dd:         xa_finalize();
+1:cccf5dd:     }
+1:cccf5dd: 
+1:cccf5dd:    /**
+1:cccf5dd:      * Prepare the global transaction for commit.
+1:cccf5dd:      */
+1:cccf5dd:     synchronized int xa_prepare() throws SQLException {
+1:0c5bc3a:         int retVal;
+1:0c5bc3a: 
+1:0c5bc3a:         try {
+1:0c5bc3a:             retVal = conn.xa_prepare();
+1:0c5bc3a:         } catch (SQLException e) {
+1:af1c18c:             if (ExceptionUtil.isDeferredConstraintViolation(e.getSQLState())) {
+1:0c5bc3a:                 // we are rolling back
+1:0c5bc3a:                 xa_finalize();
+1:0c5bc3a:             }
+1:0c5bc3a: 
+1:0c5bc3a:             throw e;
+1:0c5bc3a:         }
+1:152986e: 
+1:152986e:         if (retVal == XATransactionController.XA_RDONLY) {
+1:152986e:             // Read-only transactions are implicitly committed when they are
+1:152986e:             // prepared. Since the transaction has completed, the timeout task
+1:152986e:             // should be cancelled now. DERBY-5562.
+1:152986e:             xa_finalize();
+1:152986e:         }
+1:152986e: 
+1:cccf5dd:         return retVal;
+1:cccf5dd:     }
+1:cccf5dd: 
+1:bb9f97a:     /** This method cancels timeoutTask and assigns
+1:bb9f97a:       * 'performTimeoutRollback = false'.
+1:cccf5dd:       */
+1:152986e:     private void xa_finalize() {
+1:cccf5dd:         if (timeoutTask != null) {
+1:13673bd:             getTimerFactory().cancel(timeoutTask);
+1:849dab2:             timeoutTask = null;
+1:cccf5dd:         }
+1:bb9f97a:         performTimeoutRollback = false;
+1:cccf5dd:     }
+1:cccf5dd: 
+1:cccf5dd:     /**
+1:cccf5dd:      * This function is called from the timer task when the transaction
+1:cccf5dd:      * times out.
+1:cccf5dd:      *
+1:cccf5dd:      * @see CancelXATransactionTask
+1:cccf5dd:      */
+1:88b727b:     void cancel(String messageId) throws XAException {
+1:698bfec:         // See if it is ok to cancel.  This is for DERBY-6879
+1:698bfec:         if (cleanupOrCancelMonitor.okToCancel()) {
+1:698bfec:             synchronized (this) {
+1:698bfec:                 // We remove the XID so that the client code if any
+1:698bfec:                 //  will get an XAER_NOTA when it accesses the XA transaction
+1:698bfec:                 //  once it starts being canceled.  This makes since in that
+1:698bfec:                 //  once the cancel starts, the client will not be able
+1:698bfec:                 //  to access the XA transaction.  See DERBY-6879
+1:698bfec:                 creatingResource.removeXATransaction(xid);
+1:698bfec:                 // Check performTimeoutRollback just to be sure that
+1:698bfec:                 // the cancellation task was not started
+1:698bfec:                 // just before the xa_commit/rollback
+1:698bfec:                 // obtained this object's monitor.
+1:698bfec:                 if (performTimeoutRollback) {
+1:cccf5dd: 
+1:698bfec:                     // Log the message about the transaction cancelled
+1:698bfec:                     if (messageId != null)
+1:698bfec:                         Monitor.logTextMessage(messageId, xid.toString());
+1:cccf5dd: 
+1:698bfec:                     // Check whether the transaction is associated
+1:698bfec:                     // with any EmbedXAResource instance.
+1:698bfec:                     if (associationState == XATransactionState.T1_ASSOCIATED) {
+1:698bfec:                         conn.cancelRunningStatement();
+1:698bfec:                         EmbedXAResource assocRes = associatedResource;
+1:698bfec:                         end(assocRes, XAResource.TMFAIL, true);
+1:698bfec:                     }
+1:698bfec: 
+1:698bfec:                     // Rollback the global transaction
+1:698bfec:                     try {
+1:698bfec:                         conn.xa_rollback();
+1:698bfec:                     } catch (SQLException sqle) {
+1:698bfec:                         XAException ex = new XAException(XAException.XAER_RMERR);
+1:698bfec:                         ex.initCause(sqle);
+1:698bfec:                         throw ex;
+1:698bfec:                     }
+1:698bfec: 
+1:698bfec:                     // Do the cleanup on the resource
+1:698bfec:                     creatingResource.returnConnectionToResource(this, xid);
+1:698bfec:                 }
+1:698bfec:             }
+1:88b727b:         }
+1:cccf5dd:     }
+1:698bfec:     
+1:56c1dc2:     /**
+1:56c1dc2:      * Privileged Monitor lookup. Must be private so that user code
+1:56c1dc2:      * can't call this entry point.
+1:56c1dc2:      */
+1:56c1dc2:     private  static  ModuleFactory  getMonitor()
+1:56c1dc2:     {
+1:56c1dc2:         return AccessController.doPrivileged
+1:56c1dc2:             (
+1:56c1dc2:              new PrivilegedAction<ModuleFactory>()
+1:56c1dc2:              {
+1:56c1dc2:                  public ModuleFactory run()
+1:56c1dc2:                  {
+1:56c1dc2:                      return Monitor.getMonitor();
+1:56c1dc2:                  }
+1:56c1dc2:              }
+1:56c1dc2:              );
+1:56c1dc2:     }
+1:88b727b: 
+1:cccf5dd: }
+============================================================================
+author:Bryan Pendleton
+-------------------------------------------------------------------------------
+commit:698bfec
+/////////////////////////////////////////////////////////////////////////
+1:     
+1:     /**
+1:      * A class used to monitor if the transaction is in the middle of
+1:      * cancelling or cleaning up on an error.  
+1:      * 
+1:      * See DERBY-6879
+1:      * 
+1:      */
+1:     private static class CleanupOrCancelMonitor {
+1:         
+1:         private Long cancelThreadId;
+1:         private Long cleanupThreadId;
+1:         
+1:         /**
+1:          * See if it is ok to cancel.  It is okay to cancel if the transaction
+1:          * is not cleaning up from an error.  The assumption is that if the 
+1:          * cleanUpOnError is/has been invoked, then there is no reason for
+1:          * the cancel to be processed as the transaction is going to end
+1:          * (ab)normally.
+1:          * 
+1:          * @return <code>true</code> if it is okay to cancel.
+1:          */
+1:         public synchronized boolean okToCancel() {
+1:             boolean res = false;
+1:             if (null == cancelThreadId && null == cleanupThreadId) {
+1:                 cancelThreadId = Thread.currentThread().getId();
+1:                 res = true;
+1:             }
+1:             return res;
+1:         }
+1:         
+1:         /**
+1:          * See if it is ok to cleanup.  It is okay to cleanup if the transaction
+1:          * is not cancelling.  The assumption is that if the 
+1:          * cancel is/has been invoked, then there is no reason to try to
+1:          * mark the transaction as being in error.  The transaction will 
+1:          * be cancelled in any case.
+1:          * 
+1:          * @return <code>true</code> if it is okay to cleanup.
+1:          */
+1:         private synchronized boolean okToCleanup() {
+1:             boolean res = false;
+1:             if (null == cleanupThreadId && null == cancelThreadId) {
+1:                 cleanupThreadId = Thread.currentThread().getId();
+1:                 res = true;
+1:             }
+1:             return res;
+1:         }
+1:     };
+1:     
+1:     CleanupOrCancelMonitor cleanupOrCancelMonitor = new CleanupOrCancelMonitor();
+1:     
+/////////////////////////////////////////////////////////////////////////
+1:         // See if it is okay to cleanup.  This is for DERBY-6879
+1:         if (cleanupOrCancelMonitor.okToCleanup()) {
+1:             if (t instanceof StandardException) {
+1:                 StandardException se = (StandardException) t;
+1:                 if (se.getSeverity() >= ExceptionSeverity.SESSION_SEVERITY) {
+1:                     popMe();
+1:                     return;
+1:                 }
+1: 
+1:                 if (se.getSeverity() == ExceptionSeverity.TRANSACTION_SEVERITY) {
+1: 
+1:                     synchronized (this) {
+1:                         // prior to the DERBY-5552 fix, we would disable the connection
+1:                         // here with conn.setApplicationConnection(null);
+1:                         // which could cause a NPE
+1:                         notifyAll();
+1:                         associationState = TRO_FAIL;
+1:                         if (SQLState.DEADLOCK.equals(se.getMessageId()))
+1:                             rollbackOnlyCode = XAException.XA_RBDEADLOCK;
+1:                         else if (se.isLockTimeout())
+1:                             rollbackOnlyCode = XAException.XA_RBTIMEOUT;
+1:                         else
+1:                             rollbackOnlyCode = XAException.XA_RBOTHER;
+1:                     }
+1:                 }
+1:         }
+1:         synchronized (this) {
+1:             if (associationState == XATransactionState.TRO_FAIL)
+1:                 throw new XAException(rollbackOnlyCode);
+1:             boolean isSuspendedByResource = (suspendedList != null) && (suspendedList.get(resource) != null);
+1:             if (flags == XAResource.TMRESUME) {
+1:                 if (!isSuspendedByResource)
+1:                     throw new XAException(XAException.XAER_PROTO);
+1:             } else {
+1:                 // cannot join a transaction we have suspended.
+1:                 if (isSuspendedByResource)
+1:                     throw new XAException(XAException.XAER_PROTO);
+1:             }
+1:             while (associationState == XATransactionState.T1_ASSOCIATED) {
+1: 
+1:                 try {
+1:                     wait();
+1:                 } catch (InterruptedException ie) {
+1:                     throw new XAException(XAException.XA_RETRY);
+1:                 }
+1:             }
+1:             switch (associationState) {
+1:             case XATransactionState.T0_NOT_ASSOCIATED:
+1:                 break;
+1:             case XATransactionState.TRO_FAIL:
+1:                 throw new XAException(rollbackOnlyCode);
+1:             default:
+1:                 throw new XAException(XAException.XAER_NOTA);
+1:             }
+1:             if (isPrepared)
+1:                 throw new XAException(XAException.XAER_PROTO);
+1:             if (isSuspendedByResource) {
+1:                 suspendedList.remove(resource);
+1:             }
+1:             associationState = XATransactionState.T1_ASSOCIATED;
+1:             associatedResource = resource;
+1:         }
+1:         boolean rollbackOnly = false;
+1:         synchronized (this) {
+1:             boolean isSuspendedByResource = (suspendedList != null) && (suspendedList.get(resource) != null);
+1:             if (!endingCurrentXid) {
+1:                 while (associationState == XATransactionState.T1_ASSOCIATED) {
+1:                     try {
+1:                         wait();
+1:                     } catch (InterruptedException ie) {
+1:                         throw new XAException(XAException.XA_RETRY);
+1:                     }
+1:                 }
+1:             }
+1:             switch (associationState) {
+1:             case XATransactionState.TC_COMPLETED:
+1:                 throw new XAException(XAException.XAER_NOTA);
+1:             case XATransactionState.TRO_FAIL:
+1:                 if (endingCurrentXid)
+1:                     flags = XAResource.TMFAIL;
+1:                 else
+1:                     throw new XAException(rollbackOnlyCode);
+1:             }
+1:             boolean notify = false;
+1:             switch (flags) {
+1:             case XAResource.TMSUCCESS:
+1:                 if (isSuspendedByResource) {
+1:                     suspendedList.remove(resource);
+1:                 }
+1:                 else {
+1:                     if (resource != associatedResource)
+1:                         throw new XAException(XAException.XAER_PROTO);
+1:                     associationState = XATransactionState.T0_NOT_ASSOCIATED;
+1:                     associatedResource = null;
+1:                     notify = true;
+1:                 }
+1:                 conn.setApplicationConnection(null);
+1:                 break;
+1:             case XAResource.TMFAIL:
+1:                 if (isSuspendedByResource) {
+1:                     suspendedList.remove(resource);
+1:                 } else {
+1:                     if (resource != associatedResource)
+1:                         throw new XAException(XAException.XAER_PROTO);
+1:                     associatedResource = null;
+1:                 }
+1: 
+1:                 if (associationState != XATransactionState.TRO_FAIL) {
+1:                     associationState = XATransactionState.TRO_FAIL;
+1:                     rollbackOnlyCode = XAException.XA_RBROLLBACK;
+1:                 }
+1:                 conn.setApplicationConnection(null);
+1:                 notify = true;
+1:                 rollbackOnly = true;
+1:                 break;
+1: 
+1:             case XAResource.TMSUSPEND:
+1:                 if (isSuspendedByResource)
+1:                     throw new XAException(XAException.XAER_PROTO);
+1: 
+1:                 if (resource != associatedResource)
+1:                     throw new XAException(XAException.XAER_PROTO);
+1:                 suspendedList.put(resource, this);
+1:                 associationState = XATransactionState.T0_NOT_ASSOCIATED;
+1:                 associatedResource = null;
+1:                 conn.setApplicationConnection(null);
+1:                 notify = true;
+1:                 break;
+1:             default:
+1:                 throw new XAException(XAException.XAER_INVAL);
+1:             }
+1:             if (notify)
+1:                 notifyAll();
+1:             return rollbackOnly;
+1:         }
+/////////////////////////////////////////////////////////////////////////
+1:         // See if it is ok to cancel.  This is for DERBY-6879
+1:         if (cleanupOrCancelMonitor.okToCancel()) {
+1:             synchronized (this) {
+1:                 // We remove the XID so that the client code if any
+1:                 //  will get an XAER_NOTA when it accesses the XA transaction
+1:                 //  once it starts being canceled.  This makes since in that
+1:                 //  once the cancel starts, the client will not be able
+1:                 //  to access the XA transaction.  See DERBY-6879
+1:                 creatingResource.removeXATransaction(xid);
+1:                 // Check performTimeoutRollback just to be sure that
+1:                 // the cancellation task was not started
+1:                 // just before the xa_commit/rollback
+1:                 // obtained this object's monitor.
+1:                 if (performTimeoutRollback) {
+1:                     // Log the message about the transaction cancelled
+1:                     if (messageId != null)
+1:                         Monitor.logTextMessage(messageId, xid.toString());
+1:                     // Check whether the transaction is associated
+1:                     // with any EmbedXAResource instance.
+1:                     if (associationState == XATransactionState.T1_ASSOCIATED) {
+1:                         conn.cancelRunningStatement();
+1:                         EmbedXAResource assocRes = associatedResource;
+1:                         end(assocRes, XAResource.TMFAIL, true);
+1:                     }
+1: 
+1:                     // Rollback the global transaction
+1:                     try {
+1:                         conn.xa_rollback();
+1:                     } catch (SQLException sqle) {
+1:                         XAException ex = new XAException(XAException.XAER_RMERR);
+1:                         ex.initCause(sqle);
+1:                         throw ex;
+1:                     }
+1: 
+1:                     // Do the cleanup on the resource
+1:                     creatingResource.returnConnectionToResource(this, xid);
+1:                 }
+1:             }
+1:     
+commit:88b727b
+/////////////////////////////////////////////////////////////////////////
+1:         public synchronized boolean cancel() {
+1:         public synchronized void run() {
+1:                 if (null != xaState) {
+1:                     xaState.cancel(MessageId.CONN_XA_TRANSACTION_TIMED_OUT);
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+1:     void cancel(String messageId) throws XAException {
+0:         // Note that the synchronization has changed for this method.   See
+0:         //  DERBY-6879.
+0:         //
+0:         boolean needsRollback = false;
+1:         
+0:         // This method now synchronizes on this instanace to ensure that the state
+0:         //  is consistent when accessed and modified.  See DERBY-6879
+0:         synchronized (this) {
+0:             // Check performTimeoutRollback just to be sure that
+0:             // the cancellation task was not started
+0:             // just before the xa_commit/rollback
+0:             // obtained this object's monitor.
+0:             needsRollback = this.performTimeoutRollback;
+/////////////////////////////////////////////////////////////////////////
+1:         }
+0:         if (needsRollback) {
+0:             // While the rollback is performed on the connection, 
+0:             //  this XATransactionState is ont synchronized to work around 
+0:             //  the issue reported in DERBY-6879
+0:                 // Rollback the global transaction
+1:         }
+0:         // This method now synchronizes on this instanace again to ensure that the state
+0:         //  is consistent when accessed and modified.  See DERBY-6879
+0:         synchronized (this) {
+1:    
+author:Richard N. Hillegas
+-------------------------------------------------------------------------------
+commit:56c1dc2
+/////////////////////////////////////////////////////////////////////////
+1: import java.security.AccessController;
+1: import java.security.PrivilegedAction;
+1: import org.apache.derby.iapi.services.monitor.ModuleFactory;
+/////////////////////////////////////////////////////////////////////////
+1:         return getMonitor().getTimerFactory();
+/////////////////////////////////////////////////////////////////////////
+1:     
+1:     /**
+1:      * Privileged Monitor lookup. Must be private so that user code
+1:      * can't call this entry point.
+1:      */
+1:     private  static  ModuleFactory  getMonitor()
+1:     {
+1:         return AccessController.doPrivileged
+1:             (
+1:              new PrivilegedAction<ModuleFactory>()
+1:              {
+1:                  public ModuleFactory run()
+1:                  {
+1:                      return Monitor.getMonitor();
+1:                  }
+1:              }
+1:              );
+1:     }
+1: 
+commit:90543a4
+/////////////////////////////////////////////////////////////////////////
+1:      * @param onePhase Indicates whether to use one phase commit protocol.
+author:Dag H. Wanvik
+-------------------------------------------------------------------------------
+commit:af1c18c
+/////////////////////////////////////////////////////////////////////////
+1:             if (ExceptionUtil.isDeferredConstraintViolation(e.getSQLState())) {
+commit:0c5bc3a
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.error.ExceptionUtil;
+/////////////////////////////////////////////////////////////////////////
+1:         int retVal;
+1: 
+1:         try {
+1:             retVal = conn.xa_prepare();
+1:         } catch (SQLException e) {
+0:             if (e.getSQLState().equals(
+0:                   ExceptionUtil.getSQLStateFromIdentifier(
+0:                     SQLState.LANG_DEFERRED_DUPLICATE_KEY_CONSTRAINT_T))) {
+1:                 // we are rolling back
+1:                 xa_finalize();
+1:             }
+1: 
+1:             throw e;
+1:         }
+author:Knut Anders Hatlen
+-------------------------------------------------------------------------------
+commit:13673bd
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private static TimerFactory getTimerFactory() {
+0:         return Monitor.getMonitor().getTimerFactory();
+1:     }
+/////////////////////////////////////////////////////////////////////////
+1:     * Schedule a timeout task which will rollback the global transaction
+/////////////////////////////////////////////////////////////////////////
+1:             getTimerFactory().schedule(timeoutTask, timeoutMillis);
+/////////////////////////////////////////////////////////////////////////
+1:             getTimerFactory().cancel(timeoutTask);
+commit:850aba4
+/////////////////////////////////////////////////////////////////////////
+1:     HashMap<EmbedXAResource, XATransactionState> suspendedList;
+/////////////////////////////////////////////////////////////////////////
+1:                 if (suspendedList == null) {
+1:                     suspendedList =
+1:                         new HashMap<EmbedXAResource, XATransactionState>();
+1:                 }
+commit:152986e
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.store.access.XATransactionController;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         if (retVal == XATransactionController.XA_RDONLY) {
+1:             // Read-only transactions are implicitly committed when they are
+1:             // prepared. Since the transaction has completed, the timeout task
+1:             // should be cancelled now. DERBY-5562.
+1:             xa_finalize();
+1:         }
+1: 
+1:     private void xa_finalize() {
+commit:cccf5dd
+/////////////////////////////////////////////////////////////////////////
+1: import java.sql.SQLException;
+0: import java.util.Timer;
+1: import java.util.TimerTask;
+1: import org.apache.derby.iapi.services.monitor.Monitor;
+1: import org.apache.derby.iapi.services.timer.TimerFactory;
+/////////////////////////////////////////////////////////////////////////
+1:     /** Rollback-only due to timeout */
+1:     final static int TRO_TIMEOUT                = -3;
+/////////////////////////////////////////////////////////////////////////
+0:     /** Has this transaction been finished (committed
+0:       * or rolled back)? */
+0:     boolean isFinished;
+1: 
+1:     /** A timer task scheduled for the time when the transaction will timeout. */
+1:     CancelXATransactionTask timeoutTask = null;
+1: 
+1: 
+1:     /** The implementation of TimerTask to cancel a global transaction. */
+0:     private class CancelXATransactionTask extends TimerTask {
+1: 
+0:         /** Creates the cancelation object to be passed to a timer. */
+0:         public CancelXATransactionTask() {
+0:             XATransactionState.this.timeoutTask = this;
+1:         }
+1: 
+1:         /** Runs the cancel task of the global transaction */
+0:         public void run() {
+1:             try {
+0:                 XATransactionState.this.cancel();
+0:             } catch (XAException ex) {
+0:                 Monitor.logThrowable(ex);
+1:             }
+1:         }
+1:     }
+1: 
+1: 
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         this.isFinished = false;
+/////////////////////////////////////////////////////////////////////////
+1:             case XATransactionState.TRO_DEADLOCK:
+1:             case XATransactionState.TRO_TIMEOUT:
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:    /**
+0:     * Schedule a timeout task wich will rollback the global transaction
+1:     * after the specified time will elapse.
+1:     *
+1:     * @param timeoutMillis The number of milliseconds to be elapsed before
+1:     *                      the transaction will be rolled back.
+1:     */
+1:     synchronized void scheduleTimeoutTask(long timeoutMillis) {
+1:         // schedule a time out task if the timeout was specified
+1:         if (timeoutMillis > 0) {
+1:             // take care of the transaction timeout
+0:             TimerTask cancelTask = new CancelXATransactionTask();
+0:             TimerFactory timerFactory = Monitor.getMonitor().getTimerFactory();
+0:             Timer timer = timerFactory.getCancellationTimer();
+0:             timer.schedule(cancelTask, timeoutMillis);
+1:         } else {
+1:             timeoutTask = null;
+1:         }
+1:     }
+1: 
+1:    /**
+1:      * Rollback the global transaction and cancel the timeout task.
+1:      */
+1:     synchronized void xa_rollback() throws SQLException {
+1:         conn.xa_rollback();
+1:         xa_finalize();
+1:     }
+1: 
+1:    /**
+1:      * Commit the global transaction and cancel the timeout task.
+0:      * @param onPhase Indicates whether to use one phase commit protocol.
+1:      *                Otherwise two phase commit protocol will be used.
+1:      */
+1:     synchronized void xa_commit(boolean onePhase) throws SQLException {
+1:         conn.xa_commit(onePhase);
+1:         xa_finalize();
+1:     }
+1: 
+1:    /**
+1:      * Prepare the global transaction for commit.
+1:      */
+1:     synchronized int xa_prepare() throws SQLException {
+0:         int retVal = conn.xa_prepare();
+1:         return retVal;
+1:     }
+1: 
+0:     /** This method cancels timeoutTask and marks the transaction
+0:       * as finished by assigning 'isFinished = true'.
+1:       */
+0:     synchronized void xa_finalize() {
+1:         if (timeoutTask != null) {
+0:             timeoutTask.cancel();
+1:         }
+0:         isFinished = true;
+1:     }
+1: 
+1:     /**
+1:      * This function is called from the timer task when the transaction
+1:      * times out.
+1:      *
+1:      * @see CancelXATransactionTask
+1:      */
+0:     private synchronized void cancel() throws XAException {
+0:         // Check isFinished just to be sure that
+0:         // the cancellation task was not started
+0:         // just before the xa_commit/rollback
+0:         // obtained this object's monitor.
+0:         if (!isFinished) {
+0:             // Check whether the transaction is associated
+0:             // with any EmbedXAResource instance.
+0:             if (associationState == XATransactionState.T1_ASSOCIATED) {
+0:                 conn.cancelRunningStatement();
+0:                 EmbedXAResource assocRes = associatedResource;
+0:                 end(assocRes, XAResource.TMFAIL, true);
+1:             }
+1: 
+0:             // Rollback the global transaction
+0:             try {
+1:                 conn.xa_rollback();
+0:             } catch (SQLException sqle) {
+0:                 XAException ex = new XAException(XAException.XAER_RMERR);
+0:                 ex.initCause(sqle);
+0:                 throw ex;
+1:             }
+1: 
+0:             // Do the cleanup on the resource
+0:             creatingResource.returnConnectionToResource(this, xid);
+1:         }
+1:     }
+author:Katherine Marsden
+-------------------------------------------------------------------------------
+commit:3fe2281
+/////////////////////////////////////////////////////////////////////////
+0: 					// prior to the DERBY-5552 fix, we would disable the connection
+0: 					// here with conn.setApplicationConnection(null);
+0: 					// which could cause a NPE
+author:Mike Matrigali
+-------------------------------------------------------------------------------
+commit:c9ef166
+/////////////////////////////////////////////////////////////////////////
+0: 					else if (se.isLockTimeout())
+0: 						rollbackOnlyCode = XAException.XA_RBTIMEOUT;
+author:Kristian Waagan
+-------------------------------------------------------------------------------
+commit:849dab2
+/////////////////////////////////////////////////////////////////////////
+1:     private static class CancelXATransactionTask extends TimerTask {
+1:         private XATransactionState xaState; 
+1: 
+1:         /**
+1:          * Creates the cancellation task to be passed to a timer.
+1:          *
+1:          * @param xaState the XA state object for the transaction to cancel
+1:          */
+1:         public CancelXATransactionTask(XATransactionState xaState) {
+1:             this.xaState = xaState;
+1:         }
+1:         
+0:         public boolean cancel() {
+1:             // nullify reference to reduce memory footprint of canceled tasks
+1:             xaState = null;
+1:             return super.cancel();
+0:                 xaState.cancel(MessageId.CONN_XA_TRANSACTION_TIMED_OUT);
+/////////////////////////////////////////////////////////////////////////
+1:             timeoutTask = new CancelXATransactionTask(this);
+0:             timer.schedule(timeoutTask, timeoutMillis);
+/////////////////////////////////////////////////////////////////////////
+1:             timeoutTask = null;
+author:Dyre Tjeldvoll
+-------------------------------------------------------------------------------
+commit:bb9f97a
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.shared.common.reference.MessageId;
+/////////////////////////////////////////////////////////////////////////
+1:     /** Indicates whether this transaction is supposed to be rolled back by timeout. */
+1:     boolean performTimeoutRollback;
+/////////////////////////////////////////////////////////////////////////
+0:                 XATransactionState.this.cancel(MessageId.CONN_XA_TRANSACTION_TIMED_OUT);
+1:             } catch (Throwable th) {
+1:                 Monitor.logThrowable(th);
+/////////////////////////////////////////////////////////////////////////
+1: 		this.performTimeoutRollback = false; // there is no transaction yet
+/////////////////////////////////////////////////////////////////////////
+1:         // Mark the transaction to be rolled back bby timeout
+1:         performTimeoutRollback = true;
+/////////////////////////////////////////////////////////////////////////
+1:     /** This method cancels timeoutTask and assigns
+1:       * 'performTimeoutRollback = false'.
+1:         performTimeoutRollback = false;
+/////////////////////////////////////////////////////////////////////////
+0:     synchronized void cancel(String messageId) throws XAException {
+0:         // Check performTimeoutRollback just to be sure that
+0:         if (performTimeoutRollback) {
+1: 
+0:             // Log the message about the transaction cancelled
+0:             if (messageId != null)
+0:                 Monitor.logTextMessage(messageId, xid.toString());
+1: 
+author:Samuel Andrew McIntyre
+-------------------------------------------------------------------------------
+commit:2c21843
+/////////////////////////////////////////////////////////////////////////
+1: 		using the same XAConnection. This has been the traditional Cloudscape/Derby behaviour,
+commit:2f36947
+/////////////////////////////////////////////////////////////////////////
+1:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:    contributor license agreements.  See the NOTICE file distributed with
+1:    this work for additional information regarding copyright ownership.
+1:    The ASF licenses this file to You under the Apache License, Version 2.0
+1:    (the "License"); you may not use this file except in compliance with
+1:    the License.  You may obtain a copy of the License at
+author:Daniel John Debrunner
+-------------------------------------------------------------------------------
+commit:0076dfb
+/////////////////////////////////////////////////////////////////////////
+1: 	final EmbedXAResource creatingResource;
+1:         // owning XAResource
+1: 	private EmbedXAResource  associatedResource;	
+/////////////////////////////////////////////////////////////////////////
+1: 	XATransactionState(ContextManager cm, EmbedConnection conn, 
+1:                 EmbedXAResource resource, XAXactId xid) {
+/////////////////////////////////////////////////////////////////////////
+1: 	void start(EmbedXAResource resource, int flags) throws XAException {
+/////////////////////////////////////////////////////////////////////////
+1: 	boolean end(EmbedXAResource resource, int flags, 
+1:                 boolean endingCurrentXid) throws XAException {
+commit:913815a
+/////////////////////////////////////////////////////////////////////////
+1:             
+0:             if (se.getSeverity() >= ExceptionSeverity.SESSION_SEVERITY) {
+0:                 popMe();
+0:                 return;
+1:             }
+commit:824ca0b
+/////////////////////////////////////////////////////////////////////////
+1: final class XATransactionState extends ContextImpl {
+/////////////////////////////////////////////////////////////////////////
+1: 	final EmbedConnection	conn;
+commit:63d26f5
+/////////////////////////////////////////////////////////////////////////
+0:    Copyright 2003, 2005 The Apache Software Foundation or its licensors, as applicable.
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.impl.jdbc.EmbedConnection;
+/////////////////////////////////////////////////////////////////////////
+0: 	public final EmbedConnection	conn;
+/////////////////////////////////////////////////////////////////////////
+0: 	XATransactionState(ContextManager cm, EmbedConnection conn, EmbedXAConnection resource, XAXactId xid) {
+commit:345de35
+/////////////////////////////////////////////////////////////////////////
+1:    Derby - Class org.apache.derby.jdbc.XATransactionState
+1: 
+0:    Copyright 2003, 2004 The Apache Software Foundation or its licensors, as applicable.
+1: 
+0:    Licensed under the Apache License, Version 2.0 (the "License");
+0:    you may not use this file except in compliance with the License.
+0:    You may obtain a copy of the License at
+1: 
+1:       http://www.apache.org/licenses/LICENSE-2.0
+1: 
+1:    Unless required by applicable law or agreed to in writing, software
+1:    distributed under the License is distributed on an "AS IS" BASIS,
+1:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:    See the License for the specific language governing permissions and
+1:    limitations under the License.
+commit:4dede3b
+/////////////////////////////////////////////////////////////////////////
+commit:eac0369
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1: 
+0:    Licensed Materials - Property of IBM
+0:    Cloudscape - Package org.apache.derby.jdbc
+0:    (C) Copyright IBM Corp. 2003, 2004. All Rights Reserved.
+0:    US Government Users Restricted Rights - Use, duplication or
+0:    disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+1: 
+1:  */
+1: 
+1: package org.apache.derby.jdbc;
+1: 
+1: 
+0: import org.apache.derby.impl.jdbc.EmbedConnection20;
+1: import javax.transaction.xa.XAResource;
+1: import org.apache.derby.iapi.services.context.ContextImpl;
+1: import org.apache.derby.iapi.services.context.ContextManager;
+1: import org.apache.derby.iapi.error.ExceptionSeverity;
+1: import org.apache.derby.iapi.error.StandardException;
+1: import org.apache.derby.iapi.store.access.xa.XAXactId;
+1: import org.apache.derby.iapi.reference.SQLState;
+1: import java.util.HashMap;
+1: import javax.transaction.xa.XAException;
+1: 
+1: /** 
+1: */
+0: public final class XATransactionState extends ContextImpl {
+1: 
+1: 	/**
+0: 		IBM Copyright &copy notice.
+1: 	*/
+0: 	public static final String copyrightNotice = org.apache.derby.iapi.reference.Copyright.SHORT_2003_2004;
+1: 
+1: 	/** Rollback-only due to deadlock */
+1: 	final static int TRO_DEADLOCK				= -2;
+1: 	/** Rollback-only due to end(TMFAIL) */
+1: 	final static int TRO_FAIL					= -1;
+1: 	final static int T0_NOT_ASSOCIATED			= 0;
+1: 	final static int T1_ASSOCIATED				= 1;
+1: 	// final static int T2_ASSOCIATION_SUSPENDED	= 2;
+1: 	final static int TC_COMPLETED				= 3; // rollback/commit called
+1: 
+0: 	public final EmbedConnection20	conn;
+0: 	final EmbedXAConnection creatingResource;
+0: 	private EmbedXAConnection  associatedResource;	// owning XAResource
+1: 	final XAXactId			xid;	
+1: 	/**
+1: 		When an XAResource suspends a transaction (end(TMSUSPEND)) it must be resumed
+0: 		using the same XAConnection. This has been the traditional Cloudscape behaviour,
+1: 		though there does not seem to be a specific reference to this behaviour in
+1: 		the JTA spec. Note that while the transaction is suspended by this XAResource,
+1: 		another XAResource may join the transaction and suspend it after the join.
+1: 	*/
+0: 	HashMap suspendedList;
+1: 
+1: 
+1: 	/**
+1: 		Association state of the transaction.
+1: 	*/
+1: 	int associationState;
+1: 
+1: 	int rollbackOnlyCode;
+1: 
+1: 
+1: 	/**
+1: 		has this transaction been prepared.
+1: 	*/
+1: 	boolean isPrepared;
+1: 
+0: 	XATransactionState(ContextManager cm, EmbedConnection20 conn, EmbedXAConnection resource, XAXactId xid) {
+1: 
+1: 		super(cm, "XATransactionState");
+1: 		this.conn = conn;
+1: 		this.associatedResource = resource;
+1: 		this.creatingResource = resource;
+1: 		this.associationState = XATransactionState.T1_ASSOCIATED;
+1: 		this.xid = xid;
+1: 
+1: 	}
+1: 
+1: 	public void cleanupOnError(Throwable t) {
+1: 
+0: 		if (t instanceof StandardException) {
+1: 
+0: 			StandardException se = (StandardException) t;
+1: 
+0: 			if (se.getSeverity() == ExceptionSeverity.TRANSACTION_SEVERITY) {
+1: 
+0: 				synchronized (this) {
+0: 					// disable use of the connection until it is cleaned up.
+0: 					conn.setApplicationConnection(null);
+0: 					notifyAll();
+0: 					associationState = TRO_FAIL;
+0: 					if (SQLState.DEADLOCK.equals(se.getMessageId()))
+0: 						rollbackOnlyCode = XAException.XA_RBDEADLOCK;
+0: 					else if (SQLState.LOCK_TIMEOUT.equals(se.getMessageId()))
+0: 						rollbackOnlyCode = XAException.XA_RBTIMEOUT;					
+0: 					else
+0: 						rollbackOnlyCode = XAException.XA_RBOTHER;
+1: 				}
+1: 			}
+1: 		}
+1: 	}
+1: 
+0: 	void start(EmbedXAConnection resource, int flags) throws XAException {
+1: 
+0: 		synchronized (this) {
+0: 			if (associationState == XATransactionState.TRO_FAIL)
+0: 				throw new XAException(rollbackOnlyCode);
+1: 
+0: 			boolean isSuspendedByResource = (suspendedList != null) && (suspendedList.get(resource) != null);
+1: 
+0: 			if (flags == XAResource.TMRESUME) {
+0: 				if (!isSuspendedByResource)
+0: 					throw new XAException(XAException.XAER_PROTO);
+1: 
+0: 			} else {
+0: 				// cannot join a transaction we have suspended.
+0: 				if (isSuspendedByResource)
+0: 					throw new XAException(XAException.XAER_PROTO);
+1: 			}
+1: 
+0: 			while (associationState == XATransactionState.T1_ASSOCIATED) {
+1: 				
+0: 				try {
+0: 					wait();
+0: 				} catch (InterruptedException ie) {
+0: 					throw new XAException(XAException.XA_RETRY);
+1: 				}
+1: 			}
+1: 
+1: 
+0: 			switch (associationState) {
+0: 			case XATransactionState.T0_NOT_ASSOCIATED:
+0: 				break;
+1: 
+0: 			case XATransactionState.TRO_FAIL:
+0: 				throw new XAException(rollbackOnlyCode);
+1: 
+0: 			default:
+0: 				throw new XAException(XAException.XAER_NOTA);
+1: 			}
+1: 
+0: 			if (isPrepared)
+0: 				throw new XAException(XAException.XAER_PROTO);
+1: 
+0: 			if (isSuspendedByResource) {
+0: 				suspendedList.remove(resource);
+1: 			}
+1: 
+0: 			associationState = XATransactionState.T1_ASSOCIATED;
+0: 			associatedResource = resource;
+1: 		}
+1: 	}
+1: 
+0: 	boolean end(EmbedXAConnection resource, int flags, boolean endingCurrentXid) throws XAException {
+1: 
+0: 		boolean rollbackOnly = false;
+0: 		synchronized (this) {
+1: 
+1: 
+0: 			boolean isSuspendedByResource = (suspendedList != null) && (suspendedList.get(resource) != null);
+1: 
+0: 			if (!endingCurrentXid) {
+0: 				while (associationState == XATransactionState.T1_ASSOCIATED) {
+1: 					
+0: 					try {
+0: 						wait();
+0: 					} catch (InterruptedException ie) {
+0: 						throw new XAException(XAException.XA_RETRY);
+1: 					}
+1: 				}
+1: 			}
+1: 
+0: 			switch (associationState) {
+0: 			case XATransactionState.TC_COMPLETED:
+0: 				throw new XAException(XAException.XAER_NOTA);
+0: 			case XATransactionState.TRO_FAIL:
+0: 				if (endingCurrentXid)
+0: 					flags = XAResource.TMFAIL;
+0: 				else
+0: 					throw new XAException(rollbackOnlyCode);
+1: 			}
+1: 
+0: 			boolean notify = false;
+0: 			switch (flags) {
+0: 			case XAResource.TMSUCCESS:
+0: 				if (isSuspendedByResource) {
+0: 					suspendedList.remove(resource);
+1: 				}
+0: 				else {
+0: 					if (resource != associatedResource)
+0: 						throw new XAException(XAException.XAER_PROTO);
+1: 
+0: 					associationState = XATransactionState.T0_NOT_ASSOCIATED;
+0: 					associatedResource = null;
+0: 					notify = true;
+1: 				}
+1: 
+0: 				conn.setApplicationConnection(null);
+0: 				break;
+1: 
+0: 			case XAResource.TMFAIL:
+1: 
+0: 				if (isSuspendedByResource) {
+0: 					suspendedList.remove(resource);
+0: 				} else {
+0: 					if (resource != associatedResource)
+0: 						throw new XAException(XAException.XAER_PROTO);
+0: 					associatedResource = null;
+1: 				}
+1: 				
+0: 				if (associationState != XATransactionState.TRO_FAIL) {
+0: 					associationState = XATransactionState.TRO_FAIL;
+0: 					rollbackOnlyCode = XAException.XA_RBROLLBACK;
+1: 				}
+0: 				conn.setApplicationConnection(null);
+0: 				notify = true;
+0: 				rollbackOnly = true;
+0: 				break;
+1: 
+0: 			case XAResource.TMSUSPEND:
+0: 				if (isSuspendedByResource)
+0: 					throw new XAException(XAException.XAER_PROTO);
+1: 				
+0: 				if (resource != associatedResource)
+0: 					throw new XAException(XAException.XAER_PROTO);
+1: 
+0: 				if (suspendedList == null)
+0: 					suspendedList = new HashMap();
+0: 				suspendedList.put(resource, this);
+1: 
+0: 				associationState = XATransactionState.T0_NOT_ASSOCIATED;
+0: 				associatedResource = null;
+0: 				conn.setApplicationConnection(null);
+0: 				notify = true;
+1: 
+0: 				break;
+1: 
+0: 			default:
+0: 				throw new XAException(XAException.XAER_INVAL);
+1: 			}
+1: 
+0: 			if (notify)
+0: 				notifyAll();
+1: 
+0: 			return rollbackOnly;
+1: 		}
+1: 	}
+1: 
+1: }
+author:Oyvind Bakksjo
+-------------------------------------------------------------------------------
+commit:aaea357
+author:Ken Coar
+-------------------------------------------------------------------------------
+commit:95e7b46
+/////////////////////////////////////////////////////////////////////////
+0: /*
+0: 
+0:    Licensed Materials - Property of IBM
+0:    Cloudscape - Package org.apache.derby.jdbc
+0:    (C) Copyright IBM Corp. 2003, 2004. All Rights Reserved.
+0:    US Government Users Restricted Rights - Use, duplication or
+0:    disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+0: 
+0:  */
+0: 
+0: package org.apache.derby.jdbc;
+0: 
+0: 
+0: import org.apache.derby.impl.jdbc.EmbedConnection20;
+0: import javax.transaction.xa.XAResource;
+0: import org.apache.derby.iapi.services.context.ContextImpl;
+0: import org.apache.derby.iapi.services.context.ContextManager;
+0: import org.apache.derby.iapi.error.ExceptionSeverity;
+0: import org.apache.derby.iapi.error.StandardException;
+0: import org.apache.derby.iapi.store.access.xa.XAXactId;
+0: import org.apache.derby.iapi.reference.SQLState;
+0: import java.util.HashMap;
+0: import javax.transaction.xa.XAException;
+0: 
+0: /** 
+0: */
+0: public final class XATransactionState extends ContextImpl {
+0: 
+0: 	/**
+0: 		IBM Copyright &copy notice.
+0: 	*/
+0: 	public static final String copyrightNotice = org.apache.derby.iapi.reference.Copyright.SHORT_2003_2004;
+0: 
+0: 	/** Rollback-only due to deadlock */
+0: 	final static int TRO_DEADLOCK				= -2;
+0: 	/** Rollback-only due to end(TMFAIL) */
+0: 	final static int TRO_FAIL					= -1;
+0: 	final static int T0_NOT_ASSOCIATED			= 0;
+0: 	final static int T1_ASSOCIATED				= 1;
+0: 	// final static int T2_ASSOCIATION_SUSPENDED	= 2;
+0: 	final static int TC_COMPLETED				= 3; // rollback/commit called
+0: 
+0: 	public final EmbedConnection20	conn;
+0: 	final EmbedXAConnection creatingResource;
+0: 	private EmbedXAConnection  associatedResource;	// owning XAResource
+0: 	final XAXactId			xid;	
+0: 	/**
+0: 		When an XAResource suspends a transaction (end(TMSUSPEND)) it must be resumed
+0: 		using the same XAConnection. This has been the traditional Cloudscape behaviour,
+0: 		though there does not seem to be a specific reference to this behaviour in
+0: 		the JTA spec. Note that while the transaction is suspended by this XAResource,
+0: 		another XAResource may join the transaction and suspend it after the join.
+0: 	*/
+0: 	HashMap suspendedList;
+0: 
+0: 
+0: 	/**
+0: 		Association state of the transaction.
+0: 	*/
+0: 	int associationState;
+0: 
+0: 	int rollbackOnlyCode;
+0: 
+0: 
+0: 	/**
+0: 		has this transaction been prepared.
+0: 	*/
+0: 	boolean isPrepared;
+0: 
+0: 	XATransactionState(ContextManager cm, EmbedConnection20 conn, EmbedXAConnection resource, XAXactId xid) {
+0: 
+0: 		super(cm, "XATransactionState");
+0: 		this.conn = conn;
+0: 		this.associatedResource = resource;
+0: 		this.creatingResource = resource;
+0: 		this.associationState = XATransactionState.T1_ASSOCIATED;
+0: 		this.xid = xid;
+0: 
+0: 	}
+0: 
+0: 	public void cleanupOnError(Throwable t) {
+0: 
+0: 		if (t instanceof StandardException) {
+0: 
+0: 			StandardException se = (StandardException) t;
+0: 
+0: 			if (se.getSeverity() == ExceptionSeverity.TRANSACTION_SEVERITY) {
+0: 
+0: 				synchronized (this) {
+0: 					// disable use of the connection until it is cleaned up.
+0: 					conn.setApplicationConnection(null);
+0: 					notifyAll();
+0: 					associationState = TRO_FAIL;
+0: 					if (SQLState.DEADLOCK.equals(se.getMessageId()))
+0: 						rollbackOnlyCode = XAException.XA_RBDEADLOCK;
+0: 					else if (SQLState.LOCK_TIMEOUT.equals(se.getMessageId()))
+0: 						rollbackOnlyCode = XAException.XA_RBTIMEOUT;					
+0: 					else
+0: 						rollbackOnlyCode = XAException.XA_RBOTHER;
+0: 				}
+0: 			}
+0: 		}
+0: 	}
+0: 
+0: 	void start(EmbedXAConnection resource, int flags) throws XAException {
+0: 
+0: 		synchronized (this) {
+0: 			if (associationState == XATransactionState.TRO_FAIL)
+0: 				throw new XAException(rollbackOnlyCode);
+0: 
+0: 			boolean isSuspendedByResource = (suspendedList != null) && (suspendedList.get(resource) != null);
+0: 
+0: 			if (flags == XAResource.TMRESUME) {
+0: 				if (!isSuspendedByResource)
+0: 					throw new XAException(XAException.XAER_PROTO);
+0: 
+0: 			} else {
+0: 				// cannot join a transaction we have suspended.
+0: 				if (isSuspendedByResource)
+0: 					throw new XAException(XAException.XAER_PROTO);
+0: 			}
+0: 
+0: 			while (associationState == XATransactionState.T1_ASSOCIATED) {
+0: 				
+0: 				try {
+0: 					wait();
+0: 				} catch (InterruptedException ie) {
+0: 					throw new XAException(XAException.XA_RETRY);
+0: 				}
+0: 			}
+0: 
+0: 
+0: 			switch (associationState) {
+0: 			case XATransactionState.T0_NOT_ASSOCIATED:
+0: 				break;
+0: 
+0: 			case XATransactionState.TRO_FAIL:
+0: 				throw new XAException(rollbackOnlyCode);
+0: 
+0: 			default:
+0: 				throw new XAException(XAException.XAER_NOTA);
+0: 			}
+0: 
+0: 			if (isPrepared)
+0: 				throw new XAException(XAException.XAER_PROTO);
+0: 
+0: 			if (isSuspendedByResource) {
+0: 				suspendedList.remove(resource);
+0: 			}
+0: 
+0: 			associationState = XATransactionState.T1_ASSOCIATED;
+0: 			associatedResource = resource;
+0: 		}
+0: 	}
+0: 
+0: 	boolean end(EmbedXAConnection resource, int flags, boolean endingCurrentXid) throws XAException {
+0: 
+0: 		boolean rollbackOnly = false;
+0: 		synchronized (this) {
+0: 
+0: 
+0: 			boolean isSuspendedByResource = (suspendedList != null) && (suspendedList.get(resource) != null);
+0: 
+0: 			if (!endingCurrentXid) {
+0: 				while (associationState == XATransactionState.T1_ASSOCIATED) {
+0: 					
+0: 					try {
+0: 						wait();
+0: 					} catch (InterruptedException ie) {
+0: 						throw new XAException(XAException.XA_RETRY);
+0: 					}
+0: 				}
+0: 			}
+0: 
+0: 			switch (associationState) {
+0: 			case XATransactionState.TC_COMPLETED:
+0: 				throw new XAException(XAException.XAER_NOTA);
+0: 			case XATransactionState.TRO_FAIL:
+0: 				if (endingCurrentXid)
+0: 					flags = XAResource.TMFAIL;
+0: 				else
+0: 					throw new XAException(rollbackOnlyCode);
+0: 			}
+0: 
+0: 			boolean notify = false;
+0: 			switch (flags) {
+0: 			case XAResource.TMSUCCESS:
+0: 				if (isSuspendedByResource) {
+0: 					suspendedList.remove(resource);
+0: 				}
+0: 				else {
+0: 					if (resource != associatedResource)
+0: 						throw new XAException(XAException.XAER_PROTO);
+0: 
+0: 					associationState = XATransactionState.T0_NOT_ASSOCIATED;
+0: 					associatedResource = null;
+0: 					notify = true;
+0: 				}
+0: 
+0: 				conn.setApplicationConnection(null);
+0: 				break;
+0: 
+0: 			case XAResource.TMFAIL:
+0: 
+0: 				if (isSuspendedByResource) {
+0: 					suspendedList.remove(resource);
+0: 				} else {
+0: 					if (resource != associatedResource)
+0: 						throw new XAException(XAException.XAER_PROTO);
+0: 					associatedResource = null;
+0: 				}
+0: 				
+0: 				if (associationState != XATransactionState.TRO_FAIL) {
+0: 					associationState = XATransactionState.TRO_FAIL;
+0: 					rollbackOnlyCode = XAException.XA_RBROLLBACK;
+0: 				}
+0: 				conn.setApplicationConnection(null);
+0: 				notify = true;
+0: 				rollbackOnly = true;
+0: 				break;
+0: 
+0: 			case XAResource.TMSUSPEND:
+0: 				if (isSuspendedByResource)
+0: 					throw new XAException(XAException.XAER_PROTO);
+0: 				
+0: 				if (resource != associatedResource)
+0: 					throw new XAException(XAException.XAER_PROTO);
+0: 
+0: 				if (suspendedList == null)
+0: 					suspendedList = new HashMap();
+0: 				suspendedList.put(resource, this);
+0: 
+0: 				associationState = XATransactionState.T0_NOT_ASSOCIATED;
+0: 				associatedResource = null;
+0: 				conn.setApplicationConnection(null);
+0: 				notify = true;
+0: 
+0: 				break;
+0: 
+0: 			default:
+0: 				throw new XAException(XAException.XAER_INVAL);
+0: 			}
+0: 
+0: 			if (notify)
+0: 				notifyAll();
+0: 
+0: 			return rollbackOnly;
+0: 		}
+0: 	}
+0: 
+0: }
+============================================================================

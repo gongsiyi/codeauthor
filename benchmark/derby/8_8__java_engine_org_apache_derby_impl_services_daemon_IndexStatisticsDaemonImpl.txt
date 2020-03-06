@@ -1,0 +1,3294 @@
+1:7916398: /*
+4:7916398: 
+1:7916398:    Derby - Class org.apache.derby.impl.services.daemon.IndexStatisticsDaemonImpl
+1:7916398: 
+1:7916398:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:7916398:    contributor license agreements.  See the NOTICE file distributed with
+1:7916398:    this work for additional information regarding copyright ownership.
+1:7916398:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:7916398:    (the "License"); you may not use this file except in compliance with
+1:7916398:    the License.  You may obtain a copy of the License at
+1:7916398: 
+1:7916398:       http://www.apache.org/licenses/LICENSE-2.0
+1:7916398: 
+1:7916398:    Unless required by applicable law or agreed to in writing, software
+1:7916398:    distributed under the License is distributed on an "AS IS" BASIS,
+1:7916398:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:7916398:    See the License for the specific language governing permissions and
+1:7916398:    limitations under the License.
+1:7916398: 
+4:7916398:  */
+1:7916398: package org.apache.derby.impl.services.daemon;
+1:7916398: 
+1:7916398: import java.io.PrintWriter;
+1:a0dbbd7: import java.security.PrivilegedAction;
+1:a0dbbd7: import java.security.AccessController;
+1:7916398: import java.sql.Connection;
+1:7916398: import java.util.ArrayList;
+1:7e33399: import java.util.List;
+1:7916398: 
+1:7916398: import org.apache.derby.catalog.UUID;
+1:7916398: import org.apache.derby.catalog.types.StatisticsImpl;
+1:7916398: import org.apache.derby.iapi.error.StandardException;
+1:7916398: import org.apache.derby.iapi.db.Database;
+1:7916398: import org.apache.derby.iapi.error.ExceptionSeverity;
+1:4b58cc0: import org.apache.derby.shared.common.error.ShutdownException;
+1:7916398: import org.apache.derby.iapi.reference.Property;
+1:7916398: import org.apache.derby.iapi.reference.SQLState;
+1:7916398: import org.apache.derby.iapi.services.context.ContextManager;
+1:7916398: import org.apache.derby.iapi.services.context.ContextService;
+1:7916398: import org.apache.derby.iapi.services.daemon.IndexStatisticsDaemon;
+1:7916398: import org.apache.derby.iapi.services.property.PropertyUtil;
+1:7e51e9d: import org.apache.derby.shared.common.sanity.SanityManager;
+1:7916398: import org.apache.derby.iapi.services.stream.HeaderPrintWriter;
+1:7916398: import org.apache.derby.iapi.services.uuid.UUIDFactory;
+1:1690ef6: import org.apache.derby.iapi.services.monitor.Monitor;
+1:7916398: import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
+1:7916398: import org.apache.derby.iapi.sql.depend.DependencyManager;
+1:7916398: import org.apache.derby.iapi.sql.dictionary.ConglomerateDescriptor;
+1:7916398: import org.apache.derby.iapi.sql.dictionary.DataDictionary;
+1:bce78c9: import org.apache.derby.iapi.sql.dictionary.IndexRowGenerator;
+1:7916398: import org.apache.derby.iapi.sql.dictionary.StatisticsDescriptor;
+1:7916398: import org.apache.derby.iapi.sql.dictionary.TableDescriptor;
+1:7916398: import org.apache.derby.iapi.sql.execute.ExecIndexRow;
+1:7916398: import org.apache.derby.iapi.store.access.ConglomerateController;
+1:7916398: import org.apache.derby.iapi.store.access.GroupFetchScanController;
+1:7916398: import org.apache.derby.iapi.store.access.ScanController;
+1:7916398: import org.apache.derby.iapi.store.access.TransactionController;
+1:7916398: import org.apache.derby.iapi.types.DataValueDescriptor;
+1:ec9d167: import org.apache.derby.iapi.util.InterruptStatus;
+1:7916398: 
+1:7e33399: /**
+1:7916398:  * Daemon acting as a coordinator for creating and updating index cardinality
+1:7916398:  * statistics.
+1:7e33399:  * <p>
+1:7916398:  * The need for updated statistics is currently determined when compiling a
+1:7916398:  * SELECT query. The unit of work is then scheduled with this daemon, and the
+1:7916398:  * work itself will be carried out in a separate thread. If the worker thread
+1:7916398:  * doesn't exist it is created, if it is idle the unit of work will be
+1:7916398:  * processed immediately, and if it is busy the unit of work has to wait in the
+1:7916398:  * queue.
+2:7916398:  * <p>
+1:7916398:  * The daemon code has a notion of a background task. If the update is run as a
+1:7916398:  * background task, it will try to affect other activity in the Derby database
+1:7916398:  * as little as possible. As far as possible, it will not set locks on the
+1:7916398:  * conglomerates it scans, and if it needs to take locks it will give up
+1:7916398:  * immediately if the locks cannot be obtained. In some cases it will also roll
+1:7916398:  * back to release locks already taken, ad then retry. Since we are accessing
+1:7916398:  * shared structures the background work may still interfere with the user
+1:7916398:  * activity in the database due to locking, but all such operations carried out
+1:7916398:  * by the daemon are of short duration.
+1:7916398:  * <p>
+1:7916398:  * The high level flow of an update to index statistics is:
+1:7916398:  * <ol>
+1:7916398:  *      <li>schedule update (the only action carried out by the user thread)<li>
+1:7916398:  *      <li>for each index:</li>
+1:7916398:  *      <ol>
+1:7916398:  *          <li>scan index</li>
+1:7916398:  *          <li>invalidate statements dependent on current statistics</li>
+1:7916398:  *          <li>drop existing statistics</li>
+1:7916398:  *          <li>add new statistics</li>
+1:7916398:  *      </ol>
+1:7916398:  * </ol>
+1:7916398:  * <p>
+1:7916398:  * List of possible improvements:
+1:7916398:  * <ol>
+1:7916398:  *      <li>Reduce potential impact of multiple invalidations (per table),
+1:7916398:  *          probably by finding a way to invalidate only once after all indexes
+1:7916398:  *          for a table have had their statistics updated. So far invalidation
+1:7916398:  *          has proven to be the most difficult piece of the puzzle due to the
+1:7916398:  *          interaction with the data dictionary and sensitivity to concurrent
+1:7916398:  *          activity for the table.</li>
+1:7916398:  * </ol>
+1:7916398:  * <p>
+1:7916398:  * <em>Implementation notes:</em> List of potential cleanups before going into
+1:7916398:  * a release:
+1:7916398:  * <ol>
+1:7916398:  *      <li>Consider removing all tracing code. May involve improving logging
+1:7916398:  *          if parts of the trace output is valuable enough.</li>
+1:7916398:  * </ol>
+1:7e33399:  */
+1:7916398: public class IndexStatisticsDaemonImpl
+1:7916398:         implements IndexStatisticsDaemon, Runnable {
+1:7e33399: 
+1:7916398:     private static final boolean AS_BACKGROUND_TASK = true;
+1:7916398:     private static final boolean AS_EXPLICIT_TASK = false;
+1:7916398:     /** Maximum number of work units allowed in the queue. */
+1:7916398:     // TODO: Replace with constant after testing/tuning phase.
+1:7916398:     private static final int MAX_QUEUE_LENGTH;
+1:7916398:     static {
+1:7916398:         MAX_QUEUE_LENGTH = PropertyUtil.getSystemInt(
+1:7916398:                 Property.STORAGE_AUTO_INDEX_STATS_DEBUG_QUEUE_SIZE,
+1:7916398:                 Property.STORAGE_AUTO_INDEX_STATS_DEBUG_QUEUE_SIZE_DEFAULT);
+6:7916398:     }
+1:a346f0c: 
+1:7916398:     private final HeaderPrintWriter logStream;
+1:7916398:     /** Tells if logging is enabled. */
+1:7916398:     private final boolean doLog;
+1:7916398:     /** Tells if tracing is enabled. */
+1:7916398:     private final boolean doTrace;
+1:7916398:     /** Tells if traces are written to the Derby log file. */
+1:7916398:     private final boolean traceToDerbyLog;
+1:7916398:     /** Tells if traces are written to standard out. */
+1:7916398:     private final boolean traceToStdOut;
+1:b833933: 
+1:7916398:     /** Tells if the daemon has been disabled. */
+1:7916398:     // @GuardedBy("queue")
+1:7916398:     private boolean daemonDisabled;
+1:7916398:     /** The context manager for the worker thread. */
+1:7916398:     private final ContextManager ctxMgr;
+1:bce78c9:     /**
+1:bce78c9:      * Tells if disposable stats should be generated, which will happen in
+1:bce78c9:      * soft-upgrade mode or when the user asks us to revert to the old behavior.
+1:bce78c9:      * <p>
+1:bce78c9:      * Made public to allow access for CreateIndexConstantAction and
+1:bce78c9:      * FromBaseTable, but this is no longer necessary when the debug property
+1:bce78c9:      * to keep disposable statistics is removed.
+1:bce78c9:      */
+1:bce78c9:     public final boolean skipDisposableStats;
+1:7916398:     /** The language connection context for the worker thread. */
+1:7916398:     private LanguageConnectionContext daemonLCC;
+3:7916398:     /**
+1:7916398:      * The database object for the database we are handling automatic index
+1:7916398:      * statistics update for.
+1:7916398:      */
+1:7916398:     private final Database db;
+1:7916398:     /** The name of the database owner. */
+1:7916398:     private final String dbOwner;
+1:7916398:     private final String databaseName;
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * A list of tables that shall have their index statistics updated.
+1:7916398:      * Note that the descriptor isn't removed before the work has
+1:7916398:      * been completed.
+1:7916398:      */
+1:71c8e86:     private final ArrayList<TableDescriptor> queue = new ArrayList<TableDescriptor>(MAX_QUEUE_LENGTH);
+1:7916398:     /**
+1:7916398:      * The thread in which the index statistics refresh operation is being
+1:7916398:      * executed, if any. Created as needed, but there will only be one
+1:7916398:      * thread doing the work. The thread is allowed to die since it is assumed
+1:7916398:      * that index statistics regeneration is rather infrequent.
+1:7916398:      */
+1:7916398:     //@GuardedBy("queue")
+1:7916398:     private Thread runningThread;
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Number of consecutive errors, used as a metric to decide if the damoen
+1:7916398:      * should be automatically shut down.
+1:7916398:      */
+1:7916398:     private int errorsConsecutive;
+1:7916398:     // Counters used for tracing / logging (wu = work unit).
+1:7916398:     private long errorsUnknown;
+1:7916398:     private long errorsKnown;
+1:7916398:     private long wuProcessed;
+1:7916398:     private long wuScheduled;
+1:7916398:     private long wuRejectedDup; // Duplicates
+1:7916398:     private long wuRejectedFQ; // Full queue
+1:7916398:     private long wuRejectedOther; // Daemon disabled
+1:7916398: 
+1:7916398:     /** Specifies when the daemon was created. */
+1:7916398:     private final long timeOfCreation;
+1:7916398:     /**
+1:7916398:      * The period of time (ms) for which the daemon has been doing active work.
+1:7916398:      */
+1:7916398:     private long runTime;
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Creates a new daemon.
+1:ccdcb3d:      *
+1:7916398:      * @param log the log to write to
+1:7916398:      * @param doLog whether to log activity information
+1:7916398:      * @param traceLevel whether, and to where, trace information should be
+1:7916398:      *      written ("off|log|stdout|both")
+1:7916398:      * @param db the database ("off|log|stdout|both")
+1:7916398:      * @param userName the name of the database owner
+1:7916398:      * @param databaseName the name of the database (not stored in the db obj)
+1:7916398:      */
+1:7916398:     public IndexStatisticsDaemonImpl(HeaderPrintWriter log, boolean doLog,
+1:7916398:                                      String traceLevel, Database db,
+1:7916398:                                      String userName, String databaseName) {
+1:7916398:         // Make sure we can log errors.
+1:7916398:         if (log == null) {
+1:7916398:             throw new IllegalArgumentException("log stream cannot be null");
+1:7916398:         }
+1:7916398:         // Configure logging/tracing
+1:7916398:         this.logStream = log;
+1:7916398:         this.doLog = doLog;
+1:7916398:         this.traceToDerbyLog = (traceLevel.equalsIgnoreCase("both") ||
+1:7916398:                 traceLevel.equalsIgnoreCase("log"));
+1:7916398:         this.traceToStdOut = (traceLevel.equalsIgnoreCase("both") ||
+1:7916398:                 traceLevel.equalsIgnoreCase("stdout"));
+1:7916398:         this.doTrace = traceToDerbyLog || traceToStdOut;
+1:bce78c9: 
+1:bce78c9:         // For now allow users to override the new behavior through a debug
+1:bce78c9:         // property. Will be removed or renamed in a future release.
+1:bce78c9:         boolean keepDisposableStats = PropertyUtil.getSystemBoolean(
+1:f422f44:               Property.STORAGE_AUTO_INDEX_STATS_DEBUG_KEEP_DISPOSABLE_STATS);
+1:bce78c9:         this.skipDisposableStats = dbAtLeast10_9(db) && !keepDisposableStats;
+1:7916398: 
+1:7916398:         this.db = db;
+1:7916398:         this.dbOwner = userName;
+1:7916398:         this.databaseName = databaseName;
+1:a0dbbd7:         this.ctxMgr = getContextService().newContextManager();
+1:7916398:         this.timeOfCreation = System.currentTimeMillis();
+1:7916398:         trace(0, "created{log=" + doLog + ", traceLog=" +
+1:7916398:                 traceToDerbyLog + ", traceOut=" + traceToStdOut +
+1:7916398:                 ", createThreshold=" +
+1:7916398:                 TableDescriptor.ISTATS_CREATE_THRESHOLD +
+1:7916398:                 ", absdiffThreshold=" +
+1:7916398:                 TableDescriptor.ISTATS_ABSDIFF_THRESHOLD +
+1:7916398:                 ", lndiffThreshold=" +
+1:7916398:                 TableDescriptor.ISTATS_LNDIFF_THRESHOLD +
+1:7916398:                 ", queueLength=" + MAX_QUEUE_LENGTH +
+1:7916398:                 "}) -> " + databaseName);
+1:7916398:     }
+1:7916398: 
+1:bce78c9:     /** Tells if the database is 10.9 or newer. */
+1:bce78c9:     private boolean dbAtLeast10_9(Database db) {
+1:7e33399:         try {
+1:bce78c9:             return db.getDataDictionary().checkVersion(
+1:7e33399:                 DataDictionary.DD_VERSION_DERBY_10_9, null);
+1:7e33399:         } catch (StandardException se) {
+1:7e33399:             if (SanityManager.DEBUG) {
+1:7e33399:                 SanityManager.THROWASSERT("dd version check failed", se);
+1:7e33399:             }
+1:bce78c9:             // Not expected to happen, but if it does err on the safe-side.
+1:bce78c9:             return false;
+1:7e33399:         }
+1:7e33399:     }
+1:7e33399: 
+1:7916398:     /**
+1:7916398:      * Schedules an update of the index statistics for the specified table.
+1:7916398:      * <p>
+1:7916398:      * Assume the descriptor will be valid until we get around to generate
+1:7916398:      * the statistics. If it turns out to be invalid, it will be discarded.
+2:7916398:      *
+1:7916398:      * @param td base table descriptor to update index statistics for
+1:7916398:      */
+1:7916398:     public void schedule(TableDescriptor td) {
+1:127d92a:         String schedulingReason = td.getIndexStatsUpdateReason();
+3:7916398:         synchronized (queue) {
+1:7916398:             if (acceptWork(td)) {
+1:7916398:                 // Add the work description for the given table.
+1:7916398:                 queue.add(td);
+1:7916398:                 wuScheduled++;
+1:7916398:                 log(AS_BACKGROUND_TASK, td,
+1:3a6d457:                         "update scheduled" +
+2:7916398:                         (schedulingReason == null
+2:7916398:                             ? ""
+1:3a6d457:                             : ", reason=[" + schedulingReason + "]") +
+1:7916398:                         " (queueSize=" + queue.size() + ")");
+1:7916398:                 // If we're idle, fire off the worker thread.
+1:7916398:                 if (runningThread == null) {
+1:1690ef6:                     //DERBY-5582. Make sure the thread is in the derby group
+1:1690ef6:                     // to avoid potential security manager issues
+1:56c1dc2:                     runningThread = BasicDaemon.getMonitor().getDaemonThread(this, "index-stat-thread", false);
+1:7916398:                     runningThread.start();
+1:7916398:                 }
+1:7916398:             }
+1:7916398:         }
+1:7916398:     }
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Determines if the given work can be accepted.
+1:7916398:      *
+1:7916398:      * @param td the table descriptor to check
+1:7916398:      * @return {@code true} if work can be accepted, {@code false} if not.
+1:7916398:      */
+1:7916398:     //@GuardedBy("queue")
+1:7916398:     private boolean acceptWork(TableDescriptor td) {
+1:7916398:         // Don't allow unbounded growth.
+1:7916398:         boolean accept = !(daemonDisabled || queue.size() >= MAX_QUEUE_LENGTH);
+1:7916398:         if (accept && !queue.isEmpty()) {
+1:7916398:             // See if work is already scheduled for this table. If so, we
+1:7916398:             // give the already scheduled or in progress task precedence.
+1:7916398:             String table = td.getName();
+1:7916398:             String schema = td.getSchemaName();
+1:7916398:             // Since the queue size is limited, iterating through it to find
+1:7916398:             // duplicates should yield acceptable performance. Also, we don't
+1:7916398:             // look for duplicates if the queue is already full.
+1:7916398:             for (int i=0; i < queue.size(); i++) {
+1:71c8e86:                 TableDescriptor work = queue.get(i);
+1:7916398:                 if (work.tableNameEquals(table, schema)) {
+1:7916398:                     accept = false;
+1:7916398:                     break;
+1:7916398:                 }
+1:7916398:             }
+1:7916398:         }
+1:c9ef166: 
+1:7916398:         // If the work was rejected, trace it.
+1:7916398:         if (!accept) {
+1:3a6d457:             String msg = td.getQualifiedName() + " rejected, ";
+2:7916398:             if (daemonDisabled) {
+1:7916398:                 wuRejectedOther++;
+1:3a6d457:                 msg += "daemon disabled";
+1:7916398:             } else if (queue.size() >= MAX_QUEUE_LENGTH) {
+1:7916398:                 wuRejectedFQ++;
+1:3a6d457:                 msg += "queue full";
+2:7916398:             } else {
+1:7916398:                 wuRejectedDup++;
+1:3a6d457:                 msg += "duplicate";
+1:7916398:             }
+1:7e33399:             trace(1, msg);
+1:7916398:         }
+1:7916398:         return accept;
+1:7916398:     }
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Generates index statistics for all indexes associated with the given
+1:7916398:      * table descriptor.
+1:cd02474:      * <p>
+1:cd02474:      * This method is run as a background task.
+1:7916398:      *
+1:7916398:      * @param lcc connection context to use to perform the work
+1:7916398:      * @param td target base table descriptor
+1:7916398:      * @throws StandardException if accessing the conglomerates fail
+1:7916398:      */
+1:7916398:     private void generateStatistics(LanguageConnectionContext lcc,
+1:7916398:                                     TableDescriptor td)
+1:7916398:             throws StandardException {
+1:3a6d457:         trace(1, "processing " + td.getQualifiedName());
+1:7916398:         boolean lockConflictSeen = false;
+1:7916398:         while (true) {
+2:7916398:             try {
+1:7e33399:                 updateIndexStatsMinion(lcc, td, null, AS_BACKGROUND_TASK);
+1:7916398:                 break;
+1:7916398:             } catch (StandardException se) {
+1:7916398: 
+1:7916398:                 // At this level, we retry the whole operation. If this happens,
+1:7916398:                 // it normally means that a lengthy operation, or possibly DDL,
+1:7916398:                 // is taking place (for instance compress table). We retry only
+1:7916398:                 // once, but wait rather long before doing so.
+1:7916398:                 // Note that some lower level operations may have tried to
+1:7916398:                 // aquire the locks several times already, and we may not be
+1:7916398:                 // able to complete the work if we get here.
+1:c9ef166: 
+1:c9ef166:                 if (se.isLockTimeout() && !lockConflictSeen) {
+1:c9ef166: 
+1:7916398:                     trace(1, "locks unavailable, retrying");
+1:7916398:                     lockConflictSeen = true;
+1:7916398:                     lcc.internalRollback(); // Get rid of any locks
+1:7916398:                     sleep(1000);
+1:c9ef166: 
+1:7916398:                 } else {
+1:7916398:                     // Rethrow exception, because:
+1:7916398:                     //   o error is not a lock timeout
+1:7916398:                     //           - or -
+1:7916398:                     //   o too many lock timeouts
+1:7916398:                     // Transaction will be cleaned up elsewhere.
+1:7916398:                     throw se;
+1:7916398:                 }
+1:7916398:             }
+1:7916398:         }
+1:7916398:     }
+1:7916398: 
+1:ccdcb3d:     /** Return true if we are being shutdown */
+1:cd02474:     private boolean isShuttingDown() {
+1:7916398:         synchronized (queue) {
+1:cd02474:             if (daemonDisabled || daemonLCC == null){
+1:7e33399:                 return true;
+1:cd02474:             } else {
+1:cd02474:                 return !daemonLCC.getDatabase().isActive();
+1:7916398:             }
+1:7916398:         }
+1:7916398:     }
+1:cd02474: 
+1:7916398:     /**
+1:7916398:      * Updates the index statistics for the given table and the specified
+1:7916398:      * indexes.
+1:7e33399:      * <p>
+1:7e33399:      * <strong>API note</strong>: Using {@code null} to update the statistics
+1:7e33399:      * for all conglomerates is preferred over explicitly passing an array with
+1:7e33399:      * all the conglomerates for the table. Doing so allows for some
+1:7e33399:      * optimizations, and will cause a disposable statistics check to be
+1:7e33399:      * performed.
+1:7916398:      *
+1:ccdcb3d:      * @param lcc language connection context used to perform the work
+1:ccdcb3d:      * @param td the table to update index stats for
+1:ccdcb3d:      * @param cds the conglomerates to update statistics for (non-index
+1:7e33399:      *      conglomerates will be ignored), {@code null} means all indexes
+1:ccdcb3d:      * @param asBackgroundTask whether the updates are done automatically as
+1:ccdcb3d:      *      part of a background task or if explicitly invoked by the user
+1:ccdcb3d:      * @throws StandardException if something goes wrong
+1:ccdcb3d:      */
+1:7916398:     private void updateIndexStatsMinion(LanguageConnectionContext lcc,
+1:ccdcb3d:                                         TableDescriptor td,
+1:ccdcb3d:                                         ConglomerateDescriptor[] cds,
+1:ccdcb3d:                                         boolean asBackgroundTask)
+1:7916398:             throws StandardException {
+1:a2f00b4: 
+1:a2f00b4:         // can only properly identify disposable stats if cds == null, 
+1:a2f00b4:         // which means we are processing all indexes on the conglomerate.
+1:a2f00b4:         final boolean identifyDisposableStats = (cds == null);
+1:a2f00b4: 
+1:7e33399:         // Fetch descriptors if we're updating statistics for all indexes.
+1:7e33399:         if (cds == null) {
+1:7e33399:             cds = td.getConglomerateDescriptors();
+1:7e33399:         }
+1:a2f00b4: 
+1:7916398:         // Extract/derive information from the table descriptor
+1:a2f00b4:         long[]          conglomerateNumber      = new long[cds.length];
+1:a2f00b4:         ExecIndexRow[]  indexRow                = new ExecIndexRow[cds.length];
+1:a2f00b4: 
+1:7916398: 
+1:7916398:         TransactionController tc = lcc.getTransactionExecute();
+1:7916398:         ConglomerateController heapCC =
+1:7916398:             tc.openConglomerate(td.getHeapConglomerateId(), false,
+1:7916398:                     0,
+1:7916398:                     TransactionController.MODE_RECORD,
+1:7916398:                     asBackgroundTask
+1:7916398:                         ? TransactionController.ISOLATION_READ_UNCOMMITTED
+1:7916398:                         : TransactionController.ISOLATION_REPEATABLE_READ
+1:7916398:                 );
+1:a2f00b4: 
+1:a2f00b4: 
+1:a2f00b4:         // create a list of indexes that should have statistics, by looking
+1:a2f00b4:         // at all indexes on the conglomerate, and conditionally skipping
+1:a2f00b4:         // unique single column indexes.  This set is the "non disposable
+1:a2f00b4:         // stat list".
+1:a2f00b4:         UUID[] non_disposable_objectUUID    = new UUID[cds.length];
+1:a2f00b4: 
+1:7916398:         try
+1:92268ac:         {
+1:7916398:             for (int i = 0; i < cds.length; i++)
+1:ccdcb3d:             {
+1:bce78c9:                 // Skip non-index conglomerates
+1:7916398:                 if (!cds[i].isIndex())
+6:7916398:                 {
+1:7916398:                     conglomerateNumber[i] = -1;
+1:7e33399:                     continue;
+1:299b9e7:                 }
+1:a2f00b4: 
+1:bce78c9:                 IndexRowGenerator irg = cds[i].getIndexDescriptor();
+1:a2f00b4: 
+1:bce78c9:                 // Skip single-column unique indexes unless we're told not to,
+1:bce78c9:                 // or we are running in soft-upgrade-mode on a pre 10.9 db.
+1:bce78c9:                 if (skipDisposableStats) {
+1:bce78c9:                     if (irg.isUnique() && irg.numberOfOrderedColumns() == 1) {
+1:bce78c9:                         conglomerateNumber[i] = -1;
+1:bce78c9:                         continue;
+1:bce78c9:                     }
+1:bce78c9:                 }
+1:bce78c9:            
+1:a2f00b4:                 // at this point have found a stat for an existing
+1:a2f00b4:                 // index which is not a single column unique index, add it
+1:a2f00b4:                 // to the list of "non disposable stats"
+1:a2f00b4:                 conglomerateNumber[i]        = cds[i].getConglomerateNumber();
+1:a2f00b4:                 non_disposable_objectUUID[i] = cds[i].getUUID();
+1:7916398: 
+1:bce78c9:                 indexRow[i] = irg.getNullIndexRow(
+1:7916398:                         td.getColumnDescriptorList(),
+1:7916398:                         heapCC.newRowLocationTemplate());
+1:299b9e7:             }
+1:7916398:         }
+1:7916398:         finally
+1:7916398:         {
+1:7916398:             heapCC.close();
+1:7e33399:         }
+1:a2f00b4: 
+1:a2f00b4:         // Check for and drop disposable statistics if we have the required 
+1:a2f00b4:         // information.
+1:ccdcb3d:         //
+1:7e33399:         // Note that the algorithm would drop valid statistics entries if
+1:7e33399:         // working on a subset of the table conglomerates/indexes.
+1:a2f00b4:         // The above loop has populated "cds" with only existing indexes that
+1:a2f00b4:         // are not single column unique.
+1:ccdcb3d: 
+1:7e33399:         if (identifyDisposableStats) {
+1:a2f00b4: 
+1:a2f00b4:             // Note this loop is not controlled by the skipDisposableStats 
+1:a2f00b4:             // flag.  The above loop controls if we drop single column unique
+1:a2f00b4:             // index stats or not.  In all cases we are going to drop 
+1:a2f00b4:             // stats with no associated index (orphaned stats).
+1:a2f00b4:             
+1:a2f00b4: 
+1:71c8e86:             List<StatisticsDescriptor> existingStats = td.getStatistics();
+1:7e33399:             StatisticsDescriptor[] stats = (StatisticsDescriptor[])
+1:7e33399:                     existingStats.toArray(
+1:7e33399:                         new StatisticsDescriptor[existingStats.size()]);
+1:a2f00b4: 
+1:7e33399:             // For now we know that disposable stats only exist in two cases,
+1:7e33399:             // and that we'll only get one match for both of them per table:
+1:7e33399:             //  a) orphaned statistics entries (i.e. DERBY-5681)
+1:108093d:             //  b) single-column primary keys
+1:ccdcb3d:             //
+1:a2f00b4:             //  This loop looks for statistic entries to delete.  It deletes
+1:a2f00b4:             //  those entries that don't have a matching conglomerate in the
+1:7e33399:             for (int si=0; si < stats.length; si++) {
+1:7e33399:                 UUID referencedIndex = stats[si].getReferenceID();
+1:7e33399:                 boolean isValid = false;
+1:7e33399:                 for (int ci=0; ci < conglomerateNumber.length; ci++) {
+1:a2f00b4:                     if (referencedIndex.equals(non_disposable_objectUUID[ci])) {
+1:7e33399:                         isValid = true;
+1:7e33399:                         break;
+1:ccdcb3d:                     }
+1:ccdcb3d:                 }
+1:7e33399:                 // If the statistics entry is orphaned or not required, drop
+1:7e33399:                 // the statistics entries for this index. Those we really need
+1:7e33399:                 // will be rebuilt below. We expect this scenario to be rare,
+1:7e33399:                 // typically you would only see it on upgrades. On the other
+1:7e33399:                 // hand, this check is cheap enough such that it is feasible to
+1:7e33399:                 // do it as part of the stats update to get a "self healing"
+1:7e33399:                 // mechanism in case of another bug like DERBY-5681 in Derby.
+1:7e33399:                 if (!isValid) {
+1:7e33399:                     String msg = "dropping disposable statistics entry " +
+1:108093d:                             stats[si].getUUID() + " for index " +
+1:108093d:                             stats[si].getReferenceID() + " (cols=" +
+1:108093d:                             stats[si].getColumnCount() + ")";
+1:7e33399:                     logAlways(td, null, msg);
+1:108093d:                     trace(1, msg + " on table " + stats[si].getTableUUID());
+1:7e33399:                     DataDictionary dd = lcc.getDataDictionary();
+1:7e33399:                     if (!lcc.dataDictionaryInWriteMode()) {
+1:7e33399:                         dd.startWriting(lcc);
+1:ccdcb3d:                     }
+1:7e33399:                     dd.dropStatisticsDescriptors(
+1:7e33399:                             td.getUUID(), stats[si].getReferenceID(), tc); 
+1:7e33399:                     if (asBackgroundTask) {
+1:7e33399:                         lcc.internalCommit(true);
+1:ccdcb3d:                     }
+1:ccdcb3d:                 }
+1:7e33399:             }
+1:7e33399:         }
+1:7e33399: 
+1:7916398:         // [x][0] = conglomerate number, [x][1] = start time, [x][2] = stop time
+1:7916398:         long[][] scanTimes = new long[conglomerateNumber.length][3];
+1:a2f00b4:         int      sci       = 0;
+1:7916398:         for (int indexNumber = 0;
+1:7916398:              indexNumber < conglomerateNumber.length;
+1:7916398:              indexNumber++)
+1:ccdcb3d:         {
+1:7916398:             if (conglomerateNumber[indexNumber] == -1)
+2:7916398:                 continue;
+1:a346f0c: 
+1:7916398:             // Check if daemon has been disabled.
+1:7916398:             if (asBackgroundTask) {
+1:a346f0c:                 if (isShuttingDown()) {
+1:a346f0c:                     break;
+1:7e33399:                 }
+1:7e33399:             }
+1:7916398: 
+1:7916398:             scanTimes[sci][0] = conglomerateNumber[indexNumber];
+1:7916398:             scanTimes[sci][1] = System.currentTimeMillis();
+1:a2f00b4: 
+1:7916398:             // Subtract one for the RowLocation added for indexes.
+1:a2f00b4:             int           numCols     = indexRow[indexNumber].nColumns() - 1;
+1:a2f00b4:             long[]        cardinality = new long[numCols];
+1:a2f00b4:             KeyComparator cmp         = new KeyComparator(indexRow[indexNumber]);
+1:7916398: 
+1:7916398:             /* Read uncommitted, with record locking. Actually CS store may
+1:7916398:                not hold record locks */
+1:7916398:             GroupFetchScanController gsc =
+1:7916398:                 tc.openGroupFetchScan(
+1:7916398:                         conglomerateNumber[indexNumber],
+1:7916398:                         false,  // hold
+1:7916398:                         0,
+1:7916398:                         TransactionController.MODE_RECORD, // locking
+1:7916398:                         TransactionController.ISOLATION_READ_UNCOMMITTED,
+1:7916398:                         null,   // scancolumnlist-- want everything.
+1:7916398:                         null,   // startkeyvalue-- start from the beginning.
+1:7916398:                         0,
+1:7916398:                         null,   // qualifiers, none!
+1:7916398:                         null,   // stopkeyvalue,
+1:7916398:                         0);
+1:7916398: 
+1:7916398:             try
+1:ccdcb3d:             {
+1:a346f0c:                 int     rowsFetched           = 0;
+1:a346f0c:                 boolean giving_up_on_shutdown = false;
+1:a346f0c: 
+1:7916398:                 while ((rowsFetched = cmp.fetchRows(gsc)) > 0)
+1:ccdcb3d:                 {
+1:a346f0c:                     // DERBY-5108
+1:a346f0c:                     // Check if daemon has been disabled, and if so stop
+1:a346f0c:                     // scan and exit asap.  On shutdown the system will
+1:a346f0c:                     // send interrupts, but the system currently will
+1:a346f0c:                     // recover from these during the scan and allow the
+1:a346f0c:                     // scan to finish. Checking here after each group
+1:a346f0c:                     // I/O that is processed as a convenient point.
+1:a346f0c:                     if (asBackgroundTask) {
+1:a346f0c:                         if (isShuttingDown()) {
+1:a346f0c:                             giving_up_on_shutdown = true;
+1:a346f0c:                             break;
+1:a346f0c:                         }
+1:a346f0c:                     }
+1:a346f0c: 
+1:7916398:                     for (int i = 0; i < rowsFetched; i++)
+1:7916398:                     {
+1:7916398:                         int whichPositionChanged = cmp.compareWithPrevKey(i);
+1:7916398:                         if (whichPositionChanged >= 0) {
+1:7916398:                             for (int j = whichPositionChanged; j < numCols; j++)
+1:7916398:                                 cardinality[j]++;
+1:7e33399:                         }
+1:7e33399:                     }
+1:a346f0c: 
+1:7916398:                 } // while
+1:a346f0c: 
+1:a346f0c:                 if (giving_up_on_shutdown)
+1:a346f0c:                     break;
+1:a346f0c: 
+1:7916398:                 gsc.setEstimatedRowCount(cmp.getRowCount());
+1:7916398:             } // try
+1:7916398:             finally
+1:7916398:             {
+1:7916398:                 gsc.close();
+1:7916398:                 gsc = null;
+1:7e33399:             }
+1:7916398:             scanTimes[sci++][2] = System.currentTimeMillis();
+1:a346f0c: 
+1:7916398:             // We have scanned the indexes, so let's give this a few attempts
+1:7916398:             // before giving up.
+1:7916398:             int retries = 0;
+1:7916398:             while (true) {
+1:ccdcb3d:                 try {
+1:a2f00b4:                     writeUpdatedStats(lcc, td, 
+1:a2f00b4:                             non_disposable_objectUUID[indexNumber],
+1:7916398:                             cmp.getRowCount(), cardinality, asBackgroundTask);
+1:7916398:                     break;
+1:7916398:                 } catch (StandardException se) {
+1:c9ef166: 
+1:7916398:                     retries++;
+1:c9ef166: 
+1:c9ef166:                     if (se.isLockTimeout() && retries < 3) {
+1:7916398:                         trace(2, "lock timeout when writing stats, retrying");
+1:7916398:                         sleep(100*retries);
+1:7916398:                     } else {
+1:7916398:                         // Rethrow exception, because:
+1:7916398:                         //   o error is not a lock timeout
+1:7916398:                         //           - or -
+1:7916398:                         //   o too many lock timeouts
+1:7916398:                         throw se;
+1:7916398:                     }
+1:7916398:                 }
+1:7916398:             }
+1:7916398:         }
+1:7916398: 
+1:7916398:         log(asBackgroundTask, td, fmtScanTimes(scanTimes));
+1:7916398:     }
+1:7916398: 
+1:ccdcb3d:     /**
+1:7916398:      * Writes updated statistics for the specified index to the data dictionary.
+1:7916398:      *
+1:7916398:      * @param lcc connection context to use to perform the work
+1:7916398:      * @param td the base table
+1:7916398:      * @param index the index of the base table
+1:7916398:      * @param numRows number of rows in the base table
+1:7916398:      * @param cardinality the number of unique values in the index (per number
+1:7916398:      *      of leading columns)
+1:7916398:      * @param asBackgroundTask whether the update is done automatically as
+2:7916398:      *      part of a background task or if explicitly invoked by the user
+1:7916398:      * @throws StandardException if updating the data dictionary fails
+1:7916398:      */
+1:7916398:     private void writeUpdatedStats(LanguageConnectionContext lcc,
+1:7916398:                                    TableDescriptor td, UUID index,
+1:7916398:                                    long numRows, long[] cardinality,
+2:7916398:                                    boolean asBackgroundTask)
+1:7916398:             throws StandardException {
+1:7916398:         TransactionController tc = lcc.getTransactionExecute();
+1:7916398:         trace(1, "writing new stats (xid=" + tc.getTransactionIdString() + ")");
+1:7916398:         UUID table = td.getUUID();
+1:7916398:         DataDictionary dd = lcc.getDataDictionary();
+1:7916398:         UUIDFactory uf = dd.getUUIDFactory();
+1:7916398: 
+1:7916398:         // Update the heap row count estimate.
+1:7916398:         setHeapRowEstimate(tc, td.getHeapConglomerateId(), numRows);
+1:7916398:         // Drop existing index statistics for this index.
+1:ebe4642:         if (!lcc.dataDictionaryInWriteMode()) {
+1:ebe4642:             dd.startWriting(lcc);
+1:ebe4642:         }
+1:7916398:         dd.dropStatisticsDescriptors(table, index, tc);
+1:7916398: 
+1:ebe4642:         boolean conglomerateGone = false; // invalidation control flag
+1:7916398:         // Don't write statistics if the table is empty.
+1:7916398:         if (numRows == 0) {
+1:7916398:             trace(2, "empty table, no stats written");
+1:7916398:         } else {
+1:7916398:             // Construct and add the statistics entries.
+1:7916398:             for (int i=0; i < cardinality.length; i++) {
+1:7916398:                 StatisticsDescriptor statDesc = new StatisticsDescriptor(
+1:7916398:                         dd, uf.createUUID(), index, table, "I",
+1:7916398:                      new StatisticsImpl(numRows, cardinality[i]),
+1:7916398:                      i+1);
+1:7916398:                 dd.addDescriptor(statDesc, null,
+1:7916398:                         DataDictionary.SYSSTATISTICS_CATALOG_NUM, true, tc);
+1:7916398:             }
+1:7916398: 
+1:7916398:             // Log some information.
+1:11be777:             ConglomerateDescriptor cd = dd.getConglomerateDescriptor(index);
+1:7916398:             log(asBackgroundTask, td,
+1:3a6d457:                     "wrote stats for index "  + 
+1:11be777:                     (cd == null ? "n/a" : cd.getDescriptorName()) +
+1:3a6d457:                     " (" + index + "): rows=" + numRows +
+1:3a6d457:                     ", card=" + cardToStr(cardinality));
+1:7916398: 
+1:328c3ca:             // DERBY-5045: When running as a background task, we don't take
+1:328c3ca:             // intention locks that prevent dropping the table or its indexes.
+1:328c3ca:             // So there is a possibility that this index was dropped before
+1:328c3ca:             // we wrote the statistics to the SYSSTATISTICS table. If the table
+1:328c3ca:             // isn't there anymore, issue a rollback to prevent inserting rows
+1:328c3ca:             // for non-existent indexes in SYSSTATISTICS.
+1:328c3ca:             if (asBackgroundTask && cd == null) {
+1:328c3ca:                 log(asBackgroundTask, td,
+1:328c3ca:                     "rolled back index stats because index has been dropped");
+1:328c3ca:                 lcc.internalRollback();
+1:7916398:             }
+1:ebe4642:             conglomerateGone = (cd == null);
+1:7916398:         }
+1:7916398: 
+1:ebe4642:         if (!conglomerateGone) {
+1:ebe4642:             // Invalidate statments accessing the given table.
+1:ebe4642:             invalidateStatements(lcc, td, asBackgroundTask);
+1:ebe4642:         }
+1:7916398:         // Only commit tx as we go if running as background task.
+1:7916398:         if (asBackgroundTask) {
+1:7916398:             lcc.internalCommit(true);
+1:7916398:         }
+1:7916398:     }
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Performs an invalidation action for the given table (the event being
+1:7916398:      * statistics update).
+1:7916398:      *
+1:7916398:      * @param lcc connection context to use to perform the work
+1:7916398:      * @param td the table to invalidate for
+1:7916398:      * @param asBackgroundTask whether the update is done automatically as
+1:7916398:      *      part of a background task or if explicitly invoked by the user
+1:7916398:      * @throws StandardException if the invalidation request fails
+1:7916398:      */
+1:7916398:     private void invalidateStatements(LanguageConnectionContext lcc,
+2:7916398:                                       TableDescriptor td,
+1:7916398:                                       boolean asBackgroundTask)
+1:7916398:             throws StandardException {
+1:7916398:         // Invalidate compiled statements accessing the table.
+1:7916398:         DataDictionary dd = lcc.getDataDictionary();
+1:7916398:         DependencyManager dm = dd.getDependencyManager();
+1:7916398:         int retries = 0;
+1:7916398:         while (true) {
+1:7916398:             try {
+1:ebe4642:                 if (!lcc.dataDictionaryInWriteMode()) {
+1:7916398:                     dd.startWriting(lcc);
+1:7916398:                 }
+1:7916398:                 dm.invalidateFor(
+1:7916398:                         td, DependencyManager.UPDATE_STATISTICS, lcc);
+1:7916398:                 trace(1, "invalidation completed");
+1:7916398:                 break;
+1:7916398:             } catch (StandardException se) {
+1:7916398:                 // Special handling when running as background task.
+1:c9ef166: 
+1:c9ef166:                 if (se.isLockTimeout() && asBackgroundTask && retries < 3) {
+1:7916398:                     retries++;
+1:7916398:                     // If this is the first time we retry, don't roll back.
+1:7916398:                     // If we already waited once, but still didn't get the
+1:7916398:                     // locks, back down by releasing our own locks.
+1:7916398:                     if (retries > 1) {
+1:7916398:                         trace(2, "releasing locks");
+1:7916398:                         lcc.internalRollback();
+1:7916398:                     }
+1:7916398:                     trace(2, "lock timeout when invalidating");
+1:7916398:                     sleep(100*(1+retries)); // adaptive sleeping...
+1:7916398:                 } else {
+1:7916398:                     // Throw exception because of one of:
+1:7916398:                     //  o it isn't a lock timeout
+1:7916398:                     //          - or -
+1:7916398:                     //  o we gave up retrying
+1:7916398:                     //          - or -
+1:7916398:                     //  o we are running in explicit mode
+1:7916398:                     trace(1, "invalidation failed");
+1:7916398:                     throw se;
+1:7916398:                 }
+1:7916398:             }
+1:7916398:         }
+1:7916398:     }
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Sets the row estimate for the heap conglomerate.
+1:7916398:      *
+1:7916398:      * @param tc transaction to use
+1:7916398:      * @param tableId the heap table
+1:7916398:      * @param rowEstimate estimate of number of rows in the table
+1:7916398:      * @throws StandardException if accessing the table fails
+1:7916398:      */
+1:7916398:     private void setHeapRowEstimate(TransactionController tc, long tableId,
+1:7916398:                                     long rowEstimate)
+1:7916398:             throws StandardException {
+1:7916398:         // DERBY-4116: If we know the row count, update the store estimated row
+1:7916398:         // count for the table.
+1:7916398:         ScanController sc = tc.openScan(
+1:7916398:                 tableId,
+1:7916398:                 false,  // hold
+1:7916398:                 0,      // openMode: for read
+1:7916398:                 TransactionController.MODE_RECORD, // locking
+1:7916398:                 TransactionController.ISOLATION_READ_UNCOMMITTED, //iso level
+1:7916398:                 null,   // scancolumnlist-- want everything.
+1:7916398:                 null,   // startkeyvalue-- start from the beginning.
+1:7916398:                 0,
+1:7916398:                 null,   // qualifiers, none!
+1:7916398:                 null,   // stopkeyvalue,
+1:7916398:                 0);
+1:7916398: 
+1:7916398:         try {
+1:7916398:             sc.setEstimatedRowCount(rowEstimate);
+1:7916398:         } finally {
+1:7916398:             sc.close();
+1:7916398:         }
+1:7916398:     }
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Drives the statistics generation.
+1:7916398:      * <p>
+1:7916398:      * This method will be run in a separate thread, and it will keep working
+1:7916398:      * as long as there is work to do. When the queue is exhausted, the method
+1:7916398:      * will exit (the thread dies).
+1:7916398:      */
+1:7916398:     public void run() {
+1:7916398:         final long runStart = System.currentTimeMillis();
+1:cd02474:         ContextService ctxService = null;
+1:cd02474:         // Implement the outer-level exception handling here.
+1:cd02474:         try {
+1:cd02474:             // DERBY-5088: Factory-call may fail.
+1:a0dbbd7:             ctxService = getContextService();
+1:cd02474:             ctxService.setCurrentContextManager(ctxMgr);
+1:cd02474:             processingLoop();
+1:cd02474:         } catch (ShutdownException se) {
+1:cd02474:             // The database is/has been shut down.
+1:cd02474:             // Log processing statistics and exit.
+1:3a6d457:             trace(1, "swallowed shutdown exception: " + extractIstatInfo(se));
+1:cd02474:             stop();
+1:cd02474:             ctxMgr.cleanupOnError(se, db.isActive());
+1:cd02474:         } catch (RuntimeException re) {
+1:cd02474:             // DERBY-4037
+1:cd02474:             // Extended filtering of runtime exceptions during shutdown:
+1:cd02474:             //  o assertions raised by debug jars
+1:cd02474:             //  o runtime exceptions, like NPEs, raised by production jars -
+1:cd02474:             //    happens because the background thread interacts with store
+1:cd02474:             //    on a lower level
+1:cd02474:             if (!isShuttingDown()) {
+1:3a6d457:                 log(AS_BACKGROUND_TASK, null, re,
+1:3a6d457:                         "runtime exception during normal operation");
+1:cd02474:                 throw re;
+1:cd02474:             }
+1:3a6d457:             trace(1, "swallowed runtime exception during shutdown: " +
+1:3a6d457:                     extractIstatInfo(re));
+1:cd02474:         } finally {
+1:cd02474:             if (ctxService != null) {
+1:cd02474:                 ctxService.resetCurrentContextManager(ctxMgr);
+1:cd02474:             }
+1:cd02474:             runTime += (System.currentTimeMillis() - runStart);
+1:3a6d457:             trace(0, "worker thread exit");
+1:cd02474:         }
+1:cd02474:     }
+1:cd02474: 
+1:cd02474:     /**
+1:cd02474:      * Main processing loop which will compute statistics until the queue
+1:cd02474:      * of scheduled work units has been drained.
+1:cd02474:      */
+1:cd02474:     private void processingLoop() {
+1:7916398:         // If we don't have a connection to the database, create one.
+1:7916398:         if (daemonLCC == null) {
+1:7916398:             try {
+1:7916398:                 daemonLCC =
+1:7916398:                         db.setupConnection(ctxMgr, dbOwner, null, databaseName);
+1:7916398:                 // Initialize the lcc/transaction.
+1:7916398:                 // TODO: Would be nice to name the transaction.
+1:7916398:                 daemonLCC.setIsolationLevel(
+1:7916398:                         Connection.TRANSACTION_READ_UNCOMMITTED);
+1:7916398:                 // Don't wait for any locks.
+1:7916398:                 daemonLCC.getTransactionExecute().setNoLockWait(true);
+1:7916398:             } catch (StandardException se) {
+1:7916398:                 log(AS_BACKGROUND_TASK, null, se,
+1:cd02474:                         "failed to initialize index statistics updater");
+1:7916398:                 return;
+1:7916398:             }
+1:7916398:         }
+1:7916398: 
+1:7916398:         TransactionController tc = null;
+1:7916398:         try {
+1:7916398:             tc = daemonLCC.getTransactionExecute();
+1:7916398:             trace(0, "worker thread started (xid=" +
+1:7916398:                     tc.getTransactionIdString() + ")");
+1:7916398: 
+1:7916398:             TableDescriptor td = null;
+1:7916398:             long start = 0;
+1:7916398:             while (true) {
+1:299b9e7:                 synchronized (queue) {
+1:7916398:                     if (daemonDisabled) {
+1:7916398:                         // Clean the lcc and exit.
+1:7916398:                         try {
+1:7916398:                             tc.destroy();
+2:7916398:                         } catch (ShutdownException se) {
+1:7916398:                             // Ignore
+1:7916398:                         }
+1:7916398:                         tc = null;
+1:7916398:                         daemonLCC = null;
+1:7916398:                         queue.clear();
+1:3a6d457:                         trace(1, "daemon disabled");
+1:15b7b10:                         break;
+1:7916398:                     }
+1:7916398:                     if (queue.isEmpty()) {
+1:7916398:                         trace(1, "queue empty");
+1:7916398:                         break;
+1:7916398:                     }
+1:71c8e86:                     td = queue.get(0);
+1:7916398:                 }
+1:7916398:                 try {
+1:7916398:                     start = System.currentTimeMillis();
+1:7916398:                     generateStatistics(daemonLCC, td);
+1:7916398:                     wuProcessed++;
+1:7916398:                     // Reset consecutive error counter.
+1:7916398:                     errorsConsecutive = 0;
+1:7916398:                     log(AS_BACKGROUND_TASK, td, "generation complete (" +
+1:7916398:                             ((System.currentTimeMillis() - start))  + " ms)");
+1:7916398:                 } catch (StandardException se) {
+1:7916398:                     errorsConsecutive++;
+1:7916398:                     // Assume handling of fatal errors will clean up properly.
+1:7916398:                     // For less severe errors, rollback tx to clean up.
+1:7916398:                     if (!handleFatalErrors(ctxMgr, se)) {
+1:7916398:                         boolean handled = handleExpectedErrors(td, se);
+1:7916398:                         if (!handled) {
+1:7916398:                             handled = handleUnexpectedErrors(td, se);
+1:7916398:                         }
+1:7916398:                         daemonLCC.internalRollback();
+1:7916398:                         if (SanityManager.DEBUG) {
+1:7916398:                             SanityManager.ASSERT(handled);
+1:7916398:                         }
+1:7916398:                     }
+1:7916398:                 } finally {
+1:7916398:                     // Whatever happened, discard the unit of work.
+1:7916398:                     synchronized (queue) {
+1:7916398:                         // Queue may have been cleared due to shutdown.
+1:7916398:                         if (!queue.isEmpty()) {
+1:7916398:                             queue.remove(0);
+1:7916398:                         }
+1:7916398:                     }
+1:7916398:                     // If we have seen too many consecutive errors, disable
+1:7916398:                     // the daemon. 50 was chosen based on gut-feeling...
+1:7916398:                     // Hopefully it can withstand shortlived "hick-ups", but
+1:7916398:                     // will cause shutdown if there is a real problem.
+1:7916398:                     // Create an exception to force logging of the message.
+1:7916398:                     if (errorsConsecutive >= 50) {
+1:7916398:                         log(AS_BACKGROUND_TASK, null,
+1:7916398:                                 new IllegalStateException("degraded state"),
+1:7916398:                                 "shutting down daemon, " + errorsConsecutive +
+1:7916398:                                 " consecutive errors seen");
+2:7916398:                         stop();
+1:7916398:                     }
+1:7916398:                 }
+1:7916398:             }
+1:7916398:         } catch (StandardException se) {
+1:7916398:             log(AS_BACKGROUND_TASK, null, se, "thread died");
+1:7916398:             // Do nothing, just let the thread die.
+1:7916398:         } finally {
+1:7916398:             synchronized (queue) {
+1:7916398:                 runningThread = null;
+1:7916398:             }
+1:7916398:             if (daemonLCC != null && !daemonLCC.isTransactionPristine()) {
+1:7916398:                 if (SanityManager.DEBUG) {
+1:7916398:                     SanityManager.THROWASSERT("transaction not pristine");
+1:7916398:                 }
+1:7916398:                 log(AS_BACKGROUND_TASK, null,
+1:7916398:                         "transaction not pristine - forcing rollback");
+1:7916398:                 try {
+1:7916398:                     daemonLCC.internalRollback();
+1:7916398:                 } catch (StandardException se) {
+1:7916398:                     // Log, then continue.
+1:7916398:                     log(AS_BACKGROUND_TASK, null, se, "forced rollback failed");
+1:7916398:                 }
+1:7916398:             }
+1:7916398:         }
+1:7916398:     }
+1:a346f0c: 
+1:7916398:     /**
+1:7916398:      * Runs the statistics update sequence explicitly as requested by the user.
+1:7916398:      *
+1:7916398:      * @param lcc connection context to use to perform the work
+1:7916398:      * @param td the base table
+1:7916398:      * @param cds the indexes to update (non-index conglomerates are ignored)
+1:7916398:      * @param runContext the context in which the operation is run (i.e.
+1:7916398:      *      'ALTER TABLE', may be {@code null})
+1:7916398:      * @throws StandardException if updating the index statistics fails
+1:7916398:      */
+1:7916398:     public void runExplicitly(LanguageConnectionContext lcc,
+1:7916398:                               TableDescriptor td,
+2:7916398:                               ConglomerateDescriptor[] cds,
+1:7916398:                               String runContext)
+1:7916398:             throws StandardException {
+1:7916398:         updateIndexStatsMinion(lcc, td, cds, AS_EXPLICIT_TASK);
+1:3a6d457:         trace(0, "explicit run completed" + (runContext != null
+1:3a6d457:                                         ? " (" + runContext + "): "
+1:3a6d457:                                         : ": ") +
+1:3a6d457:                                     td.getQualifiedName());
+1:7916398:     }
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Stops the daemon.
+1:7916398:      * <p>
+1:7916398:      * Will also clear the queue and print runtime statistics to the log the
+1:7916398:      * first time the method is invoked.
+1:7916398:      */
+1:7916398:     public void stop() {
+1:a346f0c:         Thread threadToWaitFor = null;
+1:b833933:         // Controls execution of last cleanup step outside of the synchronized
+1:b833933:         // block. Should only be done once, and this is ensured by the guard on
+1:b833933:         // 'queue' and the value of 'daemonDisabled'.
+1:b833933:         boolean clearContext = false;
+1:a346f0c: 
+1:299b9e7:         synchronized (queue) {
+1:299b9e7:             if (!daemonDisabled) {
+1:b833933:                 clearContext = true;
+1:7916398:                 StringBuffer sb = new StringBuffer(100);
+1:7916398:                 sb.append("stopping daemon, active=").
+1:7916398:                         append(runningThread != null).
+1:7916398:                         append(", work/age=").append(runTime).append('/').
+1:7916398:                         append(System.currentTimeMillis() - timeOfCreation).
+1:7916398:                         append(' ');
+1:7916398:                 appendRunStats(sb);
+1:7916398:                 log(AS_BACKGROUND_TASK, null, sb.toString());
+1:7916398:                 // If there is no running thread and the daemon lcc is still
+1:7916398:                 // around, destroy the transaction and clear the lcc reference.
+1:15b7b10:                 if (runningThread == null && daemonLCC != null &&
+1:cd02474:                         !isShuttingDown()) {
+1:15b7b10:                     // try/catch as safe-guard against shutdown race condition.
+1:15b7b10:                     try {
+1:15b7b10:                         daemonLCC.getTransactionExecute().destroy();
+1:15b7b10:                     } catch (ShutdownException se) {
+1:15b7b10:                         // Ignore
+1:15b7b10:                     }
+1:7916398:                     daemonLCC = null;
+1:7916398:                 }
+1:7916398:                 daemonDisabled = true;
+1:a346f0c:                 threadToWaitFor = runningThread;
+1:7916398:                 runningThread = null;
+1:7916398:                 queue.clear();
+1:a346f0c:             }
+1:7916398:         }
+1:a346f0c: 
+1:a346f0c:         // Wait for the currently running thread, if there is one. Must do
+1:a346f0c:         // this outside of the synchronized block so that we don't deadlock
+1:a346f0c:         // with the thread.
+1:a346f0c:         if (threadToWaitFor != null) {
+1:ebd44de:             while (true) {
+1:a346f0c:                 try {
+1:a346f0c:                     threadToWaitFor.join();
+1:7916398:                     break;
+1:a346f0c:                 } catch (InterruptedException ie) {
+1:ebd44de:                     InterruptStatus.setInterrupted();
+1:a346f0c:                 }
+1:7916398:             }
+1:a346f0c: 
+1:7916398:         }
+1:7916398: 
+1:b833933:         // DERBY-5447: Remove the context only after the running daemon thread
+1:b833933:         //             (if any) has been shut down to avoid Java deadlocks
+1:b833933:         //             when closing the container handles obtained with this
+1:b833933:         //             context.
+1:b833933:         if (clearContext) {
+1:b833933:             // DERBY-5336: Trigger cleanup code to remove the context
+1:b833933:             //             from the context service. This pattern was
+1:b833933:             //             copied from BasicDaemon.
+1:b833933:             ctxMgr.cleanupOnError(StandardException.normalClose(), false);
+1:b833933:         }
+1:7916398:     }
+1:7916398: 
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Handles fatal errors that will cause the daemon to be shut down.
+1:7916398:      *
+1:7916398:      * @param cm context manager
+1:7916398:      * @param se the exception to handle
+1:7916398:      * @return {@code true} if the error was handled, {@code false} otherwise
+1:7916398:      */
+1:7916398:     private boolean handleFatalErrors(ContextManager cm, StandardException se) {
+1:7916398:         boolean disable = false;
+1:7916398:         if (SQLState.DATA_CONTAINER_READ_ONLY.equals(se.getMessageId())) {
+1:7916398:             // We are not allowed to write into the database, most likely the
+1:7916398:             // data dictionary. No point to keep doing work we can't gain from.
+1:7916398:             disable = true;
+1:cd02474:         } else if (isShuttingDown() ||
+1:cd02474:                 se.getSeverity() >= ExceptionSeverity.DATABASE_SEVERITY) {
+1:cd02474:             // DERBY-4037: Swallow exceptions raised during shutdown.
+1:7916398:             // The database or system is going down. Probably handled elsewhere
+1:7916398:             // but disable daemon anyway.
+1:3a6d457:             trace(1, "swallowed exception during shutdown: " +
+1:3a6d457:                     extractIstatInfo(se));
+1:7916398:             disable = true;
+1:4c5c16b:             cm.cleanupOnError(se, db.isActive());
+1:7916398:         }
+1:7916398: 
+1:7916398:         if (disable) {
+1:7916398:             daemonLCC.getDataDictionary().disableIndexStatsRefresher();
+1:7916398:         }
+1:7916398:         return disable;
+1:7916398:     }
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Handles expected errors.
+1:7916398:      * <p>
+1:7916398:      * The logging of expected errors is for observability purposes only. The
+1:7916398:      * daemon is capable of dealing with these errors, and no interaction from
+1:7916398:      * the user is expected.
+1:7916398:      *
+1:7916398:      * @param se the exception to handle
+1:7916398:      * @return {@code true} if the error was handled, {@code false} otherwise
+1:7916398:      */
+1:7916398:     private boolean handleExpectedErrors(TableDescriptor td,
+1:7916398:                                          StandardException se) {
+1:7916398:         String state = se.getMessageId();
+1:7916398:         // Accept that the heap/index/conglomerate has been deleted since the
+1:7916398:         // work for it was scheduled. Just ignore the unit of work and continue.
+1:7916398:         if (SQLState.STORE_CONGLOMERATE_DOES_NOT_EXIST.equals(state) ||
+1:c9ef166:             SQLState.HEAP_CONTAINER_NOT_FOUND.equals(state) ||
+1:c9ef166:             SQLState.FILE_IO_INTERRUPTED.equals(state) ||
+1:c9ef166:             se.isLockTimeout()) {
+1:c9ef166: 
+1:7916398:             errorsKnown++;
+1:7916398:             log(AS_BACKGROUND_TASK, td, "generation aborted (reason: " +
+1:7916398:                     state + ") {" + extractIstatInfo(se) + "}");
+1:299b9e7:             return true;
+1:7916398:         }
+1:7916398:         return false;
+1:7916398:     }
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Handles unexpected errors.
+1:7916398:      * <p>
+1:7916398:      * Unexpected errors are error conditions the daemon isn't set up to handle
+1:7916398:      * specifically. For this reason the stack trace will be logged to allow
+1:7916398:      * for later investigation.
+1:7916398:      * <p>
+1:7916398:      * In general it is expected that the daemon will be able to recover by
+1:7916398:      * dropping the current unit of work and move on to the next one (if any).
+1:7916398:      *
+1:7916398:      * @param se the exception to handle
+1:7916398:      * @return {@code true} if the error was handled, {@code false} otherwise
+1:7916398:      */
+1:7916398:     private boolean handleUnexpectedErrors(TableDescriptor td,
+1:7916398:                                            StandardException se) {
+1:7916398:         errorsUnknown++;
+1:7916398:         log(AS_BACKGROUND_TASK, td, se, "generation failed");
+2:7916398:         return true;
+1:7916398:     }
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Puts the current thread to sleep for maximum {@code ms} milliseconds.
+1:7916398:      * <p>
+1:7916398:      * No guarantee is provided for the minimum amount of time slept. If
+1:7916398:      * interrupted, the interrupt flag will be set again.
+1:7916398:      *
+1:7916398:      * @param ms target sleep time
+1:7916398:      */
+1:7916398:     private static void sleep(long ms) {
+1:7916398:         try {
+1:7916398:             Thread.sleep(ms);
+1:7916398:         } catch (InterruptedException ie) {
+1:ec9d167:             InterruptStatus.setInterrupted();
+1:7916398:         }
+1:7916398:     }
+1:7916398: 
+1:7916398:     /** Format array of scan durations as a string. */
+1:7916398:     private static String fmtScanTimes(long[][] timings) {
+1:7916398:         // timings[x] = [conglomId, start, end]
+1:7916398:         StringBuffer sb = new StringBuffer("scan durations (");
+1:7916398:         for (int i=0; i < timings.length && timings[i][0] > 0; i++) {
+1:764b3a0:             sb.append('c').append(timings[i][0]).append('=');
+1:764b3a0:             // Handle corner-case where the scans are aborted due to the
+1:764b3a0:             // index statistics daemon being shut down under us.
+1:764b3a0:             if (timings[i][2] == 0) {
+1:764b3a0:                 sb.append("ABORTED,");   
+1:764b3a0:             } else {
+1:764b3a0:                 long duration = timings[i][2] - timings[i][1];
+1:764b3a0:                 sb.append(duration).append("ms,");
+1:764b3a0:             }
+1:7916398:         }
+1:7916398:         sb.deleteCharAt(sb.length() -1).append(")");
+1:7916398:         return sb.toString();
+1:7916398:     }
+1:7916398: 
+1:7916398:     /** @see #log(boolean, TableDescriptor, Throwable, String)  */
+1:7916398:     private void log(boolean asBackgroundTask, TableDescriptor td, String msg) {
+1:7916398:         log(asBackgroundTask, td, null, msg);
+1:7916398:     }
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Logs the information given.
+1:7916398:      * <p>
+1:7916398:      * Note that if {@code asBackgroundTask} is false, nothing will be logged
+1:7916398:      * currently.
+1:7916398:      *
+1:7916398:      * @param asBackgroundTask {@code true} if logging for the background
+1:7916398:      *      daemon automatically updating stats, {@code false} if not
+1:7916398:      * @param td current table descriptor being worked on, may be {@code null}
+1:7916398:      * @param t raised error, may be {@code null}
+1:7916398:      * @param msg the message to log
+1:7916398:      */
+1:7916398:     private void log(boolean asBackgroundTask, TableDescriptor td, Throwable t,
+1:7916398:             String msg) {
+1:7916398:         if (asBackgroundTask && (doLog || t != null)) {
+1:7e33399:             logAlways(td, t, msg);
+1:7e33399:         }
+1:7e33399:     }
+1:7e33399: 
+1:7e33399:     /**
+1:7e33399:      * Logs the information given.
+1:7e33399:      *
+1:7e33399:      * @param td current table descriptor being worked on, may be {@code null}
+1:7e33399:      * @param t raised error, may be {@code null}
+1:7e33399:      * @param msg the message to log
+1:7e33399:      */
+1:7e33399:     private void logAlways(TableDescriptor td, Throwable t, String msg) {
+1:7e33399:         PrintWriter pw;
+1:7e33399:         String hdrMsg = "{istat} " +
+1:7e33399:                 (td == null ? "" : td.getQualifiedName() + ": ") + msg;
+1:7e33399:         if (t != null) {
+1:7e33399:             pw = new PrintWriter(logStream.getPrintWriter(), false);
+1:7e33399:             pw.print(logStream.getHeader().getHeader());
+1:7e33399:             pw.println(hdrMsg);
+1:7e33399:             t.printStackTrace(pw);
+1:7e33399:             pw.flush();
+1:7e33399:         } else {
+1:7e33399:             logStream.printlnWithHeader(hdrMsg);
+1:7916398:         }
+1:7916398:     }
+1:7916398: 
+1:7916398:     // @GuardedBy("this")
+1:7916398:     private final StringBuffer tsb = new StringBuffer();
+1:7916398:     private synchronized void trace(int indentLevel, String msg) {
+1:7916398:         if (doTrace) {
+1:7916398:             tsb.setLength(0);
+1:7916398:             tsb.append("{istat,trace@").append(hashCode()).append("} ");
+1:7916398:             for (int i=0; i < indentLevel; i++) {
+1:7916398:                 tsb.append("    ");
+1:7916398:             }
+1:7916398:             tsb.append(msg).append(' ');
+1:7916398:             if (indentLevel == 0) {
+1:7916398:                 appendRunStats(tsb);
+1:7916398:             }
+1:7916398:             if (traceToDerbyLog && logStream != null) {
+1:7916398:                 logStream.printlnWithHeader(tsb.toString());
+1:7916398:             }
+1:7916398:             if (traceToStdOut) {
+1:7916398:                 System.out.println(tsb.toString());
+1:7916398:             }
+1:7916398:         }
+1:7916398:     }
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Appends runtime statistics to the given string buffer.
+1:7916398:      *
+1:7916398:      * @param sb the string buffer to append to
+1:7916398:      */
+1:7916398:     // @GuardedBy("queue")
+1:7916398:     private void appendRunStats(StringBuffer sb) {
+1:7916398:         // Print rather detailed and cryptic stats.
+1:7916398:         sb.append("[q/p/s=").append(queue.size()). // current queue size
+1:7916398:                 append('/').append(wuProcessed). // scheduled
+1:7916398:                 append('/').append(wuScheduled). //processed
+1:7916398:                 append(",err:k/u/c=").
+1:7916398:                 append(errorsKnown). // known errors
+1:7916398:                 append('/').append(errorsUnknown). // unexpected errors
+1:7916398:                 append('/').append(errorsConsecutive). // consecutive errors
+1:7916398:                 append(",rej:f/d/o=").
+1:7916398:                 append(wuRejectedFQ). // rejected, full queue
+1:7916398:                 append('/').append(wuRejectedDup). // rejected, duplicate
+1:7916398:                 append('/').append(wuRejectedOther). // rejected, other
+1:7916398:                 append(']');
+1:7916398:     }
+1:7916398: 
+1:7916398:     /**
+1:7916398:      * Produces a textual representation of the cardinality numbers.
+1:7916398:      *
+1:7916398:      * @param cardinality index cardinality
+1:7916398:      * @return A string.
+1:7916398:      */
+1:7916398:     private static String cardToStr(long[] cardinality) {
+1:7916398:         if (cardinality.length == 1) {
+1:7916398:             return "[" + Long.toString(cardinality[0]) + "]";
+1:7916398:         } else {
+1:7916398:             StringBuffer sb = new StringBuffer("[");
+1:7916398:             for (int i=0; i < cardinality.length; i++) {
+1:7916398:                 sb.append(cardinality[i]).append(',');
+1:7916398:             }
+1:7916398:             sb.deleteCharAt(sb.length() -1).append(']');
+1:7916398:             return sb.toString();
+1:7916398:         }
+1:7916398:     }
+1:7916398: 
+1:7916398:     /** Purely for debugging, to avoid printing too much info. */
+1:3a6d457:     private static String extractIstatInfo(Throwable t) {
+1:3a6d457:         String istatClass = IndexStatisticsDaemonImpl.class.getName();
+1:3a6d457:         StackTraceElement[] stack = t.getStackTrace();
+1:3a6d457:         String trace = "<no stacktrace>";
+1:3a6d457:         String sqlState = "";
+1:7916398:         for (int i=0; i < stack.length ; i++) {
+1:7916398:             StackTraceElement ste = stack[i];
+1:3a6d457:             if (ste.getClassName().startsWith(istatClass)) {
+1:7916398:                 trace = ste.getMethodName() + "#" + ste.getLineNumber();
+1:7916398:                 if (i > 0) {
+1:7916398:                     ste = stack[i -1];
+1:7916398:                     trace += " -> " + ste.getClassName() + "." +
+1:7916398:                             ste.getMethodName() + "#" + ste.getLineNumber();
+1:7916398:                 }
+1:7916398:                 break;
+1:7916398:             }
+1:7916398:         }
+1:3a6d457:         if (t instanceof StandardException) {
+1:3a6d457:             sqlState = ", SQLSTate=" + ((StandardException)t).getSQLState();
+1:3a6d457:         }
+1:3a6d457:         return "<" + t.getClass() + ", msg=" + t.getMessage() + sqlState +
+1:3a6d457:                 "> " + trace;
+1:7916398:     }
+1:7916398: 
+1:7916398:     /**
+1:a0dbbd7:      * Privileged lookup of the ContextService. Must be private so that user code
+1:a0dbbd7:      * can't call this entry point.
+1:a0dbbd7:      */
+1:a0dbbd7:     private  static  ContextService    getContextService()
+1:a0dbbd7:     {
+1:a0dbbd7:         if ( System.getSecurityManager() == null )
+1:a0dbbd7:         {
+1:a0dbbd7:             return ContextService.getFactory();
+1:a0dbbd7:         }
+1:a0dbbd7:         else
+1:a0dbbd7:         {
+1:a0dbbd7:             return AccessController.doPrivileged
+1:a0dbbd7:                 (
+1:a0dbbd7:                  new PrivilegedAction<ContextService>()
+1:a0dbbd7:                  {
+1:a0dbbd7:                      public ContextService run()
+1:a0dbbd7:                      {
+1:a0dbbd7:                          return ContextService.getFactory();
+1:a0dbbd7:                      }
+1:a0dbbd7:                  }
+1:a0dbbd7:                  );
+1:a0dbbd7:         }
+1:a0dbbd7:     }    
+1:a0dbbd7: 
+1:a0dbbd7:     /**
+1:7916398:      * Support class used to compare keys when scanning indexes.
+1:7916398:      */
+1:7916398:     //@NotThreadSafe
+1:7916398:     private static class KeyComparator {
+1:7916398: 
+1:7916398:         /** Number of rows fetched per iteration. */
+1:7916398:         private static final int FETCH_SIZE = 16;
+1:7916398:         private final DataValueDescriptor[][] rowBufferArray;
+1:7916398:         private DataValueDescriptor[] lastUniqueKey;
+1:7916398:         private DataValueDescriptor[] curr;
+1:7916398:         private DataValueDescriptor[] prev;
+1:7916398:         private int rowsReadLastRead = -1;
+1:7916398:         private long numRows;
+1:7916398: 
+1:7916398:         /**
+1:7916398:          * Creates a key comparator for the given index.
+1:7916398:          *
+1:7916398:          * @param ir index row (template)
+1:7916398:          */
+1:9495437:         public KeyComparator(ExecIndexRow ir) {
+1:7916398:             rowBufferArray = new DataValueDescriptor[FETCH_SIZE][];
+1:7916398:             rowBufferArray[0] = ir.getRowArray(); // 1 gets old objects.
+1:7916398:             lastUniqueKey = ir.getRowArrayClone();
+1:7916398:         }
+1:7916398: 
+1:7916398:         /**
+1:7916398:          * Fetches rows from the scan controller.
+1:7916398:          *
+1:7916398:          * @param gsc the scan controller
+1:7916398:          * @return Number of rows fetched.
+1:7916398:          * @throws StandardException if fetching rows fails
+1:7916398:          */
+1:7916398:         public int fetchRows(GroupFetchScanController gsc)
+1:7916398:                 throws StandardException {
+1:7916398:             // Save state (and optimize) for next read.
+1:7916398:             // Assumes that we always read as many rows as we can per iteration.
+1:7916398:             if (rowsReadLastRead == FETCH_SIZE) {
+1:7916398:                 // Reuse curr to reference the current last unique key.
+1:7916398:                 curr = rowBufferArray[FETCH_SIZE - 1];
+1:7916398:                 // Reuse the old last unique row array for the coming fetch.
+1:7916398:                 rowBufferArray[FETCH_SIZE - 1] = lastUniqueKey;
+1:7916398:                 // Finally we update the pointer to the last unique key.
+1:7916398:                 lastUniqueKey = curr;
+1:7916398:             }
+1:7916398:             rowsReadLastRead = gsc.fetchNextGroup(rowBufferArray, null);
+1:7916398:             return rowsReadLastRead;
+1:7916398:         }
+1:7916398: 
+1:7916398:         /**
+1:7916398:          * Compares the key at the specified index with the previous key.
+1:7916398:          *
+1:7916398:          * @param index row index
+1:7916398:          * @return {@code -1} if the current and previous key are identical,
+1:7916398:          *      the index of the changed part of the key otherwise
+1:dbed020:          *      ([0, key length&gt;)
+1:7916398:          * @throws StandardException if comparing the two keys fails
+1:7916398:          */
+1:7916398:         public int compareWithPrevKey(int index)
+1:7916398:                 throws StandardException {
+1:7916398:             if (index > rowsReadLastRead) {
+1:7916398:                 throw new IllegalStateException(
+1:7916398:                         "invalid access, rowsReadLastRead=" + rowsReadLastRead +
+1:7916398:                         ", index=" + index + ", numRows=" + numRows);
+1:7916398:             }
+1:7916398:             numRows++;
+1:7916398:             // First row ever is always a distinct key.
+1:7916398:             if (numRows == 1) {
+1:7916398:                 return 0;
+1:7916398:             }
+1:7916398: 
+1:7916398:             prev = (index == 0) ? lastUniqueKey
+1:7916398:                                 : rowBufferArray[index - 1];
+1:7916398:             curr = rowBufferArray[index];
+1:7916398:             DataValueDescriptor dvd;
+1:7916398:             // no point trying to do rowlocation; hence - 1
+1:7916398:             for (int i = 0; i < (prev.length - 1); i++) {
+1:7916398:                 dvd = (DataValueDescriptor)prev[i];
+1:7916398: 
+1:7916398:                 // NULLs are counted as unique values.
+1:7916398:                 if (dvd.isNull() || prev[i].compare(curr[i]) != 0) {
+1:7916398:                   return i;
+1:7916398:                 }
+1:7916398:             }
+1:7916398:             return -1;
+1:7916398:         }
+1:7916398: 
+1:7916398:         /**
+1:7916398:          * Returns the number of rows fetched.
+1:7916398:          *
+1:7916398:          * @return Number of rows fetched.
+1:7916398:          */
+1:7916398:         public long getRowCount() {
+1:7916398:             return numRows;
+1:7916398:         }
+1:7916398:     }
+1:7916398: }
+============================================================================
+author:Richard N. Hillegas
+-------------------------------------------------------------------------------
+commit:dbed020
+/////////////////////////////////////////////////////////////////////////
+1:          *      ([0, key length&gt;)
+commit:56c1dc2
+/////////////////////////////////////////////////////////////////////////
+1:                     runningThread = BasicDaemon.getMonitor().getDaemonThread(this, "index-stat-thread", false);
+commit:a0dbbd7
+/////////////////////////////////////////////////////////////////////////
+1: import java.security.PrivilegedAction;
+1: import java.security.AccessController;
+/////////////////////////////////////////////////////////////////////////
+1:         this.ctxMgr = getContextService().newContextManager();
+/////////////////////////////////////////////////////////////////////////
+1:             ctxService = getContextService();
+/////////////////////////////////////////////////////////////////////////
+1:      * Privileged lookup of the ContextService. Must be private so that user code
+1:      * can't call this entry point.
+1:      */
+1:     private  static  ContextService    getContextService()
+1:     {
+1:         if ( System.getSecurityManager() == null )
+1:         {
+1:             return ContextService.getFactory();
+1:         }
+1:         else
+1:         {
+1:             return AccessController.doPrivileged
+1:                 (
+1:                  new PrivilegedAction<ContextService>()
+1:                  {
+1:                      public ContextService run()
+1:                      {
+1:                          return ContextService.getFactory();
+1:                      }
+1:                  }
+1:                  );
+1:         }
+1:     }    
+1: 
+1:     /**
+commit:71c8e86
+/////////////////////////////////////////////////////////////////////////
+1:     private final ArrayList<TableDescriptor> queue = new ArrayList<TableDescriptor>(MAX_QUEUE_LENGTH);
+/////////////////////////////////////////////////////////////////////////
+1:                 TableDescriptor work = queue.get(i);
+/////////////////////////////////////////////////////////////////////////
+1:             List<StatisticsDescriptor> existingStats = td.getStatistics();
+/////////////////////////////////////////////////////////////////////////
+1:                     td = queue.get(0);
+commit:9495437
+/////////////////////////////////////////////////////////////////////////
+1:         public KeyComparator(ExecIndexRow ir) {
+commit:92268ac
+/////////////////////////////////////////////////////////////////////////
+0:         public KeyComparator(ExecIndexRow ir)
+0:             throws StandardException
+1:         {
+commit:ccdcb3d
+/////////////////////////////////////////////////////////////////////////
+0:                 tryToGatherStats(lcc, td, cds, AS_BACKGROUND_TASK);
+/////////////////////////////////////////////////////////////////////////
+0:      * Try to gather statistics. Fail gracefully if we are being shutdown, e.g., the database is killed
+0:      * while we're busy. See DERBY-5037.
+1:      *
+1:      * @param lcc language connection context used to perform the work
+1:      * @param td the table to update index stats for
+1:      * @param cds the conglomerates to update statistics for (non-index
+0:      *      conglomerates will be ignored)
+1:      * @param asBackgroundTask whether the updates are done automatically as
+1:      *      part of a background task or if explicitly invoked by the user
+1:      * @throws StandardException if something goes wrong
+1:      */
+0:     private void tryToGatherStats(LanguageConnectionContext lcc,
+1:                                         TableDescriptor td,
+1:                                         ConglomerateDescriptor[] cds,
+1:                                         boolean asBackgroundTask)
+0:             throws StandardException
+1:     {
+1:         //
+0:         // Swallow exceptions raised while we are being shutdown.
+1:         //
+1:         try {
+0:             updateIndexStatsMinion( lcc, td, cds, asBackgroundTask );
+1:         }
+0:         catch (StandardException se)
+1:         {
+0:             if ( !isShuttingDown( lcc ) ) { throw se; }
+1:         }
+0:         // to filter assertions raised by debug jars
+0:         catch (RuntimeException re)
+1:         {
+0:             if ( !isShuttingDown( lcc ) ) { throw re; }
+1:         }
+1:     }
+1:     /** Return true if we are being shutdown */
+0:     private boolean isShuttingDown( LanguageConnectionContext lcc )
+1:     {
+0:         if ( daemonStopped ) { return true; }
+0:         else { return !lcc.getDatabase().isActive(); }
+1:     }
+1:     
+1:     /**
+author:Bryan Pendleton
+-------------------------------------------------------------------------------
+commit:4b58cc0
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.shared.common.error.ShutdownException;
+commit:7e51e9d
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.shared.common.sanity.SanityManager;
+author:Mike Matrigali
+-------------------------------------------------------------------------------
+commit:a2f00b4
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         // can only properly identify disposable stats if cds == null, 
+1:         // which means we are processing all indexes on the conglomerate.
+1:         final boolean identifyDisposableStats = (cds == null);
+1: 
+1: 
+1:         long[]          conglomerateNumber      = new long[cds.length];
+1:         ExecIndexRow[]  indexRow                = new ExecIndexRow[cds.length];
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: 
+1:         // create a list of indexes that should have statistics, by looking
+1:         // at all indexes on the conglomerate, and conditionally skipping
+1:         // unique single column indexes.  This set is the "non disposable
+1:         // stat list".
+1:         UUID[] non_disposable_objectUUID    = new UUID[cds.length];
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 // at this point have found a stat for an existing
+1:                 // index which is not a single column unique index, add it
+1:                 // to the list of "non disposable stats"
+1:                 conglomerateNumber[i]        = cds[i].getConglomerateNumber();
+1:                 non_disposable_objectUUID[i] = cds[i].getUUID();
+/////////////////////////////////////////////////////////////////////////
+1:         // Check for and drop disposable statistics if we have the required 
+1:         // information.
+0:         //
+1:         // The above loop has populated "cds" with only existing indexes that
+1:         // are not single column unique.
+1: 
+1: 
+1:             // Note this loop is not controlled by the skipDisposableStats 
+1:             // flag.  The above loop controls if we drop single column unique
+1:             // index stats or not.  In all cases we are going to drop 
+1:             // stats with no associated index (orphaned stats).
+1:             
+1: 
+1: 
+0:             //
+1:             //  This loop looks for statistic entries to delete.  It deletes
+1:             //  those entries that don't have a matching conglomerate in the
+1:                     if (referencedIndex.equals(non_disposable_objectUUID[ci])) {
+/////////////////////////////////////////////////////////////////////////
+1:         int      sci       = 0;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:             int           numCols     = indexRow[indexNumber].nColumns() - 1;
+1:             long[]        cardinality = new long[numCols];
+1:             KeyComparator cmp         = new KeyComparator(indexRow[indexNumber]);
+/////////////////////////////////////////////////////////////////////////
+1:                     writeUpdatedStats(lcc, td, 
+1:                             non_disposable_objectUUID[indexNumber],
+commit:c9ef166
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:                 if (se.isLockTimeout() && !lockConflictSeen) {
+1: 
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: 
+1:                     if (se.isLockTimeout() && retries < 3) {
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:                 if (se.isLockTimeout() && asBackgroundTask && retries < 3) {
+/////////////////////////////////////////////////////////////////////////
+1:             SQLState.HEAP_CONTAINER_NOT_FOUND.equals(state) ||
+1:             SQLState.FILE_IO_INTERRUPTED.equals(state) ||
+1:             se.isLockTimeout()) {
+1: 
+commit:a346f0c
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:                 if (isShuttingDown()) {
+1:                     break;
+/////////////////////////////////////////////////////////////////////////
+1:                 int     rowsFetched           = 0;
+1:                 boolean giving_up_on_shutdown = false;
+1: 
+1:                     // DERBY-5108
+1:                     // Check if daemon has been disabled, and if so stop
+1:                     // scan and exit asap.  On shutdown the system will
+1:                     // send interrupts, but the system currently will
+1:                     // recover from these during the scan and allow the
+1:                     // scan to finish. Checking here after each group
+1:                     // I/O that is processed as a convenient point.
+1:                     if (asBackgroundTask) {
+1:                         if (isShuttingDown()) {
+1:                             giving_up_on_shutdown = true;
+1:                             break;
+1:                         }
+1:                     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: 
+1:                 if (giving_up_on_shutdown)
+1:                     break;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         Thread threadToWaitFor = null;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 threadToWaitFor = runningThread;
+1: 
+1:         }
+1: 
+1:         // Wait for the currently running thread, if there is one. Must do
+1:         // this outside of the synchronized block so that we don't deadlock
+1:         // with the thread.
+1:         if (threadToWaitFor != null) {
+1:             try {
+1:                 threadToWaitFor.join();
+1:             } catch (InterruptedException ie) {
+0:                 // Never mind. The thread will die eventually.
+1:             }
+1: 
+author:Kristian Waagan
+-------------------------------------------------------------------------------
+commit:108093d
+/////////////////////////////////////////////////////////////////////////
+1:             //  b) single-column primary keys
+/////////////////////////////////////////////////////////////////////////
+1:                             stats[si].getUUID() + " for index " +
+1:                             stats[si].getReferenceID() + " (cols=" +
+1:                             stats[si].getColumnCount() + ")";
+1:                     trace(1, msg + " on table " + stats[si].getTableUUID());
+commit:f422f44
+/////////////////////////////////////////////////////////////////////////
+1:               Property.STORAGE_AUTO_INDEX_STATS_DEBUG_KEEP_DISPOSABLE_STATS);
+commit:f661a5f
+/////////////////////////////////////////////////////////////////////////
+commit:bce78c9
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.sql.dictionary.IndexRowGenerator;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Tells if disposable stats should be generated, which will happen in
+1:      * soft-upgrade mode or when the user asks us to revert to the old behavior.
+1:      * <p>
+1:      * Made public to allow access for CreateIndexConstantAction and
+1:      * FromBaseTable, but this is no longer necessary when the debug property
+1:      * to keep disposable statistics is removed.
+1:      */
+1:     public final boolean skipDisposableStats;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         // For now allow users to override the new behavior through a debug
+1:         // property. Will be removed or renamed in a future release.
+1:         boolean keepDisposableStats = PropertyUtil.getSystemBoolean(
+0:               Property.STORAGE_AUTO_INDEX_STATS_DEBUG_FORCE_OLD_BEHAVIOR);
+1:         this.skipDisposableStats = dbAtLeast10_9(db) && !keepDisposableStats;
+/////////////////////////////////////////////////////////////////////////
+1:     /** Tells if the database is 10.9 or newer. */
+1:     private boolean dbAtLeast10_9(Database db) {
+1:             return db.getDataDictionary().checkVersion(
+1:             // Not expected to happen, but if it does err on the safe-side.
+1:             return false;
+/////////////////////////////////////////////////////////////////////////
+0:                 (cds == null && skipDisposableStats);
+/////////////////////////////////////////////////////////////////////////
+1:                 // Skip non-index conglomerates
+1:                 IndexRowGenerator irg = cds[i].getIndexDescriptor();
+1:                 // Skip single-column unique indexes unless we're told not to,
+1:                 // or we are running in soft-upgrade-mode on a pre 10.9 db.
+1:                 if (skipDisposableStats) {
+1:                     if (irg.isUnique() && irg.numberOfOrderedColumns() == 1) {
+1:                         conglomerateNumber[i] = -1;
+1:                         continue;
+1:                     }
+1:                 }
+1:            
+1:                 indexRow[i] = irg.getNullIndexRow(
+commit:7e33399
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.List;
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+0:      * Tells if the user want us to fall back to pre 10.9 behavior.
+1:      * <p>
+0:      * This means do not drop any disposable statistics, and do not skip
+0:      * statistics for single-column primary key indexes.
+1:      */
+0:     private static final boolean FORCE_OLD_BEHAVIOR =
+0:             PropertyUtil.getSystemBoolean(
+0:               Property.STORAGE_AUTO_INDEX_STATS_DEBUG_FORCE_OLD_BEHAVIOR);
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:     /** Tells if the database is older than 10.9 (for soft upgrade). */
+0:     private final boolean dbIsPre10_9;
+/////////////////////////////////////////////////////////////////////////
+0:         this.dbIsPre10_9 = checkIfDbIsPre10_9(db);
+/////////////////////////////////////////////////////////////////////////
+0:     /** Tells if the database is older than 10.9. */
+0:     private boolean checkIfDbIsPre10_9(Database db) {
+1:         try {
+0:             // Note the negation.
+0:             return !db.getDataDictionary().checkVersion(
+1:                 DataDictionary.DD_VERSION_DERBY_10_9, null);
+1:         } catch (StandardException se) {
+1:             if (SanityManager.DEBUG) {
+1:                 SanityManager.THROWASSERT("dd version check failed", se);
+1:             }
+1:             return true;
+1:         }
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 updateIndexStatsMinion(lcc, td, null, AS_BACKGROUND_TASK);
+/////////////////////////////////////////////////////////////////////////
+1:      * <p>
+1:      * <strong>API note</strong>: Using {@code null} to update the statistics
+1:      * for all conglomerates is preferred over explicitly passing an array with
+1:      * all the conglomerates for the table. Doing so allows for some
+1:      * optimizations, and will cause a disposable statistics check to be
+1:      * performed.
+1:      *      conglomerates will be ignored), {@code null} means all indexes
+/////////////////////////////////////////////////////////////////////////
+0:         final boolean identifyDisposableStats =
+0:                 (cds == null && !FORCE_OLD_BEHAVIOR && !dbIsPre10_9);
+1:         // Fetch descriptors if we're updating statistics for all indexes.
+1:         if (cds == null) {
+1:             cds = td.getConglomerateDescriptors();
+1:         }
+/////////////////////////////////////////////////////////////////////////
+0:         // Check for disposable statistics if we have the required information.
+1:         // Note that the algorithm would drop valid statistics entries if
+1:         // working on a subset of the table conglomerates/indexes.
+1:         if (identifyDisposableStats) {
+0:             List existingStats = td.getStatistics();
+1:             StatisticsDescriptor[] stats = (StatisticsDescriptor[])
+1:                     existingStats.toArray(
+1:                         new StatisticsDescriptor[existingStats.size()]);
+1:             // For now we know that disposable stats only exist in two cases,
+1:             // and that we'll only get one match for both of them per table:
+1:             //  a) orphaned statistics entries (i.e. DERBY-5681)
+0:             //  b) single-column primary keys (TODO: after DERBY-3790 is done)
+1:             for (int si=0; si < stats.length; si++) {
+1:                 UUID referencedIndex = stats[si].getReferenceID();
+1:                 boolean isValid = false;
+1:                 for (int ci=0; ci < conglomerateNumber.length; ci++) {
+0:                     if (conglomerateNumber[ci] == -1) {
+1:                         continue;
+1:                     }
+0:                     if (referencedIndex.equals(objectUUID[ci])) {
+1:                         isValid = true;
+1:                         break;
+1:                     }
+1:                 }
+1:                 // If the statistics entry is orphaned or not required, drop
+1:                 // the statistics entries for this index. Those we really need
+1:                 // will be rebuilt below. We expect this scenario to be rare,
+1:                 // typically you would only see it on upgrades. On the other
+1:                 // hand, this check is cheap enough such that it is feasible to
+1:                 // do it as part of the stats update to get a "self healing"
+1:                 // mechanism in case of another bug like DERBY-5681 in Derby.
+1:                 if (!isValid) {
+1:                     String msg = "dropping disposable statistics entry " +
+0:                             stats[si].getUUID() + " for table " +
+0:                             stats[si].getTableUUID();
+1:                     logAlways(td, null, msg);
+1:                     trace(1, msg);
+1:                     DataDictionary dd = lcc.getDataDictionary();
+1:                     if (!lcc.dataDictionaryInWriteMode()) {
+1:                         dd.startWriting(lcc);
+1:                     }
+1:                     dd.dropStatisticsDescriptors(
+1:                             td.getUUID(), stats[si].getReferenceID(), tc); 
+1:                     if (asBackgroundTask) {
+1:                         lcc.internalCommit(true);
+1:                     }
+1:                 }
+1:             }
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             logAlways(td, t, msg);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Logs the information given.
+1:      *
+1:      * @param td current table descriptor being worked on, may be {@code null}
+1:      * @param t raised error, may be {@code null}
+1:      * @param msg the message to log
+1:      */
+1:     private void logAlways(TableDescriptor td, Throwable t, String msg) {
+1:         PrintWriter pw;
+1:         String hdrMsg = "{istat} " +
+1:                 (td == null ? "" : td.getQualifiedName() + ": ") + msg;
+1:         if (t != null) {
+1:             pw = new PrintWriter(logStream.getPrintWriter(), false);
+1:             pw.print(logStream.getHeader().getHeader());
+1:             pw.println(hdrMsg);
+1:             t.printStackTrace(pw);
+1:             pw.flush();
+1:         } else {
+1:             logStream.printlnWithHeader(hdrMsg);
+commit:ebe4642
+/////////////////////////////////////////////////////////////////////////
+1:         if (!lcc.dataDictionaryInWriteMode()) {
+1:             dd.startWriting(lcc);
+1:         }
+1:         boolean conglomerateGone = false; // invalidation control flag
+/////////////////////////////////////////////////////////////////////////
+1:             conglomerateGone = (cd == null);
+1:         if (!conglomerateGone) {
+1:             // Invalidate statments accessing the given table.
+1:             invalidateStatements(lcc, td, asBackgroundTask);
+1:         }
+/////////////////////////////////////////////////////////////////////////
+1:                 if (!lcc.dataDictionaryInWriteMode()) {
+/////////////////////////////////////////////////////////////////////////
+commit:1b06de6
+/////////////////////////////////////////////////////////////////////////
+commit:b833933
+/////////////////////////////////////////////////////////////////////////
+1:         // Controls execution of last cleanup step outside of the synchronized
+1:         // block. Should only be done once, and this is ensured by the guard on
+1:         // 'queue' and the value of 'daemonDisabled'.
+1:         boolean clearContext = false;
+1:                 clearContext = true;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         // DERBY-5447: Remove the context only after the running daemon thread
+1:         //             (if any) has been shut down to avoid Java deadlocks
+1:         //             when closing the container handles obtained with this
+1:         //             context.
+1:         if (clearContext) {
+1:             // DERBY-5336: Trigger cleanup code to remove the context
+1:             //             from the context service. This pattern was
+1:             //             copied from BasicDaemon.
+1:             ctxMgr.cleanupOnError(StandardException.normalClose(), false);
+1:         }
+commit:c5a7100
+/////////////////////////////////////////////////////////////////////////
+0:                 // DERBY-5336: Trigger cleanup code to remove the context
+0:                 //             from the context service. This pattern was
+0:                 //             copied from BasicDaemon.
+0:                 ctxMgr.cleanupOnError(StandardException.normalClose(), false);
+commit:764b3a0
+/////////////////////////////////////////////////////////////////////////
+1:             sb.append('c').append(timings[i][0]).append('=');
+1:             // Handle corner-case where the scans are aborted due to the
+1:             // index statistics daemon being shut down under us.
+1:             if (timings[i][2] == 0) {
+1:                 sb.append("ABORTED,");   
+1:             } else {
+1:                 long duration = timings[i][2] - timings[i][1];
+1:                 sb.append(duration).append("ms,");
+1:             }
+commit:3a6d457
+/////////////////////////////////////////////////////////////////////////
+1:                         "update scheduled" +
+1:                             : ", reason=[" + schedulingReason + "]") +
+/////////////////////////////////////////////////////////////////////////
+1:             String msg = td.getQualifiedName() + " rejected, ";
+1:                 msg += "daemon disabled";
+1:                 msg += "queue full";
+1:                 msg += "duplicate";
+0:             trace(1, msg);
+/////////////////////////////////////////////////////////////////////////
+1:         trace(1, "processing " + td.getQualifiedName());
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:                     "wrote stats for index "  + 
+0:                     dd.getConglomerateDescriptor(index).getDescriptorName() +
+1:                     " (" + index + "): rows=" + numRows +
+1:                     ", card=" + cardToStr(cardinality));
+/////////////////////////////////////////////////////////////////////////
+1:             trace(1, "swallowed shutdown exception: " + extractIstatInfo(se));
+/////////////////////////////////////////////////////////////////////////
+1:                 log(AS_BACKGROUND_TASK, null, re,
+1:                         "runtime exception during normal operation");
+1:             trace(1, "swallowed runtime exception during shutdown: " +
+1:                     extractIstatInfo(re));
+1:             trace(0, "worker thread exit");
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:                         trace(1, "daemon disabled");
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         trace(0, "explicit run completed" + (runContext != null
+1:                                         ? " (" + runContext + "): "
+1:                                         : ": ") +
+1:                                     td.getQualifiedName());
+/////////////////////////////////////////////////////////////////////////
+1:             trace(1, "swallowed exception during shutdown: " +
+1:                     extractIstatInfo(se));
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private static String extractIstatInfo(Throwable t) {
+1:         String istatClass = IndexStatisticsDaemonImpl.class.getName();
+1:         StackTraceElement[] stack = t.getStackTrace();
+1:         String trace = "<no stacktrace>";
+1:         String sqlState = "";
+1:             if (ste.getClassName().startsWith(istatClass)) {
+/////////////////////////////////////////////////////////////////////////
+1:         if (t instanceof StandardException) {
+1:             sqlState = ", SQLSTate=" + ((StandardException)t).getSQLState();
+1:         }
+1:         return "<" + t.getClass() + ", msg=" + t.getMessage() + sqlState +
+1:                 "> " + trace;
+commit:cd02474
+/////////////////////////////////////////////////////////////////////////
+1:      * <p>
+1:      * This method is run as a background task.
+/////////////////////////////////////////////////////////////////////////
+0:                 updateIndexStatsMinion(lcc, td, cds, AS_BACKGROUND_TASK);
+/////////////////////////////////////////////////////////////////////////
+1:     private boolean isShuttingDown() {
+1:             if (daemonDisabled || daemonLCC == null){
+1:             } else {
+1:                 return !daemonLCC.getDatabase().isActive();
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         ContextService ctxService = null;
+1:         // Implement the outer-level exception handling here.
+1:         try {
+1:             // DERBY-5088: Factory-call may fail.
+0:             ctxService = ContextService.getFactory();
+1:             ctxService.setCurrentContextManager(ctxMgr);
+1:             processingLoop();
+1:         } catch (ShutdownException se) {
+1:             // The database is/has been shut down.
+1:             // Log processing statistics and exit.
+1:             stop();
+1:             ctxMgr.cleanupOnError(se, db.isActive());
+1:         } catch (RuntimeException re) {
+1:             // DERBY-4037
+1:             // Extended filtering of runtime exceptions during shutdown:
+1:             //  o assertions raised by debug jars
+1:             //  o runtime exceptions, like NPEs, raised by production jars -
+1:             //    happens because the background thread interacts with store
+1:             //    on a lower level
+1:             if (!isShuttingDown()) {
+1:                 throw re;
+1:             }
+1:         } finally {
+1:             if (ctxService != null) {
+1:                 ctxService.resetCurrentContextManager(ctxMgr);
+1:             }
+1:             runTime += (System.currentTimeMillis() - runStart);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Main processing loop which will compute statistics until the queue
+1:      * of scheduled work units has been drained.
+1:      */
+1:     private void processingLoop() {
+/////////////////////////////////////////////////////////////////////////
+1:                         "failed to initialize index statistics updater");
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:                         !isShuttingDown()) {
+/////////////////////////////////////////////////////////////////////////
+1:         } else if (isShuttingDown() ||
+1:                 se.getSeverity() >= ExceptionSeverity.DATABASE_SEVERITY) {
+1:             // DERBY-4037: Swallow exceptions raised during shutdown.
+/////////////////////////////////////////////////////////////////////////
+commit:15b7b10
+/////////////////////////////////////////////////////////////////////////
+1:                         break;
+/////////////////////////////////////////////////////////////////////////
+1:                 if (runningThread == null && daemonLCC != null &&
+0:                         !isShuttingDown(daemonLCC)) {
+1:                     // try/catch as safe-guard against shutdown race condition.
+1:                     try {
+1:                         daemonLCC.getTransactionExecute().destroy();
+1:                     } catch (ShutdownException se) {
+1:                         // Ignore
+1:                     }
+commit:299b9e7
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         synchronized (queue) {
+0:             if (daemonDisabled ){
+1:                 return true;
+1:             }
+1:         }
+0:         return !lcc.getDatabase().isActive();
+/////////////////////////////////////////////////////////////////////////
+1:         synchronized (queue) {
+1:             if (!daemonDisabled) {
+commit:127d92a
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         String schedulingReason = td.getIndexStatsUpdateReason();
+commit:7916398
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1: 
+1:    Derby - Class org.apache.derby.impl.services.daemon.IndexStatisticsDaemonImpl
+1: 
+1:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:    contributor license agreements.  See the NOTICE file distributed with
+1:    this work for additional information regarding copyright ownership.
+1:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:    (the "License"); you may not use this file except in compliance with
+1:    the License.  You may obtain a copy of the License at
+1: 
+1:       http://www.apache.org/licenses/LICENSE-2.0
+1: 
+1:    Unless required by applicable law or agreed to in writing, software
+1:    distributed under the License is distributed on an "AS IS" BASIS,
+1:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:    See the License for the specific language governing permissions and
+1:    limitations under the License.
+1: 
+1:  */
+1: package org.apache.derby.impl.services.daemon;
+1: 
+1: import java.io.PrintWriter;
+1: import java.sql.Connection;
+1: import java.util.ArrayList;
+1: 
+1: import org.apache.derby.catalog.UUID;
+1: import org.apache.derby.catalog.types.StatisticsImpl;
+1: import org.apache.derby.iapi.error.StandardException;
+1: import org.apache.derby.iapi.db.Database;
+1: import org.apache.derby.iapi.error.ExceptionSeverity;
+0: import org.apache.derby.iapi.error.ShutdownException;
+1: import org.apache.derby.iapi.reference.Property;
+1: import org.apache.derby.iapi.reference.SQLState;
+1: import org.apache.derby.iapi.services.context.ContextManager;
+1: import org.apache.derby.iapi.services.context.ContextService;
+1: import org.apache.derby.iapi.services.daemon.IndexStatisticsDaemon;
+1: import org.apache.derby.iapi.services.property.PropertyUtil;
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+1: import org.apache.derby.iapi.services.stream.HeaderPrintWriter;
+1: import org.apache.derby.iapi.services.uuid.UUIDFactory;
+1: import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
+1: import org.apache.derby.iapi.sql.depend.DependencyManager;
+1: import org.apache.derby.iapi.sql.dictionary.ConglomerateDescriptor;
+1: import org.apache.derby.iapi.sql.dictionary.DataDictionary;
+1: import org.apache.derby.iapi.sql.dictionary.StatisticsDescriptor;
+1: import org.apache.derby.iapi.sql.dictionary.TableDescriptor;
+1: import org.apache.derby.iapi.sql.execute.ExecIndexRow;
+1: import org.apache.derby.iapi.store.access.ConglomerateController;
+1: import org.apache.derby.iapi.store.access.GroupFetchScanController;
+1: import org.apache.derby.iapi.store.access.ScanController;
+1: import org.apache.derby.iapi.store.access.TransactionController;
+1: import org.apache.derby.iapi.types.DataValueDescriptor;
+1: 
+1: /**
+1:  * Daemon acting as a coordinator for creating and updating index cardinality
+1:  * statistics.
+1:  * <p>
+1:  * The need for updated statistics is currently determined when compiling a
+1:  * SELECT query. The unit of work is then scheduled with this daemon, and the
+1:  * work itself will be carried out in a separate thread. If the worker thread
+1:  * doesn't exist it is created, if it is idle the unit of work will be
+1:  * processed immediately, and if it is busy the unit of work has to wait in the
+1:  * queue.
+1:  * <p>
+1:  * The daemon code has a notion of a background task. If the update is run as a
+1:  * background task, it will try to affect other activity in the Derby database
+1:  * as little as possible. As far as possible, it will not set locks on the
+1:  * conglomerates it scans, and if it needs to take locks it will give up
+1:  * immediately if the locks cannot be obtained. In some cases it will also roll
+1:  * back to release locks already taken, ad then retry. Since we are accessing
+1:  * shared structures the background work may still interfere with the user
+1:  * activity in the database due to locking, but all such operations carried out
+1:  * by the daemon are of short duration.
+1:  * <p>
+1:  * The high level flow of an update to index statistics is:
+1:  * <ol>
+1:  *      <li>schedule update (the only action carried out by the user thread)<li>
+1:  *      <li>for each index:</li>
+1:  *      <ol>
+1:  *          <li>scan index</li>
+1:  *          <li>invalidate statements dependent on current statistics</li>
+1:  *          <li>drop existing statistics</li>
+1:  *          <li>add new statistics</li>
+1:  *      </ol>
+1:  * </ol>
+1:  * <p>
+1:  * List of possible improvements:
+1:  * <ol>
+1:  *      <li>Reduce potential impact of multiple invalidations (per table),
+1:  *          probably by finding a way to invalidate only once after all indexes
+1:  *          for a table have had their statistics updated. So far invalidation
+1:  *          has proven to be the most difficult piece of the puzzle due to the
+1:  *          interaction with the data dictionary and sensitivity to concurrent
+1:  *          activity for the table.</li>
+1:  * </ol>
+1:  * <p>
+1:  * <em>Implementation notes:</em> List of potential cleanups before going into
+1:  * a release:
+1:  * <ol>
+1:  *      <li>Consider removing all tracing code. May involve improving logging
+1:  *          if parts of the trace output is valuable enough.</li>
+1:  * </ol>
+1:  */
+1: public class IndexStatisticsDaemonImpl
+1:         implements IndexStatisticsDaemon, Runnable {
+1: 
+1:     private static final boolean AS_BACKGROUND_TASK = true;
+1:     private static final boolean AS_EXPLICIT_TASK = false;
+1:     /** Maximum number of work units allowed in the queue. */
+1:     // TODO: Replace with constant after testing/tuning phase.
+1:     private static final int MAX_QUEUE_LENGTH;
+1:     static {
+1:         MAX_QUEUE_LENGTH = PropertyUtil.getSystemInt(
+1:                 Property.STORAGE_AUTO_INDEX_STATS_DEBUG_QUEUE_SIZE,
+1:                 Property.STORAGE_AUTO_INDEX_STATS_DEBUG_QUEUE_SIZE_DEFAULT);
+1:     }
+1: 
+1:     private final HeaderPrintWriter logStream;
+1:     /** Tells if logging is enabled. */
+1:     private final boolean doLog;
+0:     // TODO: Consider removing the trace functionality after testing/tuning.
+1:     /** Tells if tracing is enabled. */
+1:     private final boolean doTrace;
+1:     /** Tells if traces are written to the Derby log file. */
+1:     private final boolean traceToDerbyLog;
+1:     /** Tells if traces are written to standard out. */
+1:     private final boolean traceToStdOut;
+1: 
+1:     /** Tells if the daemon has been disabled. */
+1:     // @GuardedBy("queue")
+1:     private boolean daemonDisabled;
+0:     /** Tells if the daemon has been stopped. */
+0:     private volatile boolean daemonStopped;
+1:     /** The context manager for the worker thread. */
+1:     private final ContextManager ctxMgr;
+1:     /** The language connection context for the worker thread. */
+1:     private LanguageConnectionContext daemonLCC;
+1:     /**
+1:      * The database object for the database we are handling automatic index
+1:      * statistics update for.
+1:      */
+1:     private final Database db;
+1:     /** The name of the database owner. */
+1:     private final String dbOwner;
+1:     private final String databaseName;
+1: 
+1:     /**
+1:      * A list of tables that shall have their index statistics updated.
+1:      * Note that the descriptor isn't removed before the work has
+1:      * been completed.
+1:      */
+0:     private final ArrayList queue = new ArrayList(MAX_QUEUE_LENGTH);
+1:     /**
+1:      * The thread in which the index statistics refresh operation is being
+1:      * executed, if any. Created as needed, but there will only be one
+1:      * thread doing the work. The thread is allowed to die since it is assumed
+1:      * that index statistics regeneration is rather infrequent.
+1:      */
+1:     //@GuardedBy("queue")
+1:     private Thread runningThread;
+1: 
+1:     /**
+1:      * Number of consecutive errors, used as a metric to decide if the damoen
+1:      * should be automatically shut down.
+1:      */
+1:     private int errorsConsecutive;
+1:     // Counters used for tracing / logging (wu = work unit).
+1:     private long errorsUnknown;
+1:     private long errorsKnown;
+1:     private long wuProcessed;
+1:     private long wuScheduled;
+1:     private long wuRejectedDup; // Duplicates
+1:     private long wuRejectedFQ; // Full queue
+1:     private long wuRejectedOther; // Daemon disabled
+1: 
+1:     /** Specifies when the daemon was created. */
+1:     private final long timeOfCreation;
+1:     /**
+1:      * The period of time (ms) for which the daemon has been doing active work.
+1:      */
+1:     private long runTime;
+1: 
+1:     /**
+1:      * Creates a new daemon.
+1:      *
+1:      * @param log the log to write to
+1:      * @param doLog whether to log activity information
+1:      * @param traceLevel whether, and to where, trace information should be
+1:      *      written ("off|log|stdout|both")
+1:      * @param db the database ("off|log|stdout|both")
+1:      * @param userName the name of the database owner
+1:      * @param databaseName the name of the database (not stored in the db obj)
+1:      */
+1:     public IndexStatisticsDaemonImpl(HeaderPrintWriter log, boolean doLog,
+1:                                      String traceLevel, Database db,
+1:                                      String userName, String databaseName) {
+1:         // Make sure we can log errors.
+1:         if (log == null) {
+1:             throw new IllegalArgumentException("log stream cannot be null");
+1:         }
+1:         // Configure logging/tracing
+1:         this.logStream = log;
+1:         this.doLog = doLog;
+1:         this.traceToDerbyLog = (traceLevel.equalsIgnoreCase("both") ||
+1:                 traceLevel.equalsIgnoreCase("log"));
+1:         this.traceToStdOut = (traceLevel.equalsIgnoreCase("both") ||
+1:                 traceLevel.equalsIgnoreCase("stdout"));
+1:         this.doTrace = traceToDerbyLog || traceToStdOut;
+1: 
+1:         this.db = db;
+1:         this.dbOwner = userName;
+1:         this.databaseName = databaseName;
+0:         this.ctxMgr = ContextService.getFactory().newContextManager();
+1:         this.timeOfCreation = System.currentTimeMillis();
+1:         trace(0, "created{log=" + doLog + ", traceLog=" +
+1:                 traceToDerbyLog + ", traceOut=" + traceToStdOut +
+0:                 /* Will be fixed by DERBY-4936.
+1:                 ", createThreshold=" +
+1:                 TableDescriptor.ISTATS_CREATE_THRESHOLD +
+1:                 ", absdiffThreshold=" +
+1:                 TableDescriptor.ISTATS_ABSDIFF_THRESHOLD +
+1:                 ", lndiffThreshold=" +
+1:                 TableDescriptor.ISTATS_LNDIFF_THRESHOLD +
+1:                 */
+1:                 ", queueLength=" + MAX_QUEUE_LENGTH +
+1:                 "}) -> " + databaseName);
+1:     }
+1: 
+1:     /**
+1:      * Schedules an update of the index statistics for the specified table.
+1:      * <p>
+1:      * Assume the descriptor will be valid until we get around to generate
+1:      * the statistics. If it turns out to be invalid, it will be discarded.
+1:      *
+1:      * @param td base table descriptor to update index statistics for
+1:      */
+1:     public void schedule(TableDescriptor td) {
+0:         // TODO: Will be fixed in DERBY-4936.
+0:         String schedulingReason = null; // td.getIndexStatsUpdateReason();
+0:         trace(0, "scheduling " + td.getQualifiedName() +
+1:                     (schedulingReason == null
+1:                         ? ""
+0:                         : " reason=[" + schedulingReason + "]"));
+1:         synchronized (queue) {
+1:             if (acceptWork(td)) {
+1:                 // Add the work description for the given table.
+1:                 queue.add(td);
+1:                 wuScheduled++;
+1:                 log(AS_BACKGROUND_TASK, td,
+0:                         "update scheduled - " + td.getUUID() +
+1:                         (schedulingReason == null
+1:                             ? ""
+0:                             : " reason=[" + schedulingReason + "]") +
+1:                         " (queueSize=" + queue.size() + ")");
+1:                 // If we're idle, fire off the worker thread.
+1:                 if (runningThread == null) {
+0:                     runningThread = new Thread(this, "index-stat-thread");
+0:                     // Make the thread a daemon thread, we don't want it to stop
+0:                     // the JVM from exiting. This is a precaution.
+0:                     runningThread.setDaemon(true);
+1:                     runningThread.start();
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Determines if the given work can be accepted.
+1:      *
+1:      * @param td the table descriptor to check
+1:      * @return {@code true} if work can be accepted, {@code false} if not.
+1:      */
+1:     //@GuardedBy("queue")
+1:     private boolean acceptWork(TableDescriptor td) {
+1:         // Don't allow unbounded growth.
+1:         boolean accept = !(daemonDisabled || queue.size() >= MAX_QUEUE_LENGTH);
+1:         if (accept && !queue.isEmpty()) {
+1:             // See if work is already scheduled for this table. If so, we
+1:             // give the already scheduled or in progress task precedence.
+1:             String table = td.getName();
+1:             String schema = td.getSchemaName();
+1:             // Since the queue size is limited, iterating through it to find
+1:             // duplicates should yield acceptable performance. Also, we don't
+1:             // look for duplicates if the queue is already full.
+1:             for (int i=0; i < queue.size(); i++) {
+0:                 TableDescriptor work = (TableDescriptor)queue.get(i);
+1:                 if (work.tableNameEquals(table, schema)) {
+1:                     accept = false;
+1:                     break;
+1:                 }
+1:             }
+1:         }
+1: 
+1:         // If the work was rejected, trace it.
+1:         if (!accept) {
+1:             if (daemonDisabled) {
+1:                 wuRejectedOther++;
+0:                 trace(1, "daemon disabled - work not scheduled");
+1:             } else if (queue.size() >= MAX_QUEUE_LENGTH) {
+1:                 wuRejectedFQ++;
+0:                 trace(1, "queue full - work not scheduled");
+1:             } else {
+1:                 wuRejectedDup++;
+0:                 trace(1, "duplicate found - not scheduled");
+1:             }
+1:         }
+1:         return accept;
+1:     }
+1: 
+1:     /**
+1:      * Generates index statistics for all indexes associated with the given
+1:      * table descriptor.
+1:      *
+1:      * @param lcc connection context to use to perform the work
+1:      * @param td target base table descriptor
+1:      * @throws StandardException if accessing the conglomerates fail
+1:      */
+1:     private void generateStatistics(LanguageConnectionContext lcc,
+1:                                     TableDescriptor td)
+1:             throws StandardException {
+0:         trace(0, "generateStatistics::start {" + td.getQualifiedName() + "}");
+1:         boolean lockConflictSeen = false;
+1:         while (true) {
+1:             try {
+0:                 ConglomerateDescriptor[] cds = td.getConglomerateDescriptors();
+0:                 updateIndexStatsMinion(lcc, td, cds, AS_BACKGROUND_TASK);
+1:                 break;
+1:             } catch (StandardException se) {
+1:                 // At this level, we retry the whole operation. If this happens,
+1:                 // it normally means that a lengthy operation, or possibly DDL,
+1:                 // is taking place (for instance compress table). We retry only
+1:                 // once, but wait rather long before doing so.
+1:                 // Note that some lower level operations may have tried to
+1:                 // aquire the locks several times already, and we may not be
+1:                 // able to complete the work if we get here.
+0:                 if (SQLState.LOCK_TIMEOUT.equals(se.getMessageId()) &&
+0:                         !lockConflictSeen) {
+1:                     trace(1, "locks unavailable, retrying");
+1:                     lockConflictSeen = true;
+1:                     lcc.internalRollback(); // Get rid of any locks
+1:                     sleep(1000);
+1:                 } else {
+1:                     // Rethrow exception, because:
+1:                     //   o error is not a lock timeout
+1:                     //           - or -
+1:                     //   o too many lock timeouts
+1:                     // Transaction will be cleaned up elsewhere.
+1:                     throw se;
+1:                 }
+1:             }
+1:         }
+0:         trace(0, "generateStatistics::end");
+1:     }
+1: 
+1:     /**
+1:      * Updates the index statistics for the given table and the specified
+1:      * indexes.
+1:      *
+0:      * @param lcc language connection context used to perform the work
+0:      * @param td the table to update index stats for
+0:      * @param cds the conglomerates to update statistics for (non-index
+0:      *      conglomerates will be ignored)
+0:      * @param asBackgroundTask whether the updates are done automatically as
+1:      *      part of a background task or if explicitly invoked by the user
+0:      * @throws StandardException if something goes wrong
+1:      */
+1:     private void updateIndexStatsMinion(LanguageConnectionContext lcc,
+1:                                         TableDescriptor td,
+1:                                         ConglomerateDescriptor[] cds,
+1:                                         boolean asBackgroundTask)
+1:             throws StandardException {
+1:         // Extract/derive information from the table descriptor
+0:         long[] conglomerateNumber = new long[cds.length];
+0:         ExecIndexRow[] indexRow = new ExecIndexRow[cds.length];
+0:         UUID[] objectUUID = new UUID[cds.length];
+1: 
+1:         TransactionController tc = lcc.getTransactionExecute();
+1:         ConglomerateController heapCC =
+1:             tc.openConglomerate(td.getHeapConglomerateId(), false,
+1:                     0,
+1:                     TransactionController.MODE_RECORD,
+1:                     asBackgroundTask
+1:                         ? TransactionController.ISOLATION_READ_UNCOMMITTED
+1:                         : TransactionController.ISOLATION_REPEATABLE_READ
+1:                 );
+1:         try
+1:         {
+1:             for (int i = 0; i < cds.length; i++)
+1:             {
+1:                 if (!cds[i].isIndex())
+1:                 {
+1:                     conglomerateNumber[i] = -1;
+1:                     continue;
+1:                 }
+1: 
+0:                 conglomerateNumber[i] = cds[i].getConglomerateNumber();
+1: 
+0:                 objectUUID[i] = cds[i].getUUID();
+1: 
+0:                 indexRow[i] =
+0:                     cds[i].getIndexDescriptor().getNullIndexRow(
+1:                         td.getColumnDescriptorList(),
+1:                         heapCC.newRowLocationTemplate());
+1:             }
+1:         }
+1:         finally
+1:         {
+1:             heapCC.close();
+1:         }
+1: 
+1:         // [x][0] = conglomerate number, [x][1] = start time, [x][2] = stop time
+1:         long[][] scanTimes = new long[conglomerateNumber.length][3];
+0:         int sci = 0;
+1:         for (int indexNumber = 0;
+1:              indexNumber < conglomerateNumber.length;
+1:              indexNumber++)
+1:         {
+1:             if (conglomerateNumber[indexNumber] == -1)
+1:                 continue;
+1:             // Check if daemon has been disabled.
+1:             if (asBackgroundTask) {
+1:                 synchronized (queue) {
+1:                     if (daemonDisabled) {
+1:                         break;
+1:                     }
+1:                 }
+1:             }
+1: 
+1:             scanTimes[sci][0] = conglomerateNumber[indexNumber];
+1:             scanTimes[sci][1] = System.currentTimeMillis();
+1:             // Subtract one for the RowLocation added for indexes.
+0:             int numCols = indexRow[indexNumber].nColumns() - 1;
+0:             long[] cardinality = new long[numCols];
+0:             KeyComparator cmp = new KeyComparator(indexRow[indexNumber]);
+1: 
+1:             /* Read uncommitted, with record locking. Actually CS store may
+1:                not hold record locks */
+1:             GroupFetchScanController gsc =
+1:                 tc.openGroupFetchScan(
+1:                         conglomerateNumber[indexNumber],
+1:                         false,  // hold
+1:                         0,
+1:                         TransactionController.MODE_RECORD, // locking
+1:                         TransactionController.ISOLATION_READ_UNCOMMITTED,
+1:                         null,   // scancolumnlist-- want everything.
+1:                         null,   // startkeyvalue-- start from the beginning.
+1:                         0,
+1:                         null,   // qualifiers, none!
+1:                         null,   // stopkeyvalue,
+1:                         0);
+1: 
+1:             try
+1:             {
+0:                 int rowsFetched = 0;
+1:                 while ((rowsFetched = cmp.fetchRows(gsc)) > 0)
+1:                 {
+1:                     for (int i = 0; i < rowsFetched; i++)
+1:                     {
+1:                         int whichPositionChanged = cmp.compareWithPrevKey(i);
+1:                         if (whichPositionChanged >= 0) {
+1:                             for (int j = whichPositionChanged; j < numCols; j++)
+1:                                 cardinality[j]++;
+1:                         }
+1:                     }
+1:                 } // while
+1:                 gsc.setEstimatedRowCount(cmp.getRowCount());
+1:             } // try
+1:             finally
+1:             {
+1:                 gsc.close();
+1:                 gsc = null;
+1:             }
+1:             scanTimes[sci++][2] = System.currentTimeMillis();
+1:             // We have scanned the indexes, so let's give this a few attempts
+1:             // before giving up.
+1:             int retries = 0;
+1:             while (true) {
+1:                 try {
+0:                     writeUpdatedStats(lcc, td, objectUUID[indexNumber],
+1:                             cmp.getRowCount(), cardinality, asBackgroundTask);
+1:                     break;
+1:                 } catch (StandardException se) {
+1:                     retries++;
+0:                     if (SQLState.LOCK_TIMEOUT.equals(se.getMessageId()) &&
+0:                             retries < 3) {
+1:                         trace(2, "lock timeout when writing stats, retrying");
+1:                         sleep(100*retries);
+1:                     } else {
+1:                         // Rethrow exception, because:
+1:                         //   o error is not a lock timeout
+1:                         //           - or -
+1:                         //   o too many lock timeouts
+1:                         throw se;
+1:                     }
+1:                 }
+1:             }
+1:         }
+1:         log(asBackgroundTask, td, fmtScanTimes(scanTimes));
+1:     }
+1: 
+1:     /**
+1:      * Writes updated statistics for the specified index to the data dictionary.
+1:      *
+1:      * @param lcc connection context to use to perform the work
+1:      * @param td the base table
+1:      * @param index the index of the base table
+1:      * @param numRows number of rows in the base table
+1:      * @param cardinality the number of unique values in the index (per number
+1:      *      of leading columns)
+1:      * @param asBackgroundTask whether the update is done automatically as
+1:      *      part of a background task or if explicitly invoked by the user
+1:      * @throws StandardException if updating the data dictionary fails
+1:      */
+1:     private void writeUpdatedStats(LanguageConnectionContext lcc,
+1:                                    TableDescriptor td, UUID index,
+1:                                    long numRows, long[] cardinality,
+1:                                    boolean asBackgroundTask)
+1:             throws StandardException {
+1:         TransactionController tc = lcc.getTransactionExecute();
+1:         trace(1, "writing new stats (xid=" + tc.getTransactionIdString() + ")");
+1:         UUID table = td.getUUID();
+1:         DataDictionary dd = lcc.getDataDictionary();
+1:         UUIDFactory uf = dd.getUUIDFactory();
+1: 
+1:         // Update the heap row count estimate.
+1:         setHeapRowEstimate(tc, td.getHeapConglomerateId(), numRows);
+0:         // Invalidate statments accessing the given table.
+0:         // Note that due to retry logic, swithcing the data dictionary to
+0:         // write mode is done inside invalidateStatements.
+0:         invalidateStatements(lcc, td, asBackgroundTask);
+1:         // Drop existing index statistics for this index.
+1:         dd.dropStatisticsDescriptors(table, index, tc);
+1: 
+1:         // Don't write statistics if the table is empty.
+1:         if (numRows == 0) {
+1:             trace(2, "empty table, no stats written");
+1:         } else {
+1:             // Construct and add the statistics entries.
+1:             for (int i=0; i < cardinality.length; i++) {
+1:                 StatisticsDescriptor statDesc = new StatisticsDescriptor(
+1:                         dd, uf.createUUID(), index, table, "I",
+1:                      new StatisticsImpl(numRows, cardinality[i]),
+1:                      i+1);
+1:                 dd.addDescriptor(statDesc, null,
+1:                         DataDictionary.SYSSTATISTICS_CATALOG_NUM, true, tc);
+1:             }
+1: 
+1:             // Log some information.
+1:             log(asBackgroundTask, td,
+0:                     "wrote stats for index " + index + " (rows=" + numRows +
+0:                     ", card=" + cardToStr(cardinality) + ")");
+1:         }
+1: 
+1:         // Only commit tx as we go if running as background task.
+1:         if (asBackgroundTask) {
+1:             lcc.internalCommit(true);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Performs an invalidation action for the given table (the event being
+1:      * statistics update).
+1:      *
+1:      * @param lcc connection context to use to perform the work
+1:      * @param td the table to invalidate for
+1:      * @param asBackgroundTask whether the update is done automatically as
+1:      *      part of a background task or if explicitly invoked by the user
+1:      * @throws StandardException if the invalidation request fails
+1:      */
+1:     private void invalidateStatements(LanguageConnectionContext lcc,
+1:                                       TableDescriptor td,
+1:                                       boolean asBackgroundTask)
+1:             throws StandardException {
+1:         // Invalidate compiled statements accessing the table.
+1:         DataDictionary dd = lcc.getDataDictionary();
+1:         DependencyManager dm = dd.getDependencyManager();
+0:         boolean inWrite = false;
+1:         int retries = 0;
+1:         while (true) {
+1:             try {
+0:                 if (!inWrite) {
+1:                     dd.startWriting(lcc);
+0:                     inWrite = true;
+1:                 }
+1:                 dm.invalidateFor(
+1:                         td, DependencyManager.UPDATE_STATISTICS, lcc);
+1:                 trace(1, "invalidation completed");
+1:                 break;
+1:             } catch (StandardException se) {
+1:                 // Special handling when running as background task.
+0:                 if (SQLState.LOCK_TIMEOUT.equals(se.getMessageId()) &&
+0:                         asBackgroundTask && retries < 3) {
+1:                     retries++;
+1:                     // If this is the first time we retry, don't roll back.
+1:                     // If we already waited once, but still didn't get the
+1:                     // locks, back down by releasing our own locks.
+1:                     if (retries > 1) {
+1:                         trace(2, "releasing locks");
+1:                         lcc.internalRollback();
+0:                         inWrite = false;
+1:                     }
+1:                     trace(2, "lock timeout when invalidating");
+1:                     sleep(100*(1+retries)); // adaptive sleeping...
+1:                 } else {
+1:                     // Throw exception because of one of:
+1:                     //  o it isn't a lock timeout
+1:                     //          - or -
+1:                     //  o we gave up retrying
+1:                     //          - or -
+1:                     //  o we are running in explicit mode
+1:                     trace(1, "invalidation failed");
+1:                     throw se;
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Sets the row estimate for the heap conglomerate.
+1:      *
+1:      * @param tc transaction to use
+1:      * @param tableId the heap table
+1:      * @param rowEstimate estimate of number of rows in the table
+1:      * @throws StandardException if accessing the table fails
+1:      */
+1:     private void setHeapRowEstimate(TransactionController tc, long tableId,
+1:                                     long rowEstimate)
+1:             throws StandardException {
+1:         // DERBY-4116: If we know the row count, update the store estimated row
+1:         // count for the table.
+1:         ScanController sc = tc.openScan(
+1:                 tableId,
+1:                 false,  // hold
+1:                 0,      // openMode: for read
+1:                 TransactionController.MODE_RECORD, // locking
+1:                 TransactionController.ISOLATION_READ_UNCOMMITTED, //iso level
+1:                 null,   // scancolumnlist-- want everything.
+1:                 null,   // startkeyvalue-- start from the beginning.
+1:                 0,
+1:                 null,   // qualifiers, none!
+1:                 null,   // stopkeyvalue,
+1:                 0);
+1: 
+1:         try {
+1:             sc.setEstimatedRowCount(rowEstimate);
+1:         } finally {
+1:             sc.close();
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Drives the statistics generation.
+1:      * <p>
+1:      * This method will be run in a separate thread, and it will keep working
+1:      * as long as there is work to do. When the queue is exhausted, the method
+1:      * will exit (the thread dies).
+1:      */
+1:     public void run() {
+1:         final long runStart = System.currentTimeMillis();
+0:         final ContextService ctxService = ContextService.getFactory();
+0:         ctxService.setCurrentContextManager(ctxMgr);
+1:         // If we don't have a connection to the database, create one.
+1:         if (daemonLCC == null) {
+1:             try {
+1:                 daemonLCC =
+1:                         db.setupConnection(ctxMgr, dbOwner, null, databaseName);
+0:                 trace(1, "got database connection");
+1:                 // Initialize the lcc/transaction.
+1:                 // TODO: Would be nice to name the transaction.
+1:                 daemonLCC.setIsolationLevel(
+1:                         Connection.TRANSACTION_READ_UNCOMMITTED);
+1:                 // Don't wait for any locks.
+1:                 daemonLCC.getTransactionExecute().setNoLockWait(true);
+1:             } catch (StandardException se) {
+1:                 log(AS_BACKGROUND_TASK, null, se,
+0:                         "failed to setup index statistics updater");
+0:                 ctxService.resetCurrentContextManager(ctxMgr);
+1:                 return;
+1:             }
+1:         }
+1: 
+1:         TransactionController tc = null;
+1:         try {
+1:             tc = daemonLCC.getTransactionExecute();
+1:             trace(0, "worker thread started (xid=" +
+1:                     tc.getTransactionIdString() + ")");
+1: 
+1:             TableDescriptor td = null;
+1:             long start = 0;
+1:             while (true) {
+1:                 synchronized (queue) {
+1:                     if (daemonDisabled) {
+1:                         // Clean the lcc and exit.
+1:                         try {
+1:                             tc.destroy();
+1:                         } catch (ShutdownException se) {
+1:                             // Ignore
+1:                         }
+1:                         tc = null;
+1:                         daemonLCC = null;
+1:                         queue.clear();
+1:                     }
+1:                     if (queue.isEmpty()) {
+1:                         trace(1, "queue empty");
+1:                         break;
+1:                     }
+0:                     td = (TableDescriptor)queue.get(0);
+1:                 }
+1:                 try {
+1:                     start = System.currentTimeMillis();
+0:                     log(AS_BACKGROUND_TASK, td, "generating index statistics");
+1:                     generateStatistics(daemonLCC, td);
+1:                     wuProcessed++;
+1:                     // Reset consecutive error counter.
+1:                     errorsConsecutive = 0;
+1:                     log(AS_BACKGROUND_TASK, td, "generation complete (" +
+1:                             ((System.currentTimeMillis() - start))  + " ms)");
+1:                 } catch (StandardException se) {
+1:                     errorsConsecutive++;
+1:                     // Assume handling of fatal errors will clean up properly.
+1:                     // For less severe errors, rollback tx to clean up.
+1:                     if (!handleFatalErrors(ctxMgr, se)) {
+1:                         boolean handled = handleExpectedErrors(td, se);
+1:                         if (!handled) {
+1:                             handled = handleUnexpectedErrors(td, se);
+1:                         }
+1:                         daemonLCC.internalRollback();
+1:                         if (SanityManager.DEBUG) {
+1:                             SanityManager.ASSERT(handled);
+1:                         }
+1:                     }
+1:                 } finally {
+1:                     // Whatever happened, discard the unit of work.
+1:                     synchronized (queue) {
+1:                         // Queue may have been cleared due to shutdown.
+1:                         if (!queue.isEmpty()) {
+1:                             queue.remove(0);
+1:                         }
+1:                     }
+1:                     // If we have seen too many consecutive errors, disable
+1:                     // the daemon. 50 was chosen based on gut-feeling...
+1:                     // Hopefully it can withstand shortlived "hick-ups", but
+1:                     // will cause shutdown if there is a real problem.
+1:                     // Create an exception to force logging of the message.
+1:                     if (errorsConsecutive >= 50) {
+1:                         log(AS_BACKGROUND_TASK, null,
+1:                                 new IllegalStateException("degraded state"),
+1:                                 "shutting down daemon, " + errorsConsecutive +
+1:                                 " consecutive errors seen");
+1:                         stop();
+1:                     }
+1:                 }
+1:             }
+0:             trace(0, "run::normal_exit");
+1:         } catch (StandardException se) {
+1:             log(AS_BACKGROUND_TASK, null, se, "thread died");
+1:             // Do nothing, just let the thread die.
+1:         } catch (ShutdownException se) {
+0:             stop(); // Call stop to log activity statistics.
+0:             ctxMgr.cleanupOnError(se);
+1:         } finally {
+1:             synchronized (queue) {
+1:                 runningThread = null;
+1:             }
+1:             if (daemonLCC != null && !daemonLCC.isTransactionPristine()) {
+1:                 if (SanityManager.DEBUG) {
+1:                     SanityManager.THROWASSERT("transaction not pristine");
+1:                 }
+1:                 log(AS_BACKGROUND_TASK, null,
+1:                         "transaction not pristine - forcing rollback");
+1:                 try {
+1:                     daemonLCC.internalRollback();
+1:                 } catch (StandardException se) {
+1:                     // Log, then continue.
+1:                     log(AS_BACKGROUND_TASK, null, se, "forced rollback failed");
+1:                 }
+1:             }
+0:             ctxService.resetCurrentContextManager(ctxMgr);
+0:             runTime += (System.currentTimeMillis() - runStart);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Runs the statistics update sequence explicitly as requested by the user.
+1:      *
+1:      * @param lcc connection context to use to perform the work
+1:      * @param td the base table
+1:      * @param cds the indexes to update (non-index conglomerates are ignored)
+1:      * @param runContext the context in which the operation is run (i.e.
+1:      *      'ALTER TABLE', may be {@code null})
+1:      * @throws StandardException if updating the index statistics fails
+1:      */
+1:     public void runExplicitly(LanguageConnectionContext lcc,
+1:                               TableDescriptor td,
+1:                               ConglomerateDescriptor[] cds,
+1:                               String runContext)
+1:             throws StandardException {
+0:         trace(0, "explicit run" + (runContext != null
+0:                                         ? " (" + runContext + "): "
+0:                                         : ":") +
+0:                                     td.getQualifiedName());
+1:         updateIndexStatsMinion(lcc, td, cds, AS_EXPLICIT_TASK);
+1:     }
+1: 
+1:     /**
+1:      * Stops the daemon.
+1:      * <p>
+1:      * Will also clear the queue and print runtime statistics to the log the
+1:      * first time the method is invoked.
+1:      */
+1:     public void stop() {
+0:         if (!daemonStopped) {
+0:             daemonStopped = true;
+1:             synchronized (queue) {
+1:                 StringBuffer sb = new StringBuffer(100);
+1:                 sb.append("stopping daemon, active=").
+1:                         append(runningThread != null).
+1:                         append(", work/age=").append(runTime).append('/').
+1:                         append(System.currentTimeMillis() - timeOfCreation).
+1:                         append(' ');
+1:                 appendRunStats(sb);
+1:                 log(AS_BACKGROUND_TASK, null, sb.toString());
+1:                 // If there is no running thread and the daemon lcc is still
+1:                 // around, destroy the transaction and clear the lcc reference.
+0:                 if (runningThread == null && daemonLCC != null) {
+0:                     daemonLCC.getTransactionExecute().destroy();
+1:                     daemonLCC = null;
+1:                 }
+1:                 daemonDisabled = true;
+1:                 runningThread = null;
+1:                 queue.clear();
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Handles fatal errors that will cause the daemon to be shut down.
+1:      *
+1:      * @param cm context manager
+1:      * @param se the exception to handle
+1:      * @return {@code true} if the error was handled, {@code false} otherwise
+1:      */
+1:     private boolean handleFatalErrors(ContextManager cm, StandardException se) {
+1:         boolean disable = false;
+1:         if (SQLState.DATA_CONTAINER_READ_ONLY.equals(se.getMessageId())) {
+1:             // We are not allowed to write into the database, most likely the
+1:             // data dictionary. No point to keep doing work we can't gain from.
+1:             disable = true;
+0:         } else if (se.getSeverity() >= ExceptionSeverity.DATABASE_SEVERITY) {
+1:             // The database or system is going down. Probably handled elsewhere
+1:             // but disable daemon anyway.
+1:             disable = true;
+0:             cm.cleanupOnError(se);
+1:         }
+1: 
+1:         if (disable) {
+1:             daemonLCC.getDataDictionary().disableIndexStatsRefresher();
+1:             stop();
+1:         }
+1:         return disable;
+1:     }
+1: 
+1:     /**
+1:      * Handles expected errors.
+1:      * <p>
+1:      * The logging of expected errors is for observability purposes only. The
+1:      * daemon is capable of dealing with these errors, and no interaction from
+1:      * the user is expected.
+1:      *
+1:      * @param se the exception to handle
+1:      * @return {@code true} if the error was handled, {@code false} otherwise
+1:      */
+1:     private boolean handleExpectedErrors(TableDescriptor td,
+1:                                          StandardException se) {
+1:         String state = se.getMessageId();
+1:         // Accept that the heap/index/conglomerate has been deleted since the
+1:         // work for it was scheduled. Just ignore the unit of work and continue.
+1:         if (SQLState.STORE_CONGLOMERATE_DOES_NOT_EXIST.equals(state) ||
+0:                 SQLState.HEAP_CONTAINER_NOT_FOUND.equals(state) ||
+0:                 SQLState.FILE_IO_INTERRUPTED.equals(state) ||
+0:                 SQLState.LOCK_TIMEOUT.equals(state)) {
+1:             errorsKnown++;
+1:             log(AS_BACKGROUND_TASK, td, "generation aborted (reason: " +
+1:                     state + ") {" + extractIstatInfo(se) + "}");
+0:             trace(1, "top level expected exception: " + extractIstatInfo(se));
+1:             return true;
+1:         }
+1:         return false;
+1:     }
+1: 
+1:     /**
+1:      * Handles unexpected errors.
+1:      * <p>
+1:      * Unexpected errors are error conditions the daemon isn't set up to handle
+1:      * specifically. For this reason the stack trace will be logged to allow
+1:      * for later investigation.
+1:      * <p>
+1:      * In general it is expected that the daemon will be able to recover by
+1:      * dropping the current unit of work and move on to the next one (if any).
+1:      *
+1:      * @param se the exception to handle
+1:      * @return {@code true} if the error was handled, {@code false} otherwise
+1:      */
+1:     private boolean handleUnexpectedErrors(TableDescriptor td,
+1:                                            StandardException se) {
+1:         errorsUnknown++;
+1:         log(AS_BACKGROUND_TASK, td, se, "generation failed");
+1:         return true;
+1:     }
+1: 
+1:     /**
+1:      * Puts the current thread to sleep for maximum {@code ms} milliseconds.
+1:      * <p>
+1:      * No guarantee is provided for the minimum amount of time slept. If
+1:      * interrupted, the interrupt flag will be set again.
+1:      *
+1:      * @param ms target sleep time
+1:      */
+1:     private static void sleep(long ms) {
+1:         try {
+1:             Thread.sleep(ms);
+1:         } catch (InterruptedException ie) {
+0:             // Set the interrupt flag again.
+0:             Thread.currentThread().interrupt();
+1:         }
+1:     }
+1: 
+1:     /** Format array of scan durations as a string. */
+1:     private static String fmtScanTimes(long[][] timings) {
+1:         // timings[x] = [conglomId, start, end]
+1:         StringBuffer sb = new StringBuffer("scan durations (");
+1:         for (int i=0; i < timings.length && timings[i][0] > 0; i++) {
+0:             long duration = timings[i][2] - timings[i][1];
+0:             sb.append('c').append(timings[i][0]).append('=').append(duration).
+0:                     append("ms,");
+1:         }
+1:         sb.deleteCharAt(sb.length() -1).append(")");
+1:         return sb.toString();
+1:     }
+1: 
+1:     /** @see #log(boolean, TableDescriptor, Throwable, String)  */
+1:     private void log(boolean asBackgroundTask, TableDescriptor td, String msg) {
+1:         log(asBackgroundTask, td, null, msg);
+1:     }
+1: 
+1:     /**
+1:      * Logs the information given.
+1:      * <p>
+1:      * Note that if {@code asBackgroundTask} is false, nothing will be logged
+1:      * currently.
+1:      *
+1:      * @param asBackgroundTask {@code true} if logging for the background
+1:      *      daemon automatically updating stats, {@code false} if not
+1:      * @param td current table descriptor being worked on, may be {@code null}
+1:      * @param t raised error, may be {@code null}
+1:      * @param msg the message to log
+1:      */
+1:     private void log(boolean asBackgroundTask, TableDescriptor td, Throwable t,
+1:             String msg) {
+1:         if (asBackgroundTask && (doLog || t != null)) {
+0:             PrintWriter pw = null;
+0:             String hdrMsg = "{istat} " +
+0:                     (td == null ? "" : td.getQualifiedName() + ": ") + msg;
+0:             if (t != null) {
+0:                 pw = new PrintWriter(logStream.getPrintWriter(), false);
+0:                 pw.print(logStream.getHeader().getHeader());
+0:                 pw.println(hdrMsg);
+0:                 t.printStackTrace(pw);
+0:                 pw.flush();
+1:             } else {
+0:                 logStream.printlnWithHeader(hdrMsg);
+1:             }
+1:         }
+1:     }
+1: 
+1:     // @GuardedBy("this")
+1:     private final StringBuffer tsb = new StringBuffer();
+1:     private synchronized void trace(int indentLevel, String msg) {
+1:         if (doTrace) {
+1:             tsb.setLength(0);
+1:             tsb.append("{istat,trace@").append(hashCode()).append("} ");
+1:             for (int i=0; i < indentLevel; i++) {
+1:                 tsb.append("    ");
+1:             }
+1:             tsb.append(msg).append(' ');
+1:             if (indentLevel == 0) {
+1:                 appendRunStats(tsb);
+1:             }
+1:             if (traceToDerbyLog && logStream != null) {
+1:                 logStream.printlnWithHeader(tsb.toString());
+1:             }
+1:             if (traceToStdOut) {
+1:                 System.out.println(tsb.toString());
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Appends runtime statistics to the given string buffer.
+1:      *
+1:      * @param sb the string buffer to append to
+1:      */
+1:     // @GuardedBy("queue")
+1:     private void appendRunStats(StringBuffer sb) {
+1:         // Print rather detailed and cryptic stats.
+1:         sb.append("[q/p/s=").append(queue.size()). // current queue size
+1:                 append('/').append(wuProcessed). // scheduled
+1:                 append('/').append(wuScheduled). //processed
+1:                 append(",err:k/u/c=").
+1:                 append(errorsKnown). // known errors
+1:                 append('/').append(errorsUnknown). // unexpected errors
+1:                 append('/').append(errorsConsecutive). // consecutive errors
+1:                 append(",rej:f/d/o=").
+1:                 append(wuRejectedFQ). // rejected, full queue
+1:                 append('/').append(wuRejectedDup). // rejected, duplicate
+1:                 append('/').append(wuRejectedOther). // rejected, other
+1:                 append(']');
+1:     }
+1: 
+1:     /**
+1:      * Produces a textual representation of the cardinality numbers.
+1:      *
+1:      * @param cardinality index cardinality
+1:      * @return A string.
+1:      */
+1:     private static String cardToStr(long[] cardinality) {
+1:         if (cardinality.length == 1) {
+1:             return "[" + Long.toString(cardinality[0]) + "]";
+1:         } else {
+1:             StringBuffer sb = new StringBuffer("[");
+1:             for (int i=0; i < cardinality.length; i++) {
+1:                 sb.append(cardinality[i]).append(',');
+1:             }
+1:             sb.deleteCharAt(sb.length() -1).append(']');
+1:             return sb.toString();
+1:         }
+1:     }
+1: 
+1:     /** Purely for debugging, to avoid printing too much info. */
+0:     private static String extractIstatInfo(StandardException se) {
+0:         StackTraceElement[] stack = se.getStackTrace();
+0:         String trace = "<n/a>";
+1:         for (int i=0; i < stack.length ; i++) {
+1:             StackTraceElement ste = stack[i];
+0:             if (IndexStatisticsDaemonImpl.class.getName().equals(
+0:                     ste.getClassName())) {
+1:                 trace = ste.getMethodName() + "#" + ste.getLineNumber();
+1:                 if (i > 0) {
+1:                     ste = stack[i -1];
+1:                     trace += " -> " + ste.getClassName() + "." +
+1:                             ste.getMethodName() + "#" + ste.getLineNumber();
+1:                 }
+1:                 break;
+1:             }
+1:         }
+0:         return trace + " got " + se.getSQLState() +
+0:                 " (" +  se.getMessage() + ")";
+1:     }
+1: 
+1:     /**
+1:      * Support class used to compare keys when scanning indexes.
+1:      */
+1:     //@NotThreadSafe
+1:     private static class KeyComparator {
+1: 
+1:         /** Number of rows fetched per iteration. */
+1:         private static final int FETCH_SIZE = 16;
+1:         private final DataValueDescriptor[][] rowBufferArray;
+1:         private DataValueDescriptor[] lastUniqueKey;
+1:         private DataValueDescriptor[] curr;
+1:         private DataValueDescriptor[] prev;
+1:         private int rowsReadLastRead = -1;
+1:         private long numRows;
+1: 
+1:         /**
+1:          * Creates a key comparator for the given index.
+1:          *
+1:          * @param ir index row (template)
+1:          */
+0:         public KeyComparator(ExecIndexRow ir) {
+1:             rowBufferArray = new DataValueDescriptor[FETCH_SIZE][];
+1:             rowBufferArray[0] = ir.getRowArray(); // 1 gets old objects.
+1:             lastUniqueKey = ir.getRowArrayClone();
+1:         }
+1: 
+1:         /**
+1:          * Fetches rows from the scan controller.
+1:          *
+1:          * @param gsc the scan controller
+1:          * @return Number of rows fetched.
+1:          * @throws StandardException if fetching rows fails
+1:          */
+1:         public int fetchRows(GroupFetchScanController gsc)
+1:                 throws StandardException {
+1:             // Save state (and optimize) for next read.
+1:             // Assumes that we always read as many rows as we can per iteration.
+1:             if (rowsReadLastRead == FETCH_SIZE) {
+1:                 // Reuse curr to reference the current last unique key.
+1:                 curr = rowBufferArray[FETCH_SIZE - 1];
+1:                 // Reuse the old last unique row array for the coming fetch.
+1:                 rowBufferArray[FETCH_SIZE - 1] = lastUniqueKey;
+1:                 // Finally we update the pointer to the last unique key.
+1:                 lastUniqueKey = curr;
+1:             }
+1:             rowsReadLastRead = gsc.fetchNextGroup(rowBufferArray, null);
+1:             return rowsReadLastRead;
+1:         }
+1: 
+1:         /**
+1:          * Compares the key at the specified index with the previous key.
+1:          *
+1:          * @param index row index
+1:          * @return {@code -1} if the current and previous key are identical,
+1:          *      the index of the changed part of the key otherwise
+0:          *      ([0, key length>)
+1:          * @throws StandardException if comparing the two keys fails
+1:          */
+1:         public int compareWithPrevKey(int index)
+1:                 throws StandardException {
+1:             if (index > rowsReadLastRead) {
+1:                 throw new IllegalStateException(
+1:                         "invalid access, rowsReadLastRead=" + rowsReadLastRead +
+1:                         ", index=" + index + ", numRows=" + numRows);
+1:             }
+1:             numRows++;
+1:             // First row ever is always a distinct key.
+1:             if (numRows == 1) {
+1:                 return 0;
+1:             }
+1: 
+1:             prev = (index == 0) ? lastUniqueKey
+1:                                 : rowBufferArray[index - 1];
+1:             curr = rowBufferArray[index];
+1:             DataValueDescriptor dvd;
+1:             // no point trying to do rowlocation; hence - 1
+1:             for (int i = 0; i < (prev.length - 1); i++) {
+1:                 dvd = (DataValueDescriptor)prev[i];
+1: 
+1:                 // NULLs are counted as unique values.
+1:                 if (dvd.isNull() || prev[i].compare(curr[i]) != 0) {
+1:                   return i;
+1:                 }
+1:             }
+1:             return -1;
+1:         }
+1: 
+1:         /**
+1:          * Returns the number of rows fetched.
+1:          *
+1:          * @return Number of rows fetched.
+1:          */
+1:         public long getRowCount() {
+1:             return numRows;
+1:         }
+1:     }
+1: }
+author:Katherine Marsden
+-------------------------------------------------------------------------------
+commit:1690ef6
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.services.monitor.Monitor;
+/////////////////////////////////////////////////////////////////////////
+1:                     //DERBY-5582. Make sure the thread is in the derby group
+1:                     // to avoid potential security manager issues
+0:                     runningThread = Monitor.getMonitor().getDaemonThread(this, "index-stat-thread", false);
+author:Dag H. Wanvik
+-------------------------------------------------------------------------------
+commit:ebd44de
+/////////////////////////////////////////////////////////////////////////
+1:             while (true) {
+0:                 try {
+0:                     threadToWaitFor.join();
+0:                     break;
+0:                 } catch (InterruptedException ie) {
+1:                     InterruptStatus.setInterrupted();
+0:                 }
+0: 
+commit:ec9d167
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.util.InterruptStatus;
+/////////////////////////////////////////////////////////////////////////
+1:             InterruptStatus.setInterrupted();
+author:Knut Anders Hatlen
+-------------------------------------------------------------------------------
+commit:328c3ca
+/////////////////////////////////////////////////////////////////////////
+0: 
+1:             // DERBY-5045: When running as a background task, we don't take
+1:             // intention locks that prevent dropping the table or its indexes.
+1:             // So there is a possibility that this index was dropped before
+1:             // we wrote the statistics to the SYSSTATISTICS table. If the table
+1:             // isn't there anymore, issue a rollback to prevent inserting rows
+1:             // for non-existent indexes in SYSSTATISTICS.
+1:             if (asBackgroundTask && cd == null) {
+1:                 log(asBackgroundTask, td,
+1:                     "rolled back index stats because index has been dropped");
+1:                 lcc.internalRollback();
+0:             }
+commit:11be777
+/////////////////////////////////////////////////////////////////////////
+1:             ConglomerateDescriptor cd = dd.getConglomerateDescriptor(index);
+1:                     (cd == null ? "n/a" : cd.getDescriptorName()) +
+author:Lily Wei
+-------------------------------------------------------------------------------
+commit:4c5c16b
+/////////////////////////////////////////////////////////////////////////
+0:             ctxMgr.cleanupOnError(se, db.isActive());
+/////////////////////////////////////////////////////////////////////////
+1:             cm.cleanupOnError(se, db.isActive());
+============================================================================

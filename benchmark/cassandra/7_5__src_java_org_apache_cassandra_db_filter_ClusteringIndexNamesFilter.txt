@@ -1,0 +1,652 @@
+1:a991b64: /*
+1:a991b64:  * Licensed to the Apache Software Foundation (ASF) under one
+1:a991b64:  * or more contributor license agreements.  See the NOTICE file
+1:a991b64:  * distributed with this work for additional information
+1:a991b64:  * regarding copyright ownership.  The ASF licenses this file
+1:a991b64:  * to you under the Apache License, Version 2.0 (the
+1:a991b64:  * "License"); you may not use this file except in compliance
+1:a991b64:  * with the License.  You may obtain a copy of the License at
+1:a991b64:  *
+1:a991b64:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:a991b64:  *
+1:a991b64:  * Unless required by applicable law or agreed to in writing, software
+1:a991b64:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:a991b64:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:a991b64:  * See the License for the specific language governing permissions and
+1:a991b64:  * limitations under the License.
+1:a991b64:  */
+1:a991b64: package org.apache.cassandra.db.filter;
+8:a991b64: 
+1:a991b64: import java.io.IOException;
+1:1e4d44e: import java.nio.ByteBuffer;
+1:a991b64: import java.util.*;
+1:a991b64: 
+1:a991b64: import org.apache.cassandra.config.CFMetaData;
+1:a991b64: import org.apache.cassandra.config.ColumnDefinition;
+1:a991b64: import org.apache.cassandra.db.*;
+1:a991b64: import org.apache.cassandra.db.rows.*;
+1:a991b64: import org.apache.cassandra.db.partitions.*;
+1:6094974: import org.apache.cassandra.db.transform.Transformation;
+1:a991b64: import org.apache.cassandra.io.sstable.format.SSTableReader;
+1:2457599: import org.apache.cassandra.io.util.DataInputPlus;
+1:a991b64: import org.apache.cassandra.io.util.DataOutputPlus;
+1:a991b64: import org.apache.cassandra.utils.SearchIterator;
+1:5250d7f: import org.apache.cassandra.utils.btree.BTreeSet;
+1:a991b64: 
+1:a991b64: /**
+1:a991b64:  * A filter selecting rows given their clustering value.
+1:a991b64:  */
+1:a991b64: public class ClusteringIndexNamesFilter extends AbstractClusteringIndexFilter
+8:a991b64: {
+1:a991b64:     static final InternalDeserializer deserializer = new NamesDeserializer();
+1:1e8007b: 
+1:a991b64:     // This could be empty if selectedColumns only has static columns (in which case the filter still
+1:a991b64:     // selects the static row)
+1:a991b64:     private final NavigableSet<Clustering> clusterings;
+1:a991b64: 
+1:a991b64:     // clusterings is always in clustering order (because we need it that way in some methods), but we also
+1:a991b64:     // sometimes need those clustering in "query" order (i.e. in reverse clustering order if the query is
+1:a991b64:     // reversed), so we keep that too for simplicity.
+1:a991b64:     private final NavigableSet<Clustering> clusteringsInQueryOrder;
+1:a991b64: 
+1:a991b64:     public ClusteringIndexNamesFilter(NavigableSet<Clustering> clusterings, boolean reversed)
+1:a991b64:     {
+1:a991b64:         super(reversed);
+1:a991b64:         assert !clusterings.contains(Clustering.STATIC_CLUSTERING);
+1:a991b64:         this.clusterings = clusterings;
+1:a991b64:         this.clusteringsInQueryOrder = reversed ? clusterings.descendingSet() : clusterings;
+7:a991b64:     }
+1:a991b64: 
+1:a991b64:     /**
+1:a991b64:      * The set of requested rows.
+1:a991b64:      *
+1:a991b64:      * Please note that this can be empty if only the static row is requested.
+1:a991b64:      *
+1:a991b64:      * @return the set of requested clustering in clustering order (note that
+1:a991b64:      * this is always in clustering order even if the query is reversed).
+1:a991b64:      */
+1:a991b64:     public NavigableSet<Clustering> requestedRows()
+1:a991b64:     {
+1:a991b64:         return clusterings;
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public boolean selectsAllPartition()
+1:a991b64:     {
+1:1e8007b:         return false;
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public boolean selects(Clustering clustering)
+1:a991b64:     {
+1:a991b64:         return clusterings.contains(clustering);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public ClusteringIndexNamesFilter forPaging(ClusteringComparator comparator, Clustering lastReturned, boolean inclusive)
+1:a991b64:     {
+1:a991b64:         NavigableSet<Clustering> newClusterings = reversed ?
+1:a991b64:                                                   clusterings.headSet(lastReturned, inclusive) :
+1:a991b64:                                                   clusterings.tailSet(lastReturned, inclusive);
+1:a991b64: 
+1:a991b64:         return new ClusteringIndexNamesFilter(newClusterings, reversed);
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public boolean isFullyCoveredBy(CachedPartition partition)
+1:a991b64:     {
+1:2457599:         if (partition.isEmpty())
+1:2457599:             return false;
+1:2457599: 
+1:a991b64:         // 'partition' contains all columns, so it covers our filter if our last clusterings
+1:a991b64:         // is smaller than the last in the cache
+1:a991b64:         return clusterings.comparator().compare(clusterings.last(), partition.lastRow().clustering()) <= 0;
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public boolean isHeadFilter()
+1:a991b64:     {
+3:a991b64:         return false;
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     // Given another iterator, only return the rows that match this filter
+1:a991b64:     public UnfilteredRowIterator filterNotIndexed(ColumnFilter columnFilter, UnfilteredRowIterator iterator)
+1:a991b64:     {
+1:a991b64:         // Note that we don't filter markers because that's a bit trickier (we don't know in advance until when
+1:a991b64:         // the range extend) and it's harmless to left them.
+1:6094974:         class FilterNotIndexed extends Transformation
+1:a991b64:         {
+3:a991b64:             @Override
+1:6094974:             public Row applyToStatic(Row row)
+1:a991b64:             {
+1:2457599:                 return columnFilter.fetchedColumns().statics.isEmpty() ? null : row.filter(columnFilter, iterator.metadata());
+1:a991b64:             }
+1:a991b64: 
+1:a991b64:             @Override
+1:6094974:             public Row applyToRow(Row row)
+1:a991b64:             {
+1:2457599:                 return clusterings.contains(row.clustering()) ? row.filter(columnFilter, iterator.metadata()) : null;
+1:6094974:             }
+1:a991b64:         }
+1:6094974:         return Transformation.apply(iterator, new FilterNotIndexed());
+1:a991b64:     }
+1:a991b64: 
+1:4fb559b:     public Slices getSlices(CFMetaData metadata)
+1:a991b64:     {
+1:4fb559b:         Slices.Builder builder = new Slices.Builder(metadata.comparator, clusteringsInQueryOrder.size());
+1:4fb559b:         for (Clustering clustering : clusteringsInQueryOrder)
+1:4fb559b:             builder.add(Slice.make(clustering));
+1:4fb559b:         return builder.build();
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public UnfilteredRowIterator getUnfilteredRowIterator(final ColumnFilter columnFilter, final Partition partition)
+1:a991b64:     {
+1:a991b64:         final SearchIterator<Clustering, Row> searcher = partition.searchIterator(columnFilter, reversed);
+1:a991b64:         return new AbstractUnfilteredRowIterator(partition.metadata(),
+1:a991b64:                                         partition.partitionKey(),
+1:a991b64:                                         partition.partitionLevelDeletion(),
+1:a991b64:                                         columnFilter.fetchedColumns(),
+1:a991b64:                                         searcher.next(Clustering.STATIC_CLUSTERING),
+1:a991b64:                                         reversed,
+1:a991b64:                                         partition.stats())
+1:a991b64:         {
+2:a991b64:             private final Iterator<Clustering> clusteringIter = clusteringsInQueryOrder.iterator();
+1:a991b64: 
+1:a991b64:             protected Unfiltered computeNext()
+1:a991b64:             {
+1:a991b64:                 while (clusteringIter.hasNext() && searcher.hasNext())
+1:a991b64:                 {
+1:a991b64:                     Row row = searcher.next(clusteringIter.next());
+1:a991b64:                     if (row != null)
+1:a991b64:                         return row;
+1:a991b64:                 }
+1:a991b64:                 return endOfData();
+1:a991b64:             }
+3:a991b64:         };
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public boolean shouldInclude(SSTableReader sstable)
+1:a991b64:     {
+1:1e4d44e:         ClusteringComparator comparator = sstable.metadata.comparator;
+1:1e4d44e:         List<ByteBuffer> minClusteringValues = sstable.getSSTableMetadata().minClusteringValues;
+1:1e4d44e:         List<ByteBuffer> maxClusteringValues = sstable.getSSTableMetadata().maxClusteringValues;
+1:1e4d44e: 
+1:1e4d44e:         // If any of the requested clustering is within the bounds covered by the sstable, we need to include the sstable
+1:1e4d44e:         for (Clustering clustering : clusterings)
+1:1e4d44e:         {
+1:1e4d44e:             if (Slice.make(clustering).intersects(comparator, minClusteringValues, maxClusteringValues))
+1:1e4d44e:                 return true;
+1:1e4d44e:         }
+1:1e4d44e:         return false;
+1:1e8007b:     }
+1:a991b64: 
+1:a991b64:     public String toString(CFMetaData metadata)
+1:1e8007b:     {
+1:a991b64:         StringBuilder sb = new StringBuilder();
+1:a991b64:         sb.append("names(");
+1:a991b64:         int i = 0;
+1:1e8007b:         for (Clustering clustering : clusterings)
+1:a991b64:             sb.append(i++ == 0 ? "" : ", ").append(clustering.toString(metadata));
+1:a991b64:         if (reversed)
+1:a991b64:             sb.append(", reversed");
+1:2457599:         return sb.append(')').toString();
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     public String toCQLString(CFMetaData metadata)
+1:a991b64:     {
+1:557bbbc:         if (metadata.clusteringColumns().isEmpty() || clusterings.size() <= 1)
+1:a991b64:             return "";
+1:a991b64: 
+1:a991b64:         StringBuilder sb = new StringBuilder();
+1:2457599:         sb.append('(').append(ColumnDefinition.toCQLString(metadata.clusteringColumns())).append(')');
+1:a991b64:         sb.append(clusterings.size() == 1 ? " = " : " IN (");
+1:a991b64:         int i = 0;
+2:a991b64:         for (Clustering clustering : clusterings)
+1:a991b64:             sb.append(i++ == 0 ? "" : ", ").append("(").append(clustering.toCQLString(metadata)).append(")");
+1:a991b64:         sb.append(clusterings.size() == 1 ? "" : ")");
+1:a991b64: 
+1:a991b64:         appendOrderByToCQLString(metadata, sb);
+1:a991b64:         return sb.toString();
+1:a991b64:     }
+1:a991b64: 
+1:8c64cef:     public Kind kind()
+1:a991b64:     {
+1:a991b64:         return Kind.NAMES;
+1:a991b64:     }
+1:a991b64: 
+1:a991b64:     protected void serializeInternal(DataOutputPlus out, int version) throws IOException
+1:a991b64:     {
+1:a991b64:         ClusteringComparator comparator = (ClusteringComparator)clusterings.comparator();
+1:649a106:         out.writeUnsignedVInt(clusterings.size());
+1:a991b64:         for (Clustering clustering : clusterings)
+1:a991b64:             Clustering.serializer.serialize(clustering, out, version, comparator.subtypes());
+1:a991b64:     }
+1:a991b64: 
+1:03f72ac:     protected long serializedSizeInternal(int version)
+1:a991b64:     {
+1:a991b64:         ClusteringComparator comparator = (ClusteringComparator)clusterings.comparator();
+1:649a106:         long size = TypeSizes.sizeofUnsignedVInt(clusterings.size());
+1:a991b64:         for (Clustering clustering : clusterings)
+1:03f72ac:             size += Clustering.serializer.serializedSize(clustering, version, comparator.subtypes());
+1:a991b64:         return size;
+1:a991b64:     }
+1:a991b64: 
+1:8c64cef:     private static class NamesDeserializer implements InternalDeserializer
+1:a991b64:     {
+1:2457599:         public ClusteringIndexFilter deserialize(DataInputPlus in, int version, CFMetaData metadata, boolean reversed) throws IOException
+1:a991b64:         {
+1:a991b64:             ClusteringComparator comparator = metadata.comparator;
+1:5250d7f:             BTreeSet.Builder<Clustering> clusterings = BTreeSet.builder(comparator);
+1:649a106:             int size = (int)in.readUnsignedVInt();
+1:a991b64:             for (int i = 0; i < size; i++)
+1:2457599:                 clusterings.add(Clustering.serializer.deserialize(in, version, comparator.subtypes()));
+1:a991b64: 
+1:5250d7f:             return new ClusteringIndexNamesFilter(clusterings.build(), reversed);
+1:a991b64:         }
+1:a991b64:     }
+1:a991b64: }
+============================================================================
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:4fb559b
+/////////////////////////////////////////////////////////////////////////
+1:     public Slices getSlices(CFMetaData metadata)
+1:         Slices.Builder builder = new Slices.Builder(metadata.comparator, clusteringsInQueryOrder.size());
+1:         for (Clustering clustering : clusteringsInQueryOrder)
+1:             builder.add(Slice.make(clustering));
+1:         return builder.build();
+commit:928e4c2
+commit:6094974
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.transform.Transformation;
+/////////////////////////////////////////////////////////////////////////
+1:         class FilterNotIndexed extends Transformation
+1:             public Row applyToStatic(Row row)
+1:             public Row applyToRow(Row row)
+1:         }
+1:         return Transformation.apply(iterator, new FilterNotIndexed());
+commit:649a106
+/////////////////////////////////////////////////////////////////////////
+1:         out.writeUnsignedVInt(clusterings.size());
+/////////////////////////////////////////////////////////////////////////
+1:         long size = TypeSizes.sizeofUnsignedVInt(clusterings.size());
+/////////////////////////////////////////////////////////////////////////
+1:             int size = (int)in.readUnsignedVInt();
+commit:5250d7f
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.utils.btree.BTreeSet;
+/////////////////////////////////////////////////////////////////////////
+1:             BTreeSet.Builder<Clustering> clusterings = BTreeSet.builder(comparator);
+1:             return new ClusteringIndexNamesFilter(clusterings.build(), reversed);
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:9280273
+commit:1e4d44e
+/////////////////////////////////////////////////////////////////////////
+1: import java.nio.ByteBuffer;
+/////////////////////////////////////////////////////////////////////////
+1:         ClusteringComparator comparator = sstable.metadata.comparator;
+1:         List<ByteBuffer> minClusteringValues = sstable.getSSTableMetadata().minClusteringValues;
+1:         List<ByteBuffer> maxClusteringValues = sstable.getSSTableMetadata().maxClusteringValues;
+1: 
+1:         // If any of the requested clustering is within the bounds covered by the sstable, we need to include the sstable
+1:         for (Clustering clustering : clusterings)
+1:         {
+1:             if (Slice.make(clustering).intersects(comparator, minClusteringValues, maxClusteringValues))
+1:                 return true;
+1:         }
+1:         return false;
+commit:468a4c5
+commit:0ad0de1
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:         // TODO: we could actually exclude some sstables
+0:         return true;
+commit:9c9e392
+commit:1e8007b
+/////////////////////////////////////////////////////////////////////////
+0: import java.nio.ByteBuffer;
+/////////////////////////////////////////////////////////////////////////
+0:         ClusteringComparator comparator = sstable.metadata.comparator;
+0:         List<ByteBuffer> minClusteringValues = sstable.getSSTableMetadata().minClusteringValues;
+0:         List<ByteBuffer> maxClusteringValues = sstable.getSSTableMetadata().maxClusteringValues;
+1: 
+0:         // If any of the requested clustering is within the bounds covered by the sstable, we need to include the sstable
+1:         for (Clustering clustering : clusterings)
+1:         {
+0:             if (Slice.make(clustering).intersects(comparator, minClusteringValues, maxClusteringValues))
+0:                 return true;
+1:         }
+1:         return false;
+commit:028df72
+/////////////////////////////////////////////////////////////////////////
+commit:a59be26
+/////////////////////////////////////////////////////////////////////////
+0:         out.writeVInt(clusterings.size());
+0:         long size = TypeSizes.sizeofVInt(clusterings.size());
+/////////////////////////////////////////////////////////////////////////
+0:             int size = (int)in.readVInt();
+commit:2457599
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.io.util.DataInputPlus;
+/////////////////////////////////////////////////////////////////////////
+1:         if (partition.isEmpty())
+1:             return false;
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         return new AlteringUnfilteredRowIterator(iterator)
+0:             public Row computeNextStatic(Row row)
+1:                 return columnFilter.fetchedColumns().statics.isEmpty() ? null : row.filter(columnFilter, iterator.metadata());
+0:             public Row computeNext(Row row)
+1:                 return clusterings.contains(row.clustering()) ? row.filter(columnFilter, iterator.metadata()) : null;
+/////////////////////////////////////////////////////////////////////////
+1:         return sb.append(')').toString();
+/////////////////////////////////////////////////////////////////////////
+1:         sb.append('(').append(ColumnDefinition.toCQLString(metadata.clusteringColumns())).append(')');
+/////////////////////////////////////////////////////////////////////////
+1:         public ClusteringIndexFilter deserialize(DataInputPlus in, int version, CFMetaData metadata, boolean reversed) throws IOException
+1:                 clusterings.add(Clustering.serializer.deserialize(in, version, comparator.subtypes()));
+commit:a991b64
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.db.filter;
+1: 
+0: import java.io.DataInput;
+1: import java.io.IOException;
+1: import java.util.*;
+1: 
+1: import org.apache.cassandra.config.CFMetaData;
+1: import org.apache.cassandra.config.ColumnDefinition;
+1: import org.apache.cassandra.db.*;
+1: import org.apache.cassandra.db.rows.*;
+1: import org.apache.cassandra.db.partitions.*;
+1: import org.apache.cassandra.io.sstable.format.SSTableReader;
+1: import org.apache.cassandra.io.util.DataOutputPlus;
+1: import org.apache.cassandra.utils.SearchIterator;
+1: 
+1: /**
+1:  * A filter selecting rows given their clustering value.
+1:  */
+1: public class ClusteringIndexNamesFilter extends AbstractClusteringIndexFilter
+1: {
+1:     static final InternalDeserializer deserializer = new NamesDeserializer();
+1: 
+1:     // This could be empty if selectedColumns only has static columns (in which case the filter still
+1:     // selects the static row)
+1:     private final NavigableSet<Clustering> clusterings;
+1: 
+1:     // clusterings is always in clustering order (because we need it that way in some methods), but we also
+1:     // sometimes need those clustering in "query" order (i.e. in reverse clustering order if the query is
+1:     // reversed), so we keep that too for simplicity.
+1:     private final NavigableSet<Clustering> clusteringsInQueryOrder;
+1: 
+1:     public ClusteringIndexNamesFilter(NavigableSet<Clustering> clusterings, boolean reversed)
+1:     {
+1:         super(reversed);
+1:         assert !clusterings.contains(Clustering.STATIC_CLUSTERING);
+1:         this.clusterings = clusterings;
+1:         this.clusteringsInQueryOrder = reversed ? clusterings.descendingSet() : clusterings;
+1:     }
+1: 
+1:     /**
+1:      * The set of requested rows.
+1:      *
+1:      * Please note that this can be empty if only the static row is requested.
+1:      *
+1:      * @return the set of requested clustering in clustering order (note that
+1:      * this is always in clustering order even if the query is reversed).
+1:      */
+1:     public NavigableSet<Clustering> requestedRows()
+1:     {
+1:         return clusterings;
+1:     }
+1: 
+1:     public boolean selectsAllPartition()
+1:     {
+1:         return false;
+1:     }
+1: 
+1:     public boolean selects(Clustering clustering)
+1:     {
+1:         return clusterings.contains(clustering);
+1:     }
+1: 
+1:     public ClusteringIndexNamesFilter forPaging(ClusteringComparator comparator, Clustering lastReturned, boolean inclusive)
+1:     {
+0:         // TODO: Consider removal of the initial check.
+0:         int cmp = comparator.compare(lastReturned, clusteringsInQueryOrder.first());
+0:         if (cmp < 0 || (inclusive && cmp == 0))
+0:             return this;
+1: 
+1:         NavigableSet<Clustering> newClusterings = reversed ?
+1:                                                   clusterings.headSet(lastReturned, inclusive) :
+1:                                                   clusterings.tailSet(lastReturned, inclusive);
+1: 
+1:         return new ClusteringIndexNamesFilter(newClusterings, reversed);
+1:     }
+1: 
+1:     public boolean isFullyCoveredBy(CachedPartition partition)
+1:     {
+1:         // 'partition' contains all columns, so it covers our filter if our last clusterings
+1:         // is smaller than the last in the cache
+1:         return clusterings.comparator().compare(clusterings.last(), partition.lastRow().clustering()) <= 0;
+1:     }
+1: 
+1:     public boolean isHeadFilter()
+1:     {
+1:         return false;
+1:     }
+1: 
+1:     // Given another iterator, only return the rows that match this filter
+1:     public UnfilteredRowIterator filterNotIndexed(ColumnFilter columnFilter, UnfilteredRowIterator iterator)
+1:     {
+1:         // Note that we don't filter markers because that's a bit trickier (we don't know in advance until when
+1:         // the range extend) and it's harmless to left them.
+0:         return new FilteringRowIterator(iterator)
+1:         {
+1:             @Override
+0:             public FilteringRow makeRowFilter()
+1:             {
+0:                 return FilteringRow.columnsFilteringRow(columnFilter);
+1:             }
+1: 
+1:             @Override
+0:             protected boolean includeRow(Row row)
+1:             {
+0:                 return clusterings.contains(row.clustering());
+1:             }
+1:         };
+1:     }
+1: 
+0:     public UnfilteredRowIterator filter(final SliceableUnfilteredRowIterator iter)
+1:     {
+0:         // Please note that this method assumes that rows from 'iter' already have their columns filtered, i.e. that
+0:         // they only include columns that we select.
+0:         return new WrappingUnfilteredRowIterator(iter)
+1:         {
+1:             private final Iterator<Clustering> clusteringIter = clusteringsInQueryOrder.iterator();
+0:             private Iterator<Unfiltered> currentClustering;
+0:             private Unfiltered next;
+1: 
+1:             @Override
+0:             public boolean hasNext()
+1:             {
+0:                 if (next != null)
+0:                     return true;
+1: 
+0:                 if (currentClustering != null && currentClustering.hasNext())
+1:                 {
+0:                     next = currentClustering.next();
+0:                     return true;
+1:                 }
+1: 
+0:                 while (clusteringIter.hasNext())
+1:                 {
+0:                     Clustering nextClustering = clusteringIter.next();
+0:                     currentClustering = iter.slice(Slice.make(nextClustering));
+0:                     if (currentClustering.hasNext())
+1:                     {
+0:                         next = currentClustering.next();
+0:                         return true;
+1:                     }
+1:                 }
+1:                 return false;
+1:             }
+1: 
+1:             @Override
+0:             public Unfiltered next()
+1:             {
+0:                 if (next == null && !hasNext())
+0:                     throw new NoSuchElementException();
+1: 
+0:                 Unfiltered toReturn = next;
+0:                 next = null;
+0:                 return toReturn;
+1:             }
+1:         };
+1:     }
+1: 
+1:     public UnfilteredRowIterator getUnfilteredRowIterator(final ColumnFilter columnFilter, final Partition partition)
+1:     {
+1:         final SearchIterator<Clustering, Row> searcher = partition.searchIterator(columnFilter, reversed);
+1:         return new AbstractUnfilteredRowIterator(partition.metadata(),
+1:                                         partition.partitionKey(),
+1:                                         partition.partitionLevelDeletion(),
+1:                                         columnFilter.fetchedColumns(),
+1:                                         searcher.next(Clustering.STATIC_CLUSTERING),
+1:                                         reversed,
+1:                                         partition.stats())
+1:         {
+1:             private final Iterator<Clustering> clusteringIter = clusteringsInQueryOrder.iterator();
+1: 
+1:             protected Unfiltered computeNext()
+1:             {
+1:                 while (clusteringIter.hasNext() && searcher.hasNext())
+1:                 {
+1:                     Row row = searcher.next(clusteringIter.next());
+1:                     if (row != null)
+1:                         return row;
+1:                 }
+1:                 return endOfData();
+1:             }
+1:         };
+1:     }
+1: 
+1:     public boolean shouldInclude(SSTableReader sstable)
+1:     {
+0:         // TODO: we could actually exclude some sstables
+0:         return true;
+1:     }
+1: 
+1:     public String toString(CFMetaData metadata)
+1:     {
+1:         StringBuilder sb = new StringBuilder();
+1:         sb.append("names(");
+1:         int i = 0;
+1:         for (Clustering clustering : clusterings)
+1:             sb.append(i++ == 0 ? "" : ", ").append(clustering.toString(metadata));
+1:         if (reversed)
+1:             sb.append(", reversed");
+0:         return sb.append(")").toString();
+1:     }
+1: 
+1:     public String toCQLString(CFMetaData metadata)
+1:     {
+0:         if (clusterings.isEmpty())
+1:             return "";
+1: 
+1:         StringBuilder sb = new StringBuilder();
+0:         sb.append("(").append(ColumnDefinition.toCQLString(metadata.clusteringColumns())).append(")");
+1:         sb.append(clusterings.size() == 1 ? " = " : " IN (");
+1:         int i = 0;
+1:         for (Clustering clustering : clusterings)
+1:             sb.append(i++ == 0 ? "" : ", ").append("(").append(clustering.toCQLString(metadata)).append(")");
+1:         sb.append(clusterings.size() == 1 ? "" : ")");
+1: 
+1:         appendOrderByToCQLString(metadata, sb);
+1:         return sb.toString();
+1:     }
+1: 
+0:     Kind kind()
+1:     {
+1:         return Kind.NAMES;
+1:     }
+1: 
+1:     protected void serializeInternal(DataOutputPlus out, int version) throws IOException
+1:     {
+1:         ClusteringComparator comparator = (ClusteringComparator)clusterings.comparator();
+0:         out.writeInt(clusterings.size());
+1:         for (Clustering clustering : clusterings)
+1:             Clustering.serializer.serialize(clustering, out, version, comparator.subtypes());
+1:     }
+1: 
+0:     protected long serializedSizeInternal(int version, TypeSizes sizes)
+1:     {
+0:         long size = 0;
+1:         ClusteringComparator comparator = (ClusteringComparator)clusterings.comparator();
+1:         for (Clustering clustering : clusterings)
+0:             size += Clustering.serializer.serializedSize(clustering, version, comparator.subtypes(), sizes);
+1:         return size;
+1:     }
+1: 
+0:     private static class NamesDeserializer extends InternalDeserializer
+1:     {
+0:         public ClusteringIndexFilter deserialize(DataInput in, int version, CFMetaData metadata, boolean reversed) throws IOException
+1:         {
+1:             ClusteringComparator comparator = metadata.comparator;
+0:             NavigableSet<Clustering> clusterings = new TreeSet<>(comparator);
+0:             int size = in.readInt();
+1:             for (int i = 0; i < size; i++)
+0:                 clusterings.add(Clustering.serializer.deserialize(in, version, comparator.subtypes()).takeAlias());
+1: 
+0:             return new ClusteringIndexNamesFilter(clusterings, reversed);
+1:         }
+1:     }
+1: }
+author:Stefania Alborghetti
+-------------------------------------------------------------------------------
+commit:557bbbc
+/////////////////////////////////////////////////////////////////////////
+1:         if (metadata.clusteringColumns().isEmpty() || clusterings.size() <= 1)
+author:Tyler Hobbs
+-------------------------------------------------------------------------------
+commit:8c64cef
+/////////////////////////////////////////////////////////////////////////
+1:     public Kind kind()
+/////////////////////////////////////////////////////////////////////////
+1:     private static class NamesDeserializer implements InternalDeserializer
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:2fea59d
+/////////////////////////////////////////////////////////////////////////
+0:         out.writeVInt(clusterings.size());
+0:         long size = TypeSizes.sizeofVInt(clusterings.size());
+/////////////////////////////////////////////////////////////////////////
+0:             int size = (int)in.readVInt();
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:59a2861
+/////////////////////////////////////////////////////////////////////////
+0:         out.writeInt(clusterings.size());
+0:         long size = 0;
+/////////////////////////////////////////////////////////////////////////
+0:             int size = in.readInt();
+author:Ariel Weisberg
+-------------------------------------------------------------------------------
+commit:03f72ac
+/////////////////////////////////////////////////////////////////////////
+1:     protected long serializedSizeInternal(int version)
+1:             size += Clustering.serializer.serializedSize(clustering, version, comparator.subtypes());
+============================================================================

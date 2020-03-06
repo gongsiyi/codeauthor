@@ -1,0 +1,642 @@
+1:9f14856: /*
+1:9f14856:  * Licensed to the Apache Software Foundation (ASF) under one
+1:9f14856:  * or more contributor license agreements.  See the NOTICE file
+1:9f14856:  * distributed with this work for additional information
+1:9f14856:  * regarding copyright ownership.  The ASF licenses this file
+1:9f14856:  * to you under the Apache License, Version 2.0 (the
+1:9f14856:  * "License"); you may not use this file except in compliance
+1:9f14856:  * with the License.  You may obtain a copy of the License at
+1:9f14856:  *
+1:9f14856:  *   http://www.apache.org/licenses/LICENSE-2.0
+1:9f14856:  *
+1:9f14856:  * Unless required by applicable law or agreed to in writing,
+1:9f14856:  * software distributed under the License is distributed on an
+1:9f14856:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+1:9f14856:  * KIND, either express or implied.  See the License for the
+1:9f14856:  * specific language governing permissions and limitations
+1:9f14856:  * under the License.
+1:9f14856:  */
+1:4b54b8a: package org.apache.cassandra.utils.memory;
+12:4b54b8a: 
+1:1a3b5db: import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+1:4b54b8a: 
+1:458b36b: import com.codahale.metrics.Timer;
+1:458b36b: import org.apache.cassandra.metrics.CassandraMetricsRegistry;
+1:458b36b: import org.apache.cassandra.metrics.DefaultNameFactory;
+1:1a3b5db: import org.apache.cassandra.utils.concurrent.WaitQueue;
+1:4b54b8a: 
+1:4b54b8a: 
+1:4b54b8a: /**
+1:4b54b8a:  * Represents an amount of memory used for a given purpose, that can be allocated to specific tasks through
+1:8541cca:  * child MemtableAllocator objects.
+1:4b54b8a:  */
+1:8541cca: public abstract class MemtablePool
+14:4b54b8a: {
+1:8541cca:     final MemtableCleanerThread<?> cleaner;
+1:4b54b8a: 
+1:1a3b5db:     // the total memory used by this pool
+1:1a3b5db:     public final SubPool onHeap;
+1:1a3b5db:     public final SubPool offHeap;
+1:4b54b8a: 
+1:458b36b:     public final Timer blockedOnAllocating;
+1:458b36b: 
+1:4b54b8a:     final WaitQueue hasRoom = new WaitQueue();
+1:4b54b8a: 
+1:8541cca:     MemtablePool(long maxOnHeapMemory, long maxOffHeapMemory, float cleanThreshold, Runnable cleaner)
+1:4b54b8a:     {
+1:1a3b5db:         this.onHeap = getSubPool(maxOnHeapMemory, cleanThreshold);
+1:1a3b5db:         this.offHeap = getSubPool(maxOffHeapMemory, cleanThreshold);
+1:1a3b5db:         this.cleaner = getCleaner(cleaner);
+1:458b36b:         blockedOnAllocating = CassandraMetricsRegistry.Metrics.timer(new DefaultNameFactory("MemtablePool")
+1:458b36b:                                                                          .createMetricName("BlockedOnAllocation"));
+1:1a3b5db:         if (this.cleaner != null)
+1:1a3b5db:             this.cleaner.start();
+14:4b54b8a:     }
+1:4b54b8a: 
+1:1a3b5db:     SubPool getSubPool(long limit, float cleanThreshold)
+1:4b54b8a:     {
+1:1a3b5db:         return new SubPool(limit, cleanThreshold);
+1:4b54b8a:     }
+1:4b54b8a: 
+1:8541cca:     MemtableCleanerThread<?> getCleaner(Runnable cleaner)
+1:4b54b8a:     {
+1:8541cca:         return cleaner == null ? null : new MemtableCleanerThread<>(this, cleaner);
+1:4b54b8a:     }
+1:4b54b8a: 
+1:8541cca:     public abstract MemtableAllocator newAllocator();
+1:4b54b8a: 
+1:4b54b8a:     /**
+1:1a3b5db:      * Note the difference between acquire() and allocate(); allocate() makes more resources available to all owners,
+1:1a3b5db:      * and acquire() makes shared resources unavailable but still recorded. An Owner must always acquire resources,
+1:1a3b5db:      * but only needs to allocate if there are none already available. This distinction is not always meaningful.
+1:4b54b8a:      */
+1:1a3b5db:     public class SubPool
+1:1a3b5db:     {
+1:1a3b5db: 
+1:1a3b5db:         // total memory/resource permitted to allocate
+1:1a3b5db:         public final long limit;
+1:1a3b5db: 
+1:1a3b5db:         // ratio of used to spare (both excluding 'reclaiming') at which to trigger a clean
+1:1a3b5db:         public final float cleanThreshold;
+1:1a3b5db: 
+1:1a3b5db:         // total bytes allocated and reclaiming
+1:1a3b5db:         volatile long allocated;
+1:1a3b5db:         volatile long reclaiming;
+1:1a3b5db: 
+1:1a3b5db:         // a cache of the calculation determining at what allocation threshold we should next clean
+1:1a3b5db:         volatile long nextClean;
+1:1a3b5db: 
+1:1a3b5db:         public SubPool(long limit, float cleanThreshold)
+1:1a3b5db:         {
+1:1a3b5db:             this.limit = limit;
+1:1a3b5db:             this.cleanThreshold = cleanThreshold;
+1:1a3b5db:         }
+1:1a3b5db: 
+1:1a3b5db:         /** Methods for tracking and triggering a clean **/
+1:1a3b5db: 
+1:1a3b5db:         boolean needsCleaning()
+1:1a3b5db:         {
+1:1a3b5db:             // use strictly-greater-than so we don't clean when limit is 0
+1:1a3b5db:             return used() > nextClean && updateNextClean();
+1:1a3b5db:         }
+1:1a3b5db: 
+1:1a3b5db:         void maybeClean()
+1:1a3b5db:         {
+1:1a3b5db:             if (needsCleaning() && cleaner != null)
+2:1a3b5db:                 cleaner.trigger();
+1:1a3b5db:         }
+1:1a3b5db: 
+1:1a3b5db:         private boolean updateNextClean()
+1:1a3b5db:         {
+1:1a3b5db:             while (true)
+1:1a3b5db:             {
+1:1a3b5db:                 long current = nextClean;
+1:1a3b5db:                 long reclaiming = this.reclaiming;
+1:1a3b5db:                 long next =  reclaiming + (long) (this.limit * cleanThreshold);
+1:1a3b5db:                 if (current == next || nextCleanUpdater.compareAndSet(this, current, next))
+1:1a3b5db:                     return used() > next;
+1:1a3b5db:             }
+1:4b54b8a:         }
+1:1a3b5db: 
+1:1a3b5db:         /** Methods to allocate space **/
+1:1a3b5db: 
+1:1a3b5db:         boolean tryAllocate(long size)
+1:1a3b5db:         {
+1:1a3b5db:             while (true)
+1:1a3b5db:             {
+1:1a3b5db:                 long cur;
+1:1a3b5db:                 if ((cur = allocated) + size > limit)
+1:1a3b5db:                     return false;
+1:1a3b5db:                 if (allocatedUpdater.compareAndSet(this, cur, cur + size))
+1:1a3b5db:                     return true;
+1:1a3b5db:             }
+1:1a3b5db:         }
+1:1a3b5db: 
+1:1a3b5db:         /**
+1:1a3b5db:          * apply the size adjustment to allocated, bypassing any limits or constraints. If this reduces the
+1:1a3b5db:          * allocated total, we will signal waiters
+1:1a3b5db:          */
+1:b757db1:         private void adjustAllocated(long size)
+1:1a3b5db:         {
+1:1a3b5db:             while (true)
+1:1a3b5db:             {
+1:1a3b5db:                 long cur = allocated;
+1:1a3b5db:                 if (allocatedUpdater.compareAndSet(this, cur, cur + size))
+2:1a3b5db:                     return;
+1:1a3b5db:             }
+1:1a3b5db:         }
+1:1a3b5db: 
+1:b757db1:         void allocated(long size)
+1:1a3b5db:         {
+1:b757db1:             assert size >= 0;
+1:b757db1:             if (size == 0)
+1:1a3b5db:                 return;
+1:b757db1: 
+1:b757db1:             adjustAllocated(size);
+1:b757db1:             maybeClean();
+1:1a3b5db:         }
+1:1a3b5db: 
+1:b757db1:         void acquired(long size)
+1:1a3b5db:         {
+1:b757db1:             maybeClean();
+1:b757db1:         }
+1:b757db1: 
+1:b757db1:         void released(long size)
+1:b757db1:         {
+1:b757db1:             assert size >= 0;
+1:b757db1:             adjustAllocated(-size);
+1:b757db1:             hasRoom.signalAll();
+1:b757db1:         }
+1:b757db1: 
+1:b757db1:         void reclaiming(long size)
+1:b757db1:         {
+1:b757db1:             if (size == 0)
+1:b757db1:                 return;
+1:b757db1:             reclaimingUpdater.addAndGet(this, size);
+1:b757db1:         }
+1:b757db1: 
+1:b757db1:         void reclaimed(long size)
+1:b757db1:         {
+1:b757db1:             if (size == 0)
+1:b757db1:                 return;
+1:b757db1: 
+1:b757db1:             reclaimingUpdater.addAndGet(this, -size);
+1:b757db1:             if (updateNextClean() && cleaner != null)
+1:b757db1:                 cleaner.trigger();
+1:1a3b5db:         }
+1:1a3b5db: 
+1:1a3b5db:         public long used()
+1:1a3b5db:         {
+2:1a3b5db:             return allocated;
+1:1a3b5db:         }
+1:1a3b5db: 
+1:b757db1:         public float reclaimingRatio()
+1:b757db1:         {
+1:b757db1:             float r = reclaiming / (float) limit;
+1:b757db1:             if (Float.isNaN(r))
+1:b757db1:                 return 0;
+1:b757db1:             return r;
+1:b757db1:         }
+1:b757db1: 
+1:b757db1:         public float usedRatio()
+1:b757db1:         {
+1:b757db1:             float r = allocated / (float) limit;
+1:b757db1:             if (Float.isNaN(r))
+1:b757db1:                 return 0;
+1:b757db1:             return r;
+1:b757db1:         }
+1:b757db1: 
+1:8541cca:         public MemtableAllocator.SubAllocator newAllocator()
+1:1a3b5db:         {
+1:8541cca:             return new MemtableAllocator.SubAllocator(this);
+1:1a3b5db:         }
+1:1a3b5db: 
+1:1a3b5db:         public WaitQueue hasRoom()
+1:1a3b5db:         {
+1:1a3b5db:             return hasRoom;
+1:1a3b5db:         }
+1:458b36b: 
+1:458b36b:         public Timer.Context blockedTimerContext()
+1:458b36b:         {
+1:458b36b:             return blockedOnAllocating.time();
+1:458b36b:         }
+1:1a3b5db:     }
+1:1a3b5db: 
+1:1a3b5db:     private static final AtomicLongFieldUpdater<SubPool> reclaimingUpdater = AtomicLongFieldUpdater.newUpdater(SubPool.class, "reclaiming");
+1:1a3b5db:     private static final AtomicLongFieldUpdater<SubPool> allocatedUpdater = AtomicLongFieldUpdater.newUpdater(SubPool.class, "allocated");
+1:1a3b5db:     private static final AtomicLongFieldUpdater<SubPool> nextCleanUpdater = AtomicLongFieldUpdater.newUpdater(SubPool.class, "nextClean");
+1:4b54b8a: 
+1:1a3b5db: }
+============================================================================
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:5c84fe4
+commit:9f14856
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *   http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing,
+1:  * software distributed under the License is distributed on an
+1:  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+1:  * KIND, either express or implied.  See the License for the
+1:  * specific language governing permissions and limitations
+1:  * under the License.
+1:  */
+author:Ariel Weisberg
+-------------------------------------------------------------------------------
+commit:458b36b
+/////////////////////////////////////////////////////////////////////////
+1: import com.codahale.metrics.Timer;
+1: import org.apache.cassandra.metrics.CassandraMetricsRegistry;
+1: import org.apache.cassandra.metrics.DefaultNameFactory;
+/////////////////////////////////////////////////////////////////////////
+1:     public final Timer blockedOnAllocating;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         blockedOnAllocating = CassandraMetricsRegistry.Metrics.timer(new DefaultNameFactory("MemtablePool")
+1:                                                                          .createMetricName("BlockedOnAllocation"));
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         public Timer.Context blockedTimerContext()
+1:         {
+1:             return blockedOnAllocating.time();
+1:         }
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:2f41243
+/////////////////////////////////////////////////////////////////////////
+commit:b757db1
+/////////////////////////////////////////////////////////////////////////
+1:         private void adjustAllocated(long size)
+/////////////////////////////////////////////////////////////////////////
+1:         void allocated(long size)
+1:             assert size >= 0;
+1:             if (size == 0)
+1: 
+1:             adjustAllocated(size);
+1:             maybeClean();
+1:         void acquired(long size)
+1:             maybeClean();
+1:         }
+1: 
+1:         void released(long size)
+1:         {
+1:             assert size >= 0;
+1:             adjustAllocated(-size);
+1:             hasRoom.signalAll();
+1:         }
+1: 
+1:         void reclaiming(long size)
+1:         {
+1:             if (size == 0)
+1:                 return;
+1:             reclaimingUpdater.addAndGet(this, size);
+1:         }
+1: 
+1:         void reclaimed(long size)
+1:         {
+1:             if (size == 0)
+1:                 return;
+1: 
+1:             reclaimingUpdater.addAndGet(this, -size);
+1:             if (updateNextClean() && cleaner != null)
+1:                 cleaner.trigger();
+/////////////////////////////////////////////////////////////////////////
+1:         public float reclaimingRatio()
+1:         {
+1:             float r = reclaiming / (float) limit;
+1:             if (Float.isNaN(r))
+1:                 return 0;
+1:             return r;
+1:         }
+1: 
+1:         public float usedRatio()
+1:         {
+1:             float r = allocated / (float) limit;
+1:             if (Float.isNaN(r))
+1:                 return 0;
+1:             return r;
+1:         }
+1: 
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:8541cca
+/////////////////////////////////////////////////////////////////////////
+1:  * child MemtableAllocator objects.
+1: public abstract class MemtablePool
+1:     final MemtableCleanerThread<?> cleaner;
+/////////////////////////////////////////////////////////////////////////
+1:     MemtablePool(long maxOnHeapMemory, long maxOffHeapMemory, float cleanThreshold, Runnable cleaner)
+/////////////////////////////////////////////////////////////////////////
+1:     MemtableCleanerThread<?> getCleaner(Runnable cleaner)
+1:         return cleaner == null ? null : new MemtableCleanerThread<>(this, cleaner);
+1:     public abstract MemtableAllocator newAllocator();
+/////////////////////////////////////////////////////////////////////////
+1:         public MemtableAllocator.SubAllocator newAllocator()
+1:             return new MemtableAllocator.SubAllocator(this);
+commit:1a3b5db
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+1: import org.apache.cassandra.utils.concurrent.WaitQueue;
+0:  * child PoolAllocator objects.
+0:     final PoolCleanerThread<?> cleaner;
+1:     // the total memory used by this pool
+1:     public final SubPool onHeap;
+1:     public final SubPool offHeap;
+0:     Pool(long maxOnHeapMemory, long maxOffHeapMemory, float cleanThreshold, Runnable cleaner)
+1:         this.onHeap = getSubPool(maxOnHeapMemory, cleanThreshold);
+1:         this.offHeap = getSubPool(maxOffHeapMemory, cleanThreshold);
+1:         this.cleaner = getCleaner(cleaner);
+1:         if (this.cleaner != null)
+1:             this.cleaner.start();
+1:     SubPool getSubPool(long limit, float cleanThreshold)
+1:         return new SubPool(limit, cleanThreshold);
+0:     PoolCleanerThread<?> getCleaner(Runnable cleaner)
+0:         return cleaner == null ? null : new PoolCleanerThread<>(this, cleaner);
+0:     public abstract boolean needToCopyOnHeap();
+0:     public abstract PoolAllocator newAllocator();
+1:      * Note the difference between acquire() and allocate(); allocate() makes more resources available to all owners,
+1:      * and acquire() makes shared resources unavailable but still recorded. An Owner must always acquire resources,
+1:      * but only needs to allocate if there are none already available. This distinction is not always meaningful.
+1:     public class SubPool
+1: 
+1:         // total memory/resource permitted to allocate
+1:         public final long limit;
+1: 
+1:         // ratio of used to spare (both excluding 'reclaiming') at which to trigger a clean
+1:         public final float cleanThreshold;
+1: 
+1:         // total bytes allocated and reclaiming
+1:         volatile long allocated;
+1:         volatile long reclaiming;
+1: 
+1:         // a cache of the calculation determining at what allocation threshold we should next clean
+1:         volatile long nextClean;
+1: 
+1:         public SubPool(long limit, float cleanThreshold)
+1:             this.limit = limit;
+1:             this.cleanThreshold = cleanThreshold;
+1:         }
+1: 
+1:         /** Methods for tracking and triggering a clean **/
+1: 
+1:         boolean needsCleaning()
+1:         {
+1:             // use strictly-greater-than so we don't clean when limit is 0
+1:             return used() > nextClean && updateNextClean();
+1:         }
+1: 
+1:         void maybeClean()
+1:         {
+1:             if (needsCleaning() && cleaner != null)
+1:                 cleaner.trigger();
+1:         }
+1: 
+1:         private boolean updateNextClean()
+1:         {
+1:             while (true)
+1:                 long current = nextClean;
+1:                 long reclaiming = this.reclaiming;
+1:                 long next =  reclaiming + (long) (this.limit * cleanThreshold);
+1:                 if (current == next || nextCleanUpdater.compareAndSet(this, current, next))
+1:                     return used() > next;
+1: 
+1:         /** Methods to allocate space **/
+1: 
+1:         boolean tryAllocate(long size)
+1:         {
+1:             while (true)
+1:             {
+1:                 long cur;
+1:                 if ((cur = allocated) + size > limit)
+1:                     return false;
+1:                 if (allocatedUpdater.compareAndSet(this, cur, cur + size))
+1:                     return true;
+1:             }
+1:         }
+1: 
+1:         /**
+1:          * apply the size adjustment to allocated, bypassing any limits or constraints. If this reduces the
+1:          * allocated total, we will signal waiters
+1:          */
+0:         void adjustAllocated(long size)
+1:         {
+0:             if (size == 0)
+1:                 return;
+1:             while (true)
+1:             {
+1:                 long cur = allocated;
+1:                 if (allocatedUpdater.compareAndSet(this, cur, cur + size))
+1:                     return;
+1:             }
+1:         }
+1: 
+0:         // 'acquires' an amount of memory, and maybe also marks it allocated. This method is meant to be overridden
+0:         // by implementations with a separate concept of acquired/allocated. As this method stands, an acquire
+0:         // without an allocate is a no-op (acquisition is achieved through allocation), however a release (where size < 0)
+0:         // is always processed and accounted for in allocated.
+0:         void adjustAcquired(long size, boolean alsoAllocated)
+1:         {
+0:             if (size > 0 || alsoAllocated)
+1:             {
+0:                 if (alsoAllocated)
+0:                     adjustAllocated(size);
+0:                 maybeClean();
+1:             }
+0:             else if (size < 0)
+1:             {
+0:                 adjustAllocated(size);
+0:                 hasRoom.signalAll();
+1:             }
+1:         }
+1: 
+0:         // space reclaimed should be released prior to calling this, to avoid triggering unnecessary cleans
+0:         void adjustReclaiming(long reclaiming)
+1:         {
+0:             if (reclaiming == 0)
+1:                 return;
+0:             reclaimingUpdater.addAndGet(this, reclaiming);
+0:             if (reclaiming < 0 && updateNextClean() && cleaner != null)
+1:                 cleaner.trigger();
+1:         }
+1: 
+0:         public long allocated()
+1:         {
+1:             return allocated;
+1:         }
+1: 
+1:         public long used()
+1:         {
+1:             return allocated;
+1:         }
+1: 
+0:         public PoolAllocator.SubAllocator newAllocator()
+1:         {
+0:             return new PoolAllocator.SubAllocator(this);
+1:         }
+1: 
+1:         public WaitQueue hasRoom()
+1:         {
+1:             return hasRoom;
+1:         }
+1:     private static final AtomicLongFieldUpdater<SubPool> reclaimingUpdater = AtomicLongFieldUpdater.newUpdater(SubPool.class, "reclaiming");
+1:     private static final AtomicLongFieldUpdater<SubPool> allocatedUpdater = AtomicLongFieldUpdater.newUpdater(SubPool.class, "allocated");
+1:     private static final AtomicLongFieldUpdater<SubPool> nextCleanUpdater = AtomicLongFieldUpdater.newUpdater(SubPool.class, "nextClean");
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:02fb218
+/////////////////////////////////////////////////////////////////////////
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:4b54b8a
+/////////////////////////////////////////////////////////////////////////
+1: package org.apache.cassandra.utils.memory;
+1: 
+0: import org.apache.cassandra.utils.concurrent.OpOrder;
+0: import org.apache.cassandra.utils.concurrent.WaitQueue;
+1: 
+0: import java.util.concurrent.atomic.AtomicLong;
+0: import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+1: 
+1: 
+1: /**
+1:  * Represents an amount of memory used for a given purpose, that can be allocated to specific tasks through
+0:  * child AbstractAllocator objects. AbstractAllocator and MemoryTracker correspond approximately to PoolAllocator and Pool,
+0:  * respectively, with the MemoryTracker bookkeeping the total shared use of resources, and the AbstractAllocator the amount
+0:  * checked out and in use by a specific PoolAllocator.
+0:  *
+0:  * Note the difference between acquire() and allocate(); allocate() makes more resources available to all owners,
+0:  * and acquire() makes shared resources unavailable but still recorded. An Owner must always acquire resources,
+0:  * but only needs to allocate if there are none already available. This distinction is not always meaningful.
+1:  */
+0: public abstract class Pool
+1: {
+0:     // total memory/resource permitted to allocate
+0:     public final long limit;
+1: 
+0:     // ratio of used to spare (both excluding 'reclaiming') at which to trigger a clean
+0:     public final float cleanThreshold;
+1: 
+0:     // total bytes allocated and reclaiming
+0:     private AtomicLong allocated = new AtomicLong();
+0:     private AtomicLong reclaiming = new AtomicLong();
+1: 
+1:     final WaitQueue hasRoom = new WaitQueue();
+1: 
+0:     // a cache of the calculation determining at what allocation threshold we should next clean, and the cleaner we trigger
+0:     private volatile long nextClean;
+0:     private final PoolCleanerThread<?> cleanerThread;
+1: 
+0:     public Pool(long limit, float cleanThreshold, Runnable cleaner)
+1:     {
+0:         this.limit = limit;
+0:         this.cleanThreshold = cleanThreshold;
+0:         updateNextClean();
+0:         cleanerThread = cleaner == null ? null : new PoolCleanerThread<>(this, cleaner);
+0:         if (cleanerThread != null)
+0:             cleanerThread.start();
+1:     }
+1: 
+0:     /** Methods for tracking and triggering a clean **/
+1: 
+0:     boolean needsCleaning()
+1:     {
+0:         return used() >= nextClean && updateNextClean() && cleanerThread != null;
+1:     }
+1: 
+0:     void maybeClean()
+1:     {
+0:         if (needsCleaning())
+0:             cleanerThread.trigger();
+1:     }
+1: 
+0:     private boolean updateNextClean()
+1:     {
+0:         long reclaiming = this.reclaiming.get();
+0:         return used() >= (nextClean = reclaiming
+0:                 + (long) (this.limit * cleanThreshold));
+1:     }
+1: 
+0:     /** Methods to allocate space **/
+1: 
+0:     boolean tryAllocate(int size)
+1:     {
+0:         while (true)
+1:         {
+0:             long cur;
+0:             if ((cur = allocated.get()) + size > limit)
+0:                 return false;
+0:             if (allocated.compareAndSet(cur, cur + size))
+1:             {
+0:                 maybeClean();
+0:                 return true;
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+0:      * apply the size adjustment to allocated, bypassing any limits or constraints. If this reduces the
+0:      * allocated total, we will signal waiters
+1:      */
+0:     void adjustAllocated(long size)
+1:     {
+0:         if (size == 0)
+0:             return;
+0:         while (true)
+1:         {
+0:             long cur = allocated.get();
+0:             if (allocated.compareAndSet(cur, cur + size))
+1:             {
+0:                 if (size > 0)
+1:                 {
+0:                     maybeClean();
+1:                 }
+0:                 return;
+1:             }
+1:         }
+1:     }
+1: 
+0:     void release(long size)
+1:     {
+0:         adjustAllocated(-size);
+0:         hasRoom.signalAll();
+1:     }
+1: 
+0:     // space reclaimed should be released prior to calling this, to avoid triggering unnecessary cleans
+0:     void adjustReclaiming(long reclaiming)
+1:     {
+0:         if (reclaiming == 0)
+0:             return;
+0:         this.reclaiming.addAndGet(reclaiming);
+0:         if (reclaiming < 0 && updateNextClean() && cleanerThread != null)
+0:             cleanerThread.trigger();
+1:     }
+1: 
+0:     public long allocated()
+1:     {
+0:         return allocated.get();
+1:     }
+1: 
+0:     public long used()
+1:     {
+0:         return allocated.get();
+1:     }
+1: 
+0:     public long reclaiming()
+1:     {
+0:         return reclaiming.get();
+1:     }
+1: 
+0:     public abstract PoolAllocator newAllocator(OpOrder writes);
+1: }
+1: 
+============================================================================

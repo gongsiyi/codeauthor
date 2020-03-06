@@ -1,0 +1,2931 @@
+1:d609ee3: /*
+1:345de35: 
+1:345de35:    Derby - Class org.apache.derby.impl.store.raw.log.LogAccessFile
+1:d609ee3: 
+1:270a34d:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:270a34d:    contributor license agreements.  See the NOTICE file distributed with
+1:270a34d:    this work for additional information regarding copyright ownership.
+1:270a34d:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:270a34d:    (the "License"); you may not use this file except in compliance with
+1:270a34d:    the License.  You may obtain a copy of the License at
+1:345de35: 
+1:345de35:       http://www.apache.org/licenses/LICENSE-2.0
+1:345de35: 
+1:345de35:    Unless required by applicable law or agreed to in writing, software
+1:345de35:    distributed under the License is distributed on an "AS IS" BASIS,
+1:345de35:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:345de35:    See the License for the specific language governing permissions and
+1:345de35:    limitations under the License.
+1:345de35: 
+1:d609ee3:  */
+45:eac0369: 
+1:eac0369: package org.apache.derby.impl.store.raw.log;
+1:eac0369: 
+1:eac0369: import org.apache.derby.iapi.reference.SQLState;
+1:eac0369: 
+1:7e51e9d: import org.apache.derby.shared.common.sanity.SanityManager;
+1:eac0369: import org.apache.derby.iapi.error.StandardException;
+1:eac0369: 
+1:eac0369: import org.apache.derby.io.StorageRandomAccessFile;
+1:eac0369: 
+1:eac0369: import java.io.IOException;
+1:eac0369: import java.io.OutputStream;
+1:eac0369: import java.io.SyncFailedException;
+1:eac0369: import java.util.LinkedList;
+1:eac0369: 
+1:d609ee3: import org.apache.derby.iapi.services.io.FormatIdOutputStream;
+1:d609ee3: import org.apache.derby.iapi.services.io.ArrayOutputStream;
+1:1bac3f3: import org.apache.derby.iapi.store.replication.master.MasterFactory;
+1:c2afcc1: import org.apache.derby.iapi.store.raw.RawStoreFactory;
+1:d609ee3: 
+1:5d97422: import org.apache.derby.iapi.util.InterruptStatus;
+1:eac0369: 
+2:eac0369: /**
+1:eac0369: 	Wraps a RandomAccessFile file to provide buffering
+1:eac0369: 	on log writes. Only supports the write calls
+1:eac0369: 	required for the log!
+1:eac0369: 
+1:eac0369: 	MT - unsafe.  Caller of this class must provide synchronization.  The one
+1:eac0369: 	exception is with the log file access, LogAccessFile will touch the log
+1:eac0369: 	only inside synchronized block protected by the semaphore, which is
+1:eac0369: 	defined by the creator of this object.
+1:eac0369: 	
+1:eac0369:     Write to the log buffers are allowed when there are free buffers even
+1:eac0369:     when dirty buffers are being written(flushed) to the disk by a different
+1:eac0369: 	thread. Only one flush writes to log file at a time, other wait for it to finish.
+1:eac0369: 
+1:eac0369: 	Except for flushLogAccessFile , SyncAccessLogFile other function callers
+1:eac0369: 	must provide syncronization that will allow only one of them to write to 
+1:eac0369:     the buffers. 
+1:eac0369: 
+1:eac0369:     Log Buffers are used in circular fashion, each buffer moves through following stages: 
+1:dbed020: 	freeBuffers --&gt; dirtyBuffers --&gt; freeBuffers. Movement of buffers from one
+1:eac0369:     stage to 	another stage is synchronized using	the object(this) of this class. 
+1:eac0369: 
+1:d609ee3: 	A Checksum log record that has the checksum value for the data that is
+1:d609ee3:     being written to the disk is generated and written 	before the actual data. 
+1:d609ee3: 	Except for the large log records that does not fit into a single buffer, 
+1:d609ee3:     checksum is calcualted for a group of log records that are in the buffer 
+1:d609ee3: 	when buffers is switched. Checksum log record is written into the reserved
+1:d609ee3: 	space in the beginning buffer. 
+1:d609ee3: 
+1:10b4385:     In case of a large log record that does not fit into a buffer, the
+1:10b4385:     checksum is written to the byte[] allocated for the big log
+1:10b4385:     record. 
+1:d609ee3: 
+1:d609ee3: 	Checksum log records helps in identifying the incomplete log disk writes during 
+1:d609ee3:     recovery. This is done by recalculating the checksum value for the data on
+1:d609ee3:     the disk and comparing it to the the value stored in the checksum log
+1:d609ee3:     record. 
+1:d609ee3: 
+1:d609ee3: */
+1:d609ee3: public class LogAccessFile 
+14:eac0369: {
+1:d609ee3: 
+1:d609ee3:     /**
+1:eac0369:      * The fixed size of a log record is 16 bytes:
+1:eac0369:      *     int   length             : 4 bytes
+1:eac0369:      *     long  instant            : 8 bytes
+1:eac0369:      *     int   trailing length    : 4 bytes
+1:eac0369:      **/
+1:eac0369:     private static final int            LOG_RECORD_FIXED_OVERHEAD_SIZE = 16;
+1:d609ee3: 	private static final int            LOG_RECORD_HEADER_SIZE = 12; //(length + instant)
+1:d609ee3: 	private static final int            LOG_RECORD_TRAILER_SIZE = 4; //trailing length 
+1:eac0369:     private static final int            LOG_NUMBER_LOG_BUFFERS = 3;
+1:d609ee3: 
+1:eac0369: 
+1:7e7a589: 	private LinkedList<LogAccessFileBuffer>    freeBuffers;  //list of free buffers
+1:7e7a589: 	private LinkedList<LogAccessFileBuffer>    dirtyBuffers; //list of dirty buffers to flush
+1:eac0369: 	private  LogAccessFileBuffer currentBuffer; //current active buffer
+1:eac0369: 	private boolean flushInProgress = false;
+1:d609ee3: 	
+1:eac0369: 	private final StorageRandomAccessFile  log;
+1:eac0369: 
+1:eac0369: 	// log can be touched only inside synchronized block protected by
+1:eac0369: 	// logFileSemaphore.
+1:eac0369: 	private final Object            logFileSemaphore;
+1:eac0369: 
+1:eac0369: 	static int                      mon_numWritesToLog;
+1:eac0369: 	static int                      mon_numBytesToLog;
+1:d609ee3: 
+1:5235dfd:     // the MasterFactory that will accept log when in replication master mode
+1:5235dfd:     MasterFactory masterFac; 
+1:5235dfd:     boolean inReplicationMasterMode = false;
+1:c458b05:     boolean inReplicationSlaveMode = false;
+1:eac0369: 
+1:d609ee3: 	//streams used to generated check sume log record ; see if there is any simpler way
+1:d609ee3: 	private ArrayOutputStream logOutputBuffer;
+1:d609ee3: 	private FormatIdOutputStream logicalOut;
+1:d609ee3: 	private long checksumInstant = -1;
+1:d609ee3: 	private int checksumLength;
+1:d609ee3: 	private int checksumLogRecordSize;      //checksumLength + LOG_RECORD_FIXED_OVERHEAD_SIZE
+1:c2afcc1: 	private boolean writeChecksum; 
+1:d609ee3: 	private ChecksumOperation checksumLogOperation;
+1:d609ee3: 	private LogRecord checksumLogRecord;
+1:d609ee3: 	private LogToFile logFactory;
+1:d609ee3: 	private boolean databaseEncrypted=false;
+1:d609ee3: 		
+1:d609ee3: 	public LogAccessFile(LogToFile logFactory,
+1:d609ee3: 						 StorageRandomAccessFile    log, 
+1:d609ee3: 						 int                 bufferSize) 
+1:eac0369:     {
+1:eac0369: 		if (SanityManager.DEBUG)
+1:eac0369: 		{
+1:eac0369: 			if(SanityManager.DEBUG_ON("LogBufferOff"))
+1:eac0369: 				bufferSize = 10;	// make it very tiny
+9:eac0369: 		}
+1:d609ee3: 		
+1:c458b05: 		// Puts this LogAccessFile object in replication slave or
+1:c458b05: 		// master mode if the database has such a role
+1:c458b05: 		logFactory.checkForReplication(this);
+1:c458b05: 
+1:eac0369: 		this.log            = log;
+1:eac0369: 		logFileSemaphore    = log;
+1:d609ee3: 		this.logFactory     = logFactory;
+1:d609ee3: 
+1:eac0369: 		if (SanityManager.DEBUG)
+1:eac0369:             SanityManager.ASSERT(LOG_NUMBER_LOG_BUFFERS >= 1);
+1:d609ee3: 				
+1:eac0369: 		//initialize buffers lists
+1:7e7a589: 		freeBuffers = new LinkedList<LogAccessFileBuffer>();
+1:7e7a589: 		dirtyBuffers = new LinkedList<LogAccessFileBuffer>();
+1:d609ee3: 
+1:d609ee3: 
+1:eac0369: 		//add all buffers to free list
+1:eac0369:         for (int i = 0; i < LOG_NUMBER_LOG_BUFFERS; i++)
+1:d609ee3:         {
+1:eac0369:             LogAccessFileBuffer b = new LogAccessFileBuffer(bufferSize);
+1:eac0369:             freeBuffers.addLast(b);
+1:eac0369:         }
+1:d609ee3: 
+2:eac0369: 		currentBuffer = (LogAccessFileBuffer) freeBuffers.removeFirst();
+1:c2afcc1: 		
+1:c2afcc1: 		// Support for Transaction Log Checksum in Derby was added in 10.1
+1:c2afcc1: 		// Check to see if the Store have been upgraded to 10.1 or later before
+1:c2afcc1: 		// writing the checksum log records.  Otherwise recovery will fail
+1:c2afcc1: 		// incase user tries to revert back to versions before 10.1 in 
+1:c2afcc1: 		// soft upgrade mode. 
+1:c2afcc1: 		writeChecksum = logFactory.checkVersion(RawStoreFactory.DERBY_STORE_MAJOR_VERSION_10, 
+1:c2afcc1: 												RawStoreFactory.DERBY_STORE_MINOR_VERSION_1);
+1:c458b05: 
+1:c458b05: 		// Checksums are received from the master if in slave replication mode
+1:c458b05: 		if (inReplicationSlaveMode) writeChecksum = false;
+1:d609ee3: 		if(writeChecksum)
+1:d609ee3: 		{
+1:5235dfd: 			/**
+1:d609ee3: 			 * setup structures that are required to write the checksum log records
+1:d609ee3: 			 * for a group of log records are being written to the disk. 
+1:d609ee3: 			 */
+1:d609ee3: 			checksumLogOperation = new ChecksumOperation();
+1:d609ee3: 			checksumLogOperation.init();
+1:d609ee3: 			checksumLogRecord = new LogRecord();
+1:d609ee3: 
+1:d609ee3: 			// Note: Checksum log records are not related any particular transaction, 
+1:d609ee3: 			// they are written to store a checksum information identify
+1:d609ee3: 			// incomplete log record writes. No transacton id is set for this
+1:d609ee3: 			// log record. That is why a null argument is passed below 
+1:d609ee3: 			// setValue(..) call. 
+1:d609ee3: 			checksumLogRecord.setValue(null, checksumLogOperation);
+1:d609ee3: 
+1:d609ee3: 			checksumLength = 
+1:d609ee3: 				checksumLogRecord.getStoredSize(checksumLogOperation.group(), null) + 
+1:d609ee3: 				checksumLogOperation.getStoredSize();
+1:d609ee3: 
+1:d609ee3: 			// calculate checksum log operation length when the database is encrypted
+1:d609ee3: 			if (logFactory.databaseEncrypted())
+1:d609ee3: 			{
+1:d609ee3: 				checksumLength =  logFactory.getEncryptedDataLength(checksumLength);
+1:d609ee3: 				databaseEncrypted = true;
+1:d609ee3: 			}
+1:d609ee3: 			checksumLogRecordSize = checksumLength  + LOG_RECORD_FIXED_OVERHEAD_SIZE;
+1:d609ee3: 
+1:d609ee3: 			//streams required to convert a log record to raw byte array. 
+1:d609ee3: 			logOutputBuffer = new ArrayOutputStream(); 
+1:d609ee3: 			logicalOut = new FormatIdOutputStream(logOutputBuffer);
+1:d609ee3: 
+1:d609ee3: 			/** initialize the buffer with space reserved for checksum log record in
+1:d609ee3: 			 * the beginning of the log buffer; checksum record is written into
+1:10b4385: 			 * this space when buffer is switched
+1:d609ee3: 			 */
+1:d609ee3: 		}else
+1:d609ee3: 		{
+1:d609ee3: 			//checksumming of transaction log feature is not in use. 
+1:d609ee3: 			checksumLogRecordSize = 0;
+1:d609ee3: 		}
+1:d609ee3: 		
+1:d609ee3: 		currentBuffer.init(checksumLogRecordSize);
+1:eac0369: 	}
+1:d609ee3: 
+1:d609ee3: 
+1:10b4385:     /**
+1:eac0369:      * Write a single log record to the stream.
+1:eac0369:      * <p>
+1:eac0369:      * For performance pass all parameters rather into a specialized routine
+1:eac0369:      * rather than maintaining the writeInt, writeLong, and write interfaces
+1:eac0369:      * that this class provides as a standard OutputStream.  It will make it
+1:eac0369:      * harder to use other OutputStream implementations, but makes for less
+1:eac0369:      * function calls and allows optimizations knowing when to switch buffers.
+1:eac0369:      * <p>
+1:eac0369:      * This routine handles all log records which are smaller than one log
+1:eac0369:      * buffer.  If a log record is bigger than a log buffer it calls
+1:eac0369:      * writeUnbufferedLogRecord().
+1:eac0369:      * <p>
+1:eac0369:      * The log record written will always look the same as if the following
+1:eac0369:      * code had been executed:
+1:eac0369:      *     writeInt(length)
+1:eac0369:      *     writeLong(instant)
+1:eac0369:      *     write(data, data_offset, (length - optional_data_length) )
+1:eac0369:      *
+1:eac0369:      *     if (optional_data_length != 0)
+1:eac0369:      *         write(optional_data, optional_data_offset, optional_data_length)
+1:eac0369:      *
+1:eac0369:      *     writeInt(length)
+1:eac0369:      *
+1:eac0369:      * @param length                (data + optional_data) length bytes to write
+1:eac0369:      * @param instant               the log address of this log record.
+1:eac0369:      * @param data                  "from" array to copy "data" portion of rec
+1:eac0369:      * @param data_offset           offset in "data" to start copying from.
+1:eac0369:      * @param optional_data         "from" array to copy "optional data" from
+1:eac0369:      * @param optional_data_offset  offset in "optional_data" to start copy from
+1:eac0369:      * @param optional_data_length  length of optional data to copy.
+1:eac0369:      *
+1:eac0369: 	 * @exception  StandardException  Standard exception policy.
+1:eac0369:      **/
+1:eac0369:     public void writeLogRecord(
+1:eac0369:     int     length,
+1:eac0369:     long    instant,
+1:eac0369:     byte[]  data,
+1:eac0369:     int     data_offset,
+1:eac0369:     byte[]  optional_data,
+1:eac0369:     int     optional_data_offset,
+1:eac0369:     int     optional_data_length)
+1:eac0369:         throws StandardException, IOException 
+1:d609ee3:     {
+1:eac0369:         int total_log_record_length = length + LOG_RECORD_FIXED_OVERHEAD_SIZE;
+1:d609ee3: 
+1:10b4385:         if (total_log_record_length <= currentBuffer.bytes_free) {
+1:10b4385:             int newpos = appendLogRecordToBuffer(currentBuffer.buffer,
+1:10b4385:                                                  currentBuffer.position,
+1:10b4385:                                                  length, 
+1:10b4385:                                                  instant, 
+1:10b4385:                                                  data, 
+1:10b4385:                                                  data_offset,
+1:10b4385:                                                  optional_data,
+1:10b4385:                                                  optional_data_offset,
+1:10b4385:                                                  optional_data_length);
+1:10b4385:             currentBuffer.position = newpos;
+1:eac0369:             currentBuffer.bytes_free -= total_log_record_length;
+1:5235dfd:             currentBuffer.greatest_instant = instant;
+1:10b4385:             if (SanityManager.DEBUG) {
+1:10b4385:                 int normalizedPosition = currentBuffer.position;
+1:10b4385:                 if (writeChecksum) {
+1:10b4385:                     normalizedPosition -= checksumLogRecordSize;
+1:10b4385:                 }
+1:10b4385:                 SanityManager.ASSERT(
+1:10b4385:                     currentBuffer.bytes_free + normalizedPosition ==
+1:10b4385:                     currentBuffer.length,
+1:10b4385:                     "free_bytes and position do not add up to the total " +
+1:10b4385:                     "length of the buffer");
+1:d609ee3:             }
+1:d609ee3: 
+1:10b4385:         } else {
+1:10b4385:             /* The current log record will never fit in a single
+1:10b4385:              * buffer. The reason is that reserveSpaceForChecksum is
+1:10b4385:              * always called before writeLogRecord (see
+1:10b4385:              * LogToFile#appendLogRecord). When we reach this point,
+1:10b4385:              * reserveSpaceForChecksum has already found out that the
+1:10b4385:              * previous buffer did not have enough free bytes to store
+1:10b4385:              * this log record, and therefore switched to a fresh
+1:10b4385:              * buffer. Hence, currentBuffer is empty now, and
+1:10b4385:              * switching to the next free buffer will not help. Since
+1:10b4385:              * there is no way for this log record to fit into a
+1:10b4385:              * buffer, it is written to a new, big enough, byte[] and
+1:10b4385:              * then written to log file instead of writing it to
+1:10b4385:              * buffer.
+1:10b4385:              */
+1:10b4385: 
+1:10b4385:             // allocate a byte[] that is big enough to contain the
+1:10b4385:             // giant log record:
+1:10b4385:             int bigBufferLength =
+1:10b4385:                 checksumLogRecordSize + total_log_record_length;
+1:10b4385:             byte[] bigbuffer = new byte[bigBufferLength];
+1:10b4385:             appendLogRecordToBuffer(bigbuffer, checksumLogRecordSize,
+1:10b4385:                                     length, 
+1:10b4385:                                     instant, 
+1:10b4385:                                     data, 
+1:10b4385:                                     data_offset,
+1:10b4385:                                     optional_data,
+1:10b4385:                                     optional_data_offset,
+1:10b4385:                                     optional_data_length);
+1:10b4385: 
+1:10b4385:             // write checksum to bigbuffer
+1:10b4385:             if(writeChecksum) {
+1:10b4385:                 checksumLogOperation.reset();
+1:10b4385:                 checksumLogOperation.update(bigbuffer, checksumLogRecordSize,
+1:10b4385:                                             total_log_record_length);
+1:10b4385: 
+1:10b4385:                 writeChecksumLogRecord(bigbuffer);
+1:10b4385:             }
+1:10b4385: 
+1:10b4385:             // flush all buffers before writing the bigbuffer to the
+1:10b4385:             // log file.
+1:10b4385:             flushLogAccessFile();
+1:10b4385: 
+1:10b4385:             // Note:No Special Synchronization required here , There
+1:10b4385:             // will be nothing to write by flushDirtyBuffers that can
+1:10b4385:             // run in parallel to the threads that is executing this
+1:10b4385:             // code. Above flush call should have written all the
+1:10b4385:             // buffers and NO new log will get added until the
+1:10b4385:             // following direct log to file call finishes.
+1:10b4385: 
+1:10b4385: 			// write the log record directly to the log file.
+1:5235dfd:             writeToLog(bigbuffer, 0, bigBufferLength, instant);
+1:10b4385:         }
+1:10b4385:     }
+1:10b4385: 
+1:10b4385:     /**
+1:10b4385:      * Append a log record to a byte[]. Typically, the byte[] will be
+1:10b4385:      * currentBuffer, but if a log record that is too big to fit in a
+1:10b4385:      * buffer is added, buff will be a newly allocated byte[].
+1:10b4385:      *
+1:10b4385:      * @param buff The byte[] the log record is appended to
+1:10b4385:      * @param pos The position in buff where the method will start to
+1:10b4385:      * append to
+1:10b4385:      * @param length (data + optional_data) length bytes to write
+1:10b4385:      * @param instant the log address of this log record.
+1:10b4385:      * @param data "from" array to copy "data" portion of rec
+1:10b4385:      * @param data_offset offset in "data" to start copying from.
+1:10b4385:      * @param optional_data "from" array to copy "optional data" from
+1:10b4385:      * @param optional_data_offset offset in "optional_data" to start copy from
+1:10b4385:      * @param optional_data_length length of optional data to copy.
+1:10b4385:      *
+1:5235dfd:      * @see LogAccessFile#writeLogRecord
+1:10b4385:      */
+1:10b4385:     private int appendLogRecordToBuffer(byte[] buff, int pos,
+1:10b4385:                                         int length,
+1:10b4385:                                         long instant,
+1:10b4385:                                         byte[] data,
+1:10b4385:                                         int data_offset,
+1:10b4385:                                         byte[] optional_data,
+1:10b4385:                                         int optional_data_offset,
+1:10b4385:                                         int optional_data_length) {
+1:10b4385: 
+1:10b4385:         pos = writeInt(length, buff, pos);
+1:10b4385:         pos = writeLong(instant, buff, pos);
+1:10b4385: 
+1:10b4385:         int data_length = length - optional_data_length;
+1:10b4385:         System.arraycopy(data, data_offset,
+1:10b4385:                          buff, pos,
+1:10b4385:                          data_length);
+1:10b4385:         pos += data_length;
+1:10b4385: 
+1:10b4385:         if (optional_data_length != 0) {
+1:10b4385:             System.arraycopy(optional_data, optional_data_offset, 
+1:10b4385:                              buff, pos, 
+1:10b4385:                              optional_data_length);
+1:10b4385:             pos += optional_data_length;
+1:10b4385:         }
+1:10b4385: 
+1:10b4385:         pos = writeInt(length, buff, pos);
+1:10b4385: 
+1:10b4385:         return pos;
+1:d609ee3:     }
+1:d609ee3: 
+1:d609ee3: 
+1:d609ee3: 
+1:d609ee3: 	private final int writeInt(int i , byte b[], int p)
+1:d609ee3: 	{
+1:d609ee3: 	
+1:eac0369:         b[p++] = (byte) ((i >>> 24) & 0xff); 
+1:eac0369:         b[p++] = (byte) ((i >>> 16) & 0xff); 
+1:eac0369:         b[p++] = (byte) ((i >>> 8) & 0xff); 
+1:d609ee3:         b[p++] = (byte) (i & 0xff);	
+1:d609ee3: 		return p;
+1:eac0369: 	}
+1:d609ee3: 
+1:d609ee3: 
+1:d609ee3: 	private final int writeLong(long l , byte b[], int p)
+1:eac0369: 	{
+1:d609ee3: 		b[p++] = (byte) (((int)(l >>> 56)) & 0xff); 
+1:eac0369:         b[p++] = (byte) (((int)(l >>> 48)) & 0xff); 
+1:eac0369:         b[p++] = (byte) (((int)(l >>> 40)) & 0xff); 
+1:eac0369:         b[p++] = (byte) (((int)(l >>> 32)) & 0xff); 
+1:eac0369:         b[p++] = (byte) (((int)(l >>> 24)) & 0xff); 
+1:eac0369:         b[p++] = (byte) (((int)(l >>> 16)) & 0xff); 
+1:eac0369:         b[p++] = (byte) (((int)(l >>> 8)) & 0xff); 
+1:eac0369:         b[p++] = (byte) (((int)l) & 0xff); 
+1:d609ee3: 		return p;
+1:d609ee3: 	}
+1:d609ee3: 
+1:d609ee3: 	public void writeInt(int i) 
+1:d609ee3:     {
+1:d609ee3: 
+1:d609ee3: 		if (SanityManager.DEBUG)
+1:d609ee3: 		{
+1:d609ee3: 			SanityManager.ASSERT(currentBuffer.bytes_free >= 4);
+1:d609ee3: 		}
+1:d609ee3: 		
+1:d609ee3: 		currentBuffer.position = 
+1:d609ee3: 			writeInt(i , currentBuffer.buffer, currentBuffer.position);
+1:d609ee3: 		currentBuffer.bytes_free -= 4;
+1:d609ee3: 	}
+1:d609ee3: 
+1:d609ee3: 	public void writeLong(long l) 
+1:d609ee3:     {
+1:d609ee3: 		
+1:d609ee3: 		if (SanityManager.DEBUG)
+1:d609ee3: 		{
+1:d609ee3: 			SanityManager.ASSERT(currentBuffer.bytes_free >= 8);
+1:d609ee3: 		}
+1:d609ee3: 		
+1:d609ee3: 		currentBuffer.position = 
+1:d609ee3: 			writeLong(l , currentBuffer.buffer, currentBuffer.position);
+1:eac0369: 		currentBuffer.bytes_free -= 8;
+1:eac0369:     }
+1:eac0369: 
+1:eac0369: 	public void write(int b) 
+1:d609ee3:     {
+1:d609ee3: 		if (SanityManager.DEBUG)
+1:eac0369: 		{
+1:d609ee3: 			SanityManager.ASSERT(currentBuffer.bytes_free > 0);
+1:d609ee3: 		}
+1:d609ee3: 		
+1:eac0369: 		currentBuffer.buffer[currentBuffer.position++] = (byte) b;
+1:eac0369: 		currentBuffer.bytes_free--;
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 	public void write(byte b[], int off, int len) 
+1:d609ee3:     {
+1:d609ee3: 		if (SanityManager.DEBUG)
+1:eac0369: 		{
+1:d609ee3: 			SanityManager.ASSERT(len <= currentBuffer.bytes_free);
+1:eac0369: 		}
+1:d609ee3: 		
+1:d609ee3: 		System.arraycopy(b, off, currentBuffer.buffer, currentBuffer.position, len);
+1:d609ee3: 		currentBuffer.bytes_free -= len;
+1:d609ee3: 		currentBuffer.position += len;
+1:eac0369: 	}
+1:d609ee3: 
+1:d609ee3: 
+1:eac0369:     /**
+1:eac0369:      * Write data from all dirty buffers into the log file.
+1:eac0369:      * <p>
+1:eac0369:      * A call for clients of LogAccessFile to insure that all privately buffered
+1:eac0369:      * data has been writen to the file - so that reads on the file using one
+1:eac0369:      * of the various scan classes will see
+1:eac0369:      * all the data which has been writen to this point.
+1:eac0369:      * <p>
+1:eac0369:      * Note that this routine only "writes" the data to the file, this does not
+1:eac0369:      * mean that the data has been synced to disk unless file was opened in
+1:eac0369: 	 * WRITE SYNC mode(rws/rwd).  The only way to insure that is by calling
+1:eac0369:      * is to call syncLogAccessFile() after this call in Non-WRITE sync mode(rw)
+1:eac0369: 	 * 
+1:eac0369: 	 * <p>
+1:eac0369: 	 * MT-Safe : parallel thereads can call this function, only one threads does
+1:eac0369: 	 * the flush and the other threads waits for the one that is doing the flush to finish.
+1:eac0369: 	 * Currently there are two possible threads that can call this function in parallel 
+1:eac0369: 	 * 1) A Thread that is doing the commit
+1:eac0369: 	 * 2) A Thread that is writing to the log and log buffers are full or
+1:eac0369: 	 * a log records does not fit in a buffer. (Log Buffers
+1:eac0369: 	 * full(switchLogBuffer() or a log record size that is greater than
+1:eac0369: 	 * logbuffer size has to be writtern through writeToLog call directlty)
+1:eac0369: 	 * Note: writeToLog() is not synchronized on the semaphore
+1:eac0369: 	 * that is used to do  buffer management to allow writes 
+1:eac0369: 	 * to the free buffers when flush is in progress.  
+1:eac0369:      **/
+1:eac0369: 	protected void flushDirtyBuffers() throws IOException 
+1:eac0369:     {
+1:eac0369:         LogAccessFileBuffer buf = null;
+1:eac0369: 		int noOfBuffers;
+1:eac0369: 		int nFlushed= 0;
+1:eac0369: 		try{
+1:eac0369: 			synchronized(this)
+1:eac0369: 			{
+1:eac0369: 				/**if some one else flushing wait, otherwise it is possible 
+1:eac0369: 				 * different threads will get different buffers and order can 
+1:eac0369: 				 * not be determined.
+1:eac0369: 				 * 
+1:eac0369: 				 **/
+1:eac0369: 				while(flushInProgress)
+1:eac0369: 				{
+1:eac0369: 					try{
+1:eac0369: 						wait();
+1:eac0369: 					}catch (InterruptedException ie) 
+1:eac0369: 					{
+1:5d97422:                         InterruptStatus.setInterrupted();
+1:eac0369: 					}
+1:eac0369: 				}
+1:eac0369: 		
+1:eac0369: 				noOfBuffers = dirtyBuffers.size();
+1:eac0369: 				if(noOfBuffers > 0)
+1:7e7a589: 					buf = dirtyBuffers.removeFirst();
+1:eac0369: 				
+1:eac0369: 				flushInProgress = true;
+1:eac0369: 			}
+1:eac0369: 			
+1:eac0369: 			while(nFlushed < noOfBuffers)
+1:eac0369: 			{
+1:5235dfd: 				if (buf.position != 0) {
+1:5235dfd: 					writeToLog(buf.buffer, 0, buf.position, buf.greatest_instant);
+1:5235dfd: 				}
+1:eac0369: 
+1:eac0369: 				nFlushed++;
+1:eac0369: 				synchronized(this)
+1:eac0369: 				{
+1:eac0369: 					//add the buffer that was written previosly to the free list
+1:eac0369: 					freeBuffers.addLast(buf);
+1:eac0369: 					if(nFlushed < noOfBuffers)
+1:7e7a589: 						buf = dirtyBuffers.removeFirst();
+3:eac0369: 					else
+1:eac0369: 					{
+1:eac0369: 						//see if we can flush more, that came when we are at it.
+1:eac0369: 						//don't flush more than the total number of buffers,
+1:eac0369: 						//that might lead to starvation of the current thread.
+1:eac0369: 						int size = dirtyBuffers.size();
+1:eac0369: 						if(size > 0 && nFlushed <= LOG_NUMBER_LOG_BUFFERS)
+1:eac0369: 						{
+1:eac0369: 							noOfBuffers += size;
+1:7e7a589: 							buf = dirtyBuffers.removeFirst();
+1:eac0369: 						}
+1:eac0369: 					}
+1:eac0369: 				}
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369: 				
+1:eac0369: 		}finally{
+1:eac0369: 			synchronized(this)
+1:eac0369: 			{
+1:eac0369: 				flushInProgress = false;
+1:eac0369: 				notifyAll();
+1:eac0369: 			}
+1:eac0369: 		}
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 	//flush all the the dirty buffers to disk
+1:d609ee3: 	public void flushLogAccessFile() throws IOException,  StandardException 
+1:eac0369: 	{
+6:eac0369: 		switchLogBuffer();
+1:eac0369: 		flushDirtyBuffers();
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 		
+1:eac0369: 	/**
+1:eac0369: 	 * Appends the current Buffer to the dirty Buffer list and assigns a free
+1:eac0369: 	 * buffer to be the currrent active buffer . Flushing of the buffer
+1:eac0369: 	 * to disk is delayed if there is a free buffer available. 
+1:eac0369: 	 * dirty buffers will be  flushed to the disk   
+1:eac0369: 	 * when  flushDirtyBuffers() is invoked by  a commit call 
+1:eac0369: 	 * or when no more free buffers are available. 
+4:eac0369: 	 */
+1:d609ee3: 	public void switchLogBuffer() throws IOException, StandardException  
+1:eac0369:     {
+1:eac0369: 
+1:eac0369: 		synchronized(this)
+1:eac0369: 		{
+1:d609ee3: 			// ignore empty buffer switch requests
+1:d609ee3: 			if(currentBuffer.position == checksumLogRecordSize)
+1:d609ee3: 				return;
+1:d609ee3: 
+1:d609ee3: 			// calculate the checksum for the current log buffer 
+1:d609ee3: 			// and write the record to the space reserverd in 
+1:d609ee3: 			// the beginning of the buffer. 
+1:10b4385: 			if(writeChecksum)
+1:d609ee3: 			{
+1:d609ee3: 				checksumLogOperation.reset();
+1:d609ee3: 				checksumLogOperation.update(currentBuffer.buffer, checksumLogRecordSize, currentBuffer.position - checksumLogRecordSize);
+1:10b4385: 				writeChecksumLogRecord(currentBuffer.buffer);
+1:d609ee3: 			}
+1:d609ee3: 
+1:eac0369: 			//add the current buffer to the flush buffer list
+1:eac0369: 			dirtyBuffers.addLast(currentBuffer);
+1:eac0369: 
+1:eac0369: 			//if there is No free buffer, flush the buffers to get a free one 
+1:eac0369: 			if(freeBuffers.size() == 0) 
+1:d609ee3: 			{
+1:eac0369: 				flushDirtyBuffers();
+1:eac0369: 				//after the flush call there should be a free buffer
+1:eac0369: 				//because this is only methods removes items from 
+1:eac0369: 				//free buffers and removal is in synchronized block. 
+1:eac0369: 			}
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 			// there should be free buffer available at this point.
+1:eac0369: 			if (SanityManager.DEBUG)
+1:eac0369: 				SanityManager.ASSERT(freeBuffers.size() > 0);
+1:eac0369: 
+1:eac0369: 			//switch over to the next log buffer, let someone else write it.
+1:7e7a589: 			currentBuffer = freeBuffers.removeFirst();
+1:d609ee3: 			currentBuffer.init(checksumLogRecordSize);
+1:d609ee3: 
+1:eac0369: 			if (SanityManager.DEBUG)
+1:d609ee3: 			{
+1:d609ee3: 				SanityManager.ASSERT(currentBuffer.position == checksumLogRecordSize);
+1:eac0369: 				SanityManager.ASSERT(
+1:d609ee3: 									 currentBuffer.bytes_free == currentBuffer.length);
+1:eac0369:                 SanityManager.ASSERT(currentBuffer.bytes_free > 0);
+1:eac0369: 			}
+1:eac0369: 		}
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369: 
+1:eac0369:     /**
+1:eac0369:      * Guarantee all writes up to the last call to flushLogAccessFile on disk.
+1:eac0369:      * <p>
+1:eac0369:      * A call for clients of LogAccessFile to insure that all data written
+1:eac0369:      * up to the last call to flushLogAccessFile() are written to disk.
+1:eac0369:      * This call will not return until those writes have hit disk.
+1:eac0369:      * <p>
+1:eac0369:      * Note that this routine may block waiting for I/O to complete so 
+1:eac0369:      * callers should limit the number of resource held locked while this
+1:eac0369:      * operation is called.  It is expected that the caller
+1:eac0369:      * Note that this routine only "writes" the data to the file, this does not
+1:eac0369:      * mean that the data has been synced to disk.  The only way to insure that
+1:eac0369:      * is to first call switchLogBuffer() and then follow by a call of sync().
+1:eac0369:      *
+1:eac0369:      **/
+1:eac0369:     public void syncLogAccessFile() 
+1:eac0369:         throws IOException, StandardException
+1:eac0369:     {
+1:eac0369:         for( int i=0; ; )
+1:eac0369:         {
+1:eac0369:             // 3311: JVM sync call sometimes fails under high load against NFS 
+1:eac0369:             // mounted disk.  We re-try to do this 20 times.
+1:eac0369:             try
+1:eac0369:             {
+1:eac0369:                 synchronized( this)
+1:eac0369:                 {
+1:a552fe6:                     log.sync();
+1:eac0369:                 }
+1:eac0369: 
+1:eac0369:                 // the sync succeed, so return
+1:eac0369:                 break;
+1:eac0369:             }
+1:eac0369:             catch( SyncFailedException sfe )
+1:eac0369:             {
+1:eac0369:                 i++;
+1:eac0369:                 try
+1:eac0369:                 {
+1:eac0369:                     // wait for .2 of a second, hopefully I/O is done by now
+1:eac0369:                     // we wait a max of 4 seconds before we give up
+1:eac0369:                     Thread.sleep( 200 ); 
+1:eac0369:                 }
+1:eac0369:                 catch( InterruptedException ie )
+1:5d97422:                 {
+1:5d97422:                     InterruptStatus.setInterrupted();
+1:eac0369:                 }
+1:eac0369: 
+1:eac0369:                 if( i > 20 )
+1:eac0369:                     throw StandardException.newException(
+1:75fb1cf:                         SQLState.LOG_FULL, sfe);
+1:eac0369:             }
+1:eac0369:         }
+1:eac0369:     }
+1:eac0369: 
+1:eac0369: 	/**
+1:eac0369: 		The database is being marked corrupted, get rid of file pointer without
+1:eac0369: 		writing out anything more.
+1:eac0369: 	 */
+1:eac0369: 	public void corrupt() throws IOException
+1:eac0369: 	{
+1:eac0369: 		synchronized(logFileSemaphore)
+1:eac0369: 		{
+1:eac0369: 			if (log != null)
+1:eac0369: 				log.close();
+1:eac0369: 		}
+1:eac0369: 	}
+1:d609ee3: 
+1:d609ee3: 	public void close() throws IOException, StandardException
+1:eac0369:     {
+1:eac0369: 		if (SanityManager.DEBUG) 
+1:eac0369:         {
+1:d609ee3: 			if (currentBuffer.position !=  checksumLogRecordSize)
+1:eac0369: 				SanityManager.THROWASSERT(
+1:eac0369: 				"Log file being closed with data still buffered " + 
+1:eac0369:                 currentBuffer.position +  " " + currentBuffer.bytes_free);
+1:eac0369: 		}
+1:eac0369: 
+1:d609ee3: 		flushLogAccessFile();
+1:eac0369: 
+1:eac0369: 		synchronized(logFileSemaphore)
+1:eac0369: 		{
+1:eac0369: 			if (log != null)
+1:eac0369: 				log.close();
+1:eac0369: 		}
+1:eac0369: 	}
+1:eac0369: 
+1:eac0369:     /**
+1:5235dfd:      * Make this LogAccessFile pass chunks of log records (byte[]) to
+1:5235dfd:      * the MasterFactory when the chunks are written to disk.
+1:5235dfd:      * @param masterFac The MasterFactory service responsible for
+1:5235dfd:      * controlling the master side replication behaviour.
+1:5235dfd:      */
+1:5235dfd:     protected void setReplicationMasterRole(MasterFactory masterFac) {
+1:5235dfd:         this.masterFac = masterFac;
+1:5235dfd:         inReplicationMasterMode = true;
+1:5235dfd:     }
+1:5235dfd: 
+1:5235dfd:     /**
+1:5235dfd:      * Stop this LogAccessFile from passing chunks of log records to
+1:5235dfd:      * the MasterFactory.
+1:5235dfd:      */
+1:5235dfd:     protected void stopReplicationMasterRole() {
+1:5235dfd:         inReplicationMasterMode = false;
+1:5235dfd:         masterFac = null;
+1:5235dfd:     }
+1:eac0369: 
+1:c458b05:     /**
+1:c458b05:      * Method to put this LogAccessFile object in replication slave
+1:c458b05:      * mode, effectively disabling checksum writes.
+1:c458b05:      *
+1:c458b05:      * Because checksums are received from the replication master, the
+1:c458b05:      * slave can not be allowed to add it's own checksums - that would
+1:c458b05:      * invalidate the checksums and would stop the database from
+1:c458b05:      * recovering. Replication slave mode must therefore be set before
+1:c458b05:      * LogAccessFile decides whether to write it's own checksums, and
+1:c458b05:      * this method is therefore indirectly called from the constructor
+1:c458b05:      * of this class by calling LogFactory.checkForReplication
+1:c458b05:      *
+1:c458b05:      * If replication slave mode for the database is stopped after
+1:c458b05:      * this object has been created, checksums cannot be reenabled
+1:c458b05:      * without creating a new instance of this class. That is
+1:c458b05:      * conveniently handled as LogToFile.recover completes (which
+1:c458b05:      * automatically happens once replication slave mode is no longer
+1:c458b05:      * active)
+1:c458b05:      *
+1:c458b05:      * @see LogToFile#checkForReplication
+1:c458b05:      */
+1:c458b05:     protected void setReplicationSlaveRole() {
+1:c458b05:         inReplicationSlaveMode = true;
+1:c458b05:     }
+1:c458b05: 
+1:eac0369: 	/* write to the log file */
+1:5235dfd: 	private void writeToLog(byte b[], int off, int len, long highestInstant)
+1:5235dfd: 		throws IOException
+1:eac0369: 	{
+1:eac0369: 		synchronized(logFileSemaphore)
+1:eac0369: 		{
+1:eac0369:             if (log != null)
+1:eac0369:             {
+1:eac0369: 
+1:eac0369:                 // Try to handle case where user application is throwing
+1:94f158a:                 // random interrupts at Derby threads, retry in the case
+1:eac0369:                 // of IO exceptions 5 times.  After that hope that it is 
+1:eac0369:                 // a real disk problem - an IO error in a write to the log file
+1:eac0369:                 // is going to take down the whole system, so seems worthwhile
+1:eac0369:                 // to retry.
+1:eac0369:                 for (int i = 0; ;i++)
+1:eac0369:                 {
+1:eac0369:                     try 
+1:eac0369:                     {
+1:eac0369:                         log.write(b, off, len);
+1:5235dfd:                         if (inReplicationMasterMode) {
+1:5235dfd:                             masterFac.appendLog(highestInstant,
+1:5235dfd:                                                 b, off, len);
+1:5235dfd:                         }
+1:eac0369:                         break;
+1:eac0369:                     }
+1:eac0369:                     catch (IOException ioe)
+1:eac0369:                     {
+1:eac0369:                         // just fall through and rety the log write 1st 5 times.
+1:eac0369: 
+1:eac0369:                         if (i >= 5)
+1:eac0369:                             throw ioe;
+1:eac0369:                     }
+1:eac0369:                 }
+1:eac0369:             }
+1:eac0369: 		}
+1:eac0369: 
+1:eac0369: 		if (SanityManager.DEBUG) 
+1:eac0369:         {
+1:eac0369: 			mon_numWritesToLog++;
+1:eac0369: 			mon_numBytesToLog += len;
+1:eac0369: 		}
+1:eac0369: 	}
+1:d609ee3: 
+1:d609ee3: 	/**
+1:d609ee3: 	 * reserve the space for the checksum log record in the log file. 
+1:75b112d:      *
+1:75b112d: 	 * @param  length           the length of the log record to be written
+1:75b112d: 	 * @param  logFileNumber    current log file number 
+1:d609ee3: 	 * @param  currentPosition  current position in the log file. 
+1:75b112d:      *
+1:d609ee3: 	 * @return the space that is needed to write a checksum log record.
+1:d609ee3: 	 */
+1:d609ee3: 	protected long reserveSpaceForChecksum(int length, long logFileNumber, long currentPosition )
+1:d609ee3: 		throws StandardException, IOException 
+1:d609ee3: 	{
+1:d609ee3: 
+1:d609ee3: 		int total_log_record_length = length + LOG_RECORD_FIXED_OVERHEAD_SIZE;
+1:d609ee3: 		boolean reserveChecksumSpace = false;
+1:d609ee3: 		
+1:d609ee3: 		/* checksum log record is calculated for a group of log 
+1:d609ee3: 		 * records that can fit in to a single buffer or for 
+1:d609ee3: 		 * a single record when it does not fit into 
+1:d609ee3: 		 * a fit into a buffer at all. When a new buffer 
+1:d609ee3: 		 * is required to write a log record, log space 
+1:d609ee3: 		 * has to be reserved before writing the log record
+1:d609ee3: 		 * becuase checksum is written in the before the 
+1:d609ee3: 		 * log records that are being checksummed. 
+1:d609ee3: 		 * What it also means is a real log instant has to be 
+1:d609ee3: 		 * reserved for writing the checksum log record in addition 
+1:d609ee3: 		 * to the log buffer space.
+1:d609ee3: 		 */
+1:d609ee3: 		
+1:d609ee3: 
+1:d609ee3: 		/* reserve checkum space for new log records if a log buffer switch had
+1:d609ee3: 		 * happened before because of a explicit log flush requests(like commit)
+1:d609ee3: 		 * or a long record write 
+1:d609ee3: 		 */
+1:d609ee3: 		if(currentBuffer.position == checksumLogRecordSize)
+1:d609ee3: 		{
+1:cae67a8: 			// reserver space if log checksum feature is enabled.
+1:cae67a8: 			reserveChecksumSpace = writeChecksum;
+1:d609ee3: 		}
+1:d609ee3: 		else{
+1:d609ee3: 			if (total_log_record_length > currentBuffer.bytes_free)
+1:d609ee3: 			{
+1:d609ee3: 				// the log record that is going to be written is not 
+1:d609ee3: 				// going to fit in the current buffer, switch the 
+1:d609ee3: 				// log buffer to create buffer space for it. 
+1:d609ee3: 				switchLogBuffer();
+1:cae67a8: 				// reserve space if log checksum feature is enabled. 
+1:cae67a8: 				reserveChecksumSpace = writeChecksum;
+1:d609ee3: 			}
+1:d609ee3: 		}
+1:d609ee3: 		
+1:d609ee3: 		if(reserveChecksumSpace)
+1:d609ee3: 		{
+1:d609ee3: 			if (SanityManager.DEBUG)
+1:d609ee3: 			{
+1:d609ee3: 				// Prevoiusly reserved real checksum instant should have been
+1:d609ee3: 				// used, before an another one is generated. 
+1:d609ee3: 				SanityManager.ASSERT(checksumInstant == -1,  "CHECKSUM INSTANT IS GETTING OVER WRITTEN");
+1:d609ee3: 			}
+1:d609ee3: 			
+1:d609ee3: 			checksumInstant = LogCounter.makeLogInstantAsLong(logFileNumber, currentPosition);
+1:d609ee3: 			return  checksumLogRecordSize;
+1:d609ee3: 		}else
+1:d609ee3: 		{
+1:d609ee3: 			return 0 ;
+1:d609ee3: 		}
+1:d609ee3: 	}
+1:d609ee3: 
+1:d609ee3: 
+1:eac0369: 	/**
+1:10b4385: 	 * Generate the checkum log record and write it into the log
+1:10b4385: 	 * buffer. The checksum applies to all bytes from this checksum
+1:10b4385: 	 * log record to the next one. 
+1:10b4385:      * @param buffer The byte[] the checksum is written to. The
+1:10b4385:      * checksum is always written at the beginning of buffer.
+1:d609ee3: 	 */
+1:10b4385: 	private void writeChecksumLogRecord(byte[] buffer)
+1:10b4385: 		throws IOException, StandardException{
+1:d609ee3: 		
+1:d609ee3: 		int    p    = 0; //checksum is written in the beginning of the buffer
+1:d609ee3: 
+2:d609ee3: 		// writeInt(length)
+1:10b4385: 		p = writeInt(checksumLength, buffer, p);
+1:d609ee3:             
+1:d609ee3: 		// writeLong(instant)
+1:10b4385: 		p = writeLong(checksumInstant, buffer, p);
+1:d609ee3: 
+1:d609ee3: 		//write the checksum log operation  
+1:10b4385: 		logOutputBuffer.setData(buffer);
+1:d609ee3: 		logOutputBuffer.setPosition(p);
+1:d609ee3: 		logicalOut.writeObject(checksumLogRecord);
+1:d609ee3: 
+1:d609ee3: 		if(databaseEncrypted)
+1:d609ee3: 		{
+1:d609ee3: 			//encrypt the checksum log operation part.
+1:d609ee3: 			int len = 
+1:10b4385: 				logFactory.encrypt(buffer, LOG_RECORD_HEADER_SIZE, checksumLength, 
+1:10b4385: 								   buffer, LOG_RECORD_HEADER_SIZE);
+1:d609ee3: 			
+1:d609ee3: 		   
+1:d609ee3: 			if (SanityManager.DEBUG)
+1:d609ee3: 				SanityManager.ASSERT(len == checksumLength, 
+1:d609ee3: 									 "encrypted log buffer length != log buffer len");
+1:d609ee3: 		}
+1:d609ee3: 
+1:d609ee3: 		p = LOG_RECORD_HEADER_SIZE + checksumLength ;
+1:d609ee3: 
+1:d609ee3: 		// writeInt(length) trailing
+1:10b4385: 		p = writeInt(checksumLength, buffer, p );
+1:d609ee3: 		
+1:d609ee3: 		if (SanityManager.DEBUG)
+1:d609ee3: 		{
+1:d609ee3: 			SanityManager.ASSERT(p == checksumLogRecordSize, "position=" + p  + "ckrecordsize=" + checksumLogRecordSize);
+1:d609ee3: 			if (SanityManager.DEBUG_ON(LogToFile.DBG_FLAG))
+1:d609ee3: 			{
+1:d609ee3: 				SanityManager.DEBUG(
+1:d609ee3: 									LogToFile.DBG_FLAG, 
+1:d609ee3: 									"Write log record: tranId=Null"  +
+1:d609ee3: 									" instant: " + LogCounter.toDebugString(checksumInstant) + " length: " +
+1:d609ee3: 									checksumLength + "\n" + checksumLogOperation + "\n");
+1:d609ee3: 			}
+1:d609ee3: 			checksumInstant = -1; 
+1:d609ee3: 		}
+1:d609ee3: 
+1:d609ee3: 	}
+1:d609ee3: 
+1:5891683:     /** Return the length of a checksum record */
+1:5891683:     public  int getChecksumLogRecordSize() { return checksumLogRecordSize; }
+1:5891683: 
+1:d609ee3: 
+1:d609ee3: 	protected void writeEndMarker(int marker) throws IOException, StandardException 
+1:d609ee3: 	{
+1:d609ee3: 		//flush all the buffers and then write the end marker.
+1:d609ee3: 		flushLogAccessFile();
+1:d609ee3: 		
+1:d609ee3: 		byte[] b    = currentBuffer.buffer;
+1:d609ee3: 		int    p    = 0; //end is written in the beginning of the buffer, no
+1:d609ee3: 						 //need to checksum a int write.
+1:d609ee3: 		p = writeInt(marker , b , p);
+1:5235dfd: 		writeToLog(b, 0, p, -1); //end marker has no instant
+1:d609ee3: 	}
+1:d609ee3: 
+1:d609ee3: 	
+1:eac0369: }
+1:d609ee3: 
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 
+1:eac0369: 
+============================================================================
+author:Richard N. Hillegas
+-------------------------------------------------------------------------------
+commit:dbed020
+/////////////////////////////////////////////////////////////////////////
+1: 	freeBuffers --&gt; dirtyBuffers --&gt; freeBuffers. Movement of buffers from one
+commit:7e7a589
+/////////////////////////////////////////////////////////////////////////
+1: 	private LinkedList<LogAccessFileBuffer>    freeBuffers;  //list of free buffers
+1: 	private LinkedList<LogAccessFileBuffer>    dirtyBuffers; //list of dirty buffers to flush
+/////////////////////////////////////////////////////////////////////////
+1: 		freeBuffers = new LinkedList<LogAccessFileBuffer>();
+1: 		dirtyBuffers = new LinkedList<LogAccessFileBuffer>();
+/////////////////////////////////////////////////////////////////////////
+1: 					buf = dirtyBuffers.removeFirst();
+/////////////////////////////////////////////////////////////////////////
+1: 						buf = dirtyBuffers.removeFirst();
+/////////////////////////////////////////////////////////////////////////
+1: 							buf = dirtyBuffers.removeFirst();
+/////////////////////////////////////////////////////////////////////////
+1: 			currentBuffer = freeBuffers.removeFirst();
+commit:5891683
+/////////////////////////////////////////////////////////////////////////
+1:     /** Return the length of a checksum record */
+1:     public  int getChecksumLogRecordSize() { return checksumLogRecordSize; }
+1: 
+commit:270a34d
+/////////////////////////////////////////////////////////////////////////
+1:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:    contributor license agreements.  See the NOTICE file distributed with
+1:    this work for additional information regarding copyright ownership.
+1:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:    (the "License"); you may not use this file except in compliance with
+1:    the License.  You may obtain a copy of the License at
+author:Bryan Pendleton
+-------------------------------------------------------------------------------
+commit:7e51e9d
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.shared.common.sanity.SanityManager;
+author:Dag H. Wanvik
+-------------------------------------------------------------------------------
+commit:5d97422
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.util.InterruptStatus;
+/////////////////////////////////////////////////////////////////////////
+1:                         InterruptStatus.setInterrupted();
+/////////////////////////////////////////////////////////////////////////
+1:                 {
+1:                     InterruptStatus.setInterrupted();
+commit:a552fe6
+/////////////////////////////////////////////////////////////////////////
+1:                     log.sync();
+author:Oystein Grovlen
+-------------------------------------------------------------------------------
+commit:1bac3f3
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.store.replication.master.MasterFactory;
+commit:c458b05
+/////////////////////////////////////////////////////////////////////////
+1:     boolean inReplicationSlaveMode = false;
+/////////////////////////////////////////////////////////////////////////
+1: 		// Puts this LogAccessFile object in replication slave or
+1: 		// master mode if the database has such a role
+1: 		logFactory.checkForReplication(this);
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: 		// Checksums are received from the master if in slave replication mode
+1: 		if (inReplicationSlaveMode) writeChecksum = false;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Method to put this LogAccessFile object in replication slave
+1:      * mode, effectively disabling checksum writes.
+1:      *
+1:      * Because checksums are received from the replication master, the
+1:      * slave can not be allowed to add it's own checksums - that would
+1:      * invalidate the checksums and would stop the database from
+1:      * recovering. Replication slave mode must therefore be set before
+1:      * LogAccessFile decides whether to write it's own checksums, and
+1:      * this method is therefore indirectly called from the constructor
+1:      * of this class by calling LogFactory.checkForReplication
+1:      *
+1:      * If replication slave mode for the database is stopped after
+1:      * this object has been created, checksums cannot be reenabled
+1:      * without creating a new instance of this class. That is
+1:      * conveniently handled as LogToFile.recover completes (which
+1:      * automatically happens once replication slave mode is no longer
+1:      * active)
+1:      *
+1:      * @see LogToFile#checkForReplication
+1:      */
+1:     protected void setReplicationSlaveRole() {
+1:         inReplicationSlaveMode = true;
+1:     }
+1: 
+commit:5235dfd
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.derby.iapi.services.replication.master.MasterFactory;
+/////////////////////////////////////////////////////////////////////////
+1:     // the MasterFactory that will accept log when in replication master mode
+1:     MasterFactory masterFac; 
+1:     boolean inReplicationMasterMode = false;
+/////////////////////////////////////////////////////////////////////////
+0: 		logFactory.checkForReplication(this);
+/////////////////////////////////////////////////////////////////////////
+1:             currentBuffer.greatest_instant = instant;
+/////////////////////////////////////////////////////////////////////////
+1:             writeToLog(bigbuffer, 0, bigBufferLength, instant);
+/////////////////////////////////////////////////////////////////////////
+1:      * @see LogAccessFile#writeLogRecord
+/////////////////////////////////////////////////////////////////////////
+1: 				if (buf.position != 0) {
+1: 					writeToLog(buf.buffer, 0, buf.position, buf.greatest_instant);
+1: 				}
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Make this LogAccessFile pass chunks of log records (byte[]) to
+1:      * the MasterFactory when the chunks are written to disk.
+1:      * @param masterFac The MasterFactory service responsible for
+1:      * controlling the master side replication behaviour.
+1:      */
+1:     protected void setReplicationMasterRole(MasterFactory masterFac) {
+1:         this.masterFac = masterFac;
+1:         inReplicationMasterMode = true;
+1:     }
+1: 
+1:     /**
+1:      * Stop this LogAccessFile from passing chunks of log records to
+1:      * the MasterFactory.
+1:      */
+1:     protected void stopReplicationMasterRole() {
+1:         inReplicationMasterMode = false;
+1:         masterFac = null;
+1:     }
+1: 	private void writeToLog(byte b[], int off, int len, long highestInstant)
+1: 		throws IOException
+/////////////////////////////////////////////////////////////////////////
+1:                         if (inReplicationMasterMode) {
+1:                             masterFac.appendLog(highestInstant,
+1:                                                 b, off, len);
+1:                         }
+/////////////////////////////////////////////////////////////////////////
+1: 		writeToLog(b, 0, p, -1); //end marker has no instant
+commit:10b4385
+/////////////////////////////////////////////////////////////////////////
+1:     In case of a large log record that does not fit into a buffer, the
+1:     checksum is written to the byte[] allocated for the big log
+1:     record. 
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: 			 * this space when buffer is switched
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:         if (total_log_record_length <= currentBuffer.bytes_free) {
+1:             int newpos = appendLogRecordToBuffer(currentBuffer.buffer,
+1:                                                  currentBuffer.position,
+1:                                                  length, 
+1:                                                  instant, 
+1:                                                  data, 
+1:                                                  data_offset,
+1:                                                  optional_data,
+1:                                                  optional_data_offset,
+1:                                                  optional_data_length);
+1:             currentBuffer.position = newpos;
+1:             if (SanityManager.DEBUG) {
+1:                 int normalizedPosition = currentBuffer.position;
+1:                 if (writeChecksum) {
+1:                     normalizedPosition -= checksumLogRecordSize;
+1:                 }
+1:                 SanityManager.ASSERT(
+1:                     currentBuffer.bytes_free + normalizedPosition ==
+1:                     currentBuffer.length,
+1:                     "free_bytes and position do not add up to the total " +
+1:                     "length of the buffer");
+1:         } else {
+1:             /* The current log record will never fit in a single
+1:              * buffer. The reason is that reserveSpaceForChecksum is
+1:              * always called before writeLogRecord (see
+1:              * LogToFile#appendLogRecord). When we reach this point,
+1:              * reserveSpaceForChecksum has already found out that the
+1:              * previous buffer did not have enough free bytes to store
+1:              * this log record, and therefore switched to a fresh
+1:              * buffer. Hence, currentBuffer is empty now, and
+1:              * switching to the next free buffer will not help. Since
+1:              * there is no way for this log record to fit into a
+1:              * buffer, it is written to a new, big enough, byte[] and
+1:              * then written to log file instead of writing it to
+1:              * buffer.
+1:              */
+1: 
+1:             // allocate a byte[] that is big enough to contain the
+1:             // giant log record:
+1:             int bigBufferLength =
+1:                 checksumLogRecordSize + total_log_record_length;
+1:             byte[] bigbuffer = new byte[bigBufferLength];
+1:             appendLogRecordToBuffer(bigbuffer, checksumLogRecordSize,
+1:                                     length, 
+1:                                     instant, 
+1:                                     data, 
+1:                                     data_offset,
+1:                                     optional_data,
+1:                                     optional_data_offset,
+1:                                     optional_data_length);
+1: 
+1:             // write checksum to bigbuffer
+1:             if(writeChecksum) {
+1:                 checksumLogOperation.reset();
+1:                 checksumLogOperation.update(bigbuffer, checksumLogRecordSize,
+1:                                             total_log_record_length);
+1: 
+1:                 writeChecksumLogRecord(bigbuffer);
+1:             }
+1: 
+1:             // flush all buffers before writing the bigbuffer to the
+1:             // log file.
+1:             flushLogAccessFile();
+1: 
+1:             // Note:No Special Synchronization required here , There
+1:             // will be nothing to write by flushDirtyBuffers that can
+1:             // run in parallel to the threads that is executing this
+1:             // code. Above flush call should have written all the
+1:             // buffers and NO new log will get added until the
+1:             // following direct log to file call finishes.
+1: 
+1: 			// write the log record directly to the log file.
+0:             writeToLog(bigbuffer, 0, bigBufferLength);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Append a log record to a byte[]. Typically, the byte[] will be
+1:      * currentBuffer, but if a log record that is too big to fit in a
+1:      * buffer is added, buff will be a newly allocated byte[].
+1:      *
+1:      * @param buff The byte[] the log record is appended to
+1:      * @param pos The position in buff where the method will start to
+1:      * append to
+1:      * @param length (data + optional_data) length bytes to write
+1:      * @param instant the log address of this log record.
+1:      * @param data "from" array to copy "data" portion of rec
+1:      * @param data_offset offset in "data" to start copying from.
+1:      * @param optional_data "from" array to copy "optional data" from
+1:      * @param optional_data_offset offset in "optional_data" to start copy from
+1:      * @param optional_data_length length of optional data to copy.
+1:      *
+0:      * @see writeLogRecord
+1:      */
+1:     private int appendLogRecordToBuffer(byte[] buff, int pos,
+1:                                         int length,
+1:                                         long instant,
+1:                                         byte[] data,
+1:                                         int data_offset,
+1:                                         byte[] optional_data,
+1:                                         int optional_data_offset,
+1:                                         int optional_data_length) {
+1: 
+1:         pos = writeInt(length, buff, pos);
+1:         pos = writeLong(instant, buff, pos);
+1: 
+1:         int data_length = length - optional_data_length;
+1:         System.arraycopy(data, data_offset,
+1:                          buff, pos,
+1:                          data_length);
+1:         pos += data_length;
+1: 
+1:         if (optional_data_length != 0) {
+1:             System.arraycopy(optional_data, optional_data_offset, 
+1:                              buff, pos, 
+1:                              optional_data_length);
+1:             pos += optional_data_length;
+1:         }
+1: 
+1:         pos = writeInt(length, buff, pos);
+1: 
+1:         return pos;
+/////////////////////////////////////////////////////////////////////////
+1: 			if(writeChecksum)
+1: 				writeChecksumLogRecord(currentBuffer.buffer);
+/////////////////////////////////////////////////////////////////////////
+1: 	/**
+1: 	 * Generate the checkum log record and write it into the log
+1: 	 * buffer. The checksum applies to all bytes from this checksum
+1: 	 * log record to the next one. 
+1:      * @param buffer The byte[] the checksum is written to. The
+1:      * checksum is always written at the beginning of buffer.
+1: 	private void writeChecksumLogRecord(byte[] buffer)
+1: 		throws IOException, StandardException{
+1: 		p = writeInt(checksumLength, buffer, p);
+1: 		p = writeLong(checksumInstant, buffer, p);
+1: 		logOutputBuffer.setData(buffer);
+/////////////////////////////////////////////////////////////////////////
+1: 				logFactory.encrypt(buffer, LOG_RECORD_HEADER_SIZE, checksumLength, 
+1: 								   buffer, LOG_RECORD_HEADER_SIZE);
+/////////////////////////////////////////////////////////////////////////
+1: 		p = writeInt(checksumLength, buffer, p );
+author:Knut Anders Hatlen
+-------------------------------------------------------------------------------
+commit:a1c9906
+/////////////////////////////////////////////////////////////////////////
+0:      * @see #writeLogRecord
+author:Samuel Andrew McIntyre
+-------------------------------------------------------------------------------
+commit:94f158a
+/////////////////////////////////////////////////////////////////////////
+1:                 // random interrupts at Derby threads, retry in the case
+author:Oyvind Bakksjo
+-------------------------------------------------------------------------------
+commit:aaea357
+author:David Van Couvering
+-------------------------------------------------------------------------------
+commit:75fb1cf
+/////////////////////////////////////////////////////////////////////////
+1:                         SQLState.LOG_FULL, sfe);
+author:Mike Matrigali
+-------------------------------------------------------------------------------
+commit:cae67a8
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: 			// reserver space if log checksum feature is enabled.
+1: 			reserveChecksumSpace = writeChecksum;
+/////////////////////////////////////////////////////////////////////////
+1: 				// reserve space if log checksum feature is enabled. 
+1: 				reserveChecksumSpace = writeChecksum;
+commit:75b112d
+/////////////////////////////////////////////////////////////////////////
+1:      *
+1: 	 * @param  length           the length of the log record to be written
+1: 	 * @param  logFileNumber    current log file number 
+1:      *
+commit:c2afcc1
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.store.raw.RawStoreFactory;
+/////////////////////////////////////////////////////////////////////////
+1: 	private boolean writeChecksum; 
+/////////////////////////////////////////////////////////////////////////
+1: 		
+1: 		// Support for Transaction Log Checksum in Derby was added in 10.1
+1: 		// Check to see if the Store have been upgraded to 10.1 or later before
+1: 		// writing the checksum log records.  Otherwise recovery will fail
+1: 		// incase user tries to revert back to versions before 10.1 in 
+1: 		// soft upgrade mode. 
+1: 		writeChecksum = logFactory.checkVersion(RawStoreFactory.DERBY_STORE_MAJOR_VERSION_10, 
+1: 												RawStoreFactory.DERBY_STORE_MINOR_VERSION_1);
+commit:d609ee3
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.iapi.services.io.FormatIdOutputStream;
+1: import org.apache.derby.iapi.services.io.ArrayOutputStream;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 	A Checksum log record that has the checksum value for the data that is
+1:     being written to the disk is generated and written 	before the actual data. 
+1: 	Except for the large log records that does not fit into a single buffer, 
+1:     checksum is calcualted for a group of log records that are in the buffer 
+1: 	when buffers is switched. Checksum log record is written into the reserved
+1: 	space in the beginning buffer. 
+1: 
+0:     In case of a large log record that does not fit into a bufffer, it needs to 
+0:     be written directly to the disk instead of going through the log buffers. 
+0:     In this case the log record write gets broken into three parts:
+0:         1) Write checksum log record and LOG RECORD HEADER (length + instant) 
+0:         2) Write the log record. 
+0:         3) Write the trailing length of the log record. 
+1: 
+1: 	Checksum log records helps in identifying the incomplete log disk writes during 
+1:     recovery. This is done by recalculating the checksum value for the data on
+1:     the disk and comparing it to the the value stored in the checksum log
+1:     record. 
+1: 
+1: public class LogAccessFile 
+/////////////////////////////////////////////////////////////////////////
+1: 	private static final int            LOG_RECORD_HEADER_SIZE = 12; //(length + instant)
+1: 	private static final int            LOG_RECORD_TRAILER_SIZE = 4; //trailing length 
+/////////////////////////////////////////////////////////////////////////
+1: 	
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: 	//streams used to generated check sume log record ; see if there is any simpler way
+1: 	private ArrayOutputStream logOutputBuffer;
+1: 	private FormatIdOutputStream logicalOut;
+0: 	private boolean directWrite = false; //true when log is written directly to file.
+1: 	private long checksumInstant = -1;
+1: 	private int checksumLength;
+1: 	private int checksumLogRecordSize;      //checksumLength + LOG_RECORD_FIXED_OVERHEAD_SIZE
+0: 	private boolean writeChecksum = true;  //gets set to false incase of a soft upgrade.
+1: 	private ChecksumOperation checksumLogOperation;
+1: 	private LogRecord checksumLogRecord;
+1: 	private LogToFile logFactory;
+1: 	private boolean databaseEncrypted=false;
+1: 		
+1: 	public LogAccessFile(LogToFile logFactory,
+1: 						 StorageRandomAccessFile    log, 
+1: 						 int                 bufferSize) 
+/////////////////////////////////////////////////////////////////////////
+1: 		this.logFactory     = logFactory;
+/////////////////////////////////////////////////////////////////////////
+1: 		if(writeChecksum)
+1: 		{
+1: 			/**
+1: 			 * setup structures that are required to write the checksum log records
+1: 			 * for a group of log records are being written to the disk. 
+1: 			 */
+1: 			checksumLogOperation = new ChecksumOperation();
+1: 			checksumLogOperation.init();
+1: 			checksumLogRecord = new LogRecord();
+1: 
+1: 			// Note: Checksum log records are not related any particular transaction, 
+1: 			// they are written to store a checksum information identify
+1: 			// incomplete log record writes. No transacton id is set for this
+1: 			// log record. That is why a null argument is passed below 
+1: 			// setValue(..) call. 
+1: 			checksumLogRecord.setValue(null, checksumLogOperation);
+1: 
+1: 			checksumLength = 
+1: 				checksumLogRecord.getStoredSize(checksumLogOperation.group(), null) + 
+1: 				checksumLogOperation.getStoredSize();
+1: 
+1: 			// calculate checksum log operation length when the database is encrypted
+1: 			if (logFactory.databaseEncrypted())
+1: 			{
+1: 				checksumLength =  logFactory.getEncryptedDataLength(checksumLength);
+1: 				databaseEncrypted = true;
+1: 			}
+1: 			checksumLogRecordSize = checksumLength  + LOG_RECORD_FIXED_OVERHEAD_SIZE;
+1: 
+1: 			//streams required to convert a log record to raw byte array. 
+1: 			logOutputBuffer = new ArrayOutputStream(); 
+1: 			logicalOut = new FormatIdOutputStream(logOutputBuffer);
+1: 
+1: 			/** initialize the buffer with space reserved for checksum log record in
+1: 			 * the beginning of the log buffer; checksum record is written into
+0: 			 * this space when buffer is switched or while doing direct write to the log file.
+1: 			 */
+1: 		}else
+1: 		{
+1: 			//checksumming of transaction log feature is not in use. 
+1: 			checksumLogRecordSize = 0;
+1: 		}
+1: 		
+1: 		currentBuffer.init(checksumLogRecordSize);
+0: 	private byte[] db = new byte[LOG_RECORD_TRAILER_SIZE]; 
+1: 
+1: 
+/////////////////////////////////////////////////////////////////////////
+0: 			p = writeInt(length, b, p);
+0: 			p = writeLong(instant, b , p);
+/////////////////////////////////////////////////////////////////////////
+0: 			p = writeInt(length, b, p);
+1:             
+0: 			currentBuffer.position   = p;
+1: 			
+0: 			/** Because current log record will never fit in a single buffer
+0: 			 * a direct write to the log file is required instead of 
+0: 			 * writing the log record through  the log bufffers. 
+1: 			 */
+0: 			directWrite = true;
+1: 
+1: 			byte[] b    = currentBuffer.buffer;
+0:             int    p    = currentBuffer.position;
+1: 
+1:             // writeInt(length)
+0: 			p = writeInt(length , b, p);
+1:             
+1:             // writeLong(instant)
+0: 			p = writeLong(instant, b, p);
+1: 
+0: 			currentBuffer.position   = p;
+0: 			currentBuffer.bytes_free -= LOG_RECORD_HEADER_SIZE;
+1: 
+0: 			/** using a seperate small buffer to write the traling length
+0: 			 * instead of the log buffer because data portion will be 
+0: 			 * written directly to log file after the log buffer is 
+0: 			 * flushed and the trailing length should be written after that. 
+1: 			 */
+1: 
+1: 			// writeInt(length)
+0: 			writeInt(length , db, 0);
+1: 
+0: 			if(writeChecksum)
+1: 			{
+1: 				checksumLogOperation.reset();
+0: 				checksumLogOperation.update(b, checksumLogRecordSize, p - checksumLogRecordSize);
+0: 				checksumLogOperation.update(data, data_offset, length - optional_data_length);
+0: 				if (optional_data_length != 0)
+1: 				{
+0: 					checksumLogOperation.update(optional_data, optional_data_offset, optional_data_length);	
+1: 				}
+1: 
+0: 				// update the checksum to include the trailing length.
+0: 				checksumLogOperation.update(db, 0, LOG_RECORD_TRAILER_SIZE);
+1: 			
+0: 				// write checksum log record to the log buffer 
+0: 				writeChecksumLogRecord();
+1: 			}
+1: 			
+1: 			
+0: 			// now do the  writes directly to the log file. 
+1: 
+0: 			// flush all buffers before wrting directly to the log file. 
+1: 			flushLogAccessFile();
+1: 
+0: 			// Note:No Special Synchronization required here , 
+0: 			// There will be nothing to write by flushDirtyBuffers that can run
+0: 			// in parallel to the threads that is executing this code. Above
+0: 			// flush call should have written all the buffers and NO new log will 
+0: 			// get added until the following direct log to file call finishes. 
+1: 
+1: 
+0: 			// write the rest of the log directltly to the log file. 
+0:             writeToLog(data, data_offset, length - optional_data_length);
+0:                 writeToLog(
+1: 
+0: 			// write the trailing length 
+0: 			writeToLog(db,0, 4);
+0: 			directWrite = false;
+1: 	private final int writeInt(int i , byte b[], int p)
+1: 	{
+1: 	
+1:         b[p++] = (byte) (i & 0xff);	
+1: 		return p;
+1: 	private final int writeLong(long l , byte b[], int p)
+1: 	{
+1: 		b[p++] = (byte) (((int)(l >>> 56)) & 0xff); 
+/////////////////////////////////////////////////////////////////////////
+1: 		return p;
+1: 	}
+1: 
+1: 	public void writeInt(int i) 
+1:     {
+1: 
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			SanityManager.ASSERT(currentBuffer.bytes_free >= 4);
+1: 		}
+1: 		
+1: 		currentBuffer.position = 
+1: 			writeInt(i , currentBuffer.buffer, currentBuffer.position);
+1: 		currentBuffer.bytes_free -= 4;
+1: 	}
+1: 
+1: 	public void writeLong(long l) 
+1:     {
+1: 		
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			SanityManager.ASSERT(currentBuffer.bytes_free >= 8);
+1: 		}
+1: 		
+1: 		currentBuffer.position = 
+1: 			writeLong(l , currentBuffer.buffer, currentBuffer.position);
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			SanityManager.ASSERT(currentBuffer.bytes_free > 0);
+1: 		}
+1: 		
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			SanityManager.ASSERT(len <= currentBuffer.bytes_free);
+1: 		
+1: 		System.arraycopy(b, off, currentBuffer.buffer, currentBuffer.position, len);
+1: 		currentBuffer.bytes_free -= len;
+1: 		currentBuffer.position += len;
+1: 
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 	public void flushLogAccessFile() throws IOException,  StandardException 
+/////////////////////////////////////////////////////////////////////////
+1: 	public void switchLogBuffer() throws IOException, StandardException  
+1: 			// ignore empty buffer switch requests
+1: 			if(currentBuffer.position == checksumLogRecordSize)
+1: 				return;
+1: 
+1: 			// calculate the checksum for the current log buffer 
+1: 			// and write the record to the space reserverd in 
+1: 			// the beginning of the buffer. 
+0: 			if(writeChecksum && !directWrite)
+1: 			{
+0: 				checksumLogOperation.reset();
+1: 				checksumLogOperation.update(currentBuffer.buffer, checksumLogRecordSize, currentBuffer.position - checksumLogRecordSize);
+0: 				writeChecksumLogRecord();
+1: 			}
+/////////////////////////////////////////////////////////////////////////
+1: 			currentBuffer.init(checksumLogRecordSize);
+1: 
+1: 				SanityManager.ASSERT(currentBuffer.position == checksumLogRecordSize);
+1: 									 currentBuffer.bytes_free == currentBuffer.length);
+/////////////////////////////////////////////////////////////////////////
+1: 	public void close() throws IOException, StandardException
+1: 			if (currentBuffer.position !=  checksumLogRecordSize)
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+1: 	/**
+1: 	 * reserve the space for the checksum log record in the log file. 
+0: 	 * @param  the length of the log record that is going to be written
+0: 	 * @param  logFileNumber current log file number 
+1: 	 * @param  currentPosition  current position in the log file. 
+1: 	 * @return the space that is needed to write a checksum log record.
+1: 	 */
+1: 	protected long reserveSpaceForChecksum(int length, long logFileNumber, long currentPosition )
+1: 		throws StandardException, IOException 
+1: 	{
+0: 		if(!writeChecksum)
+0: 			return 0;
+1: 
+1: 		int total_log_record_length = length + LOG_RECORD_FIXED_OVERHEAD_SIZE;
+1: 		boolean reserveChecksumSpace = false;
+1: 		
+1: 		/* checksum log record is calculated for a group of log 
+1: 		 * records that can fit in to a single buffer or for 
+1: 		 * a single record when it does not fit into 
+1: 		 * a fit into a buffer at all. When a new buffer 
+1: 		 * is required to write a log record, log space 
+1: 		 * has to be reserved before writing the log record
+1: 		 * becuase checksum is written in the before the 
+1: 		 * log records that are being checksummed. 
+1: 		 * What it also means is a real log instant has to be 
+1: 		 * reserved for writing the checksum log record in addition 
+1: 		 * to the log buffer space.
+1: 		 */
+1: 		
+1: 
+1: 		/* reserve checkum space for new log records if a log buffer switch had
+1: 		 * happened before because of a explicit log flush requests(like commit)
+1: 		 * or a long record write 
+1: 		 */
+1: 		if(currentBuffer.position == checksumLogRecordSize)
+1: 		{
+0: 			reserveChecksumSpace = true;
+1: 		}
+1: 		else{
+1: 			if (total_log_record_length > currentBuffer.bytes_free)
+1: 			{
+1: 				// the log record that is going to be written is not 
+1: 				// going to fit in the current buffer, switch the 
+1: 				// log buffer to create buffer space for it. 
+1: 				switchLogBuffer();
+0: 				reserveChecksumSpace = true;
+1: 			}
+1: 		}
+1: 		
+1: 		if(reserveChecksumSpace)
+1: 		{
+1: 			if (SanityManager.DEBUG)
+1: 			{
+1: 				// Prevoiusly reserved real checksum instant should have been
+1: 				// used, before an another one is generated. 
+1: 				SanityManager.ASSERT(checksumInstant == -1,  "CHECKSUM INSTANT IS GETTING OVER WRITTEN");
+1: 			}
+1: 			
+1: 			checksumInstant = LogCounter.makeLogInstantAsLong(logFileNumber, currentPosition);
+1: 			return  checksumLogRecordSize;
+1: 		}else
+1: 		{
+1: 			return 0 ;
+1: 		}
+1: 	}
+1: 
+1: 
+1: 	/*
+0: 	 * generate the checkum log record and write it into the log buffer.
+1: 	 */
+0: 	private void writeChecksumLogRecord() throws IOException, StandardException
+1: 	{
+1: 		
+0: 		byte[] b    = currentBuffer.buffer;
+1: 		int    p    = 0; //checksum is written in the beginning of the buffer
+1: 
+0: 		// writeInt(length)
+0: 		p = writeInt(checksumLength, b , p);
+1:             
+0: 		// writeLong(instant)
+0: 		p = writeLong(checksumInstant, b , p);
+1: 
+1: 		//write the checksum log operation  
+0: 		logOutputBuffer.setData(b);
+1: 		logOutputBuffer.setPosition(p);
+1: 		logicalOut.writeObject(checksumLogRecord);
+1: 
+1: 		if(databaseEncrypted)
+1: 		{
+1: 			//encrypt the checksum log operation part.
+1: 			int len = 
+0: 				logFactory.encrypt(b, LOG_RECORD_HEADER_SIZE, checksumLength, 
+0: 								   b, LOG_RECORD_HEADER_SIZE);
+1: 			
+1: 		   
+1: 			if (SanityManager.DEBUG)
+1: 				SanityManager.ASSERT(len == checksumLength, 
+1: 									 "encrypted log buffer length != log buffer len");
+1: 		}
+1: 
+1: 		p = LOG_RECORD_HEADER_SIZE + checksumLength ;
+1: 
+1: 		// writeInt(length) trailing
+0: 		p = writeInt(checksumLength, b, p );
+1: 		
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			SanityManager.ASSERT(p == checksumLogRecordSize, "position=" + p  + "ckrecordsize=" + checksumLogRecordSize);
+1: 			if (SanityManager.DEBUG_ON(LogToFile.DBG_FLAG))
+1: 			{
+1: 				SanityManager.DEBUG(
+1: 									LogToFile.DBG_FLAG, 
+1: 									"Write log record: tranId=Null"  +
+1: 									" instant: " + LogCounter.toDebugString(checksumInstant) + " length: " +
+1: 									checksumLength + "\n" + checksumLogOperation + "\n");
+1: 			}
+1: 			checksumInstant = -1; 
+1: 		}
+1: 
+1: 	}
+1: 
+1: 
+1: 	protected void writeEndMarker(int marker) throws IOException, StandardException 
+1: 	{
+1: 		//flush all the buffers and then write the end marker.
+1: 		flushLogAccessFile();
+1: 		
+0: 		byte[] b    = currentBuffer.buffer;
+1: 		int    p    = 0; //end is written in the beginning of the buffer, no
+1: 						 //need to checksum a int write.
+1: 		p = writeInt(marker , b , p);
+0: 		writeToLog(b, 0, p);
+1: 	}
+1: 
+1: 	
+author:Daniel John Debrunner
+-------------------------------------------------------------------------------
+commit:345de35
+/////////////////////////////////////////////////////////////////////////
+1:    Derby - Class org.apache.derby.impl.store.raw.log.LogAccessFile
+1: 
+0:    Copyright 1999, 2004 The Apache Software Foundation or its licensors, as applicable.
+1: 
+0:    Licensed under the Apache License, Version 2.0 (the "License");
+0:    you may not use this file except in compliance with the License.
+0:    You may obtain a copy of the License at
+1: 
+1:       http://www.apache.org/licenses/LICENSE-2.0
+1: 
+1:    Unless required by applicable law or agreed to in writing, software
+1:    distributed under the License is distributed on an "AS IS" BASIS,
+1:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:    See the License for the specific language governing permissions and
+1:    limitations under the License.
+commit:c6ad534
+/////////////////////////////////////////////////////////////////////////
+commit:eac0369
+/////////////////////////////////////////////////////////////////////////
+0: /*
+1: 
+0:    Licensed Materials - Property of IBM
+0:    Cloudscape - Package org.apache.derby.impl.store.raw.log
+0:    (C) Copyright IBM Corp. 1999, 2004. All Rights Reserved.
+0:    US Government Users Restricted Rights - Use, duplication or
+0:    disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+1: 
+1:  */
+1: 
+1: package org.apache.derby.impl.store.raw.log;
+1: 
+1: import org.apache.derby.iapi.reference.SQLState;
+1: 
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+1: import org.apache.derby.iapi.error.StandardException;
+1: 
+1: import org.apache.derby.io.StorageRandomAccessFile;
+1: 
+1: import java.io.IOException;
+1: import java.io.OutputStream;
+1: import java.io.SyncFailedException;
+0: import java.io.InterruptedIOException;
+1: import java.util.LinkedList;
+1: 
+1: 
+1: /**
+1: 	Wraps a RandomAccessFile file to provide buffering
+1: 	on log writes. Only supports the write calls
+1: 	required for the log!
+1: 
+1: 	MT - unsafe.  Caller of this class must provide synchronization.  The one
+1: 	exception is with the log file access, LogAccessFile will touch the log
+1: 	only inside synchronized block protected by the semaphore, which is
+1: 	defined by the creator of this object.
+1: 	
+1:     Write to the log buffers are allowed when there are free buffers even
+1:     when dirty buffers are being written(flushed) to the disk by a different
+1: 	thread. Only one flush writes to log file at a time, other wait for it to finish.
+1: 
+1: 	Except for flushLogAccessFile , SyncAccessLogFile other function callers
+1: 	must provide syncronization that will allow only one of them to write to 
+1:     the buffers. 
+1: 
+1:     Log Buffers are used in circular fashion, each buffer moves through following stages: 
+0: 	freeBuffers --> dirtyBuffers --> freeBuffers. Movement of buffers from one
+1:     stage to 	another stage is synchronized using	the object(this) of this class. 
+1: 
+1: */
+0: public class LogAccessFile extends OutputStream 
+1: {
+1: 	/**
+0: 		IBM Copyright &copy notice.
+1: 	*/
+1:  
+0:     private static final String copyrightNotice = org.apache.derby.iapi.reference.Copyright.SHORT_1999_2004;
+1: 
+1:     /**
+1:      * The fixed size of a log record is 16 bytes:
+1:      *     int   length             : 4 bytes
+1:      *     long  instant            : 8 bytes
+1:      *     int   trailing length    : 4 bytes
+1:      **/
+1:     private static final int            LOG_RECORD_FIXED_OVERHEAD_SIZE = 16;
+1: 
+1:     private static final int            LOG_NUMBER_LOG_BUFFERS = 3;
+1: 
+1: 
+0: 	private LinkedList    freeBuffers;  //list of free buffers
+0: 	private LinkedList    dirtyBuffers; //list of dirty buffers to flush
+1: 	private  LogAccessFileBuffer currentBuffer; //current active buffer
+1: 	private boolean flushInProgress = false;
+1: 
+1: 	private final StorageRandomAccessFile  log;
+1: 
+1: 	// log can be touched only inside synchronized block protected by
+1: 	// logFileSemaphore.
+1: 	private final Object            logFileSemaphore;
+1: 
+1: 	static int                      mon_numWritesToLog;
+1: 	static int                      mon_numBytesToLog;
+1: 
+0: 	public LogAccessFile(
+0:     StorageRandomAccessFile    log, 
+0:     int                 bufferSize) throws IOException 
+1:     {
+1: 		if (SanityManager.DEBUG)
+1: 		{
+1: 			if(SanityManager.DEBUG_ON("LogBufferOff"))
+1: 				bufferSize = 10;	// make it very tiny
+1: 		}
+1: 		
+1: 		this.log            = log;
+1: 		logFileSemaphore    = log;
+1: 
+1: 		if (SanityManager.DEBUG)
+1:             SanityManager.ASSERT(LOG_NUMBER_LOG_BUFFERS >= 1);
+1: 				
+1: 		//initialize buffers lists
+0: 		freeBuffers = new LinkedList();
+0: 		dirtyBuffers = new LinkedList();
+1: 
+1: 
+1: 		//add all buffers to free list
+1:         for (int i = 0; i < LOG_NUMBER_LOG_BUFFERS; i++)
+1:         {
+1:             LogAccessFileBuffer b = new LogAccessFileBuffer(bufferSize);
+1:             freeBuffers.addLast(b);
+1:         }
+1: 
+1: 		currentBuffer = (LogAccessFileBuffer) freeBuffers.removeFirst();
+1: 
+1: 	}
+1: 
+1: 
+1:     /**
+1:      * Write a single log record to the stream.
+1:      * <p>
+1:      * For performance pass all parameters rather into a specialized routine
+1:      * rather than maintaining the writeInt, writeLong, and write interfaces
+1:      * that this class provides as a standard OutputStream.  It will make it
+1:      * harder to use other OutputStream implementations, but makes for less
+1:      * function calls and allows optimizations knowing when to switch buffers.
+1:      * <p>
+1:      * This routine handles all log records which are smaller than one log
+1:      * buffer.  If a log record is bigger than a log buffer it calls
+1:      * writeUnbufferedLogRecord().
+1:      * <p>
+1:      * The log record written will always look the same as if the following
+1:      * code had been executed:
+1:      *     writeInt(length)
+1:      *     writeLong(instant)
+1:      *     write(data, data_offset, (length - optional_data_length) )
+1:      *
+1:      *     if (optional_data_length != 0)
+1:      *         write(optional_data, optional_data_offset, optional_data_length)
+1:      *
+1:      *     writeInt(length)
+1:      *
+1:      * @param length                (data + optional_data) length bytes to write
+1:      * @param instant               the log address of this log record.
+1:      * @param data                  "from" array to copy "data" portion of rec
+1:      * @param data_offset           offset in "data" to start copying from.
+1:      * @param optional_data         "from" array to copy "optional data" from
+1:      * @param optional_data_offset  offset in "optional_data" to start copy from
+1:      * @param optional_data_length  length of optional data to copy.
+1:      *
+1: 	 * @exception  StandardException  Standard exception policy.
+1:      **/
+1:     public void writeLogRecord(
+1:     int     length,
+1:     long    instant,
+1:     byte[]  data,
+1:     int     data_offset,
+1:     byte[]  optional_data,
+1:     int     optional_data_offset,
+1:     int     optional_data_length)
+1:         throws StandardException, IOException 
+1:     {
+1:         int total_log_record_length = length + LOG_RECORD_FIXED_OVERHEAD_SIZE;
+1: 
+0:         if (total_log_record_length > currentBuffer.bytes_free && 
+0:             total_log_record_length <= currentBuffer.buffer.length) 
+1:         {
+0:             // If the whole record will fit in an empty buffer, flush this
+0:             // one now and put this record into the next one.
+1:             switchLogBuffer();
+1:         }
+1: 
+0: 		if (total_log_record_length <= currentBuffer.bytes_free)
+1:         {
+0:             byte[] b    = currentBuffer.buffer;
+0:             int    p    = currentBuffer.position;
+1: 
+0:             // writeInt(length)
+0:             b[p++] = (byte) ((length >>> 24) & 0xff); 
+0:             b[p++] = (byte) ((length >>> 16) & 0xff); 
+0:             b[p++] = (byte) ((length >>>  8) & 0xff); 
+0:             b[p++] = (byte) ((length       ) & 0xff);
+1:             
+0:             // writeLong(instant)
+0:             b[p++] = (byte) (((int)(instant >>> 56)) & 0xff); 
+0:             b[p++] = (byte) (((int)(instant >>> 48)) & 0xff); 
+0:             b[p++] = (byte) (((int)(instant >>> 40)) & 0xff); 
+0:             b[p++] = (byte) (((int)(instant >>> 32)) & 0xff); 
+0:             b[p++] = (byte) (((int)(instant >>> 24)) & 0xff); 
+0:             b[p++] = (byte) (((int)(instant >>> 16)) & 0xff); 
+0:             b[p++] = (byte) (((int)(instant >>>  8)) & 0xff); 
+0:             b[p++] = (byte) (((int)(instant       )) & 0xff); 
+1: 
+0:             // write(data, data_offset, length - optional_data_length)
+0:             int transfer_length = (length - optional_data_length);
+0: 			System.arraycopy(data, data_offset, b, p, transfer_length);
+1: 
+0:             p += transfer_length;
+1: 
+0:             if (optional_data_length != 0)
+1:             {
+0:                 // write(
+0:                 //   optional_data, optional_data_offset, optional_data_length);
+1: 
+0:                 System.arraycopy(
+0:                     optional_data, optional_data_offset, 
+0:                     b,             p, 
+0:                     optional_data_length);
+1: 
+0:                 p += optional_data_length;
+1:             }
+1: 
+0:             // writeInt(length)
+0:             b[p++] = (byte) ((length >>> 24) & 0xff); 
+0:             b[p++] = (byte) ((length >>> 16) & 0xff); 
+0:             b[p++] = (byte) ((length >>>  8) & 0xff); 
+0:             b[p++] = (byte) ((length       ) & 0xff);
+1: 
+0:             currentBuffer.position   = p;
+1:             currentBuffer.bytes_free -= total_log_record_length;
+1: 		}
+1:         else
+1:         {
+0:             writeInt(length);
+0:             writeLong(instant);
+0:             write(data, data_offset, length - optional_data_length);
+0:             if (optional_data_length != 0)
+1:             {
+0:                 write(
+0:                     optional_data, optional_data_offset, optional_data_length);
+1:             }
+0:             writeInt(length);
+1: 		}
+1:     }
+1: 
+1: 
+0: 	public void writeInt(int i) throws IOException 
+1:     {
+0: 		if (currentBuffer.bytes_free < 4)
+1: 			switchLogBuffer();
+1: 
+0: 		byte[] b = currentBuffer.buffer;
+0: 		int p = currentBuffer.position;
+1: 
+1:         b[p++] = (byte) ((i >>> 24) & 0xff); 
+1:         b[p++] = (byte) ((i >>> 16) & 0xff); 
+1:         b[p++] = (byte) ((i >>> 8) & 0xff); 
+0:         b[p++] = (byte) (i & 0xff);
+1: 
+0: 		currentBuffer.position = p;
+0: 		currentBuffer.bytes_free -= 4;
+1: 	}
+1: 
+0: 	public void writeLong(long l) 
+0:         throws IOException 
+1:     {
+0: 		if (currentBuffer.bytes_free < 8)
+1: 			switchLogBuffer();
+1: 
+0: 		byte[] b = currentBuffer.buffer;
+0:  		int p = currentBuffer.position;
+0:         b[p++] = (byte) (((int)(l >>> 56)) & 0xff); 
+1:         b[p++] = (byte) (((int)(l >>> 48)) & 0xff); 
+1:         b[p++] = (byte) (((int)(l >>> 40)) & 0xff); 
+1:         b[p++] = (byte) (((int)(l >>> 32)) & 0xff); 
+1:         b[p++] = (byte) (((int)(l >>> 24)) & 0xff); 
+1:         b[p++] = (byte) (((int)(l >>> 16)) & 0xff); 
+1:         b[p++] = (byte) (((int)(l >>> 8)) & 0xff); 
+1:         b[p++] = (byte) (((int)l) & 0xff); 
+0: 		currentBuffer.position = p;
+1: 		currentBuffer.bytes_free -= 8;
+1:     }
+1: 
+1: 	public void write(int b) 
+0:         throws IOException 
+1:     {
+1: 
+0: 		if (currentBuffer.bytes_free == 0)
+1: 			switchLogBuffer();
+1: 
+1: 		currentBuffer.buffer[currentBuffer.position++] = (byte) b;
+1: 		currentBuffer.bytes_free--;
+1: 	}
+1: 
+1: 
+1: 	public void write(byte b[], int off, int len) 
+0:         throws IOException 
+1:     {
+1: 
+0: 		if (len <= currentBuffer.bytes_free)  
+1:         {
+0: 			// data fits in buffer
+0: 			System.arraycopy(b, off, currentBuffer.buffer, currentBuffer.position, len);
+0: 			currentBuffer.bytes_free -= len;
+0: 			currentBuffer.position += len;
+0: 			return;
+1: 		}
+0:         else if (len <= currentBuffer.buffer.length) 
+1:         {
+0:             // some data will be cached
+0:             System.arraycopy(b, off, currentBuffer.buffer, currentBuffer.position, currentBuffer.bytes_free);
+0:             len -= currentBuffer.bytes_free;
+0:             off += currentBuffer.bytes_free;
+0:             currentBuffer.position += currentBuffer.bytes_free;
+0:             currentBuffer.bytes_free = 0;
+1:             switchLogBuffer();
+1: 
+0:             System.arraycopy(b, off, currentBuffer.buffer, 0, len);
+0:             currentBuffer.position = len;
+0:             currentBuffer.bytes_free -= len;	
+1:         }
+1:         else
+1:         {
+1: 			
+0: 			//data will never fit in currentBuffer.buffer, write directly to log
+0: 			//flush all buffers before wrting directly to the log file. 
+0: 			flushLogAccessFile();
+1: 
+0: 			//Note:No Special Synchronization required here , 
+0: 			//There will be nothing to write by flushDirtyBuffers that can run
+0: 			//in parallel to the threads that is executing this code. Above
+0: 			//flush call should have written all the buffers and NO new log will 
+0: 			//get added until the following direct log to file call finishes. 
+1: 
+0: 			writeToLog(b, off, len);
+0: 			return;
+1: 		}
+1: 	}
+1:     /**
+1:      * Write data from all dirty buffers into the log file.
+1:      * <p>
+1:      * A call for clients of LogAccessFile to insure that all privately buffered
+1:      * data has been writen to the file - so that reads on the file using one
+1:      * of the various scan classes will see
+1:      * all the data which has been writen to this point.
+1:      * <p>
+1:      * Note that this routine only "writes" the data to the file, this does not
+1:      * mean that the data has been synced to disk unless file was opened in
+1: 	 * WRITE SYNC mode(rws/rwd).  The only way to insure that is by calling
+1:      * is to call syncLogAccessFile() after this call in Non-WRITE sync mode(rw)
+1: 	 * 
+1: 	 * <p>
+1: 	 * MT-Safe : parallel thereads can call this function, only one threads does
+1: 	 * the flush and the other threads waits for the one that is doing the flush to finish.
+1: 	 * Currently there are two possible threads that can call this function in parallel 
+1: 	 * 1) A Thread that is doing the commit
+1: 	 * 2) A Thread that is writing to the log and log buffers are full or
+1: 	 * a log records does not fit in a buffer. (Log Buffers
+1: 	 * full(switchLogBuffer() or a log record size that is greater than
+1: 	 * logbuffer size has to be writtern through writeToLog call directlty)
+1: 	 * Note: writeToLog() is not synchronized on the semaphore
+1: 	 * that is used to do  buffer management to allow writes 
+1: 	 * to the free buffers when flush is in progress.  
+1:      **/
+1: 	protected void flushDirtyBuffers() throws IOException 
+1:     {
+1:         LogAccessFileBuffer buf = null;
+1: 		int noOfBuffers;
+1: 		int nFlushed= 0;
+1: 		try{
+1: 			synchronized(this)
+1: 			{
+1: 				/**if some one else flushing wait, otherwise it is possible 
+1: 				 * different threads will get different buffers and order can 
+1: 				 * not be determined.
+1: 				 * 
+1: 				 **/
+1: 				while(flushInProgress)
+1: 				{
+1: 					try{
+1: 						wait();
+1: 					}catch (InterruptedException ie) 
+1: 					{
+0: 						//do nothing, let the flush request to complete.
+0: 						//because it possible that other thread which is
+0: 						//currently might have completed this request also ,
+0: 						//if exited  on interrupt and throw exception, can not
+0: 						//be sure whether this transaction is COMMITTED ot not.
+1: 					}
+1: 				}
+1: 		
+1: 				noOfBuffers = dirtyBuffers.size();
+1: 				if(noOfBuffers > 0)
+0: 					buf = (LogAccessFileBuffer) dirtyBuffers.removeFirst();
+1: 				
+1: 				flushInProgress = true;
+1: 			}
+1: 			
+1: 			while(nFlushed < noOfBuffers)
+1: 			{
+0: 				if (buf.position != 0)
+0: 					writeToLog(buf.buffer, 0, buf.position);
+1: 
+1: 				nFlushed++;
+1: 				synchronized(this)
+1: 				{
+1: 					//add the buffer that was written previosly to the free list
+1: 					freeBuffers.addLast(buf);
+1: 					if(nFlushed < noOfBuffers)
+0: 						buf = (LogAccessFileBuffer) dirtyBuffers.removeFirst();
+1: 					else
+1: 					{
+1: 						//see if we can flush more, that came when we are at it.
+1: 						//don't flush more than the total number of buffers,
+1: 						//that might lead to starvation of the current thread.
+1: 						int size = dirtyBuffers.size();
+1: 						if(size > 0 && nFlushed <= LOG_NUMBER_LOG_BUFFERS)
+1: 						{
+1: 							noOfBuffers += size;
+0: 							buf = (LogAccessFileBuffer) dirtyBuffers.removeFirst();
+1: 						}
+1: 					}
+1: 				}
+1: 			}
+1: 
+1: 				
+1: 		}finally{
+1: 			synchronized(this)
+1: 			{
+1: 				flushInProgress = false;
+1: 				notifyAll();
+1: 			}
+1: 		}
+1: 	}
+1: 
+1: 
+1: 	//flush all the the dirty buffers to disk
+0: 	public void flushLogAccessFile() throws IOException 
+1: 	{
+1: 		switchLogBuffer();
+1: 		flushDirtyBuffers();
+1: 	}
+1: 
+1: 		
+1: 	/**
+1: 	 * Appends the current Buffer to the dirty Buffer list and assigns a free
+1: 	 * buffer to be the currrent active buffer . Flushing of the buffer
+1: 	 * to disk is delayed if there is a free buffer available. 
+1: 	 * dirty buffers will be  flushed to the disk   
+1: 	 * when  flushDirtyBuffers() is invoked by  a commit call 
+1: 	 * or when no more free buffers are available. 
+1: 	 */
+0: 	public void switchLogBuffer() throws IOException  
+1:     {
+1: 
+1: 		synchronized(this)
+1: 		{
+1: 
+1: 			//add the current buffer to the flush buffer list
+1: 			dirtyBuffers.addLast(currentBuffer);
+1: 
+1: 			//if there is No free buffer, flush the buffers to get a free one 
+1: 			if(freeBuffers.size() == 0) 
+1: 			{
+1: 				flushDirtyBuffers();
+1: 				//after the flush call there should be a free buffer
+1: 				//because this is only methods removes items from 
+1: 				//free buffers and removal is in synchronized block. 
+1: 			}
+1: 
+1: 
+1: 			// there should be free buffer available at this point.
+1: 			if (SanityManager.DEBUG)
+1: 				SanityManager.ASSERT(freeBuffers.size() > 0);
+1: 
+1: 			//switch over to the next log buffer, let someone else write it.
+1: 			currentBuffer = (LogAccessFileBuffer) freeBuffers.removeFirst();
+0: 			currentBuffer.init();
+1:      
+1: 			if (SanityManager.DEBUG)
+1: 			{
+0: 				SanityManager.ASSERT(currentBuffer.position == 0);
+1: 				SanityManager.ASSERT(
+0: 									 currentBuffer.bytes_free == currentBuffer.buffer.length);
+1:                 SanityManager.ASSERT(currentBuffer.bytes_free > 0);
+1: 			}
+1: 		}
+1: 	}
+1: 
+1: 
+1:     /**
+1:      * Guarantee all writes up to the last call to flushLogAccessFile on disk.
+1:      * <p>
+1:      * A call for clients of LogAccessFile to insure that all data written
+1:      * up to the last call to flushLogAccessFile() are written to disk.
+1:      * This call will not return until those writes have hit disk.
+1:      * <p>
+1:      * Note that this routine may block waiting for I/O to complete so 
+1:      * callers should limit the number of resource held locked while this
+1:      * operation is called.  It is expected that the caller
+1:      * Note that this routine only "writes" the data to the file, this does not
+1:      * mean that the data has been synced to disk.  The only way to insure that
+1:      * is to first call switchLogBuffer() and then follow by a call of sync().
+1:      *
+1:      **/
+1:     public void syncLogAccessFile() 
+1:         throws IOException, StandardException
+1:     {
+1:         for( int i=0; ; )
+1:         {
+1:             // 3311: JVM sync call sometimes fails under high load against NFS 
+1:             // mounted disk.  We re-try to do this 20 times.
+1:             try
+1:             {
+1:                 synchronized( this)
+1:                 {
+0:                     log.sync( false);
+1:                 }
+1: 
+1:                 // the sync succeed, so return
+1:                 break;
+1:             }
+1:             catch( SyncFailedException sfe )
+1:             {
+1:                 i++;
+1:                 try
+1:                 {
+1:                     // wait for .2 of a second, hopefully I/O is done by now
+1:                     // we wait a max of 4 seconds before we give up
+1:                     Thread.sleep( 200 ); 
+1:                 }
+1:                 catch( InterruptedException ie )
+0:                 {   //does not matter weather I get interrupted or not
+1:                 }
+1: 
+1:                 if( i > 20 )
+1:                     throw StandardException.newException(
+0:                         SQLState.LOG_FULL, sfe, null);
+1:             }
+1:         }
+1:     }
+1: 
+1: 	/**
+1: 		The database is being marked corrupted, get rid of file pointer without
+1: 		writing out anything more.
+1: 	 */
+1: 	public void corrupt() throws IOException
+1: 	{
+1: 		synchronized(logFileSemaphore)
+1: 		{
+1: 			if (log != null)
+1: 				log.close();
+1: 		}
+1: 	}
+1: 
+0: 	public void close() throws IOException 
+1:     {
+1: 		if (SanityManager.DEBUG) 
+1:         {
+0: 			if (currentBuffer.position != 0)
+1: 				SanityManager.THROWASSERT(
+1: 				"Log file being closed with data still buffered " + 
+1:                 currentBuffer.position +  " " + currentBuffer.bytes_free);
+1: 		}
+1: 
+0: 		flushLogAccessFile();
+1: 
+1: 		synchronized(logFileSemaphore)
+1: 		{
+1: 			if (log != null)
+1: 				log.close();
+1: 		}
+1: 	}
+1: 
+1: 
+1: 	/* write to the log file */
+0: 	private void writeToLog(byte b[], int off, int len) throws IOException
+1: 	{
+1: 		synchronized(logFileSemaphore)
+1: 		{
+1:             if (log != null)
+1:             {
+1:                 // Try to handle case where user application is throwing
+0:                 // random interrupts at cloudscape threads, retry in the case
+1:                 // of IO exceptions 5 times.  After that hope that it is 
+1:                 // a real disk problem - an IO error in a write to the log file
+1:                 // is going to take down the whole system, so seems worthwhile
+1:                 // to retry.
+1:                 for (int i = 0; ;i++)
+1:                 {
+1:                     try 
+1:                     {
+1:                         log.write(b, off, len);
+1:                         break;
+1:                     }
+1:                     catch (IOException ioe)
+1:                     {
+1:                         // just fall through and rety the log write 1st 5 times.
+1: 
+1:                         if (i >= 5)
+1:                             throw ioe;
+1:                     }
+1:                 }
+1:             }
+1: 		}
+1: 
+1: 		if (SanityManager.DEBUG) 
+1:         {
+1: 			mon_numWritesToLog++;
+1: 			mon_numBytesToLog += len;
+1: 		}
+1: 	}
+1: }
+1: 
+1: 
+1: 
+1: 
+1: 
+1: 
+1: 
+1: 
+author:Ken Coar
+-------------------------------------------------------------------------------
+commit:95e7b46
+/////////////////////////////////////////////////////////////////////////
+0: /*
+0: 
+0:    Licensed Materials - Property of IBM
+0:    Cloudscape - Package org.apache.derby.impl.store.raw.log
+0:    (C) Copyright IBM Corp. 1999, 2004. All Rights Reserved.
+0:    US Government Users Restricted Rights - Use, duplication or
+0:    disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+0: 
+0:  */
+0: 
+0: package org.apache.derby.impl.store.raw.log;
+0: 
+0: import org.apache.derby.iapi.reference.SQLState;
+0: 
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+0: import org.apache.derby.iapi.error.StandardException;
+0: 
+0: import org.apache.derby.io.StorageRandomAccessFile;
+0: 
+0: import java.io.IOException;
+0: import java.io.OutputStream;
+0: import java.io.SyncFailedException;
+0: import java.io.InterruptedIOException;
+0: import java.util.LinkedList;
+0: 
+0: 
+0: /**
+0: 	Wraps a RandomAccessFile file to provide buffering
+0: 	on log writes. Only supports the write calls
+0: 	required for the log!
+0: 
+0: 	MT - unsafe.  Caller of this class must provide synchronization.  The one
+0: 	exception is with the log file access, LogAccessFile will touch the log
+0: 	only inside synchronized block protected by the semaphore, which is
+0: 	defined by the creator of this object.
+0: 	
+0:     Write to the log buffers are allowed when there are free buffers even
+0:     when dirty buffers are being written(flushed) to the disk by a different
+0: 	thread. Only one flush writes to log file at a time, other wait for it to finish.
+0: 
+0: 	Except for flushLogAccessFile , SyncAccessLogFile other function callers
+0: 	must provide syncronization that will allow only one of them to write to 
+0:     the buffers. 
+0: 
+0:     Log Buffers are used in circular fashion, each buffer moves through following stages: 
+0: 	freeBuffers --> dirtyBuffers --> freeBuffers. Movement of buffers from one
+0:     stage to 	another stage is synchronized using	the object(this) of this class. 
+0: 
+0: */
+0: public class LogAccessFile extends OutputStream 
+0: {
+0: 	/**
+0: 		IBM Copyright &copy notice.
+0: 	*/
+0:  
+0:     private static final String copyrightNotice = org.apache.derby.iapi.reference.Copyright.SHORT_1999_2004;
+0: 
+0:     /**
+0:      * The fixed size of a log record is 16 bytes:
+0:      *     int   length             : 4 bytes
+0:      *     long  instant            : 8 bytes
+0:      *     int   trailing length    : 4 bytes
+0:      **/
+0:     private static final int            LOG_RECORD_FIXED_OVERHEAD_SIZE = 16;
+0: 
+0:     private static final int            LOG_NUMBER_LOG_BUFFERS = 3;
+0: 
+0: 
+0: 	private LinkedList    freeBuffers;  //list of free buffers
+0: 	private LinkedList    dirtyBuffers; //list of dirty buffers to flush
+0: 	private  LogAccessFileBuffer currentBuffer; //current active buffer
+0: 	private boolean flushInProgress = false;
+0: 
+0: 	private final StorageRandomAccessFile  log;
+0: 
+0: 	// log can be touched only inside synchronized block protected by
+0: 	// logFileSemaphore.
+0: 	private final Object            logFileSemaphore;
+0: 
+0: 	static int                      mon_numWritesToLog;
+0: 	static int                      mon_numBytesToLog;
+0: 
+0: 	public LogAccessFile(
+0:     StorageRandomAccessFile    log, 
+0:     int                 bufferSize) throws IOException 
+0:     {
+0: 		if (SanityManager.DEBUG)
+0: 		{
+0: 			if(SanityManager.DEBUG_ON("LogBufferOff"))
+0: 				bufferSize = 10;	// make it very tiny
+0: 		}
+0: 		
+0: 		this.log            = log;
+0: 		logFileSemaphore    = log;
+0: 
+0: 		if (SanityManager.DEBUG)
+0:             SanityManager.ASSERT(LOG_NUMBER_LOG_BUFFERS >= 1);
+0: 				
+0: 		//initialize buffers lists
+0: 		freeBuffers = new LinkedList();
+0: 		dirtyBuffers = new LinkedList();
+0: 
+0: 
+0: 		//add all buffers to free list
+0:         for (int i = 0; i < LOG_NUMBER_LOG_BUFFERS; i++)
+0:         {
+0:             LogAccessFileBuffer b = new LogAccessFileBuffer(bufferSize);
+0:             freeBuffers.addLast(b);
+0:         }
+0: 
+0: 		currentBuffer = (LogAccessFileBuffer) freeBuffers.removeFirst();
+0: 
+0: 	}
+0: 
+0: 
+0:     /**
+0:      * Write a single log record to the stream.
+0:      * <p>
+0:      * For performance pass all parameters rather into a specialized routine
+0:      * rather than maintaining the writeInt, writeLong, and write interfaces
+0:      * that this class provides as a standard OutputStream.  It will make it
+0:      * harder to use other OutputStream implementations, but makes for less
+0:      * function calls and allows optimizations knowing when to switch buffers.
+0:      * <p>
+0:      * This routine handles all log records which are smaller than one log
+0:      * buffer.  If a log record is bigger than a log buffer it calls
+0:      * writeUnbufferedLogRecord().
+0:      * <p>
+0:      * The log record written will always look the same as if the following
+0:      * code had been executed:
+0:      *     writeInt(length)
+0:      *     writeLong(instant)
+0:      *     write(data, data_offset, (length - optional_data_length) )
+0:      *
+0:      *     if (optional_data_length != 0)
+0:      *         write(optional_data, optional_data_offset, optional_data_length)
+0:      *
+0:      *     writeInt(length)
+0:      *
+0:      * @param length                (data + optional_data) length bytes to write
+0:      * @param instant               the log address of this log record.
+0:      * @param data                  "from" array to copy "data" portion of rec
+0:      * @param data_offset           offset in "data" to start copying from.
+0:      * @param optional_data         "from" array to copy "optional data" from
+0:      * @param optional_data_offset  offset in "optional_data" to start copy from
+0:      * @param optional_data_length  length of optional data to copy.
+0:      *
+0: 	 * @exception  StandardException  Standard exception policy.
+0:      **/
+0:     public void writeLogRecord(
+0:     int     length,
+0:     long    instant,
+0:     byte[]  data,
+0:     int     data_offset,
+0:     byte[]  optional_data,
+0:     int     optional_data_offset,
+0:     int     optional_data_length)
+0:         throws StandardException, IOException 
+0:     {
+0:         int total_log_record_length = length + LOG_RECORD_FIXED_OVERHEAD_SIZE;
+0: 
+0:         if (total_log_record_length > currentBuffer.bytes_free && 
+0:             total_log_record_length <= currentBuffer.buffer.length) 
+0:         {
+0:             // If the whole record will fit in an empty buffer, flush this
+0:             // one now and put this record into the next one.
+0:             switchLogBuffer();
+0:         }
+0: 
+0: 		if (total_log_record_length <= currentBuffer.bytes_free)
+0:         {
+0:             byte[] b    = currentBuffer.buffer;
+0:             int    p    = currentBuffer.position;
+0: 
+0:             // writeInt(length)
+0:             b[p++] = (byte) ((length >>> 24) & 0xff); 
+0:             b[p++] = (byte) ((length >>> 16) & 0xff); 
+0:             b[p++] = (byte) ((length >>>  8) & 0xff); 
+0:             b[p++] = (byte) ((length       ) & 0xff);
+0:             
+0:             // writeLong(instant)
+0:             b[p++] = (byte) (((int)(instant >>> 56)) & 0xff); 
+0:             b[p++] = (byte) (((int)(instant >>> 48)) & 0xff); 
+0:             b[p++] = (byte) (((int)(instant >>> 40)) & 0xff); 
+0:             b[p++] = (byte) (((int)(instant >>> 32)) & 0xff); 
+0:             b[p++] = (byte) (((int)(instant >>> 24)) & 0xff); 
+0:             b[p++] = (byte) (((int)(instant >>> 16)) & 0xff); 
+0:             b[p++] = (byte) (((int)(instant >>>  8)) & 0xff); 
+0:             b[p++] = (byte) (((int)(instant       )) & 0xff); 
+0: 
+0:             // write(data, data_offset, length - optional_data_length)
+0:             int transfer_length = (length - optional_data_length);
+0: 			System.arraycopy(data, data_offset, b, p, transfer_length);
+0: 
+0:             p += transfer_length;
+0: 
+0:             if (optional_data_length != 0)
+0:             {
+0:                 // write(
+0:                 //   optional_data, optional_data_offset, optional_data_length);
+0: 
+0:                 System.arraycopy(
+0:                     optional_data, optional_data_offset, 
+0:                     b,             p, 
+0:                     optional_data_length);
+0: 
+0:                 p += optional_data_length;
+0:             }
+0: 
+0:             // writeInt(length)
+0:             b[p++] = (byte) ((length >>> 24) & 0xff); 
+0:             b[p++] = (byte) ((length >>> 16) & 0xff); 
+0:             b[p++] = (byte) ((length >>>  8) & 0xff); 
+0:             b[p++] = (byte) ((length       ) & 0xff);
+0: 
+0:             currentBuffer.position   = p;
+0:             currentBuffer.bytes_free -= total_log_record_length;
+0: 		}
+0:         else
+0:         {
+0:             writeInt(length);
+0:             writeLong(instant);
+0:             write(data, data_offset, length - optional_data_length);
+0:             if (optional_data_length != 0)
+0:             {
+0:                 write(
+0:                     optional_data, optional_data_offset, optional_data_length);
+0:             }
+0:             writeInt(length);
+0: 		}
+0:     }
+0: 
+0: 
+0: 	public void writeInt(int i) throws IOException 
+0:     {
+0: 		if (currentBuffer.bytes_free < 4)
+0: 			switchLogBuffer();
+0: 
+0: 		byte[] b = currentBuffer.buffer;
+0: 		int p = currentBuffer.position;
+0: 
+0:         b[p++] = (byte) ((i >>> 24) & 0xff); 
+0:         b[p++] = (byte) ((i >>> 16) & 0xff); 
+0:         b[p++] = (byte) ((i >>> 8) & 0xff); 
+0:         b[p++] = (byte) (i & 0xff);
+0: 
+0: 		currentBuffer.position = p;
+0: 		currentBuffer.bytes_free -= 4;
+0: 	}
+0: 
+0: 	public void writeLong(long l) 
+0:         throws IOException 
+0:     {
+0: 		if (currentBuffer.bytes_free < 8)
+0: 			switchLogBuffer();
+0: 
+0: 		byte[] b = currentBuffer.buffer;
+0:  		int p = currentBuffer.position;
+0:         b[p++] = (byte) (((int)(l >>> 56)) & 0xff); 
+0:         b[p++] = (byte) (((int)(l >>> 48)) & 0xff); 
+0:         b[p++] = (byte) (((int)(l >>> 40)) & 0xff); 
+0:         b[p++] = (byte) (((int)(l >>> 32)) & 0xff); 
+0:         b[p++] = (byte) (((int)(l >>> 24)) & 0xff); 
+0:         b[p++] = (byte) (((int)(l >>> 16)) & 0xff); 
+0:         b[p++] = (byte) (((int)(l >>> 8)) & 0xff); 
+0:         b[p++] = (byte) (((int)l) & 0xff); 
+0: 		currentBuffer.position = p;
+0: 		currentBuffer.bytes_free -= 8;
+0:     }
+0: 
+0: 	public void write(int b) 
+0:         throws IOException 
+0:     {
+0: 
+0: 		if (currentBuffer.bytes_free == 0)
+0: 			switchLogBuffer();
+0: 
+0: 		currentBuffer.buffer[currentBuffer.position++] = (byte) b;
+0: 		currentBuffer.bytes_free--;
+0: 	}
+0: 
+0: 
+0: 	public void write(byte b[], int off, int len) 
+0:         throws IOException 
+0:     {
+0: 
+0: 		if (len <= currentBuffer.bytes_free)  
+0:         {
+0: 			// data fits in buffer
+0: 			System.arraycopy(b, off, currentBuffer.buffer, currentBuffer.position, len);
+0: 			currentBuffer.bytes_free -= len;
+0: 			currentBuffer.position += len;
+0: 			return;
+0: 		}
+0:         else if (len <= currentBuffer.buffer.length) 
+0:         {
+0:             // some data will be cached
+0:             System.arraycopy(b, off, currentBuffer.buffer, currentBuffer.position, currentBuffer.bytes_free);
+0:             len -= currentBuffer.bytes_free;
+0:             off += currentBuffer.bytes_free;
+0:             currentBuffer.position += currentBuffer.bytes_free;
+0:             currentBuffer.bytes_free = 0;
+0:             switchLogBuffer();
+0: 
+0:             System.arraycopy(b, off, currentBuffer.buffer, 0, len);
+0:             currentBuffer.position = len;
+0:             currentBuffer.bytes_free -= len;	
+0:         }
+0:         else
+0:         {
+0: 			
+0: 			//data will never fit in currentBuffer.buffer, write directly to log
+0: 			//flush all buffers before wrting directly to the log file. 
+0: 			flushLogAccessFile();
+0: 
+0: 			//Note:No Special Synchronization required here , 
+0: 			//There will be nothing to write by flushDirtyBuffers that can run
+0: 			//in parallel to the threads that is executing this code. Above
+0: 			//flush call should have written all the buffers and NO new log will 
+0: 			//get added until the following direct log to file call finishes. 
+0: 
+0: 			writeToLog(b, off, len);
+0: 			return;
+0: 		}
+0: 	}
+0:     /**
+0:      * Write data from all dirty buffers into the log file.
+0:      * <p>
+0:      * A call for clients of LogAccessFile to insure that all privately buffered
+0:      * data has been writen to the file - so that reads on the file using one
+0:      * of the various scan classes will see
+0:      * all the data which has been writen to this point.
+0:      * <p>
+0:      * Note that this routine only "writes" the data to the file, this does not
+0:      * mean that the data has been synced to disk unless file was opened in
+0: 	 * WRITE SYNC mode(rws/rwd).  The only way to insure that is by calling
+0:      * is to call syncLogAccessFile() after this call in Non-WRITE sync mode(rw)
+0: 	 * 
+0: 	 * <p>
+0: 	 * MT-Safe : parallel thereads can call this function, only one threads does
+0: 	 * the flush and the other threads waits for the one that is doing the flush to finish.
+0: 	 * Currently there are two possible threads that can call this function in parallel 
+0: 	 * 1) A Thread that is doing the commit
+0: 	 * 2) A Thread that is writing to the log and log buffers are full or
+0: 	 * a log records does not fit in a buffer. (Log Buffers
+0: 	 * full(switchLogBuffer() or a log record size that is greater than
+0: 	 * logbuffer size has to be writtern through writeToLog call directlty)
+0: 	 * Note: writeToLog() is not synchronized on the semaphore
+0: 	 * that is used to do  buffer management to allow writes 
+0: 	 * to the free buffers when flush is in progress.  
+0:      **/
+0: 	protected void flushDirtyBuffers() throws IOException 
+0:     {
+0:         LogAccessFileBuffer buf = null;
+0: 		int noOfBuffers;
+0: 		int nFlushed= 0;
+0: 		try{
+0: 			synchronized(this)
+0: 			{
+0: 				/**if some one else flushing wait, otherwise it is possible 
+0: 				 * different threads will get different buffers and order can 
+0: 				 * not be determined.
+0: 				 * 
+0: 				 **/
+0: 				while(flushInProgress)
+0: 				{
+0: 					try{
+0: 						wait();
+0: 					}catch (InterruptedException ie) 
+0: 					{
+0: 						//do nothing, let the flush request to complete.
+0: 						//because it possible that other thread which is
+0: 						//currently might have completed this request also ,
+0: 						//if exited  on interrupt and throw exception, can not
+0: 						//be sure whether this transaction is COMMITTED ot not.
+0: 					}
+0: 				}
+0: 		
+0: 				noOfBuffers = dirtyBuffers.size();
+0: 				if(noOfBuffers > 0)
+0: 					buf = (LogAccessFileBuffer) dirtyBuffers.removeFirst();
+0: 				
+0: 				flushInProgress = true;
+0: 			}
+0: 			
+0: 			while(nFlushed < noOfBuffers)
+0: 			{
+0: 				if (buf.position != 0)
+0: 					writeToLog(buf.buffer, 0, buf.position);
+0: 
+0: 				nFlushed++;
+0: 				synchronized(this)
+0: 				{
+0: 					//add the buffer that was written previosly to the free list
+0: 					freeBuffers.addLast(buf);
+0: 					if(nFlushed < noOfBuffers)
+0: 						buf = (LogAccessFileBuffer) dirtyBuffers.removeFirst();
+0: 					else
+0: 					{
+0: 						//see if we can flush more, that came when we are at it.
+0: 						//don't flush more than the total number of buffers,
+0: 						//that might lead to starvation of the current thread.
+0: 						int size = dirtyBuffers.size();
+0: 						if(size > 0 && nFlushed <= LOG_NUMBER_LOG_BUFFERS)
+0: 						{
+0: 							noOfBuffers += size;
+0: 							buf = (LogAccessFileBuffer) dirtyBuffers.removeFirst();
+0: 						}
+0: 					}
+0: 				}
+0: 			}
+0: 
+0: 				
+0: 		}finally{
+0: 			synchronized(this)
+0: 			{
+0: 				flushInProgress = false;
+0: 				notifyAll();
+0: 			}
+0: 		}
+0: 	}
+0: 
+0: 
+0: 	//flush all the the dirty buffers to disk
+0: 	public void flushLogAccessFile() throws IOException 
+0: 	{
+0: 		switchLogBuffer();
+0: 		flushDirtyBuffers();
+0: 	}
+0: 
+0: 		
+0: 	/**
+0: 	 * Appends the current Buffer to the dirty Buffer list and assigns a free
+0: 	 * buffer to be the currrent active buffer . Flushing of the buffer
+0: 	 * to disk is delayed if there is a free buffer available. 
+0: 	 * dirty buffers will be  flushed to the disk   
+0: 	 * when  flushDirtyBuffers() is invoked by  a commit call 
+0: 	 * or when no more free buffers are available. 
+0: 	 */
+0: 	public void switchLogBuffer() throws IOException  
+0:     {
+0: 
+0: 		synchronized(this)
+0: 		{
+0: 
+0: 			//add the current buffer to the flush buffer list
+0: 			dirtyBuffers.addLast(currentBuffer);
+0: 
+0: 			//if there is No free buffer, flush the buffers to get a free one 
+0: 			if(freeBuffers.size() == 0) 
+0: 			{
+0: 				flushDirtyBuffers();
+0: 				//after the flush call there should be a free buffer
+0: 				//because this is only methods removes items from 
+0: 				//free buffers and removal is in synchronized block. 
+0: 			}
+0: 
+0: 
+0: 			// there should be free buffer available at this point.
+0: 			if (SanityManager.DEBUG)
+0: 				SanityManager.ASSERT(freeBuffers.size() > 0);
+0: 
+0: 			//switch over to the next log buffer, let someone else write it.
+0: 			currentBuffer = (LogAccessFileBuffer) freeBuffers.removeFirst();
+0: 			currentBuffer.init();
+0:      
+0: 			if (SanityManager.DEBUG)
+0: 			{
+0: 				SanityManager.ASSERT(currentBuffer.position == 0);
+0: 				SanityManager.ASSERT(
+0: 									 currentBuffer.bytes_free == currentBuffer.buffer.length);
+0:                 SanityManager.ASSERT(currentBuffer.bytes_free > 0);
+0: 			}
+0: 		}
+0: 	}
+0: 
+0: 
+0:     /**
+0:      * Guarantee all writes up to the last call to flushLogAccessFile on disk.
+0:      * <p>
+0:      * A call for clients of LogAccessFile to insure that all data written
+0:      * up to the last call to flushLogAccessFile() are written to disk.
+0:      * This call will not return until those writes have hit disk.
+0:      * <p>
+0:      * Note that this routine may block waiting for I/O to complete so 
+0:      * callers should limit the number of resource held locked while this
+0:      * operation is called.  It is expected that the caller
+0:      * Note that this routine only "writes" the data to the file, this does not
+0:      * mean that the data has been synced to disk.  The only way to insure that
+0:      * is to first call switchLogBuffer() and then follow by a call of sync().
+0:      *
+0:      **/
+0:     public void syncLogAccessFile() 
+0:         throws IOException, StandardException
+0:     {
+0:         for( int i=0; ; )
+0:         {
+0:             // 3311: JVM sync call sometimes fails under high load against NFS 
+0:             // mounted disk.  We re-try to do this 20 times.
+0:             try
+0:             {
+0:                 synchronized( this)
+0:                 {
+0:                     log.sync( false);
+0:                 }
+0: 
+0:                 // the sync succeed, so return
+0:                 break;
+0:             }
+0:             catch( SyncFailedException sfe )
+0:             {
+0:                 i++;
+0:                 try
+0:                 {
+0:                     // wait for .2 of a second, hopefully I/O is done by now
+0:                     // we wait a max of 4 seconds before we give up
+0:                     Thread.sleep( 200 ); 
+0:                 }
+0:                 catch( InterruptedException ie )
+0:                 {   //does not matter weather I get interrupted or not
+0:                 }
+0: 
+0:                 if( i > 20 )
+0:                     throw StandardException.newException(
+0:                         SQLState.LOG_FULL, sfe, null);
+0:             }
+0:         }
+0:     }
+0: 
+0: 	/**
+0: 		The database is being marked corrupted, get rid of file pointer without
+0: 		writing out anything more.
+0: 	 */
+0: 	public void corrupt() throws IOException
+0: 	{
+0: 		synchronized(logFileSemaphore)
+0: 		{
+0: 			if (log != null)
+0: 				log.close();
+0: 		}
+0: 	}
+0: 
+0: 	public void close() throws IOException 
+0:     {
+0: 		if (SanityManager.DEBUG) 
+0:         {
+0: 			if (currentBuffer.position != 0)
+0: 				SanityManager.THROWASSERT(
+0: 				"Log file being closed with data still buffered " + 
+0:                 currentBuffer.position +  " " + currentBuffer.bytes_free);
+0: 		}
+0: 
+0: 		flushLogAccessFile();
+0: 
+0: 		synchronized(logFileSemaphore)
+0: 		{
+0: 			if (log != null)
+0: 				log.close();
+0: 		}
+0: 	}
+0: 
+0: 
+0: 	/* write to the log file */
+0: 	private void writeToLog(byte b[], int off, int len) throws IOException
+0: 	{
+0: 		synchronized(logFileSemaphore)
+0: 		{
+0:             if (log != null)
+0:             {
+0:                 // Try to handle case where user application is throwing
+0:                 // random interrupts at cloudscape threads, retry in the case
+0:                 // of IO exceptions 5 times.  After that hope that it is 
+0:                 // a real disk problem - an IO error in a write to the log file
+0:                 // is going to take down the whole system, so seems worthwhile
+0:                 // to retry.
+0:                 for (int i = 0; ;i++)
+0:                 {
+0:                     try 
+0:                     {
+0:                         log.write(b, off, len);
+0:                         break;
+0:                     }
+0:                     catch (IOException ioe)
+0:                     {
+0:                         // just fall through and rety the log write 1st 5 times.
+0: 
+0:                         if (i >= 5)
+0:                             throw ioe;
+0:                     }
+0:                 }
+0:             }
+0: 		}
+0: 
+0: 		if (SanityManager.DEBUG) 
+0:         {
+0: 			mon_numWritesToLog++;
+0: 			mon_numBytesToLog += len;
+0: 		}
+0: 	}
+0: }
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+0: 
+============================================================================

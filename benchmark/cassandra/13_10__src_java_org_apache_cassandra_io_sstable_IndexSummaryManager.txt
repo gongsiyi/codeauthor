@@ -1,0 +1,1008 @@
+1:dbd1a72: /*
+1:dbd1a72:  * Licensed to the Apache Software Foundation (ASF) under one
+1:dbd1a72:  * or more contributor license agreements.  See the NOTICE file
+1:dbd1a72:  * distributed with this work for additional information
+1:dbd1a72:  * regarding copyright ownership.  The ASF licenses this file
+1:dbd1a72:  * to you under the Apache License, Version 2.0 (the
+1:dbd1a72:  * "License"); you may not use this file except in compliance
+1:dbd1a72:  * with the License.  You may obtain a copy of the License at
+1:dbd1a72:  *
+1:dbd1a72:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:dbd1a72:  *
+1:dbd1a72:  * Unless required by applicable law or agreed to in writing, software
+1:dbd1a72:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:dbd1a72:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:dbd1a72:  * See the License for the specific language governing permissions and
+1:dbd1a72:  * limitations under the License.
+1:dbd1a72:  */
+1:dbd1a72: package org.apache.cassandra.io.sstable;
+40:dbd1a72: 
+1:dbd1a72: import java.io.IOException;
+1:dbd1a72: import java.lang.management.ManagementFactory;
+1:e5a76bd: import java.util.*;
+1:dbd1a72: import java.util.concurrent.ScheduledFuture;
+1:dbd1a72: import java.util.concurrent.TimeUnit;
+1:dbd1a72: import javax.management.MBeanServer;
+1:dbd1a72: import javax.management.ObjectName;
+1:e5a76bd: 
+1:dbd1a72: import com.google.common.annotations.VisibleForTesting;
+1:e5a76bd: import com.google.common.collect.*;
+1:dbd1a72: import org.slf4j.Logger;
+1:dbd1a72: import org.slf4j.LoggerFactory;
+1:e5a76bd: 
+1:dbd1a72: import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
+1:dbd1a72: import org.apache.cassandra.config.DatabaseDescriptor;
+1:dbd1a72: import org.apache.cassandra.db.ColumnFamilyStore;
+1:e5a76bd: import org.apache.cassandra.db.compaction.OperationType;
+1:dbd1a72: import org.apache.cassandra.db.Keyspace;
+1:e5a76bd: import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+1:e5a76bd: import org.apache.cassandra.db.lifecycle.View;
+1:ad8cad7: import org.apache.cassandra.db.lifecycle.SSTableSet;
+1:fc7075a: import org.apache.cassandra.db.compaction.CompactionManager;
+1:0368e97: import org.apache.cassandra.io.sstable.format.SSTableReader;
+1:dbd1a72: import org.apache.cassandra.utils.Pair;
+1:dbd1a72: import org.apache.cassandra.utils.WrappedRunnable;
+1:ee477cc: 
+1:dbd1a72: /**
+1:dbd1a72:  * Manages the fixed-size memory pool for index summaries, periodically resizing them
+1:dbd1a72:  * in order to give more memory to hot sstables and less memory to cold sstables.
+1:dbd1a72:  */
+1:dbd1a72: public class IndexSummaryManager implements IndexSummaryManagerMBean
+1:ee477cc: {
+1:dbd1a72:     private static final Logger logger = LoggerFactory.getLogger(IndexSummaryManager.class);
+1:dbd1a72:     public static final String MBEAN_NAME = "org.apache.cassandra.db:type=IndexSummaries";
+1:dbd1a72:     public static final IndexSummaryManager instance;
+1:b09e60f: 
+1:dbd1a72:     private int resizeIntervalInMinutes = 0;
+1:dbd1a72:     private long memoryPoolBytes;
+1:dbd1a72: 
+1:dbd1a72:     private final DebuggableScheduledThreadPoolExecutor executor;
+1:dbd1a72: 
+1:dbd1a72:     // our next scheduled resizing run
+1:dbd1a72:     private ScheduledFuture future;
+1:dbd1a72: 
+1:dbd1a72:     static
+31:dbd1a72:     {
+1:dbd1a72:         instance = new IndexSummaryManager();
+1:dbd1a72:         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+1:dbd1a72: 
+1:dbd1a72:         try
+1:dbd1a72:         {
+1:dbd1a72:             mbs.registerMBean(instance, new ObjectName(MBEAN_NAME));
+1:ee477cc:         }
+1:dbd1a72:         catch (Exception e)
+1:ee477cc:         {
+1:dbd1a72:             throw new RuntimeException(e);
+1:ee477cc:         }
+1:ee477cc:     }
+1:ee477cc: 
+1:dbd1a72:     private IndexSummaryManager()
+1:ee477cc:     {
+1:dbd1a72:         executor = new DebuggableScheduledThreadPoolExecutor(1, "IndexSummaryManager", Thread.MIN_PRIORITY);
+1:ee477cc: 
+1:dbd1a72:         long indexSummarySizeInMB = DatabaseDescriptor.getIndexSummaryCapacityInMB();
+1:dbd1a72:         int interval = DatabaseDescriptor.getIndexSummaryResizeIntervalInMinutes();
+1:dbd1a72:         logger.info("Initializing index summary manager with a memory pool size of {} MB and a resize interval of {} minutes",
+1:dbd1a72:                     indexSummarySizeInMB, interval);
+1:c937657: 
+1:dbd1a72:         setMemoryPoolCapacityInMB(DatabaseDescriptor.getIndexSummaryCapacityInMB());
+1:dbd1a72:         setResizeIntervalInMinutes(DatabaseDescriptor.getIndexSummaryResizeIntervalInMinutes());
+1:c937657:     }
+1:c937657: 
+1:dbd1a72:     public int getResizeIntervalInMinutes()
+1:c937657:     {
+1:dbd1a72:         return resizeIntervalInMinutes;
+30:dbd1a72:     }
+1:c937657: 
+1:dbd1a72:     public void setResizeIntervalInMinutes(int resizeIntervalInMinutes)
+1:c937657:     {
+1:dbd1a72:         int oldInterval = this.resizeIntervalInMinutes;
+1:dbd1a72:         this.resizeIntervalInMinutes = resizeIntervalInMinutes;
+1:dbd1a72: 
+1:dbd1a72:         long initialDelay;
+1:dbd1a72:         if (future != null)
+1:c937657:         {
+1:dbd1a72:             initialDelay = oldInterval < 0
+1:dbd1a72:                            ? resizeIntervalInMinutes
+1:dbd1a72:                            : Math.max(0, resizeIntervalInMinutes - (oldInterval - future.getDelay(TimeUnit.MINUTES)));
+1:dbd1a72:             future.cancel(false);
+1:dbd1a72:         }
+1:c937657:         else
+1:dbd1a72:         {
+1:dbd1a72:             initialDelay = resizeIntervalInMinutes;
+1:c937657:         }
+1:dbd1a72: 
+1:dbd1a72:         if (this.resizeIntervalInMinutes < 0)
+1:dbd1a72:         {
+1:dbd1a72:             future = null;
+1:dbd1a72:             return;
+1:c937657:         }
+1:dbd1a72: 
+1:dbd1a72:         future = executor.scheduleWithFixedDelay(new WrappedRunnable()
+1:dbd1a72:         {
+1:dbd1a72:             protected void runMayThrow() throws Exception
+1:dbd1a72:             {
+1:dbd1a72:                 redistributeSummaries();
+1:dbd1a72:             }
+1:dbd1a72:         }, initialDelay, resizeIntervalInMinutes, TimeUnit.MINUTES);
+1:dbd1a72:     }
+1:dbd1a72: 
+1:dbd1a72:     // for testing only
+2:dbd1a72:     @VisibleForTesting
+1:dbd1a72:     Long getTimeToNextResize(TimeUnit timeUnit)
+1:e5a76bd:     {
+1:dbd1a72:         if (future == null)
+1:dbd1a72:             return null;
+1:dbd1a72: 
+1:dbd1a72:         return future.getDelay(timeUnit);
+1:fc7075a:     }
+1:dbd1a72: 
+1:dbd1a72:     public long getMemoryPoolCapacityInMB()
+1:dbd1a72:     {
+1:dbd1a72:         return memoryPoolBytes / 1024L / 1024L;
+1:dbd1a72:     }
+1:dbd1a72: 
+1:ee477cc:     public Map<String, Integer> getIndexIntervals()
+1:dbd1a72:     {
+1:dbd1a72:         List<SSTableReader> sstables = getAllSSTables();
+1:ee477cc:         Map<String, Integer> intervals = new HashMap<>(sstables.size());
+2:dbd1a72:         for (SSTableReader sstable : sstables)
+1:ee477cc:             intervals.put(sstable.getFilename(), (int) Math.round(sstable.getEffectiveIndexInterval()));
+1:ee477cc: 
+1:ee477cc:         return intervals;
+1:dbd1a72:     }
+1:dbd1a72: 
+1:ee477cc:     public double getAverageIndexInterval()
+1:dbd1a72:     {
+1:dbd1a72:         List<SSTableReader> sstables = getAllSSTables();
+1:dbd1a72:         double total = 0.0;
+1:dbd1a72:         for (SSTableReader sstable : sstables)
+1:ee477cc:             total += sstable.getEffectiveIndexInterval();
+1:dbd1a72:         return total / sstables.size();
+1:dbd1a72:     }
+1:dbd1a72: 
+1:dbd1a72:     public void setMemoryPoolCapacityInMB(long memoryPoolCapacityInMB)
+1:dbd1a72:     {
+1:dbd1a72:         this.memoryPoolBytes = memoryPoolCapacityInMB * 1024L * 1024L;
+1:dbd1a72:     }
+1:dbd1a72: 
+1:dbd1a72:     /**
+1:dbd1a72:      * Returns the actual space consumed by index summaries for all sstables.
+1:dbd1a72:      * @return space currently used in MB
+1:dbd1a72:      */
+1:dbd1a72:     public double getMemoryPoolSizeInMB()
+1:dbd1a72:     {
+2:dbd1a72:         long total = 0;
+1:dbd1a72:         for (SSTableReader sstable : getAllSSTables())
+3:dbd1a72:             total += sstable.getIndexSummaryOffHeapSize();
+1:dbd1a72:         return total / 1024.0 / 1024.0;
+1:7ff25f0:     }
+1:7ff25f0: 
+1:dbd1a72:     private List<SSTableReader> getAllSSTables()
+1:7ff25f0:     {
+1:dbd1a72:         List<SSTableReader> result = new ArrayList<>();
+1:dbd1a72:         for (Keyspace ks : Keyspace.all())
+1:dbd1a72:         {
+1:dbd1a72:             for (ColumnFamilyStore cfStore: ks.getColumnFamilyStores())
+1:ad8cad7:                 result.addAll(cfStore.getLiveSSTables());
+1:dbd1a72:         }
+1:dbd1a72: 
+1:dbd1a72:         return result;
+1:dbd1a72:     }
+1:dbd1a72: 
+1:dbd1a72:     /**
+1:dbd1a72:      * Returns a Pair of all compacting and non-compacting sstables.  Non-compacting sstables will be marked as
+1:dbd1a72:      * compacting.
+1:dbd1a72:      */
+1:7aafe05:     @SuppressWarnings("resource")
+1:e5a76bd:     private Pair<List<SSTableReader>, Map<UUID, LifecycleTransaction>> getCompactingAndNonCompactingSSTables()
+1:dbd1a72:     {
+1:dbd1a72:         List<SSTableReader> allCompacting = new ArrayList<>();
+1:e5a76bd:         Map<UUID, LifecycleTransaction> allNonCompacting = new HashMap<>();
+1:dbd1a72:         for (Keyspace ks : Keyspace.all())
+1:dbd1a72:         {
+1:dbd1a72:             for (ColumnFamilyStore cfStore: ks.getColumnFamilyStores())
+1:dbd1a72:             {
+1:dbd1a72:                 Set<SSTableReader> nonCompacting, allSSTables;
+1:e5a76bd:                 LifecycleTransaction txn = null;
+1:dbd1a72:                 do
+1:dbd1a72:                 {
+1:e5a76bd:                     View view = cfStore.getTracker().getView();
+1:bc23632:                     allSSTables = ImmutableSet.copyOf(view.select(SSTableSet.CANONICAL));
+1:e5a76bd:                     nonCompacting = ImmutableSet.copyOf(view.getUncompacting(allSSTables));
+1:dbd1a72:                 }
+1:e5a76bd:                 while (null == (txn = cfStore.getTracker().tryModify(nonCompacting, OperationType.UNKNOWN)));
+1:e5a76bd: 
+1:e5a76bd:                 allNonCompacting.put(cfStore.metadata.cfId, txn);
+1:dbd1a72:                 allCompacting.addAll(Sets.difference(allSSTables, nonCompacting));
+1:dbd1a72:             }
+1:dbd1a72:         }
+1:dbd1a72:         return Pair.create(allCompacting, allNonCompacting);
+1:dbd1a72:     }
+1:dbd1a72: 
+1:dbd1a72:     public void redistributeSummaries() throws IOException
+1:dbd1a72:     {
+1:e5a76bd:         Pair<List<SSTableReader>, Map<UUID, LifecycleTransaction>> compactingAndNonCompacting = getCompactingAndNonCompactingSSTables();
+1:dbd1a72:         try
+1:dbd1a72:         {
+1:ca85bec:             redistributeSummaries(new IndexSummaryRedistribution(compactingAndNonCompacting.left,
+1:ca85bec:                                                                  compactingAndNonCompacting.right,
+1:ca85bec:                                                                  this.memoryPoolBytes));
+1:dbd1a72:         }
+1:dbd1a72:         finally
+1:e5a76bd:         {
+1:e5a76bd:             for (LifecycleTransaction modifier : compactingAndNonCompacting.right.values())
+1:e5a76bd:                 modifier.close();
+1:e5a76bd:         }
+1:e5a76bd:     }
+1:e5a76bd: 
+1:dbd1a72:     /**
+1:dbd1a72:      * Attempts to fairly distribute a fixed pool of memory for index summaries across a set of SSTables based on
+1:dbd1a72:      * their recent read rates.
+1:ca85bec:      * @param redistribution encapsulating the transactions containing the sstables we are to redistribute the
+1:ca85bec:      *                       memory pool across and a size (in bytes) that the total index summary space usage
+1:ca85bec:      *                       should stay close to or under, if possible
+1:dbd1a72:      * @return a list of new SSTableReader instances
+1:dbd1a72:      */
+1:dbd1a72:     @VisibleForTesting
+1:ca85bec:     public static List<SSTableReader> redistributeSummaries(IndexSummaryRedistribution redistribution) throws IOException
+1:e5a76bd:     {
+1:ca85bec:         return CompactionManager.instance.runIndexSummaryRedistribution(redistribution);
+1:e5a76bd:     }
+1:dbd1a72: }
+============================================================================
+author:Sam Tunnicliffe
+-------------------------------------------------------------------------------
+commit:bfa8c80
+commit:ca85bec
+/////////////////////////////////////////////////////////////////////////
+1:             redistributeSummaries(new IndexSummaryRedistribution(compactingAndNonCompacting.left,
+1:                                                                  compactingAndNonCompacting.right,
+1:                                                                  this.memoryPoolBytes));
+/////////////////////////////////////////////////////////////////////////
+1:      * @param redistribution encapsulating the transactions containing the sstables we are to redistribute the
+1:      *                       memory pool across and a size (in bytes) that the total index summary space usage
+1:      *                       should stay close to or under, if possible
+1:     public static List<SSTableReader> redistributeSummaries(IndexSummaryRedistribution redistribution) throws IOException
+1:         return CompactionManager.instance.runIndexSummaryRedistribution(redistribution);
+commit:b447ffc
+/////////////////////////////////////////////////////////////////////////
+0:             redistributeSummaries(new IndexSummaryRedistribution(compactingAndNonCompacting.left,
+0:                                                                  compactingAndNonCompacting.right,
+0:                                                                  this.memoryPoolBytes));
+/////////////////////////////////////////////////////////////////////////
+0:      * @param redistribution encapsulating the transactions containing the sstables we are to redistribute the
+0:      *                       memory pool across and a size (in bytes) that the total index summary space usage
+0:      *                       should stay close to or under, if possible
+0:     public static List<SSTableReader> redistributeSummaries(IndexSummaryRedistribution redistribution) throws IOException
+0:         return CompactionManager.instance.runIndexSummaryRedistribution(redistribution);
+author:Marcus Eriksson
+-------------------------------------------------------------------------------
+commit:bc23632
+/////////////////////////////////////////////////////////////////////////
+1:                     allSSTables = ImmutableSet.copyOf(view.select(SSTableSet.CANONICAL));
+commit:65885e7
+commit:f166749
+commit:d996c36
+commit:813eb23
+/////////////////////////////////////////////////////////////////////////
+0:         logger.info("Redistributing index summaries");
+/////////////////////////////////////////////////////////////////////////
+0:                 transactions.get(sstable.metadata.cfId).cancel(sstable);
+/////////////////////////////////////////////////////////////////////////
+0:             for (SSTableReader sstable : result.left)
+0:                 transactions.get(sstable.metadata.cfId).cancel(sstable);
+commit:0f59629
+commit:5160c91
+/////////////////////////////////////////////////////////////////////////
+0:             tracker.replaceWithNewInstances(replacedByTracker.get(tracker), replacementsByTracker.get(tracker));
+commit:3261d5e
+/////////////////////////////////////////////////////////////////////////
+0:             tracker.replaceReaders(replacedByTracker.get(tracker), replacementsByTracker.get(tracker), true);
+author:Carl Yeksigian
+-------------------------------------------------------------------------------
+commit:fc7075a
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.compaction.CompactionManager;
+/////////////////////////////////////////////////////////////////////////
+0:         return CompactionManager.instance.runIndexSummaryRedistribution(new IndexSummaryRedistribution(compacting, nonCompacting, memoryPoolBytes));
+1: }
+author:blerer
+-------------------------------------------------------------------------------
+commit:aa60cde
+author:Paulo Motta
+-------------------------------------------------------------------------------
+commit:4a849ef
+/////////////////////////////////////////////////////////////////////////
+0:         logger.trace("Beginning redistribution of index summaries for {} sstables with memory pool size {} MB; current spaced used is {} MB",
+/////////////////////////////////////////////////////////////////////////
+0:         logger.trace("Completed resizing of index summaries; current approximate memory used: {} MB",
+/////////////////////////////////////////////////////////////////////////
+0:                 logger.trace("Forcing resample of {} because the current index interval ({}) is below min_index_interval ({})",
+/////////////////////////////////////////////////////////////////////////
+0:                 logger.trace("Forcing upsample of {} because the current index interval ({}) is above max_index_interval ({})",
+/////////////////////////////////////////////////////////////////////////
+0:             logger.trace("Re-sampling index summary for {} from {}/{} to {}/{} of the original number of entries",
+author:Aleksey Yeschenko
+-------------------------------------------------------------------------------
+commit:b31845c
+/////////////////////////////////////////////////////////////////////////
+0:             int minIndexInterval = sstable.metadata.params.minIndexInterval;
+0:             int maxIndexInterval = sstable.metadata.params.maxIndexInterval;
+commit:ee477cc
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.cassandra.config.CFMetaData;
+/////////////////////////////////////////////////////////////////////////
+0: import static org.apache.cassandra.io.sstable.Downsampling.BASE_SAMPLING_LEVEL;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     public Map<String, Integer> getIndexIntervals()
+1:         Map<String, Integer> intervals = new HashMap<>(sstables.size());
+1:             intervals.put(sstable.getFilename(), (int) Math.round(sstable.getEffectiveIndexInterval()));
+1:         return intervals;
+1:     public double getAverageIndexInterval()
+1:             total += sstable.getEffectiveIndexInterval();
+/////////////////////////////////////////////////////////////////////////
+0:         List<ResampleEntry> forceResample = new ArrayList<>();
+0:         List<ResampleEntry> forceUpsample = new ArrayList<>();
+/////////////////////////////////////////////////////////////////////////
+0:             int minIndexInterval = sstable.metadata.getMinIndexInterval();
+0:             int maxIndexInterval = sstable.metadata.getMaxIndexInterval();
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:             int maxSummarySize = sstable.getMaxIndexSummarySize();
+0:             // if the min_index_interval changed, calculate what our current sampling level would be under the new min
+0:             if (sstable.getMinIndexInterval() != minIndexInterval)
+1:             {
+0:                 int effectiveSamplingLevel = (int) Math.round(currentSamplingLevel * (minIndexInterval / (double) sstable.getMinIndexInterval()));
+0:                 maxSummarySize = (int) Math.round(maxSummarySize * (sstable.getMinIndexInterval() / (double) minIndexInterval));
+0:                 logger.trace("min_index_interval changed from {} to {}, so the current sampling level for {} is effectively now {} (was {})",
+0:                              sstable.getMinIndexInterval(), minIndexInterval, sstable, effectiveSamplingLevel, currentSamplingLevel);
+0:                 currentSamplingLevel = effectiveSamplingLevel;
+1:             }
+0:             int newSamplingLevel = IndexSummaryBuilder.calculateSamplingLevel(currentSamplingLevel, currentNumEntries, targetNumEntries,
+0:                     minIndexInterval, maxIndexInterval);
+0:             int numEntriesAtNewSamplingLevel = IndexSummaryBuilder.entriesAtSamplingLevel(newSamplingLevel, maxSummarySize);
+0:             double effectiveIndexInterval = sstable.getEffectiveIndexInterval();
+1: 
+0:             logger.trace("{} has {} reads/sec; ideal space for index summary: {} bytes ({} entries); considering moving " +
+0:                     "from level {} ({} entries, {} bytes) to level {} ({} entries, {} bytes)",
+0:                     sstable.getFilename(), readsPerSec, idealSpace, targetNumEntries, currentSamplingLevel, currentNumEntries,
+0:                     currentNumEntries * avgEntrySize, newSamplingLevel, numEntriesAtNewSamplingLevel,
+0:                     numEntriesAtNewSamplingLevel * avgEntrySize);
+1: 
+0:             if (effectiveIndexInterval < minIndexInterval)
+1:             {
+0:                 // The min_index_interval was changed; re-sample to match it.
+0:                 logger.debug("Forcing resample of {} because the current index interval ({}) is below min_index_interval ({})",
+0:                         sstable, effectiveIndexInterval, minIndexInterval);
+0:                 long spaceUsed = (long) Math.ceil(avgEntrySize * numEntriesAtNewSamplingLevel);
+0:                 forceResample.add(new ResampleEntry(sstable, spaceUsed, newSamplingLevel));
+0:                 remainingSpace -= spaceUsed;
+1:             }
+0:             else if (effectiveIndexInterval > maxIndexInterval)
+1:             {
+0:                 // The max_index_interval was lowered; force an upsample to the effective minimum sampling level
+0:                 logger.debug("Forcing upsample of {} because the current index interval ({}) is above max_index_interval ({})",
+0:                         sstable, effectiveIndexInterval, maxIndexInterval);
+0:                 newSamplingLevel = Math.max(1, (BASE_SAMPLING_LEVEL * minIndexInterval) / maxIndexInterval);
+0:                 numEntriesAtNewSamplingLevel = IndexSummaryBuilder.entriesAtSamplingLevel(newSamplingLevel, sstable.getMaxIndexSummarySize());
+0:                 long spaceUsed = (long) Math.ceil(avgEntrySize * numEntriesAtNewSamplingLevel);
+0:                 forceUpsample.add(new ResampleEntry(sstable, spaceUsed, newSamplingLevel));
+0:                 remainingSpace -= avgEntrySize * numEntriesAtNewSamplingLevel;
+1:             }
+0:             else if (targetNumEntries >= currentNumEntries * UPSAMPLE_THRESHOLD && newSamplingLevel > currentSamplingLevel)
+/////////////////////////////////////////////////////////////////////////
+0:         toDownsample.addAll(forceResample);
+0:         toDownsample.addAll(forceUpsample);
+author:Benedict Elliott Smith
+-------------------------------------------------------------------------------
+commit:ad8cad7
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.lifecycle.SSTableSet;
+/////////////////////////////////////////////////////////////////////////
+1:                 result.addAll(cfStore.getLiveSSTables());
+/////////////////////////////////////////////////////////////////////////
+0:                     allSSTables = ImmutableSet.copyOf(view.sstables(SSTableSet.CANONICAL));
+commit:e5a76bd
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.*;
+1: import com.google.common.collect.*;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.compaction.OperationType;
+1: import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+1: import org.apache.cassandra.db.lifecycle.View;
+/////////////////////////////////////////////////////////////////////////
+1:     private Pair<List<SSTableReader>, Map<UUID, LifecycleTransaction>> getCompactingAndNonCompactingSSTables()
+1:         Map<UUID, LifecycleTransaction> allNonCompacting = new HashMap<>();
+1:                 LifecycleTransaction txn = null;
+1:                     View view = cfStore.getTracker().getView();
+0:                     allSSTables = view.sstables;
+1:                     nonCompacting = ImmutableSet.copyOf(view.getUncompacting(allSSTables));
+1:                 while (null == (txn = cfStore.getTracker().tryModify(nonCompacting, OperationType.UNKNOWN)));
+1: 
+1:                 allNonCompacting.put(cfStore.metadata.cfId, txn);
+/////////////////////////////////////////////////////////////////////////
+1:         Pair<List<SSTableReader>, Map<UUID, LifecycleTransaction>> compactingAndNonCompacting = getCompactingAndNonCompactingSSTables();
+0:             redistributeSummaries(compactingAndNonCompacting.left, compactingAndNonCompacting.right, this.memoryPoolBytes);
+1:             for (LifecycleTransaction modifier : compactingAndNonCompacting.right.values())
+1:                 modifier.close();
+0:      * @param transactions containing the sstables we are to redistribute the memory pool across
+0:     public static List<SSTableReader> redistributeSummaries(List<SSTableReader> compacting, Map<UUID, LifecycleTransaction> transactions, long memoryPoolBytes) throws IOException
+0:         List<SSTableReader> oldFormatSSTables = new ArrayList<>();
+0:         List<SSTableReader> redistribute = new ArrayList<>();
+0:         for (LifecycleTransaction txn : transactions.values())
+1:         {
+0:             for (SSTableReader sstable : ImmutableList.copyOf(txn.originals()))
+1:             {
+0:                 // We can't change the sampling level of sstables with the old format, because the serialization format
+0:                 // doesn't include the sampling level.  Leave this one as it is.  (See CASSANDRA-8993 for details.)
+0:                 logger.trace("SSTable {} cannot be re-sampled due to old sstable format", sstable);
+0:                 if (!sstable.descriptor.version.hasSamplingLevel())
+1:                 {
+0:                     oldFormatSSTables.add(sstable);
+0:                     txn.cancel(sstable);
+1:                 }
+1:             }
+0:             redistribute.addAll(txn.originals());
+1:         }
+1: 
+0:         for (SSTableReader sstable : Iterables.concat(compacting, redistribute))
+0:                      redistribute.size(), memoryPoolBytes / 1024L / 1024L, total / 1024.0 / 1024.0);
+0:         final Map<SSTableReader, Double> readRates = new HashMap<>(redistribute.size());
+0:         for (SSTableReader sstable : redistribute)
+/////////////////////////////////////////////////////////////////////////
+0:         List<SSTableReader> sstablesByHotness = new ArrayList<>(redistribute);
+/////////////////////////////////////////////////////////////////////////
+0:         List<SSTableReader> newSSTables = adjustSamplingLevels(sstablesByHotness, transactions, totalReadsPerSec, remainingBytes);
+1: 
+0:         for (LifecycleTransaction txn : transactions.values())
+0:             txn.finish();
+/////////////////////////////////////////////////////////////////////////
+0:     private static List<SSTableReader> adjustSamplingLevels(List<SSTableReader> sstables, Map<UUID, LifecycleTransaction> transactions,
+/////////////////////////////////////////////////////////////////////////
+0:             ColumnFamilyStore cfs = Keyspace.open(sstable.metadata.ksName).getColumnFamilyStore(sstable.metadata.cfId);
+0:             newSSTables.add(replacement);
+0:             transactions.get(sstable.metadata.cfId).update(replacement, true);
+commit:02c3489
+commit:61384c5
+/////////////////////////////////////////////////////////////////////////
+0:             if (sstable.getReadMeter() != null)
+0:                 Double readRate = sstable.getReadMeter().fifteenMinuteRate();
+/////////////////////////////////////////////////////////////////////////
+0:             double readsPerSec = sstable.getReadMeter() == null ? 0.0 : sstable.getReadMeter().fifteenMinuteRate();
+author:Stefania Alborghetti
+-------------------------------------------------------------------------------
+commit:b09e60f
+/////////////////////////////////////////////////////////////////////////
+0:                     // We can't change the sampling level of sstables with the old format, because the serialization format
+0:                     // doesn't include the sampling level.  Leave this one as it is.  (See CASSANDRA-8993 for details.)
+0:                     logger.trace("SSTable {} cannot be re-sampled due to old sstable format", sstable);
+1: 
+author:T Jake Luciani
+-------------------------------------------------------------------------------
+commit:7aafe05
+/////////////////////////////////////////////////////////////////////////
+1:     @SuppressWarnings("resource")
+author:Tyler Hobbs
+-------------------------------------------------------------------------------
+commit:8e115da
+commit:7ff25f0
+/////////////////////////////////////////////////////////////////////////
+0:         List<SSTableReader> oldFormatSSTables = new ArrayList<>();
+0:         for (SSTableReader sstable : nonCompacting)
+1:         {
+0:             // We can't change the sampling level of sstables with the old format, because the serialization format
+0:             // doesn't include the sampling level.  Leave this one as it is.  (See CASSANDRA-8993 for details.)
+0:             logger.trace("SSTable {} cannot be re-sampled due to old sstable format", sstable);
+0:             if (!sstable.descriptor.version.hasSamplingLevel)
+0:                 oldFormatSSTables.add(sstable);
+1:         }
+0:         nonCompacting.removeAll(oldFormatSSTables);
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:         for (SSTableReader sstable : Iterables.concat(compacting, oldFormatSSTables))
+/////////////////////////////////////////////////////////////////////////
+0:         for (SSTableReader sstable : Iterables.concat(compacting, oldFormatSSTables, newSSTables))
+commit:708c6ba
+commit:c937657
+/////////////////////////////////////////////////////////////////////////
+0:         final Map<SSTableReader, Double> readRates = new HashMap<>(nonCompacting.size());
+0:                 Double readRate = sstable.readMeter.fifteenMinuteRate();
+0:                 totalReadsPerSec += readRate;
+0:                 readRates.put(sstable, readRate);
+0:         Collections.sort(sstablesByHotness, new ReadRateComparator(readRates));
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:     /** Utility class for sorting sstables by their read rates. */
+0:     private static class ReadRateComparator implements Comparator<SSTableReader>
+1:     {
+0:         private final Map<SSTableReader, Double> readRates;
+1: 
+0:         public ReadRateComparator(Map<SSTableReader, Double> readRates)
+1:         {
+0:             this.readRates = readRates;
+1:         }
+1: 
+0:         @Override
+0:         public int compare(SSTableReader o1, SSTableReader o2)
+1:         {
+0:             Double readRate1 = readRates.get(o1);
+0:             Double readRate2 = readRates.get(o2);
+0:             if (readRate1 == null && readRate2 == null)
+0:                 return 0;
+0:             else if (readRate1 == null)
+0:                 return -1;
+0:             else if (readRate2 == null)
+0:                 return 1;
+1:             else
+0:                 return Double.compare(readRate1, readRate2);
+1:         }
+1:     }
+author:Jake Luciani
+-------------------------------------------------------------------------------
+commit:0368e97
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.io.sstable.format.SSTableReader;
+author:belliottsmith
+-------------------------------------------------------------------------------
+commit:5ebadc1
+/////////////////////////////////////////////////////////////////////////
+0: import java.util.ArrayList;
+0: import java.util.Collections;
+0: import java.util.Comparator;
+0: import java.util.HashMap;
+0: import java.util.List;
+0: import java.util.Map;
+0: import java.util.Set;
+0: import com.google.common.collect.HashMultimap;
+0: import com.google.common.collect.Iterables;
+0: import com.google.common.collect.Lists;
+0: import com.google.common.collect.Multimap;
+0: import com.google.common.collect.Sets;
+/////////////////////////////////////////////////////////////////////////
+0:             ColumnFamilyStore cfs = Keyspace.open(sstable.getKeyspaceName()).getColumnFamilyStore(sstable.getColumnFamilyName());
+0:             SSTableReader replacement = sstable.cloneWithNewSummarySamplingLevel(cfs, entry.newSamplingLevel);
+0:             DataTracker tracker = cfs.getDataTracker();
+author:Jonathan Ellis
+-------------------------------------------------------------------------------
+commit:dbd1a72
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.io.sstable;
+1: 
+1: import java.io.IOException;
+1: import java.lang.management.ManagementFactory;
+0: import java.util.*;
+1: import java.util.concurrent.ScheduledFuture;
+1: import java.util.concurrent.TimeUnit;
+1: 
+1: import javax.management.MBeanServer;
+1: import javax.management.ObjectName;
+1: 
+1: import com.google.common.annotations.VisibleForTesting;
+0: import com.google.common.collect.*;
+1: 
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
+1: import org.apache.cassandra.config.DatabaseDescriptor;
+1: import org.apache.cassandra.db.ColumnFamilyStore;
+0: import org.apache.cassandra.db.DataTracker;
+1: import org.apache.cassandra.db.Keyspace;
+1: import org.apache.cassandra.utils.Pair;
+1: import org.apache.cassandra.utils.WrappedRunnable;
+1: 
+1: /**
+1:  * Manages the fixed-size memory pool for index summaries, periodically resizing them
+1:  * in order to give more memory to hot sstables and less memory to cold sstables.
+1:  */
+1: public class IndexSummaryManager implements IndexSummaryManagerMBean
+1: {
+1:     private static final Logger logger = LoggerFactory.getLogger(IndexSummaryManager.class);
+1:     public static final String MBEAN_NAME = "org.apache.cassandra.db:type=IndexSummaries";
+1:     public static final IndexSummaryManager instance;
+1: 
+1:     private int resizeIntervalInMinutes = 0;
+1:     private long memoryPoolBytes;
+1: 
+0:     // The target (or ideal) number of index summary entries must differ from the actual number of
+0:     // entries by this ratio in order to trigger an upsample or downsample of the summary.  Because
+0:     // upsampling requires reading the primary index in order to rebuild the summary, the threshold
+0:     // for upsampling is is higher.
+0:     static final double UPSAMPLE_THRESHOLD = 1.5;
+0:     static final double DOWNSAMPLE_THESHOLD = 0.75;
+1: 
+1:     private final DebuggableScheduledThreadPoolExecutor executor;
+1: 
+1:     // our next scheduled resizing run
+1:     private ScheduledFuture future;
+1: 
+1:     static
+1:     {
+1:         instance = new IndexSummaryManager();
+1:         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+1: 
+1:         try
+1:         {
+1:             mbs.registerMBean(instance, new ObjectName(MBEAN_NAME));
+1:         }
+1:         catch (Exception e)
+1:         {
+1:             throw new RuntimeException(e);
+1:         }
+1:     }
+1: 
+1:     private IndexSummaryManager()
+1:     {
+1:         executor = new DebuggableScheduledThreadPoolExecutor(1, "IndexSummaryManager", Thread.MIN_PRIORITY);
+1: 
+1:         long indexSummarySizeInMB = DatabaseDescriptor.getIndexSummaryCapacityInMB();
+1:         int interval = DatabaseDescriptor.getIndexSummaryResizeIntervalInMinutes();
+1:         logger.info("Initializing index summary manager with a memory pool size of {} MB and a resize interval of {} minutes",
+1:                     indexSummarySizeInMB, interval);
+1: 
+1:         setMemoryPoolCapacityInMB(DatabaseDescriptor.getIndexSummaryCapacityInMB());
+1:         setResizeIntervalInMinutes(DatabaseDescriptor.getIndexSummaryResizeIntervalInMinutes());
+1:     }
+1: 
+1:     public int getResizeIntervalInMinutes()
+1:     {
+1:         return resizeIntervalInMinutes;
+1:     }
+1: 
+1:     public void setResizeIntervalInMinutes(int resizeIntervalInMinutes)
+1:     {
+1:         int oldInterval = this.resizeIntervalInMinutes;
+1:         this.resizeIntervalInMinutes = resizeIntervalInMinutes;
+1: 
+1:         long initialDelay;
+1:         if (future != null)
+1:         {
+1:             initialDelay = oldInterval < 0
+1:                            ? resizeIntervalInMinutes
+1:                            : Math.max(0, resizeIntervalInMinutes - (oldInterval - future.getDelay(TimeUnit.MINUTES)));
+1:             future.cancel(false);
+1:         }
+0:         else
+1:         {
+1:             initialDelay = resizeIntervalInMinutes;
+1:         }
+1: 
+1:         if (this.resizeIntervalInMinutes < 0)
+1:         {
+1:             future = null;
+1:             return;
+1:         }
+1: 
+1:         future = executor.scheduleWithFixedDelay(new WrappedRunnable()
+1:         {
+1:             protected void runMayThrow() throws Exception
+1:             {
+1:                 redistributeSummaries();
+1:             }
+1:         }, initialDelay, resizeIntervalInMinutes, TimeUnit.MINUTES);
+1:     }
+1: 
+1:     // for testing only
+1:     @VisibleForTesting
+1:     Long getTimeToNextResize(TimeUnit timeUnit)
+1:     {
+1:         if (future == null)
+1:             return null;
+1: 
+1:         return future.getDelay(timeUnit);
+1:     }
+1: 
+1:     public long getMemoryPoolCapacityInMB()
+1:     {
+1:         return memoryPoolBytes / 1024L / 1024L;
+1:     }
+1: 
+0:     public Map<String, Double> getSamplingRatios()
+1:     {
+1:         List<SSTableReader> sstables = getAllSSTables();
+0:         Map<String, Double> ratios = new HashMap<>(sstables.size());
+1:         for (SSTableReader sstable : sstables)
+0:             ratios.put(sstable.getFilename(), sstable.getIndexSummarySamplingLevel() / (double) Downsampling.BASE_SAMPLING_LEVEL);
+1: 
+0:         return ratios;
+1:     }
+1: 
+0:     public double getAverageSamplingRatio()
+1:     {
+1:         List<SSTableReader> sstables = getAllSSTables();
+1:         double total = 0.0;
+1:         for (SSTableReader sstable : sstables)
+0:             total += sstable.getIndexSummarySamplingLevel() / (double) Downsampling.BASE_SAMPLING_LEVEL;
+1:         return total / sstables.size();
+1:     }
+1: 
+1:     public void setMemoryPoolCapacityInMB(long memoryPoolCapacityInMB)
+1:     {
+1:         this.memoryPoolBytes = memoryPoolCapacityInMB * 1024L * 1024L;
+1:     }
+1: 
+1:     /**
+1:      * Returns the actual space consumed by index summaries for all sstables.
+1:      * @return space currently used in MB
+1:      */
+1:     public double getMemoryPoolSizeInMB()
+1:     {
+1:         long total = 0;
+1:         for (SSTableReader sstable : getAllSSTables())
+1:             total += sstable.getIndexSummaryOffHeapSize();
+1:         return total / 1024.0 / 1024.0;
+1:     }
+1: 
+1:     private List<SSTableReader> getAllSSTables()
+1:     {
+1:         List<SSTableReader> result = new ArrayList<>();
+1:         for (Keyspace ks : Keyspace.all())
+1:         {
+1:             for (ColumnFamilyStore cfStore: ks.getColumnFamilyStores())
+0:                 result.addAll(cfStore.getSSTables());
+1:         }
+1: 
+1:         return result;
+1:     }
+1: 
+1:     /**
+1:      * Returns a Pair of all compacting and non-compacting sstables.  Non-compacting sstables will be marked as
+1:      * compacting.
+1:      */
+0:     private Pair<List<SSTableReader>, Multimap<DataTracker, SSTableReader>> getCompactingAndNonCompactingSSTables()
+1:     {
+1:         List<SSTableReader> allCompacting = new ArrayList<>();
+0:         Multimap<DataTracker, SSTableReader> allNonCompacting = HashMultimap.create();
+1:         for (Keyspace ks : Keyspace.all())
+1:         {
+1:             for (ColumnFamilyStore cfStore: ks.getColumnFamilyStores())
+1:             {
+1:                 Set<SSTableReader> nonCompacting, allSSTables;
+1:                 do
+1:                 {
+0:                     allSSTables = cfStore.getDataTracker().getSSTables();
+0:                     nonCompacting = Sets.newHashSet(cfStore.getDataTracker().getUncompactingSSTables(allSSTables));
+1:                 }
+0:                 while (!(nonCompacting.isEmpty() || cfStore.getDataTracker().markCompacting(nonCompacting)));
+0:                 allNonCompacting.putAll(cfStore.getDataTracker(), nonCompacting);
+1:                 allCompacting.addAll(Sets.difference(allSSTables, nonCompacting));
+1:             }
+1:         }
+1:         return Pair.create(allCompacting, allNonCompacting);
+1:     }
+1: 
+1:     public void redistributeSummaries() throws IOException
+1:     {
+0:         Pair<List<SSTableReader>, Multimap<DataTracker, SSTableReader>> compactingAndNonCompacting = getCompactingAndNonCompactingSSTables();
+1:         try
+1:         {
+0:             redistributeSummaries(compactingAndNonCompacting.left, Lists.newArrayList(compactingAndNonCompacting.right.values()), this.memoryPoolBytes);
+1:         }
+1:         finally
+1:         {
+0:             for(DataTracker tracker : compactingAndNonCompacting.right.keySet())
+0:                 tracker.unmarkCompacting(compactingAndNonCompacting.right.get(tracker));
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Attempts to fairly distribute a fixed pool of memory for index summaries across a set of SSTables based on
+1:      * their recent read rates.
+0:      * @param nonCompacting a list of sstables to share the memory pool across
+0:      * @param memoryPoolBytes a size (in bytes) that the total index summary space usage should stay close to or
+0:      *                        under, if possible
+1:      * @return a list of new SSTableReader instances
+1:      */
+1:     @VisibleForTesting
+0:     public static List<SSTableReader> redistributeSummaries(List<SSTableReader> compacting, List<SSTableReader> nonCompacting, long memoryPoolBytes) throws IOException
+1:     {
+1:         long total = 0;
+0:         for (SSTableReader sstable : Iterables.concat(compacting, nonCompacting))
+1:             total += sstable.getIndexSummaryOffHeapSize();
+1: 
+0:         logger.debug("Beginning redistribution of index summaries for {} sstables with memory pool size {} MB; current spaced used is {} MB",
+0:                      nonCompacting.size(), memoryPoolBytes / 1024L / 1024L, total / 1024.0 / 1024.0);
+1: 
+0:         double totalReadsPerSec = 0.0;
+0:         for (SSTableReader sstable : nonCompacting)
+1:         {
+0:             if (sstable.readMeter != null)
+1:             {
+0:                 totalReadsPerSec += sstable.readMeter.fifteenMinuteRate();
+1:             }
+1:         }
+0:         logger.trace("Total reads/sec across all sstables in index summary resize process: {}", totalReadsPerSec);
+1: 
+0:         // copy and sort by read rates (ascending)
+0:         List<SSTableReader> sstablesByHotness = new ArrayList<>(nonCompacting);
+0:         Collections.sort(sstablesByHotness, new Comparator<SSTableReader>()
+1:         {
+0:             public int compare(SSTableReader o1, SSTableReader o2)
+1:             {
+0:                 if (o1.readMeter == null && o2.readMeter == null)
+0:                     return 0;
+0:                 else if (o1.readMeter == null)
+0:                     return -1;
+0:                 else if (o2.readMeter == null)
+0:                     return 1;
+0:                 else
+0:                     return Double.compare(o1.readMeter.fifteenMinuteRate(), o2.readMeter.fifteenMinuteRate());
+1:             }
+0:         });
+1: 
+0:         long remainingBytes = memoryPoolBytes;
+0:         for (SSTableReader sstable : compacting)
+0:             remainingBytes -= sstable.getIndexSummaryOffHeapSize();
+1: 
+0:         logger.trace("Index summaries for compacting SSTables are using {} MB of space",
+0:                      (memoryPoolBytes - remainingBytes) / 1024.0 / 1024.0);
+0:         List<SSTableReader> newSSTables = adjustSamplingLevels(sstablesByHotness, totalReadsPerSec, remainingBytes);
+1: 
+0:         total = 0;
+0:         for (SSTableReader sstable : Iterables.concat(compacting, newSSTables))
+1:             total += sstable.getIndexSummaryOffHeapSize();
+0:         logger.debug("Completed resizing of index summaries; current approximate memory used: {} MB",
+0:                      total / 1024.0 / 1024.0);
+1: 
+0:         return newSSTables;
+1:     }
+1: 
+0:     private static List<SSTableReader> adjustSamplingLevels(List<SSTableReader> sstables,
+0:                                                             double totalReadsPerSec, long memoryPoolCapacity) throws IOException
+1:     {
+1: 
+0:         List<ResampleEntry> toDownsample = new ArrayList<>(sstables.size() / 4);
+0:         List<ResampleEntry> toUpsample = new ArrayList<>(sstables.size() / 4);
+0:         List<SSTableReader> newSSTables = new ArrayList<>(sstables.size());
+1: 
+0:         // Going from the coldest to the hottest sstables, try to give each sstable an amount of space proportional
+0:         // to the number of total reads/sec it handles.
+0:         long remainingSpace = memoryPoolCapacity;
+1:         for (SSTableReader sstable : sstables)
+1:         {
+0:             double readsPerSec = sstable.readMeter == null ? 0.0 : sstable.readMeter.fifteenMinuteRate();
+0:             long idealSpace = Math.round(remainingSpace * (readsPerSec / totalReadsPerSec));
+1: 
+0:             // figure out how many entries our idealSpace would buy us, and pick a new sampling level based on that
+0:             int currentNumEntries = sstable.getIndexSummarySize();
+0:             double avgEntrySize = sstable.getIndexSummaryOffHeapSize() / (double) currentNumEntries;
+0:             long targetNumEntries = Math.max(1, Math.round(idealSpace / avgEntrySize));
+0:             int currentSamplingLevel = sstable.getIndexSummarySamplingLevel();
+0:             int newSamplingLevel = IndexSummaryBuilder.calculateSamplingLevel(currentSamplingLevel, currentNumEntries, targetNumEntries);
+0:             int numEntriesAtNewSamplingLevel = IndexSummaryBuilder.entriesAtSamplingLevel(newSamplingLevel, sstable.getMaxIndexSummarySize());
+1: 
+0:             logger.trace("{} has {} reads/sec; ideal space for index summary: {} bytes ({} entries); considering moving from level " +
+0:                          "{} ({} entries) to level {} ({} entries)",
+0:                          sstable.getFilename(), readsPerSec, idealSpace, targetNumEntries, currentSamplingLevel, currentNumEntries, newSamplingLevel, numEntriesAtNewSamplingLevel);
+1: 
+0:             if (targetNumEntries >= currentNumEntries * UPSAMPLE_THRESHOLD && newSamplingLevel > currentSamplingLevel)
+1:             {
+0:                 long spaceUsed = (long) Math.ceil(avgEntrySize * numEntriesAtNewSamplingLevel);
+0:                 toUpsample.add(new ResampleEntry(sstable, spaceUsed, newSamplingLevel));
+0:                 remainingSpace -= avgEntrySize * numEntriesAtNewSamplingLevel;
+1:             }
+0:             else if (targetNumEntries < currentNumEntries * DOWNSAMPLE_THESHOLD && newSamplingLevel < currentSamplingLevel)
+1:             {
+0:                 long spaceUsed = (long) Math.ceil(avgEntrySize * numEntriesAtNewSamplingLevel);
+0:                 toDownsample.add(new ResampleEntry(sstable, spaceUsed, newSamplingLevel));
+0:                 remainingSpace -= spaceUsed;
+1:             }
+0:             else
+1:             {
+0:                 // keep the same sampling level
+0:                 logger.trace("SSTable {} is within thresholds of ideal sampling", sstable);
+0:                 remainingSpace -= sstable.getIndexSummaryOffHeapSize();
+0:                 newSSTables.add(sstable);
+1:             }
+0:             totalReadsPerSec -= readsPerSec;
+1:         }
+1: 
+0:         if (remainingSpace > 0)
+1:         {
+0:             Pair<List<SSTableReader>, List<ResampleEntry>> result = distributeRemainingSpace(toDownsample, remainingSpace);
+0:             toDownsample = result.right;
+0:             newSSTables.addAll(result.left);
+1:         }
+1: 
+0:         // downsample first, then upsample
+0:         toDownsample.addAll(toUpsample);
+0:         Multimap<DataTracker, SSTableReader> replacedByTracker = HashMultimap.create();
+0:         Multimap<DataTracker, SSTableReader> replacementsByTracker = HashMultimap.create();
+0:         for (ResampleEntry entry : toDownsample)
+1:         {
+0:             SSTableReader sstable = entry.sstable;
+0:             logger.debug("Re-sampling index summary for {} from {}/{} to {}/{} of the original number of entries",
+0:                          sstable, sstable.getIndexSummarySamplingLevel(), Downsampling.BASE_SAMPLING_LEVEL,
+0:                          entry.newSamplingLevel, Downsampling.BASE_SAMPLING_LEVEL);
+0:             SSTableReader replacement = sstable.cloneWithNewSummarySamplingLevel(entry.newSamplingLevel);
+0:             DataTracker tracker = Keyspace.open(sstable.getKeyspaceName()).getColumnFamilyStore(sstable.getColumnFamilyName()).getDataTracker();
+1: 
+0:             replacedByTracker.put(tracker, sstable);
+0:             replacementsByTracker.put(tracker, replacement);
+1:         }
+1: 
+0:         for (DataTracker tracker : replacedByTracker.keySet())
+1:         {
+0:             tracker.replaceReaders(replacedByTracker.get(tracker), replacementsByTracker.get(tracker));
+0:             newSSTables.addAll(replacementsByTracker.get(tracker));
+1:         }
+1: 
+0:         return newSSTables;
+1:     }
+1: 
+1:     @VisibleForTesting
+0:     static Pair<List<SSTableReader>, List<ResampleEntry>> distributeRemainingSpace(List<ResampleEntry> toDownsample, long remainingSpace)
+1:     {
+0:         // sort by the amount of space regained by doing the downsample operation; we want to try to avoid operations
+0:         // that will make little difference.
+0:         Collections.sort(toDownsample, new Comparator<ResampleEntry>()
+1:         {
+0:             public int compare(ResampleEntry o1, ResampleEntry o2)
+1:             {
+0:                 return Double.compare(o1.sstable.getIndexSummaryOffHeapSize() - o1.newSpaceUsed,
+0:                                       o2.sstable.getIndexSummaryOffHeapSize() - o2.newSpaceUsed);
+1:             }
+0:         });
+1: 
+0:         int noDownsampleCutoff = 0;
+0:         List<SSTableReader> willNotDownsample = new ArrayList<>();
+0:         while (remainingSpace > 0 && noDownsampleCutoff < toDownsample.size())
+1:         {
+0:             ResampleEntry entry = toDownsample.get(noDownsampleCutoff);
+1: 
+0:             long extraSpaceRequired = entry.sstable.getIndexSummaryOffHeapSize() - entry.newSpaceUsed;
+0:             // see if we have enough leftover space to keep the current sampling level
+0:             if (extraSpaceRequired <= remainingSpace)
+1:             {
+0:                 logger.trace("Using leftover space to keep {} at the current sampling level ({})",
+0:                              entry.sstable, entry.sstable.getIndexSummarySamplingLevel());
+0:                 willNotDownsample.add(entry.sstable);
+0:                 remainingSpace -= extraSpaceRequired;
+1:             }
+0:             else
+1:             {
+0:                 break;
+1:             }
+1: 
+0:             noDownsampleCutoff++;
+1:         }
+0:         return Pair.create(willNotDownsample, toDownsample.subList(noDownsampleCutoff, toDownsample.size()));
+1:     }
+1: 
+0:     private static class ResampleEntry
+1:     {
+0:         public final SSTableReader sstable;
+0:         public final long newSpaceUsed;
+0:         public final int newSamplingLevel;
+1: 
+0:         public ResampleEntry(SSTableReader sstable, long newSpaceUsed, int newSamplingLevel)
+1:         {
+0:             this.sstable = sstable;
+0:             this.newSpaceUsed = newSpaceUsed;
+0:             this.newSamplingLevel = newSamplingLevel;
+1:         }
+1:     }
+1: }
+============================================================================

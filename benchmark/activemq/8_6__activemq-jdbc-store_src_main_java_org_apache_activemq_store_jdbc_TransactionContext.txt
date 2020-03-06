@@ -1,0 +1,1410 @@
+1:d29ca2a: /**
+1:57b4941:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:57b4941:  * contributor license agreements.  See the NOTICE file distributed with
+1:57b4941:  * this work for additional information regarding copyright ownership.
+1:57b4941:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:57b4941:  * (the "License"); you may not use this file except in compliance with
+1:57b4941:  * the License.  You may obtain a copy of the License at
+5:d29ca2a:  *
+1:230a86c:  *      http://www.apache.org/licenses/LICENSE-2.0
+1:b0c2a40:  *
+1:d29ca2a:  * Unless required by applicable law or agreed to in writing, software
+1:d29ca2a:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:d29ca2a:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:d29ca2a:  * See the License for the specific language governing permissions and
+1:d29ca2a:  * limitations under the License.
+1:d29ca2a:  */
+1:d29ca2a: package org.apache.activemq.store.jdbc;
+13:d29ca2a: 
+1:d29ca2a: import java.io.IOException;
+1:2a815c2: import java.sql.*;
+1:6348d11: import java.util.LinkedList;
+1:2a815c2: import java.util.Map;
+1:2a815c2: import java.util.Properties;
+1:2a815c2: import java.util.concurrent.Executor;
+1:2a815c2: import java.util.concurrent.locks.Lock;
+1:2a815c2: import java.util.concurrent.locks.ReentrantReadWriteLock;
+1:d29ca2a: 
+1:d29ca2a: import javax.sql.DataSource;
+1:d29ca2a: 
+1:d29ca2a: import org.apache.activemq.util.IOExceptionSupport;
+1:8bf987b: import org.slf4j.Logger;
+1:8bf987b: import org.slf4j.LoggerFactory;
+1:d29ca2a: 
+1:d29ca2a: /**
+1:d29ca2a:  * Helps keep track of the current transaction/JDBC connection.
+1:d29ca2a:  */
+1:d29ca2a: public class TransactionContext {
+1:f812e34: 
+1:8bf987b:     private static final Logger LOG = LoggerFactory.getLogger(TransactionContext.class);
+1:d29ca2a: 
+1:d29ca2a:     private final DataSource dataSource;
+1:4150650:     private final JDBCPersistenceAdapter persistenceAdapter;
+1:d29ca2a:     private Connection connection;
+1:b7c430d:     private boolean inTx;
+1:d29ca2a:     private PreparedStatement addMessageStatement;
+1:d29ca2a:     private PreparedStatement removedMessageStatement;
+1:d29ca2a:     private PreparedStatement updateLastAckStatement;
+1:00e2f51:     // a cheap dirty level that we can live with    
+1:00e2f51:     private int transactionIsolation = Connection.TRANSACTION_READ_UNCOMMITTED;
+1:6348d11:     private LinkedList<Runnable> completions = new LinkedList<Runnable>();
+1:2a815c2:     private ReentrantReadWriteLock exclusiveConnectionLock = new ReentrantReadWriteLock();
+1:6348d11: 
+1:4150650:     public TransactionContext(JDBCPersistenceAdapter persistenceAdapter) throws IOException {
+1:4150650:         this.persistenceAdapter = persistenceAdapter;
+1:4150650:         this.dataSource = persistenceAdapter.getDataSource();
+10:d29ca2a:     }
+1:00e2f51: 
+1:2a815c2:     public Connection getExclusiveConnection() throws IOException {
+1:2a815c2:         return lockAndWrapped(exclusiveConnectionLock.writeLock());
+1:2a815c2:     }
+1:2a815c2: 
+1:d29ca2a:     public Connection getConnection() throws IOException {
+1:2a815c2:         return lockAndWrapped(exclusiveConnectionLock.readLock());
+1:2a815c2:     }
+1:2a815c2: 
+1:2a815c2:     private Connection lockAndWrapped(Lock toLock) throws IOException {
+1:f812e34:         if (connection == null) {
+1:2a815c2:             toLock.lock();
+3:d29ca2a:             try {
+1:d29ca2a:                 connection = dataSource.getConnection();
+1:ddda400:                 if (persistenceAdapter.isChangeAutoCommitAllowed()) {
+1:ddda400:                     boolean autoCommit = !inTx;
+1:ddda400:                     if (connection.getAutoCommit() != autoCommit) {
+1:ddda400:                         LOG.trace("Setting auto commit to {} on connection {}", autoCommit, connection);
+1:ddda400:                         connection.setAutoCommit(autoCommit);
+1:7a0168a:                     }
+1:ddda400:                 }
+1:2a815c2:                 connection = new UnlockOnCloseConnection(connection, toLock);
+1:d29ca2a:             } catch (SQLException e) {
+1:911177e:                 JDBCPersistenceAdapter.log("Could not get JDBC connection: ", e);
+1:b7c430d:                 inTx = false;
+1:2a815c2:                 try {
+1:2a815c2:                     toLock.unlock();
+1:2a815c2:                 } catch (IllegalMonitorStateException oops) {
+1:2a815c2:                     LOG.error("Thread does not hold the context lock on close of:"  + connection, oops);
+1:2a815c2:                 }
+1:bd45d93:                 silentClose();
+1:13bbe52:                 IOException ioe = IOExceptionSupport.create(e);
+1:977deb4:                 if (persistenceAdapter.getBrokerService() != null) {
+1:977deb4:                     persistenceAdapter.getBrokerService().handleIOException(ioe);
+1:977deb4:                 }
+1:13bbe52:                 throw ioe;
+1:d29ca2a:             }
+1:4150650: 
+1:d29ca2a:             try {
+1:00e2f51:                 connection.setTransactionIsolation(transactionIsolation);
+1:f812e34:             } catch (Throwable e) {
+1:d0f48b3:                 // ignore
+1:d0f48b3:                 LOG.trace("Cannot set transaction isolation to " + transactionIsolation + " due " + e.getMessage()
+1:d0f48b3:                         + ". This exception is ignored.", e);
+1:d29ca2a:             }
+1:d29ca2a:         }
+1:d29ca2a:         return connection;
+1:d29ca2a:     }
+1:f812e34: 
+1:d29ca2a:     public void executeBatch() throws SQLException {
+1:d29ca2a:         try {
+1:d29ca2a:             executeBatch(addMessageStatement, "Failed add a message");
+3:d29ca2a:         } finally {
+1:7a0168a:             addMessageStatement = null;
+1:d29ca2a:             try {
+1:d29ca2a:                 executeBatch(removedMessageStatement, "Failed to remove a message");
+1:d29ca2a:             } finally {
+1:7a0168a:                 removedMessageStatement = null;
+1:d29ca2a:                 try {
+1:d29ca2a:                     executeBatch(updateLastAckStatement, "Failed to ack a message");
+1:d29ca2a:                 } finally {
+1:7a0168a:                     updateLastAckStatement = null;
+1:7a0168a:                 }
+1:7a0168a:             }
+1:d29ca2a:         }
+1:d29ca2a:     }
+1:d29ca2a: 
+1:d29ca2a:     private void executeBatch(PreparedStatement p, String message) throws SQLException {
+1:ecf89a6:         if (p == null) {
+1:d29ca2a:             return;
+1:ecf89a6:         }
+1:f812e34: 
+1:d29ca2a:         try {
+1:d29ca2a:             int[] rc = p.executeBatch();
+1:d29ca2a:             for (int i = 0; i < rc.length; i++) {
+1:862c1f2:                 int code = rc[i];
+1:f812e34:                 if (code < 0 && code != Statement.SUCCESS_NO_INFO) {
+1:862c1f2:                     throw new SQLException(message + ". Response code: " + code);
+1:d29ca2a:                 }
+1:d29ca2a:             }
+1:d29ca2a:         } finally {
+1:f812e34:             try {
+1:f812e34:                 p.close();
+1:bd45d93:             } catch (Throwable ignored) {}
+1:f812e34:         }
+1:d29ca2a:     }
+1:f812e34: 
+1:bd45d93:     private void silentClose() {
+1:bd45d93:         silentClosePreparedStatements();
+1:bd45d93:         if (connection != null) {
+1:bd45d93:             try {
+1:bd45d93:                 connection.close();
+1:bd45d93:             } catch (Throwable ignored) {}
+1:bd45d93:             connection = null;
+1:bd45d93:         }
+1:bd45d93:     }
+1:bd45d93: 
+1:bd45d93: 
+1:d29ca2a:     public void close() throws IOException {
+1:f812e34:         if (!inTx) {
+1:f812e34:             try {
+1:bd45d93:                 // can be null for topic ops that bypass the store via existing cursor state
+1:bd45d93:                 if (connection != null) {
+1:bd45d93:                     final boolean needsCommit = !connection.getAutoCommit();
+1:d29ca2a:                     executeBatch();
+1:bd45d93:                     if (needsCommit) {
+2:d29ca2a:                         connection.commit();
+1:d29ca2a:                     }
+1:d29ca2a:                 }
+1:d29ca2a:             } catch (SQLException e) {
+1:911177e:                 JDBCPersistenceAdapter.log("Error while closing connection: ", e);
+1:4150650:                 IOException ioe = IOExceptionSupport.create(e);
+1:13bbe52:                 persistenceAdapter.getBrokerService().handleIOException(ioe);
+1:4150650:                 throw ioe;
+1:d29ca2a:             } finally {
+1:bd45d93:                 silentClose();
+1:6348d11:                 for (Runnable completion: completions) {
+1:6348d11:                     completion.run();
+1:6348d11:                 }
+1:ea70e82:                 completions.clear();
+1:d29ca2a:             }
+1:d29ca2a:         }
+1:d29ca2a:     }
+1:f812e34: 
+1:d29ca2a:     public void begin() throws IOException {
+1:ecf89a6:         if (inTx) {
+1:d29ca2a:             throw new IOException("Already started.");
+1:ecf89a6:         }
+1:d0f48b3:         inTx = true;
+1:b7c430d:         connection = getConnection();
+1:ecf89a6:     }
+1:f812e34: 
+1:d29ca2a:     public void commit() throws IOException {
+1:ecf89a6:         if (!inTx) {
+1:d29ca2a:             throw new IOException("Not started.");
+1:ecf89a6:         }
+1:d29ca2a:         try {
+1:bd45d93:             final boolean needsCommit = !connection.getAutoCommit();
+1:d29ca2a:             executeBatch();
+1:bd45d93:             if (needsCommit) {
+1:7976ad9:                 connection.commit();
+1:d29ca2a:             }
+1:d29ca2a:         } catch (SQLException e) {
+1:911177e:             JDBCPersistenceAdapter.log("Commit failed: ", e);
+1:7a0168a:             try {
+1:7a0168a:                 doRollback();
+1:7a0168a:             } catch (Exception ignored) {}
+1:7a0168a:             IOException ioe = IOExceptionSupport.create(e);
+1:7a0168a:             persistenceAdapter.getBrokerService().handleIOException(ioe);
+1:7a0168a:             throw ioe;
+1:d29ca2a:         } finally {
+1:f812e34:             inTx = false;
+1:b7c430d:             close();
+1:d29ca2a:         }
+1:d29ca2a:     }
+1:f812e34: 
+1:d29ca2a:     public void rollback() throws IOException {
+1:ecf89a6:         if (!inTx) {
+1:d29ca2a:             throw new IOException("Not started.");
+1:ecf89a6:         }
+1:d29ca2a:         try {
+1:7a0168a:             doRollback();
+1:d29ca2a:         } catch (SQLException e) {
+1:911177e:             JDBCPersistenceAdapter.log("Rollback failed: ", e);
+4:d29ca2a:             throw IOExceptionSupport.create(e);
+1:d29ca2a:         } finally {
+1:f812e34:             inTx = false;
+2:d29ca2a:             close();
+1:d29ca2a:         }
+1:d29ca2a:     }
+1:f812e34: 
+1:bd45d93:     private PreparedStatement silentClosePreparedStatement(PreparedStatement preparedStatement) {
+1:bd45d93:         if (preparedStatement != null) {
+1:bd45d93:             try {
+1:bd45d93:                 preparedStatement.close();
+1:bd45d93:             } catch (Throwable ignored) {}
+1:bd45d93:         }
+1:bd45d93:         return null;
+1:bd45d93:     }
+1:bd45d93: 
+1:bd45d93:     private void silentClosePreparedStatements() {
+1:bd45d93:         addMessageStatement = silentClosePreparedStatement(addMessageStatement);
+1:bd45d93:         removedMessageStatement = silentClosePreparedStatement(removedMessageStatement);
+1:bd45d93:         updateLastAckStatement = silentClosePreparedStatement(updateLastAckStatement);
+1:bd45d93:     }
+1:bd45d93: 
+1:7a0168a:     private void doRollback() throws SQLException {
+1:bd45d93:         silentClosePreparedStatements();
+1:7c11663:         completions.clear();
+1:7a0168a:         connection.rollback();
+1:7a0168a:     }
+1:7a0168a: 
+1:d29ca2a:     public PreparedStatement getAddMessageStatement() {
+1:d29ca2a:         return addMessageStatement;
+1:d29ca2a:     }
+1:f812e34: 
+1:d29ca2a:     public void setAddMessageStatement(PreparedStatement addMessageStatement) {
+1:d29ca2a:         this.addMessageStatement = addMessageStatement;
+1:d29ca2a:     }
+1:d29ca2a: 
+1:d29ca2a:     public PreparedStatement getUpdateLastAckStatement() {
+1:d29ca2a:         return updateLastAckStatement;
+1:d29ca2a:     }
+1:f812e34: 
+1:d29ca2a:     public void setUpdateLastAckStatement(PreparedStatement ackMessageStatement) {
+1:d29ca2a:         this.updateLastAckStatement = ackMessageStatement;
+1:d29ca2a:     }
+1:d29ca2a: 
+1:d29ca2a:     public PreparedStatement getRemovedMessageStatement() {
+1:d29ca2a:         return removedMessageStatement;
+1:d29ca2a:     }
+1:f812e34: 
+1:d29ca2a:     public void setRemovedMessageStatement(PreparedStatement removedMessageStatement) {
+1:d29ca2a:         this.removedMessageStatement = removedMessageStatement;
+1:d29ca2a:     }
+1:00e2f51:     
+1:00e2f51:     public void setTransactionIsolation(int transactionIsolation) {
+1:00e2f51:         this.transactionIsolation = transactionIsolation;
+1:00e2f51:     }
+1:d29ca2a: 
+1:6348d11:     public void onCompletion(Runnable runnable) {
+1:6348d11:         completions.add(runnable);
+1:6348d11:     }
+1:2a815c2: 
+1:2a815c2:     final private class UnlockOnCloseConnection implements Connection {
+1:2a815c2: 
+1:2a815c2:         private final Connection delegate;
+1:2a815c2:         private final Lock lock;
+1:2a815c2: 
+1:2a815c2:         UnlockOnCloseConnection(Connection delegate, Lock toUnlockOnClose) {
+1:2a815c2:             this.delegate = delegate;
+1:2a815c2:             this.lock = toUnlockOnClose;
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void close() throws SQLException {
+1:2a815c2:             try {
+1:2a815c2:                 delegate.close();
+1:2a815c2:             } finally {
+1:2a815c2:                 lock.unlock();
+1:2a815c2:             }
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         // simple delegate for the  rest of the impl..
+1:2a815c2:         @Override
+1:2a815c2:         public Statement createStatement() throws SQLException {
+1:2a815c2:             return delegate.createStatement();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public PreparedStatement prepareStatement(String sql) throws SQLException {
+1:2a815c2:             return delegate.prepareStatement(sql);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public CallableStatement prepareCall(String sql) throws SQLException {
+1:2a815c2:             return delegate.prepareCall(sql);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public String nativeSQL(String sql) throws SQLException {
+1:2a815c2:             return delegate.nativeSQL(sql);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void setAutoCommit(boolean autoCommit) throws SQLException {
+1:2a815c2:             delegate.setAutoCommit(autoCommit);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public boolean getAutoCommit() throws SQLException {
+1:2a815c2:             return delegate.getAutoCommit();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void commit() throws SQLException {
+1:2a815c2:             delegate.commit();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void rollback() throws SQLException {
+1:2a815c2:             delegate.rollback();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public boolean isClosed() throws SQLException {
+1:2a815c2:             return delegate.isClosed();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public DatabaseMetaData getMetaData() throws SQLException {
+1:2a815c2:             return delegate.getMetaData();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void setReadOnly(boolean readOnly) throws SQLException {
+1:2a815c2:             delegate.setReadOnly(readOnly);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public boolean isReadOnly() throws SQLException {
+1:2a815c2:             return delegate.isReadOnly();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void setCatalog(String catalog) throws SQLException {
+1:2a815c2:             delegate.setCatalog(catalog);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public String getCatalog() throws SQLException {
+1:2a815c2:             return delegate.getCatalog();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void setTransactionIsolation(int level) throws SQLException {
+1:2a815c2:             delegate.setTransactionIsolation(level);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public int getTransactionIsolation() throws SQLException {
+1:2a815c2:             return delegate.getTransactionIsolation();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public SQLWarning getWarnings() throws SQLException {
+1:2a815c2:             return delegate.getWarnings();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void clearWarnings() throws SQLException {
+1:2a815c2:             delegate.clearWarnings();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public Statement createStatement(int resultSetType, int resultSetConcurrency) throws SQLException {
+1:2a815c2:             return delegate.createStatement(resultSetType, resultSetConcurrency);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public PreparedStatement prepareStatement(String sql, int resultSetType, int resultSetConcurrency) throws SQLException {
+1:2a815c2:             return delegate.prepareStatement(sql, resultSetType, resultSetConcurrency);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public CallableStatement prepareCall(String sql, int resultSetType, int resultSetConcurrency) throws SQLException {
+1:2a815c2:             return delegate.prepareCall(sql, resultSetType, resultSetConcurrency);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public Map<String, Class<?>> getTypeMap() throws SQLException {
+1:2a815c2:             return delegate.getTypeMap();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void setTypeMap(Map<String, Class<?>> map) throws SQLException {
+1:2a815c2:             delegate.setTypeMap(map);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void setHoldability(int holdability) throws SQLException {
+1:2a815c2:             delegate.setHoldability(holdability);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public int getHoldability() throws SQLException {
+1:2a815c2:             return delegate.getHoldability();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public Savepoint setSavepoint() throws SQLException {
+1:2a815c2:             return delegate.setSavepoint();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public Savepoint setSavepoint(String name) throws SQLException {
+1:2a815c2:             return delegate.setSavepoint(name);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void rollback(Savepoint savepoint) throws SQLException {
+1:2a815c2:             delegate.rollback(savepoint);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void releaseSavepoint(Savepoint savepoint) throws SQLException {
+1:2a815c2:             delegate.releaseSavepoint(savepoint);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public Statement createStatement(int resultSetType, int resultSetConcurrency, int resultSetHoldability) throws SQLException {
+1:2a815c2:             return delegate.createStatement(resultSetType, resultSetConcurrency, resultSetHoldability);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public PreparedStatement prepareStatement(String sql, int resultSetType, int resultSetConcurrency, int resultSetHoldability) throws SQLException {
+1:2a815c2:             return delegate.prepareStatement(sql, resultSetType, resultSetConcurrency, resultSetHoldability);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public CallableStatement prepareCall(String sql, int resultSetType, int resultSetConcurrency, int resultSetHoldability) throws SQLException {
+1:2a815c2:             return delegate.prepareCall(sql, resultSetType, resultSetConcurrency, resultSetHoldability);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public PreparedStatement prepareStatement(String sql, int autoGeneratedKeys) throws SQLException {
+1:2a815c2:             return delegate.prepareStatement(sql, autoGeneratedKeys);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public PreparedStatement prepareStatement(String sql, int[] columnIndexes) throws SQLException {
+1:2a815c2:             return delegate.prepareStatement(sql, columnIndexes);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public PreparedStatement prepareStatement(String sql, String[] columnNames) throws SQLException {
+1:2a815c2:             return delegate.prepareStatement(sql, columnNames);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public Clob createClob() throws SQLException {
+1:2a815c2:             return delegate.createClob();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public Blob createBlob() throws SQLException {
+1:2a815c2:             return delegate.createBlob();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public NClob createNClob() throws SQLException {
+1:2a815c2:             return delegate.createNClob();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public SQLXML createSQLXML() throws SQLException {
+1:2a815c2:             return delegate.createSQLXML();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public boolean isValid(int timeout) throws SQLException {
+1:2a815c2:             return delegate.isValid(timeout);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void setClientInfo(String name, String value) throws SQLClientInfoException {
+1:2a815c2:             delegate.setClientInfo(name, value);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void setClientInfo(Properties properties) throws SQLClientInfoException {
+1:2a815c2:             delegate.setClientInfo(properties);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public String getClientInfo(String name) throws SQLException {
+1:2a815c2:             return delegate.getClientInfo(name);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public Properties getClientInfo() throws SQLException {
+1:2a815c2:             return delegate.getClientInfo();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public Array createArrayOf(String typeName, Object[] elements) throws SQLException {
+1:2a815c2:             return delegate.createArrayOf(typeName, elements);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public Struct createStruct(String typeName, Object[] attributes) throws SQLException {
+1:2a815c2:             return delegate.createStruct(typeName, attributes);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void setSchema(String schema) throws SQLException {
+1:2a815c2:             delegate.setSchema(schema);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public String getSchema() throws SQLException {
+1:2a815c2:             return delegate.getSchema();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void abort(Executor executor) throws SQLException {
+1:2a815c2:             delegate.abort(executor);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public void setNetworkTimeout(Executor executor, int milliseconds) throws SQLException {
+1:2a815c2:             delegate.setNetworkTimeout(executor, milliseconds);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public int getNetworkTimeout() throws SQLException {
+1:2a815c2:             return delegate.getNetworkTimeout();
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public <T> T unwrap(Class<T> iface) throws SQLException {
+1:2a815c2:             return delegate.unwrap(iface);
+1:2a815c2:         }
+1:2a815c2: 
+1:2a815c2:         @Override
+1:2a815c2:         public boolean isWrapperFor(Class<?> iface) throws SQLException {
+1:2a815c2:             return delegate.isWrapperFor(iface);
+1:2a815c2:         }
+1:2a815c2:     }
+1:d29ca2a: }
+============================================================================
+author:gtully
+-------------------------------------------------------------------------------
+commit:bd45d93
+/////////////////////////////////////////////////////////////////////////
+1:                 silentClose();
+/////////////////////////////////////////////////////////////////////////
+1:             } catch (Throwable ignored) {}
+1:     private void silentClose() {
+1:         silentClosePreparedStatements();
+1:         if (connection != null) {
+1:             try {
+1:                 connection.close();
+1:             } catch (Throwable ignored) {}
+1:             connection = null;
+1:         }
+1:     }
+1: 
+1: 
+1:                 // can be null for topic ops that bypass the store via existing cursor state
+1:                 if (connection != null) {
+1:                     final boolean needsCommit = !connection.getAutoCommit();
+1:                     if (needsCommit) {
+1:                 silentClose();
+/////////////////////////////////////////////////////////////////////////
+1:             final boolean needsCommit = !connection.getAutoCommit();
+1:             if (needsCommit) {
+/////////////////////////////////////////////////////////////////////////
+1:     private PreparedStatement silentClosePreparedStatement(PreparedStatement preparedStatement) {
+1:         if (preparedStatement != null) {
+1:             try {
+1:                 preparedStatement.close();
+1:             } catch (Throwable ignored) {}
+1:         }
+1:         return null;
+1:     }
+1: 
+1:     private void silentClosePreparedStatements() {
+1:         addMessageStatement = silentClosePreparedStatement(addMessageStatement);
+1:         removedMessageStatement = silentClosePreparedStatement(removedMessageStatement);
+1:         updateLastAckStatement = silentClosePreparedStatement(updateLastAckStatement);
+1:     }
+1: 
+1:         silentClosePreparedStatements();
+commit:ea70e82
+/////////////////////////////////////////////////////////////////////////
+1:         completions.clear();
+commit:2a815c2
+/////////////////////////////////////////////////////////////////////////
+1: import java.sql.*;
+1: import java.util.Map;
+1: import java.util.Properties;
+1: import java.util.concurrent.Executor;
+1: import java.util.concurrent.locks.Lock;
+1: import java.util.concurrent.locks.ReentrantReadWriteLock;
+/////////////////////////////////////////////////////////////////////////
+1:     private ReentrantReadWriteLock exclusiveConnectionLock = new ReentrantReadWriteLock();
+1:     public Connection getExclusiveConnection() throws IOException {
+1:         return lockAndWrapped(exclusiveConnectionLock.writeLock());
+1:     }
+1: 
+1:         return lockAndWrapped(exclusiveConnectionLock.readLock());
+1:     }
+1: 
+1:     private Connection lockAndWrapped(Lock toLock) throws IOException {
+1:             toLock.lock();
+/////////////////////////////////////////////////////////////////////////
+1:                 connection = new UnlockOnCloseConnection(connection, toLock);
+1:                 try {
+1:                     toLock.unlock();
+1:                 } catch (IllegalMonitorStateException oops) {
+1:                     LOG.error("Thread does not hold the context lock on close of:"  + connection, oops);
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     final private class UnlockOnCloseConnection implements Connection {
+1: 
+1:         private final Connection delegate;
+1:         private final Lock lock;
+1: 
+1:         UnlockOnCloseConnection(Connection delegate, Lock toUnlockOnClose) {
+1:             this.delegate = delegate;
+1:             this.lock = toUnlockOnClose;
+1:         }
+1: 
+1:         @Override
+1:         public void close() throws SQLException {
+1:             try {
+1:                 delegate.close();
+1:             } finally {
+1:                 lock.unlock();
+1:             }
+1:         }
+1: 
+1:         // simple delegate for the  rest of the impl..
+1:         @Override
+1:         public Statement createStatement() throws SQLException {
+1:             return delegate.createStatement();
+1:         }
+1: 
+1:         @Override
+1:         public PreparedStatement prepareStatement(String sql) throws SQLException {
+1:             return delegate.prepareStatement(sql);
+1:         }
+1: 
+1:         @Override
+1:         public CallableStatement prepareCall(String sql) throws SQLException {
+1:             return delegate.prepareCall(sql);
+1:         }
+1: 
+1:         @Override
+1:         public String nativeSQL(String sql) throws SQLException {
+1:             return delegate.nativeSQL(sql);
+1:         }
+1: 
+1:         @Override
+1:         public void setAutoCommit(boolean autoCommit) throws SQLException {
+1:             delegate.setAutoCommit(autoCommit);
+1:         }
+1: 
+1:         @Override
+1:         public boolean getAutoCommit() throws SQLException {
+1:             return delegate.getAutoCommit();
+1:         }
+1: 
+1:         @Override
+1:         public void commit() throws SQLException {
+1:             delegate.commit();
+1:         }
+1: 
+1:         @Override
+1:         public void rollback() throws SQLException {
+1:             delegate.rollback();
+1:         }
+1: 
+1:         @Override
+1:         public boolean isClosed() throws SQLException {
+1:             return delegate.isClosed();
+1:         }
+1: 
+1:         @Override
+1:         public DatabaseMetaData getMetaData() throws SQLException {
+1:             return delegate.getMetaData();
+1:         }
+1: 
+1:         @Override
+1:         public void setReadOnly(boolean readOnly) throws SQLException {
+1:             delegate.setReadOnly(readOnly);
+1:         }
+1: 
+1:         @Override
+1:         public boolean isReadOnly() throws SQLException {
+1:             return delegate.isReadOnly();
+1:         }
+1: 
+1:         @Override
+1:         public void setCatalog(String catalog) throws SQLException {
+1:             delegate.setCatalog(catalog);
+1:         }
+1: 
+1:         @Override
+1:         public String getCatalog() throws SQLException {
+1:             return delegate.getCatalog();
+1:         }
+1: 
+1:         @Override
+1:         public void setTransactionIsolation(int level) throws SQLException {
+1:             delegate.setTransactionIsolation(level);
+1:         }
+1: 
+1:         @Override
+1:         public int getTransactionIsolation() throws SQLException {
+1:             return delegate.getTransactionIsolation();
+1:         }
+1: 
+1:         @Override
+1:         public SQLWarning getWarnings() throws SQLException {
+1:             return delegate.getWarnings();
+1:         }
+1: 
+1:         @Override
+1:         public void clearWarnings() throws SQLException {
+1:             delegate.clearWarnings();
+1:         }
+1: 
+1:         @Override
+1:         public Statement createStatement(int resultSetType, int resultSetConcurrency) throws SQLException {
+1:             return delegate.createStatement(resultSetType, resultSetConcurrency);
+1:         }
+1: 
+1:         @Override
+1:         public PreparedStatement prepareStatement(String sql, int resultSetType, int resultSetConcurrency) throws SQLException {
+1:             return delegate.prepareStatement(sql, resultSetType, resultSetConcurrency);
+1:         }
+1: 
+1:         @Override
+1:         public CallableStatement prepareCall(String sql, int resultSetType, int resultSetConcurrency) throws SQLException {
+1:             return delegate.prepareCall(sql, resultSetType, resultSetConcurrency);
+1:         }
+1: 
+1:         @Override
+1:         public Map<String, Class<?>> getTypeMap() throws SQLException {
+1:             return delegate.getTypeMap();
+1:         }
+1: 
+1:         @Override
+1:         public void setTypeMap(Map<String, Class<?>> map) throws SQLException {
+1:             delegate.setTypeMap(map);
+1:         }
+1: 
+1:         @Override
+1:         public void setHoldability(int holdability) throws SQLException {
+1:             delegate.setHoldability(holdability);
+1:         }
+1: 
+1:         @Override
+1:         public int getHoldability() throws SQLException {
+1:             return delegate.getHoldability();
+1:         }
+1: 
+1:         @Override
+1:         public Savepoint setSavepoint() throws SQLException {
+1:             return delegate.setSavepoint();
+1:         }
+1: 
+1:         @Override
+1:         public Savepoint setSavepoint(String name) throws SQLException {
+1:             return delegate.setSavepoint(name);
+1:         }
+1: 
+1:         @Override
+1:         public void rollback(Savepoint savepoint) throws SQLException {
+1:             delegate.rollback(savepoint);
+1:         }
+1: 
+1:         @Override
+1:         public void releaseSavepoint(Savepoint savepoint) throws SQLException {
+1:             delegate.releaseSavepoint(savepoint);
+1:         }
+1: 
+1:         @Override
+1:         public Statement createStatement(int resultSetType, int resultSetConcurrency, int resultSetHoldability) throws SQLException {
+1:             return delegate.createStatement(resultSetType, resultSetConcurrency, resultSetHoldability);
+1:         }
+1: 
+1:         @Override
+1:         public PreparedStatement prepareStatement(String sql, int resultSetType, int resultSetConcurrency, int resultSetHoldability) throws SQLException {
+1:             return delegate.prepareStatement(sql, resultSetType, resultSetConcurrency, resultSetHoldability);
+1:         }
+1: 
+1:         @Override
+1:         public CallableStatement prepareCall(String sql, int resultSetType, int resultSetConcurrency, int resultSetHoldability) throws SQLException {
+1:             return delegate.prepareCall(sql, resultSetType, resultSetConcurrency, resultSetHoldability);
+1:         }
+1: 
+1:         @Override
+1:         public PreparedStatement prepareStatement(String sql, int autoGeneratedKeys) throws SQLException {
+1:             return delegate.prepareStatement(sql, autoGeneratedKeys);
+1:         }
+1: 
+1:         @Override
+1:         public PreparedStatement prepareStatement(String sql, int[] columnIndexes) throws SQLException {
+1:             return delegate.prepareStatement(sql, columnIndexes);
+1:         }
+1: 
+1:         @Override
+1:         public PreparedStatement prepareStatement(String sql, String[] columnNames) throws SQLException {
+1:             return delegate.prepareStatement(sql, columnNames);
+1:         }
+1: 
+1:         @Override
+1:         public Clob createClob() throws SQLException {
+1:             return delegate.createClob();
+1:         }
+1: 
+1:         @Override
+1:         public Blob createBlob() throws SQLException {
+1:             return delegate.createBlob();
+1:         }
+1: 
+1:         @Override
+1:         public NClob createNClob() throws SQLException {
+1:             return delegate.createNClob();
+1:         }
+1: 
+1:         @Override
+1:         public SQLXML createSQLXML() throws SQLException {
+1:             return delegate.createSQLXML();
+1:         }
+1: 
+1:         @Override
+1:         public boolean isValid(int timeout) throws SQLException {
+1:             return delegate.isValid(timeout);
+1:         }
+1: 
+1:         @Override
+1:         public void setClientInfo(String name, String value) throws SQLClientInfoException {
+1:             delegate.setClientInfo(name, value);
+1:         }
+1: 
+1:         @Override
+1:         public void setClientInfo(Properties properties) throws SQLClientInfoException {
+1:             delegate.setClientInfo(properties);
+1:         }
+1: 
+1:         @Override
+1:         public String getClientInfo(String name) throws SQLException {
+1:             return delegate.getClientInfo(name);
+1:         }
+1: 
+1:         @Override
+1:         public Properties getClientInfo() throws SQLException {
+1:             return delegate.getClientInfo();
+1:         }
+1: 
+1:         @Override
+1:         public Array createArrayOf(String typeName, Object[] elements) throws SQLException {
+1:             return delegate.createArrayOf(typeName, elements);
+1:         }
+1: 
+1:         @Override
+1:         public Struct createStruct(String typeName, Object[] attributes) throws SQLException {
+1:             return delegate.createStruct(typeName, attributes);
+1:         }
+1: 
+1:         @Override
+1:         public void setSchema(String schema) throws SQLException {
+1:             delegate.setSchema(schema);
+1:         }
+1: 
+1:         @Override
+1:         public String getSchema() throws SQLException {
+1:             return delegate.getSchema();
+1:         }
+1: 
+1:         @Override
+1:         public void abort(Executor executor) throws SQLException {
+1:             delegate.abort(executor);
+1:         }
+1: 
+1:         @Override
+1:         public void setNetworkTimeout(Executor executor, int milliseconds) throws SQLException {
+1:             delegate.setNetworkTimeout(executor, milliseconds);
+1:         }
+1: 
+1:         @Override
+1:         public int getNetworkTimeout() throws SQLException {
+1:             return delegate.getNetworkTimeout();
+1:         }
+1: 
+1:         @Override
+1:         public <T> T unwrap(Class<T> iface) throws SQLException {
+1:             return delegate.unwrap(iface);
+1:         }
+1: 
+1:         @Override
+1:         public boolean isWrapperFor(Class<?> iface) throws SQLException {
+1:             return delegate.isWrapperFor(iface);
+1:         }
+1:     }
+commit:7c11663
+/////////////////////////////////////////////////////////////////////////
+1:                 completions.clear();
+commit:977deb4
+/////////////////////////////////////////////////////////////////////////
+1:                 if (persistenceAdapter.getBrokerService() != null) {
+1:                     persistenceAdapter.getBrokerService().handleIOException(ioe);
+1:                 }
+commit:6348d11
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.LinkedList;
+0: import java.util.List;
+/////////////////////////////////////////////////////////////////////////
+1:     private LinkedList<Runnable> completions = new LinkedList<Runnable>();
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 for (Runnable completion: completions) {
+1:                     completion.run();
+1:                 }
+/////////////////////////////////////////////////////////////////////////
+1:     public void onCompletion(Runnable runnable) {
+1:         completions.add(runnable);
+1:     }
+commit:7a0168a
+/////////////////////////////////////////////////////////////////////////
+1:             try {
+1:                 doRollback();
+1:             } catch (Exception ignored) {}
+1:             IOException ioe = IOExceptionSupport.create(e);
+1:             persistenceAdapter.getBrokerService().handleIOException(ioe);
+1:             throw ioe;
+/////////////////////////////////////////////////////////////////////////
+1:             doRollback();
+/////////////////////////////////////////////////////////////////////////
+1:     private void doRollback() throws SQLException {
+0:         if (addMessageStatement != null) {
+0:             addMessageStatement.close();
+1:             addMessageStatement = null;
+1:         }
+0:         if (removedMessageStatement != null) {
+0:             removedMessageStatement.close();
+1:             removedMessageStatement = null;
+1:         }
+0:         if (updateLastAckStatement != null) {
+0:             updateLastAckStatement.close();
+1:             updateLastAckStatement = null;
+1:         }
+1:         connection.rollback();
+1:     }
+1: 
+commit:b7c430d
+/////////////////////////////////////////////////////////////////////////
+1:     private boolean inTx;
+/////////////////////////////////////////////////////////////////////////
+1:                 inTx = false;
+1:                 close();
+/////////////////////////////////////////////////////////////////////////
+1:         connection = getConnection();
+author:Hadrian Zbarcea
+-------------------------------------------------------------------------------
+commit:d54d046
+author:Claus Ibsen
+-------------------------------------------------------------------------------
+commit:d0f48b3
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:     private volatile boolean inTx;
+/////////////////////////////////////////////////////////////////////////
+1:                 // ignore
+1:                 LOG.trace("Cannot set transaction isolation to " + transactionIsolation + " due " + e.getMessage()
+1:                         + ". This exception is ignored.", e);
+/////////////////////////////////////////////////////////////////////////
+0:                     // ignore
+0:                     LOG.trace("Closing connection failed due: " + e.getMessage() + ". This exception is ignored.", e);
+/////////////////////////////////////////////////////////////////////////
+0:         // only mark in tx if we could get a connection
+1:         inTx = true;
+commit:ddda400
+/////////////////////////////////////////////////////////////////////////
+1:                 if (persistenceAdapter.isChangeAutoCommitAllowed()) {
+1:                     boolean autoCommit = !inTx;
+1:                     if (connection.getAutoCommit() != autoCommit) {
+1:                         LOG.trace("Setting auto commit to {} on connection {}", autoCommit, connection);
+1:                         connection.setAutoCommit(autoCommit);
+1:                     }
+author:Gary Tully
+-------------------------------------------------------------------------------
+commit:13bbe52
+/////////////////////////////////////////////////////////////////////////
+1:                 IOException ioe = IOExceptionSupport.create(e);
+1:                 persistenceAdapter.getBrokerService().handleIOException(ioe);
+1:                 throw ioe;
+commit:4150650
+/////////////////////////////////////////////////////////////////////////
+1:     private final JDBCPersistenceAdapter persistenceAdapter;
+/////////////////////////////////////////////////////////////////////////
+1:     public TransactionContext(JDBCPersistenceAdapter persistenceAdapter) throws IOException {
+1:         this.persistenceAdapter = persistenceAdapter;
+1:         this.dataSource = persistenceAdapter.getDataSource();
+/////////////////////////////////////////////////////////////////////////
+1:                 IOException ioe = IOExceptionSupport.create(e);
+0:                 persistenceAdapter.getBrokerService().handleIOException(ioe);
+1:                 throw ioe;
+1: 
+commit:00e2f51
+/////////////////////////////////////////////////////////////////////////
+1:     // a cheap dirty level that we can live with    
+1:     private int transactionIsolation = Connection.TRANSACTION_READ_UNCOMMITTED;
+1:     
+/////////////////////////////////////////////////////////////////////////
+1:                 connection.setTransactionIsolation(transactionIsolation);
+/////////////////////////////////////////////////////////////////////////
+1:     
+1:     public void setTransactionIsolation(int transactionIsolation) {
+1:         this.transactionIsolation = transactionIsolation;
+1:     }
+author:Hiram R. Chirino
+-------------------------------------------------------------------------------
+commit:c5cf038
+commit:b0c2a40
+/////////////////////////////////////////////////////////////////////////
+1:  * 
+commit:ecf89a6
+/////////////////////////////////////////////////////////////////////////
+1:         if (p == null) {
+1:         }
+/////////////////////////////////////////////////////////////////////////
+1:         if (inTx) {
+1:         }
+1:         if (!inTx) {
+1:         }
+0:             if (!connection.getAutoCommit()) {
+1:             }
+/////////////////////////////////////////////////////////////////////////
+1:         if (!inTx) {
+1:         }
+commit:fc00993
+/////////////////////////////////////////////////////////////////////////
+0:     private static final Log LOG = LogFactory.getLog(TransactionContext.class);
+/////////////////////////////////////////////////////////////////////////
+0:                     LOG.warn("Close failed: " + e.getMessage(), e);
+commit:f812e34
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         if (connection == null) {
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:                 removedMessageStatement = null;
+0:                     updateLastAckStatement = null;
+0:         if (p == null)
+1: 
+1:                 if (code < 0 && code != Statement.SUCCESS_NO_INFO) {
+1:             try {
+1:                 p.close();
+1:             } catch (Throwable e) {
+1:             }
+1: 
+1:         if (!inTx) {
+1: 
+0:                  * This was previously commented out - but had adverse affects
+0:                  * on testing - so it's back!
+1:                 try {
+1: 
+/////////////////////////////////////////////////////////////////////////
+0:                     log.warn("Close failed: " + e.getMessage(), e);
+0:                     connection = null;
+0:         if (inTx)
+0:         if (!inTx)
+0:             if (!connection.getAutoCommit())
+1:             inTx = false;
+1: 
+0:         if (!inTx)
+0:             if (addMessageStatement != null) {
+0:                 addMessageStatement = null;
+0:             if (removedMessageStatement != null) {
+0:                 removedMessageStatement = null;
+0:             if (updateLastAckStatement != null) {
+0:                 updateLastAckStatement = null;
+1: 
+1:             inTx = false;
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+commit:230a86c
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:  *      http://www.apache.org/licenses/LICENSE-2.0
+commit:57b4941
+/////////////////////////////////////////////////////////////////////////
+1:  * Licensed to the Apache Software Foundation (ASF) under one or more
+1:  * contributor license agreements.  See the NOTICE file distributed with
+1:  * this work for additional information regarding copyright ownership.
+1:  * The ASF licenses this file to You under the Apache License, Version 2.0
+1:  * (the "License"); you may not use this file except in compliance with
+1:  * the License.  You may obtain a copy of the License at
+commit:7976ad9
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:                     if (connection != null && !connection.getAutoCommit()) {
+/////////////////////////////////////////////////////////////////////////
+0:             if( !connection.getAutoCommit() )
+1:                 connection.commit();
+commit:911177e
+/////////////////////////////////////////////////////////////////////////
+0: import org.apache.commons.logging.Log;
+0: import org.apache.commons.logging.LogFactory;
+/////////////////////////////////////////////////////////////////////////
+0:     private static final Log log = LogFactory.getLog(TransactionContext.class);
+/////////////////////////////////////////////////////////////////////////
+1:                 JDBCPersistenceAdapter.log("Could not get JDBC connection: ", e);
+/////////////////////////////////////////////////////////////////////////
+1:                 JDBCPersistenceAdapter.log("Error while closing connection: ", e);
+/////////////////////////////////////////////////////////////////////////
+1:             JDBCPersistenceAdapter.log("Commit failed: ", e);
+/////////////////////////////////////////////////////////////////////////
+1:             JDBCPersistenceAdapter.log("Rollback failed: ", e);
+commit:48b4869
+/////////////////////////////////////////////////////////////////////////
+0:  * Copyright 2005-2006 The Apache Software Foundation
+commit:d29ca2a
+/////////////////////////////////////////////////////////////////////////
+1: /**
+1:  *
+0:  * Copyright 2004 The Apache Software Foundation
+1:  *
+0:  * Licensed under the Apache License, Version 2.0 (the "License");
+0:  * you may not use this file except in compliance with the License.
+0:  * You may obtain a copy of the License at
+1:  *
+0:  * http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.activemq.store.jdbc;
+1: 
+1: import java.io.IOException;
+0: import java.sql.Connection;
+0: import java.sql.PreparedStatement;
+0: import java.sql.SQLException;
+1: 
+1: import javax.sql.DataSource;
+1: 
+1: import org.apache.activemq.util.IOExceptionSupport;
+1: 
+1: /**
+1:  * Helps keep track of the current transaction/JDBC connection.
+1:  * 
+0:  * @version $Revision: 1.2 $
+1:  */
+1: public class TransactionContext {
+1: 
+0:     private static final org.apache.commons.logging.Log log = org.apache.commons.logging.LogFactory
+0:             .getLog(TransactionContext.class);
+1:     
+1:     private final DataSource dataSource;
+1:     private Connection connection;
+0:     private boolean inTx;
+1:     private PreparedStatement addMessageStatement;
+1:     private PreparedStatement removedMessageStatement;
+1:     private PreparedStatement updateLastAckStatement;
+1: 
+0:     public TransactionContext(DataSource dataSource) {
+0:         this.dataSource = dataSource;
+1:     }
+1: 
+1:     public Connection getConnection() throws IOException {
+0:         if( connection == null ) {
+1:             try {
+1:                 connection = dataSource.getConnection();
+0:                 connection.setAutoCommit(!inTx);
+1:             } catch (SQLException e) {
+1:                 throw IOExceptionSupport.create(e);
+1:             }
+1:             
+1:             try {
+0:                 connection.setTransactionIsolation(Connection.TRANSACTION_READ_UNCOMMITTED);
+0:             } catch (Throwable e) {
+1:             }
+1:         }
+1:         return connection;
+1:     }
+1: 
+1:     public void executeBatch() throws SQLException {
+1:         try {
+1:             executeBatch(addMessageStatement, "Failed add a message");
+1:         } finally {
+0:             addMessageStatement = null;
+1:             try {
+1:                 executeBatch(removedMessageStatement, "Failed to remove a message");
+1:             } finally {
+0:                 removedMessageStatement=null;
+1:                 try {
+1:                     executeBatch(updateLastAckStatement, "Failed to ack a message");
+1:                 } finally {
+0:                     updateLastAckStatement=null;
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+1:     private void executeBatch(PreparedStatement p, String message) throws SQLException {
+0:         if( p == null )
+1:             return;
+1:         
+1:         try {
+1:             int[] rc = p.executeBatch();
+1:             for (int i = 0; i < rc.length; i++) {
+0:                 if ( rc[i]!= 1 ) {
+0:                     throw new SQLException(message);
+1:                 }
+1:             }
+1:         } finally {
+0:             try { p.close(); } catch (Throwable e) { }
+1:         }
+1:     }
+1:     
+1:     public void close() throws IOException {
+0:         if( !inTx ) {
+1:             try {
+0:                 try{
+1:                     executeBatch();
+1:                 } finally {
+0:                     if (connection != null) {
+1:                         connection.commit();
+1:                     }
+1:                 }
+1:             } catch (SQLException e) {
+1:                 throw IOExceptionSupport.create(e);
+1:             } finally {
+1:                 try {
+0:                     if (connection != null) {
+0:                         connection.close();
+1:                     }
+0:                 } catch (Throwable e) {
+0:                     log.warn("Close failed: "+e.getMessage(), e);
+1:                 } finally {
+0:                     connection=null;
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+1:     public void begin() throws IOException {
+0:         if( inTx )
+1:             throw new IOException("Already started.");
+0:         inTx = true;
+0:         connection = getConnection();
+1:     }
+1: 
+1:     public void commit() throws IOException {
+0:         if( !inTx )
+1:             throw new IOException("Not started.");
+1:         try {
+1:             executeBatch();
+1:             connection.commit();
+1:         } catch (SQLException e) {
+0:             log.info("commit failed: "+e.getMessage(), e);
+0:             while( e.getNextException() !=null ) {
+0:                 e = e.getNextException();
+0:                 log.info("Nested exception: "+e);
+1:             }
+1:             throw IOExceptionSupport.create(e);
+1:         } finally {
+0:             inTx=false;
+1:             close();
+1:         }
+1:     }
+1:     
+1:     public void rollback() throws IOException {
+0:         if( !inTx )
+1:             throw new IOException("Not started.");
+1:         try {
+0:             if( addMessageStatement != null ) {
+0:                 addMessageStatement.close();
+0:                 addMessageStatement=null;
+1:             }
+0:             if( removedMessageStatement != null ) {
+0:                 removedMessageStatement.close();
+0:                 removedMessageStatement=null;
+1:             }
+0:             if( updateLastAckStatement != null ) {
+0:                 updateLastAckStatement.close();
+0:                 updateLastAckStatement=null;
+1:             }
+0:             connection.rollback();
+1:             
+1:         } catch (SQLException e) {
+1:             throw IOExceptionSupport.create(e);
+1:         } finally {
+0:             inTx=false;
+1:             close();
+1:         }
+1:     }
+1: 
+1:     public PreparedStatement getAddMessageStatement() {
+1:         return addMessageStatement;
+1:     }
+1:     public void setAddMessageStatement(PreparedStatement addMessageStatement) {
+1:         this.addMessageStatement = addMessageStatement;
+1:     }
+1: 
+1:     public PreparedStatement getUpdateLastAckStatement() {
+1:         return updateLastAckStatement;
+1:     }
+1:     public void setUpdateLastAckStatement(PreparedStatement ackMessageStatement) {
+1:         this.updateLastAckStatement = ackMessageStatement;
+1:     }
+1: 
+1:     public PreparedStatement getRemovedMessageStatement() {
+1:         return removedMessageStatement;
+1:     }
+1:     public void setRemovedMessageStatement(PreparedStatement removedMessageStatement) {
+1:         this.removedMessageStatement = removedMessageStatement;
+1:     }
+1: 
+1: }
+author:Bosanac Dejan
+-------------------------------------------------------------------------------
+commit:8bf987b
+/////////////////////////////////////////////////////////////////////////
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+/////////////////////////////////////////////////////////////////////////
+1:     private static final Logger LOG = LoggerFactory.getLogger(TransactionContext.class);
+commit:2e6443b
+/////////////////////////////////////////////////////////////////////////
+0:             close();
+/////////////////////////////////////////////////////////////////////////
+0:             close();
+commit:52f48db
+/////////////////////////////////////////////////////////////////////////
+0:             
+0:             this.rollback(); 
+0:             
+0:             inTx = false;
+/////////////////////////////////////////////////////////////////////////
+0:             inTx = false;
+author:James Strachan
+-------------------------------------------------------------------------------
+commit:9324b59
+/////////////////////////////////////////////////////////////////////////
+0:                 boolean autoCommit = !inTx;
+0:                 if (connection.getAutoCommit() != autoCommit) {
+0:                     connection.setAutoCommit(autoCommit);
+0:                 }
+commit:ba0ada4
+/////////////////////////////////////////////////////////////////////////
+0:                 if ( code < 0 && code != Statement.SUCCESS_NO_INFO ) {
+commit:862c1f2
+/////////////////////////////////////////////////////////////////////////
+0: import java.sql.Statement;
+/////////////////////////////////////////////////////////////////////////
+1:                 int code = rc[i];
+0:                 if ( code > 0 || code == Statement.SUCCESS_NO_INFO ) {
+1:                     throw new SQLException(message + ". Response code: " + code);
+commit:2f944a1
+/////////////////////////////////////////////////////////////////////////
+0:                 executeBatch();
+0:                 
+0:                 /**
+0:                  * we are not in a transaction so should not be committing
+/////////////////////////////////////////////////////////////////////////
+0:                 */
+author:Robert Davies
+-------------------------------------------------------------------------------
+commit:6985a09
+/////////////////////////////////////////////////////////////////////////
+0:                  * we are not in a transaction so should not be committing ??
+0:                  * This was previously commented out - but had
+0:                  * adverse affects on testing - so it's back!
+0:                  * 
+0:                  */
+/////////////////////////////////////////////////////////////////////////
+0:                 
+============================================================================

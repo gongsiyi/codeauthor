@@ -1,0 +1,2030 @@
+1:73a34db: /*
+18:73a34db: 
+1:73a34db:    Derby - Class org.apache.derby.impl.services.cache.ConcurrentCache
+1:73a34db: 
+1:73a34db:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:73a34db:    contributor license agreements.  See the NOTICE file distributed with
+1:73a34db:    this work for additional information regarding copyright ownership.
+1:73a34db:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:73a34db:    (the "License"); you may not use this file except in compliance with
+1:73a34db:    the License.  You may obtain a copy of the License at
+1:73a34db: 
+1:73a34db:       http://www.apache.org/licenses/LICENSE-2.0
+1:73a34db: 
+1:73a34db:    Unless required by applicable law or agreed to in writing, software
+1:73a34db:    distributed under the License is distributed on an "AS IS" BASIS,
+1:73a34db:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:73a34db:    See the License for the specific language governing permissions and
+1:73a34db:    limitations under the License.
+1:73a34db: 
+2:73a34db:  */
+1:3141a3b: 
+1:73a34db: package org.apache.derby.impl.services.cache;
+1:e450130: 
+1:56c1dc2: import java.security.AccessController;
+1:56c1dc2: import java.security.PrivilegedAction;
+1:a854464: import java.util.ArrayList;
+1:73a34db: import java.util.Collection;
+1:73a34db: import java.util.concurrent.ConcurrentHashMap;
+1:86ee0a0: import java.util.concurrent.atomic.AtomicLong;
+1:73a34db: import org.apache.derby.iapi.error.StandardException;
+1:86ee0a0: import org.apache.derby.iapi.reference.Module;
+1:73a34db: import org.apache.derby.iapi.reference.SQLState;
+1:73a34db: import org.apache.derby.iapi.services.cache.CacheManager;
+1:73a34db: import org.apache.derby.iapi.services.cache.Cacheable;
+1:73a34db: import org.apache.derby.iapi.services.cache.CacheableFactory;
+1:73a34db: import org.apache.derby.iapi.services.daemon.DaemonService;
+1:86ee0a0: import org.apache.derby.iapi.services.jmx.ManagementService;
+1:86ee0a0: import org.apache.derby.iapi.services.monitor.Monitor;
+1:7e51e9d: import org.apache.derby.shared.common.sanity.SanityManager;
+1:73a34db: import org.apache.derby.iapi.util.Matchable;
+1:86ee0a0: import org.apache.derby.mbeans.CacheManagerMBean;
+1:73a34db: 
+2:73a34db: /**
+1:73a34db:  * A cache manager based on the utilities found in the
+1:73a34db:  * <code>java.util.concurrent</code> package. It allows multiple threads to
+1:73a34db:  * access the cache concurrently without blocking each other, given that they
+1:73a34db:  * request different objects and the requested objects are present in the
+1:73a34db:  * cache.
+2:73a34db:  *
+1:73a34db:  * <p>
+1:73a34db:  *
+1:73a34db:  * All methods of this class should be thread safe. When exclusive access to an
+1:73a34db:  * entry is required, it is achieved by calling the <code>lock()</code> method
+1:73a34db:  * on the <code>CacheEntry</code> object. To ensure that the entry is always
+1:73a34db:  * unlocked, all calls to <code>CacheEntry.lock()</code> should be followed by
+1:73a34db:  * a <code>try</code> block with a <code>finally</code> clause that unlocks the
+1:73a34db:  * entry.
+1:73a34db:  */
+1:73a34db: final class ConcurrentCache implements CacheManager {
+1:73a34db: 
+1:73a34db:     /** Map with all the cached objects. */
+1:73a34db:     private final ConcurrentHashMap<Object, CacheEntry> cache;
+1:73a34db:     /** Factory which creates <code>Cacheable</code>s. */
+1:73a34db:     private final CacheableFactory holderFactory;
+1:73a34db:     /** Name of this cache. */
+1:73a34db:     private final String name;
+1:651fa21:     /** The maximum size (number of elements) for this cache. */
+1:651fa21:     private final int maxSize;
+1:7a816cb:     /** Replacement policy to be used for this cache. */
+1:7a816cb:     private final ReplacementPolicy replacementPolicy;
+1:73a34db: 
+1:86ee0a0:     // Fields used by the MBean that monitors this instance.
+1:86ee0a0: 
+1:86ee0a0:     /** The identifier of the MBean that allows monitoring of this instance. */
+1:86ee0a0:     private Object mbean;
+1:86ee0a0:     /** Flag that tells if hit/miss/eviction counts should be collected. */
+1:86ee0a0:     private volatile boolean collectAccessCounts;
+1:86ee0a0:     /** The number of cache hits. */
+1:86ee0a0:     private final AtomicLong hits = new AtomicLong();
+1:86ee0a0:     /** The number of cache misses. */
+1:86ee0a0:     private final AtomicLong misses = new AtomicLong();
+1:86ee0a0:     /** The number of evictions from the cache. */
+1:86ee0a0:     private final AtomicLong evictions = new AtomicLong();
+1:86ee0a0: 
+1:73a34db:     /**
+1:e450130:      * Flag that indicates whether this cache instance has been shut down. When
+1:e450130:      * it has been stopped, <code>find()</code>, <code>findCached()</code> and
+1:e450130:      * <code>create()</code> will return <code>null</code>. The flag is
+1:e450130:      * declared <code>volatile</code> so that no synchronization is needed when
+1:e450130:      * it is accessed by concurrent threads.
+1:e450130:      */
+1:e450130:     private volatile boolean stopped;
+1:e450130: 
+1:e450130:     /**
+1:651fa21:      * Background cleaner which can be used to clean cached objects in a
+1:651fa21:      * separate thread to avoid blocking the user threads.
+1:651fa21:      */
+1:651fa21:     private BackgroundCleaner cleaner;
+1:651fa21: 
+1:651fa21:     /**
+1:73a34db:      * Creates a new cache manager.
+1:73a34db:      *
+1:73a34db:      * @param holderFactory factory which creates <code>Cacheable</code>s
+1:73a34db:      * @param name the name of the cache
+1:d7a1ddd:      * @param initialSize the initial capacity of the cache
+1:7a816cb:      * @param maxSize maximum number of elements in the cache
+1:73a34db:      */
+1:d7a1ddd:     ConcurrentCache(CacheableFactory holderFactory, String name,
+1:d7a1ddd:                     int initialSize, int maxSize) {
+1:d7a1ddd:         cache = new ConcurrentHashMap<Object, CacheEntry>(initialSize);
+1:d7a1ddd:         replacementPolicy = new ClockPolicy(this, initialSize, maxSize);
+1:73a34db:         this.holderFactory = holderFactory;
+1:73a34db:         this.name = name;
+1:651fa21:         this.maxSize = maxSize;
+1:7a816cb:     }
+1:45c4ca4: 
+1:e450130:     /**
+1:d8bdc4c:      * Return the <code>ReplacementPolicy</code> instance for this cache.
+1:d8bdc4c:      *
+1:d8bdc4c:      * @return replacement policy
+1:d8bdc4c:      */
+1:d8bdc4c:     ReplacementPolicy getReplacementPolicy() {
+1:d8bdc4c:         return replacementPolicy;
+1:45c4ca4:     }
+1:45c4ca4: 
+1:d8bdc4c:     /**
+1:73a34db:      * Get the entry associated with the specified key from the cache. If the
+1:73a34db:      * entry does not exist, insert an empty one and return it. The returned
+1:73a34db:      * entry is always locked for exclusive access by the current thread, but
+1:45c4ca4:      * not kept. If another thread is currently setting the identity of this
+1:45c4ca4:      * entry, this method will block until the identity has been set.
+1:73a34db:      *
+1:73a34db:      * @param key the identity of the cached object
+1:73a34db:      * @return an entry for the specified key, always locked
+1:73a34db:      */
+1:73a34db:     private CacheEntry getEntry(Object key) {
+1:73a34db:         CacheEntry entry = cache.get(key);
+1:73a34db:         while (true) {
+1:73a34db:             if (entry != null) {
+1:086dee2:                 // Found an entry in the cache, lock it.
+1:086dee2:                 entry.lock();
+1:086dee2:                 // If someone else is setting the identity of the Cacheable
+1:086dee2:                 // in this entry, we'll need to wait for them to complete.
+1:086dee2:                 entry.waitUntilIdentityIsSet();
+2:73a34db:                 if (entry.isValid()) {
+1:73a34db:                     // Entry is still valid. Return it.
+1:73a34db:                     return entry;
+1:df17cb0:                 } else {
+1:73a34db:                     // This entry has been removed from the cache while we were
+1:73a34db:                     // waiting for the lock. Unlock it and try again.
+4:73a34db:                     entry.unlock();
+1:73a34db:                     entry = cache.get(key);
+1:45c4ca4:                 }
+1:45c4ca4:             } else {
+1:73a34db:                 CacheEntry freshEntry = new CacheEntry();
+1:73a34db:                 // Lock the entry before it's inserted to avoid window for
+1:73a34db:                 // others to remove it.
+1:73a34db:                 freshEntry.lock();
+1:73a34db:                 CacheEntry oldEntry = cache.putIfAbsent(key, freshEntry);
+1:73a34db:                 if (oldEntry != null) {
+1:73a34db:                     // Someone inserted the entry while we created a new
+1:73a34db:                     // one. Retry with the entry currently in the cache. Don't
+1:73a34db:                     // bother unlocking freshEntry since no one else could have
+1:73a34db:                     // seen it.
+1:73a34db:                     entry = oldEntry;
+4:73a34db:                 } else {
+1:73a34db:                     // We successfully inserted a new entry.
+1:73a34db:                     return freshEntry;
+1:45c4ca4:                 }
+1:d8bdc4c:             }
+25:73a34db:         }
+1:73a34db:     }
+1:45c4ca4: 
+1:73a34db:     /**
+1:73a34db:      * Remove an entry from the cache. Its <code>Cacheable</code> is cleared
+1:73a34db:      * and made available for other entries. This method should only be called
+1:7a816cb:      * if the entry is present in the cache and locked by the current thread.
+1:73a34db:      *
+1:dbc7584:      * @param key the identity of the entry to remove
+1:73a34db:      */
+1:dbc7584:     private void removeEntry(Object key) {
+1:dbc7584:         CacheEntry entry = cache.remove(key);
+1:df17cb0:         Cacheable c = entry.getCacheable();
+1:df17cb0:         if (c != null && c.getIdentity() != null) {
+1:df17cb0:             // The cacheable should not have an identity when it has been
+1:df17cb0:             // removed.
+1:7a816cb:             c.clearIdentity();
+1:df17cb0:         }
+1:7a816cb:         entry.free();
+1:7a816cb:     }
+1:d8bdc4c: 
+1:7a816cb:     /**
+1:3141a3b:      * Evict an entry to make room for a new entry that is being inserted into
+1:3141a3b:      * the cache. Clear the identity of its {@code Cacheable} and set it to
+1:3141a3b:      * {@code null}. When this method is called, the caller has already chosen
+1:3141a3b:      * the {@code Cacheable} for reuse. Therefore, this method won't call
+1:3141a3b:      * {@code CacheEntry.free()} as that would make the {@code Cacheable} free
+1:3141a3b:      * for reuse by other entries as well.
+1:3141a3b:      *
+1:3141a3b:      * <p>
+1:3141a3b:      *
+1:3141a3b:      * The caller must have locked the entry that is about to be evicted.
+1:7a816cb:      *
+1:7a816cb:      * @param key identity of the entry to remove
+1:7a816cb:      */
+1:7a816cb:     void evictEntry(Object key) {
+1:7a816cb:         CacheEntry entry = cache.remove(key);
+1:7a816cb:         entry.getCacheable().clearIdentity();
+1:73a34db:         entry.setCacheable(null);
+1:86ee0a0:         countEviction();
+1:73a34db:     }
+1:7a816cb: 
+1:df17cb0:     /**
+1:f30ee41:      * Insert a {@code CacheEntry} into a free slot in the {@code
+1:f30ee41:      * ReplacementPolicy}'s internal data structure, and return a {@code
+1:f30ee41:      * Cacheable} that the caller can reuse. The entry must have been locked
+1:f30ee41:      * before this method is called.
+1:df17cb0:      *
+1:f30ee41:      * @param key the identity of the object being inserted
+1:f30ee41:      * @param entry the entry that is being inserted
+1:f30ee41:      * @return a {@code Cacheable} object that the caller can reuse
+1:f30ee41:      * @throws StandardException if an error occurs while inserting the entry
+1:f30ee41:      * or while allocating a new {@code Cacheable}
+1:df17cb0:      */
+1:f30ee41:     private Cacheable insertIntoFreeSlot(Object key, CacheEntry entry)
+1:df17cb0:             throws StandardException {
+1:45c4ca4: 
+1:45c4ca4:         try {
+1:f30ee41:             replacementPolicy.insertEntry(entry);
+1:f30ee41:         } catch (StandardException se) {
+1:f30ee41:             // Failed to insert the entry into the replacement policy. Make
+1:f30ee41:             // sure that it's also removed from the hash table.
+1:f30ee41:             removeEntry(key);
+1:f30ee41:             throw se;
+1:f30ee41:         }
+1:f30ee41: 
+1:f30ee41:         Cacheable free = entry.getCacheable();
+1:f30ee41: 
+1:f30ee41:         if (free == null) {
+1:f30ee41:             // We didn't get a reusable cacheable. Create a new one.
+1:f30ee41:             free = holderFactory.newCacheable(this);
+1:f30ee41:         }
+1:f30ee41: 
+1:f30ee41:         entry.keep(true);
+1:f30ee41: 
+1:f30ee41:         return free;
+1:f30ee41:     }
+1:f30ee41: 
+1:f30ee41:     /**
+1:f30ee41:      * Complete the setting of the identity. This includes notifying the
+1:f30ee41:      * threads that are waiting for the setting of the identity to complete,
+1:f30ee41:      * so that they can wake up and continue. If setting the identity failed,
+1:f30ee41:      * the entry will be removed from the cache.
+1:f30ee41:      *
+1:f30ee41:      * @param key the identity of the object being inserted
+1:f30ee41:      * @param entry the entry which is going to hold the cached object
+1:f30ee41:      * @param item a {@code Cacheable} object with the identity set (if
+1:f30ee41:      * the identity was successfully set), or {@code null} if setting the
+1:f30ee41:      * identity failed
+1:f30ee41:      */
+1:f30ee41:     private void settingIdentityComplete(
+1:f30ee41:             Object key, CacheEntry entry, Cacheable item) {
+1:f30ee41:         entry.lock();
+1:f30ee41:         try {
+1:f30ee41:             entry.settingIdentityComplete();
+1:df17cb0:             if (item != null) {
+1:f30ee41:                 entry.setCacheable(item);
+1:f30ee41:             } else {
+1:45c4ca4:                 removeEntry(key);
+1:df17cb0:             }
+1:df17cb0:         } finally {
+1:73a34db:             entry.unlock();
+1:73a34db:         }
+1:73a34db:     }
+1:df17cb0: 
+1:73a34db:     // Implementation of the CacheManager interface
+1:73a34db: 
+1:73a34db:     /**
+1:73a34db:      * Find an object in the cache. If it is not present, add it to the
+1:73a34db:      * cache. The returned object is kept until <code>release()</code> is
+1:73a34db:      * called.
+1:73a34db:      *
+1:73a34db:      * @param key identity of the object to find
+1:45c4ca4:      * @return the cached object, or <code>null</code> if it cannot be found
+1:73a34db:      */
+1:73a34db:     public Cacheable find(Object key) throws StandardException {
+1:f30ee41: 
+1:f30ee41:         if (stopped) {
+1:f30ee41:             return null;
+1:f30ee41:         }
+1:f30ee41: 
+1:f30ee41:         CacheEntry entry = getEntry(key);
+1:f30ee41: 
+1:f30ee41:         Cacheable item;
+1:f30ee41:         try {
+1:f30ee41:             item = entry.getCacheable();
+1:f30ee41:             if (item != null) {
+1:f30ee41:                 // The object is already cached. Increase the use count and
+1:f30ee41:                 // return it.
+1:f30ee41:                 entry.keep(true);
+1:86ee0a0:                 countHit();
+1:f30ee41:                 return item;
+1:f30ee41:             } else {
+1:f30ee41:                 // The object is not cached. Insert the entry into a free
+1:f30ee41:                 // slot and retrieve a reusable Cacheable.
+1:f30ee41:                 item = insertIntoFreeSlot(key, entry);
+1:86ee0a0:                 countMiss();
+1:f30ee41:             }
+1:f30ee41:         } finally {
+1:f30ee41:             entry.unlock();
+1:f30ee41:         }
+1:f30ee41: 
+1:f30ee41:         // Set the identity without holding the lock on the entry. If we
+1:f30ee41:         // hold the lock, we may run into a deadlock if the user code in
+1:f30ee41:         // setIdentity() re-enters the buffer manager.
+1:f30ee41:         Cacheable itemWithIdentity = null;
+1:f30ee41:         try {
+1:f30ee41:             itemWithIdentity = item.setIdentity(key);
+1:f30ee41:         } finally {
+1:f30ee41:             // Always invoke settingIdentityComplete(), also on error,
+1:f30ee41:             // otherwise other threads may wait forever. If setIdentity()
+1:f30ee41:             // fails, itemWithIdentity is going to be null.
+1:f30ee41:             settingIdentityComplete(key, entry, itemWithIdentity);
+1:f30ee41:         }
+1:f30ee41: 
+1:f30ee41:         return itemWithIdentity;
+1:e450130:     }
+1:45c4ca4: 
+1:73a34db:     /**
+1:73a34db:      * Find an object in the cache. If it is not present, return
+1:73a34db:      * <code>null</code>. The returned object is kept until
+1:73a34db:      * <code>release()</code> is called.
+1:73a34db:      *
+1:73a34db:      * @param key identity of the object to find
+1:73a34db:      * @return the cached object, or <code>null</code> if it's not in the cache
+1:73a34db:      */
+1:73a34db:     public Cacheable findCached(Object key) throws StandardException {
+1:e450130: 
+1:45c4ca4:         if (stopped) {
+1:45c4ca4:             return null;
+1:e450130:         }
+1:e450130: 
+1:3141a3b:         // Use get() instead of getEntry() so that we don't insert an empty
+1:3141a3b:         // entry if the requested object isn't there.
+1:73a34db:         CacheEntry entry = cache.get(key);
+1:73a34db:         if (entry == null) {
+1:73a34db:             // No such object was found in the cache.
+1:86ee0a0:             countMiss();
+1:e450130:             return null;
+1:73a34db:         }
+1:45c4ca4: 
+1:45c4ca4:         // Lock the entry, but wait until its identity has been set.
+1:086dee2:         entry.lock();
+1:df17cb0:         try {
+1:086dee2:             // If the identity of the cacheable is being set, we need to wait
+1:086dee2:             // for it to complete so that we don't return a cacheable that
+1:086dee2:             // isn't fully initialized.
+1:086dee2:             entry.waitUntilIdentityIsSet();
+1:86ee0a0: 
+1:73a34db:             // Return the cacheable. If the entry was removed right before we
+1:73a34db:             // locked it, getCacheable() returns null and so should we do.
+1:45c4ca4:             Cacheable item = entry.getCacheable();
+1:45c4ca4:             if (item != null) {
+1:86ee0a0:                 countHit();
+2:45c4ca4:                 entry.keep(true);
+1:86ee0a0:             } else {
+1:86ee0a0:                 countMiss();
+1:73a34db:             }
+1:45c4ca4:             return item;
+5:73a34db:         } finally {
+1:73a34db:             entry.unlock();
+1:73a34db:         }
+1:73a34db:     }
+1:e450130: 
+1:73a34db:     /**
+1:73a34db:      * Create an object in the cache. The object is kept until
+1:73a34db:      * <code>release()</code> is called.
+1:73a34db:      *
+1:73a34db:      * @param key identity of the object to create
+1:73a34db:      * @param createParameter parameters passed to
+1:73a34db:      * <code>Cacheable.createIdentity()</code>
+1:73a34db:      * @return a reference to the cached object, or <code>null</code> if the
+1:73a34db:      * object cannot be created
+1:73a34db:      * @exception StandardException if the object is already in the cache, or
+1:73a34db:      * if some other error occurs
+1:df17cb0:      * @see Cacheable#createIdentity(Object,Object)
+1:73a34db:      */
+1:73a34db:     public Cacheable create(Object key, Object createParameter)
+1:73a34db:             throws StandardException {
+1:f30ee41: 
+1:f30ee41:         if (stopped) {
+1:f30ee41:             return null;
+1:f30ee41:         }
+1:f30ee41: 
+1:f30ee41:         CacheEntry entry = new CacheEntry();
+1:f30ee41:         entry.lock();
+1:f30ee41: 
+1:f30ee41:         if (cache.putIfAbsent(key, entry) != null) {
+1:f30ee41:             // We can't create the object if it's already in the cache.
+1:f30ee41:             throw StandardException.newException(
+1:f30ee41:                     SQLState.OBJECT_EXISTS_IN_CACHE, name, key);
+1:f30ee41:         }
+1:f30ee41: 
+1:f30ee41:         Cacheable item;
+1:f30ee41:         try {
+1:f30ee41:             item = insertIntoFreeSlot(key, entry);
+1:f30ee41:         } finally {
+1:f30ee41:             entry.unlock();
+1:f30ee41:         }
+1:f30ee41: 
+1:f30ee41:         // Create the identity without holding the lock on the entry.
+1:f30ee41:         // Otherwise, we may run into a deadlock if the user code in
+1:f30ee41:         // createIdentity() re-enters the buffer manager.
+1:f30ee41:         Cacheable itemWithIdentity = null;
+1:f30ee41:         try {
+1:f30ee41:             itemWithIdentity = item.createIdentity(key, createParameter);
+1:f30ee41:         } finally {
+1:f30ee41:             // Always invoke settingIdentityComplete(), also on error,
+1:f30ee41:             // otherwise other threads may wait forever. If createIdentity()
+1:f30ee41:             // fails, itemWithIdentity is going to be null.
+1:f30ee41:             settingIdentityComplete(key, entry, itemWithIdentity);
+1:f30ee41:         }
+1:f30ee41: 
+1:f30ee41:         return itemWithIdentity;
+1:e450130:     }
+1:df17cb0: 
+1:73a34db:     /**
+1:73a34db:      * Release an object that has been fetched from the cache with
+1:73a34db:      * <code>find()</code>, <code>findCached()</code> or <code>create()</code>.
+1:73a34db:      *
+1:73a34db:      * @param item a <code>Cacheable</code> value
+1:73a34db:      */
+1:73a34db:     public void release(Cacheable item) {
+1:3141a3b:         // The entry must be present and kept when this method is called, so we
+1:3141a3b:         // don't need the complexity of getEntry() to ensure that the entry is
+1:3141a3b:         // not added to or removed from the cache before we have locked
+1:3141a3b:         // it. Just call get() which is cheaper.
+2:73a34db:         CacheEntry entry = cache.get(item.getIdentity());
+4:73a34db:         entry.lock();
+6:73a34db:         try {
+1:45c4ca4:             if (SanityManager.DEBUG) {
+1:73a34db:                 SanityManager.ASSERT(item == entry.getCacheable());
+1:86ee0a0:             }
+1:73a34db:             entry.unkeep();
+1:45c4ca4:         } finally {
+1:45c4ca4:             entry.unlock();
+1:45c4ca4:         }
+1:45c4ca4:     }
+1:45c4ca4: 
+1:73a34db:     /**
+1:73a34db:      * Remove an object from the cache. The object must previously have been
+1:73a34db:      * fetched from the cache with <code>find()</code>,
+1:73a34db:      * <code>findCached()</code> or <code>create()</code>. The user of the
+1:73a34db:      * cache must make sure that only one caller executes this method on a
+1:73a34db:      * cached object. This method will wait until the object has been removed
+1:73a34db:      * (its keep count must drop to zero before it can be removed).
+1:73a34db:      *
+1:73a34db:      * @param item the object to remove from the cache
+1:73a34db:      */
+1:73a34db:     public void remove(Cacheable item) throws StandardException {
+1:dbc7584:         Object key = item.getIdentity();
+1:3141a3b: 
+1:3141a3b:         // The entry must be present and kept when this method is called, so we
+1:3141a3b:         // don't need the complexity of getEntry() to ensure that the entry is
+1:3141a3b:         // not added to or removed from the cache before we have locked
+1:3141a3b:         // it. Just call get() which is cheaper.
+1:dbc7584:         CacheEntry entry = cache.get(key);
+1:45c4ca4: 
+1:45c4ca4:         entry.lock();
+1:45c4ca4:         try {
+2:73a34db:             if (SanityManager.DEBUG) {
+1:73a34db:                 SanityManager.ASSERT(item == entry.getCacheable());
+1:45c4ca4:             }
+1:73a34db:             entry.unkeepForRemove();
+1:73a34db:             item.clean(true);
+1:45c4ca4:             removeEntry(key);
+1:73a34db:         } finally {
+1:73a34db:             entry.unlock();
+1:73a34db:         }
+1:73a34db:     }
+1:e450130: 
+1:73a34db:     /**
+1:73a34db:      * Clean all dirty objects in the cache. All objects that existed in the
+1:73a34db:      * cache at the time of the call will be cleaned. Objects added later may
+1:73a34db:      * or may not be cleaned.
+1:73a34db:      */
+1:73a34db:     public void cleanAll() throws StandardException {
+1:73a34db:         cleanCache(null);
+1:73a34db:     }
+1:e450130: 
+1:73a34db:     /**
+1:73a34db:      * Clean all dirty objects matching a partial key.
+1:73a34db:      *
+1:73a34db:      * @param partialKey the partial (or exact) key to match
+1:73a34db:      */
+1:73a34db:     public void clean(Matchable partialKey) throws StandardException {
+1:73a34db:         cleanCache(partialKey);
+1:73a34db:     }
+1:73a34db: 
+1:73a34db:     /**
+1:73a34db:      * Clean all dirty objects matching a partial key. If no key is specified,
+1:73a34db:      * clean all dirty objects in the cache.
+1:73a34db:      *
+1:73a34db:      * @param partialKey the partial (or exact) key to match, or
+1:73a34db:      * <code>null</code> to match all keys
+1:73a34db:      */
+1:73a34db:     private void cleanCache(Matchable partialKey) throws StandardException {
+1:73a34db:         for (CacheEntry entry : cache.values()) {
+1:651fa21:             final Cacheable dirtyObject;
+1:73a34db:             entry.lock();
+1:73a34db:             try {
+1:651fa21:                 if (!entry.isValid()) {
+1:651fa21:                     // no need to clean an invalid entry
+1:651fa21:                     continue;
+1:73a34db:                 }
+1:651fa21:                 Cacheable c = entry.getCacheable();
+1:651fa21:                 if (partialKey != null && !partialKey.match(c.getIdentity())) {
+1:651fa21:                     // don't clean objects that don't match the partial key
+1:651fa21:                     continue;
+1:651fa21:                 }
+1:651fa21:                 if (!c.isDirty()) {
+1:651fa21:                     // already clean
+1:651fa21:                     continue;
+1:651fa21:                 }
+1:651fa21: 
+1:651fa21:                 // Increment the keep count for this entry to prevent others
+1:651fa21:                 // from removing it. Then release the lock on the entry to
+1:651fa21:                 // avoid blocking others when the object is cleaned.
+1:651fa21:                 entry.keep(false);
+1:651fa21:                 dirtyObject = c;
+1:651fa21: 
+1:651fa21:             } finally {
+1:651fa21:                 entry.unlock();
+1:651fa21:             }
+1:651fa21: 
+1:651fa21:             // Clean the object and decrement the keep count.
+1:651fa21:             cleanAndUnkeepEntry(entry, dirtyObject);
+1:651fa21:         }
+1:651fa21:     }
+1:651fa21: 
+1:651fa21:     /**
+1:651fa21:      * Clean an entry in the cache.
+1:651fa21:      *
+1:651fa21:      * @param entry the entry to clean
+1:651fa21:      * @exception StandardException if an error occurs while cleaning
+1:651fa21:      */
+1:651fa21:     void cleanEntry(CacheEntry entry) throws StandardException {
+1:651fa21:         // Fetch the cacheable while having exclusive access to the entry.
+1:651fa21:         // Release the lock before cleaning to avoid blocking others.
+1:651fa21:         Cacheable item;
+1:651fa21:         entry.lock();
+1:651fa21:         try {
+1:651fa21:             item = entry.getCacheable();
+1:651fa21:             if (item == null) {
+1:651fa21:                 // nothing to do
+1:651fa21:                 return;
+1:651fa21:             }
+1:651fa21:             entry.keep(false);
+1:651fa21:         } finally {
+1:651fa21:             entry.unlock();
+1:651fa21:         }
+1:651fa21:         cleanAndUnkeepEntry(entry, item);
+1:651fa21:     }
+1:651fa21: 
+1:651fa21:     /**
+1:651fa21:      * Clean an entry in the cache and decrement its keep count. The entry must
+1:651fa21:      * be kept before this method is called, and it must contain the specified
+1:651fa21:      * <code>Cacheable</code>.
+1:651fa21:      *
+1:651fa21:      * @param entry the entry to clean
+1:651fa21:      * @param item the cached object contained in the entry
+1:651fa21:      * @exception StandardException if an error occurs while cleaning
+1:651fa21:      */
+1:651fa21:     void cleanAndUnkeepEntry(CacheEntry entry, Cacheable item)
+1:651fa21:             throws StandardException {
+1:651fa21:         try {
+1:651fa21:             // Clean the cacheable while we're not holding
+1:651fa21:             // the lock on its entry.
+1:651fa21:             item.clean(false);
+1:651fa21:         } finally {
+1:651fa21:             // Re-obtain the lock on the entry, and reduce the keep count
+1:651fa21:             // since the entry should not be kept by the cleaner any longer.
+1:651fa21:             entry.lock();
+1:651fa21:             try {
+1:651fa21:                 if (SanityManager.DEBUG) {
+1:651fa21:                     // Since the entry is kept, the Cacheable shouldn't
+1:651fa21:                     // have changed.
+1:651fa21:                     SanityManager.ASSERT(entry.getCacheable() == item,
+1:651fa21:                             "CacheEntry didn't contain the expected Cacheable");
+1:651fa21:                 }
+1:651fa21:                 entry.unkeep();
+1:73a34db:             } finally {
+1:73a34db:                 entry.unlock();
+1:73a34db:             }
+1:73a34db:         }
+1:73a34db:     }
+1:73a34db: 
+1:73a34db:     /**
+1:73a34db:      * Remove all objects that are not kept and not dirty.
+1:73a34db:      */
+1:73a34db:     public void ageOut() {
+1:73a34db:         for (CacheEntry entry : cache.values()) {
+1:73a34db:             entry.lock();
+1:73a34db:             try {
+1:73a34db:                 // never remove kept entries
+1:73a34db:                 if (!entry.isKept()) {
+3:73a34db:                     Cacheable c = entry.getCacheable();
+1:73a34db:                     // If c is null, it's not in the cache and there's no need
+1:73a34db:                     // to remove it. If c is dirty, we can't remove it yet.
+1:73a34db:                     if (c != null && !c.isDirty()) {
+1:dbc7584:                         removeEntry(c.getIdentity());
+1:d8bdc4c:                     }
+1:d8bdc4c:                 }
+1:73a34db:             } finally {
+1:73a34db:                 entry.unlock();
+1:73a34db:             }
+1:73a34db:         }
+1:73a34db:     }
+1:73a34db: 
+1:73a34db:     /**
+1:e450130:      * Shut down the cache.
+1:e450130:      */
+1:73a34db:     public void shutdown() throws StandardException {
+1:e450130:         stopped = true;
+1:e450130:         cleanAll();
+1:e450130:         ageOut();
+1:651fa21:         if (cleaner != null) {
+1:651fa21:             cleaner.unsubscribe();
+1:651fa21:         }
+1:6da88fc:         deregisterMBean();
+1:73a34db:     }
+1:86ee0a0: 
+1:651fa21:     /**
+1:651fa21:      * Specify a daemon service that can be used to perform operations in
+1:651fa21:      * the background. Callers must provide enough synchronization so that
+1:651fa21:      * they have exclusive access to the cache when this method is called.
+1:651fa21:      *
+1:651fa21:      * @param daemon the daemon service to use
+1:651fa21:      */
+1:73a34db:     public void useDaemonService(DaemonService daemon) {
+1:651fa21:         if (cleaner != null) {
+1:651fa21:             cleaner.unsubscribe();
+1:651fa21:         }
+1:651fa21:         // Create a background cleaner that can queue up 1/10 of the elements
+1:45c4ca4:         // in the cache.
+1:651fa21:         cleaner = new BackgroundCleaner(this, daemon, Math.max(maxSize/10, 1));
+1:45c4ca4:     }
+1:45c4ca4: 
+1:651fa21:     BackgroundCleaner getBackgroundCleaner() {
+1:651fa21:         return cleaner;
+1:651fa21:     }
+1:45c4ca4: 
+1:73a34db:     /**
+1:73a34db:      * Discard all unused objects that match a partial key. Dirty objects will
+1:73a34db:      * not be cleaned before their removal.
+1:73a34db:      *
+1:73a34db:      * @param partialKey the partial (or exact) key, or <code>null</code> to
+1:73a34db:      * match all keys
+1:73a34db:      * @return <code>true</code> if all matching objects were removed,
+1:73a34db:      * <code>false</code> otherwise
+1:73a34db:      */
+1:73a34db:     public boolean discard(Matchable partialKey) {
+1:73a34db:         boolean allRemoved = true;
+1:73a34db:         for (CacheEntry entry : cache.values()) {
+1:73a34db:             entry.lock();
+1:45c4ca4:             try {
+1:73a34db:                 Cacheable c = entry.getCacheable();
+1:45c4ca4:                 if (c == null) {
+1:73a34db:                     // not in the cache - no need to remove it
+1:73a34db:                     continue;
+1:45c4ca4:                 }
+1:73a34db:                 if (partialKey != null && !partialKey.match(c.getIdentity())) {
+1:73a34db:                     // not a match, don't remove it
+1:73a34db:                     continue;
+1:df17cb0:                 }
+1:73a34db:                 if (entry.isKept()) {
+1:73a34db:                     // still in use, don't remove it
+1:73a34db:                     allRemoved = false;
+1:73a34db:                     continue;
+1:df17cb0:                 }
+1:dbc7584:                 removeEntry(c.getIdentity());
+1:45c4ca4:             } finally {
+1:45c4ca4:                 entry.unlock();
+1:73a34db:             }
+1:73a34db:         }
+1:73a34db:         return allRemoved;
+1:a854464:     }
+1:651fa21: 
+1:a854464:     /**
+1:a854464:      * Return a collection view of all the <code>Cacheable</code>s in the
+1:a854464:      * cache. There is no guarantee that the objects in the collection can be
+1:a854464:      * accessed in a thread-safe manner once this method has returned, so it
+1:a854464:      * should only be used for diagnostic purposes. (Currently, it is only used
+1:a854464:      * by the <code>StatementCache</code> VTI.)
+1:a854464:      *
+1:a854464:      * @return a collection view of the objects in the cache
+1:a854464:      */
+1:a854464:     public Collection<Cacheable> values() {
+1:a854464:         ArrayList<Cacheable> values = new ArrayList<Cacheable>();
+1:a854464:         for (CacheEntry entry : cache.values()) {
+1:a854464:             entry.lock();
+1:a854464:             try {
+1:a854464:                 Cacheable c = entry.getCacheable();
+1:df17cb0:                 if (c != null) {
+1:a854464:                     values.add(c);
+1:df17cb0:                 }
+1:a854464:             } finally {
+1:a854464:                 entry.unlock();
+1:df17cb0:             }
+1:a854464:         }
+1:a854464:         return values;
+1:86ee0a0:     }
+1:86ee0a0: 
+1:6da88fc:     @Override
+1:86ee0a0:     public void registerMBean(String dbName) throws StandardException {
+1:86ee0a0:         if (SanityManager.DEBUG) {
+1:86ee0a0:             SanityManager.ASSERT(mbean == null, "registerMBean() called twice");
+1:86ee0a0:         }
+1:86ee0a0: 
+1:86ee0a0:         ManagementService managementService =
+1:56c1dc2:                 (ManagementService) getSystemModule(Module.JMX);
+1:86ee0a0: 
+1:86ee0a0:         if (managementService != null) {
+1:86ee0a0:             mbean = managementService.registerMBean(
+1:86ee0a0:                     new ConcurrentCacheMBeanImpl(this),
+1:86ee0a0:                     CacheManagerMBean.class,
+1:86ee0a0:                     "type=CacheManager,name=" + name +
+1:86ee0a0:                     ",db=" + managementService.quotePropertyValue(dbName));
+1:86ee0a0:         }
+1:86ee0a0:     }
+1:86ee0a0: 
+1:86ee0a0:     @Override
+1:6da88fc:     public void deregisterMBean() {
+1:6da88fc:         if (mbean != null) {
+1:6da88fc:             ManagementService managementService =
+1:56c1dc2:                 (ManagementService) getSystemModule(Module.JMX);
+1:6da88fc:             if (managementService != null) {
+1:6da88fc:                 managementService.unregisterMBean(mbean);
+1:6da88fc:             }
+1:6da88fc:             mbean = null;
+1:6da88fc:         }
+1:6da88fc:     }
+1:6da88fc: 
+1:86ee0a0:     /** Count a cache hit. */
+1:86ee0a0:     private void countHit() {
+1:86ee0a0:         if (collectAccessCounts) {
+1:86ee0a0:             hits.getAndIncrement();
+1:86ee0a0:         }
+1:86ee0a0:     }
+1:86ee0a0: 
+1:86ee0a0:     /** Count a cache miss. */
+1:86ee0a0:     private void countMiss() {
+1:86ee0a0:         if (collectAccessCounts) {
+1:86ee0a0:             misses.getAndIncrement();
+1:86ee0a0:         }
+1:86ee0a0:     }
+1:86ee0a0: 
+1:86ee0a0:     /** Count an eviction from the cache. */
+1:86ee0a0:     private void countEviction() {
+1:86ee0a0:         if (collectAccessCounts) {
+1:86ee0a0:             evictions.getAndIncrement();
+1:86ee0a0:         }
+1:86ee0a0:     }
+1:86ee0a0: 
+1:86ee0a0:     /** Enable or disable collection of hit/miss/eviction counts. */
+1:86ee0a0:     void setCollectAccessCounts(boolean collect) {
+1:86ee0a0:         collectAccessCounts = collect;
+1:86ee0a0:     }
+1:86ee0a0: 
+1:86ee0a0:     /** Check if collection of hit/miss/eviction counts is enabled. */
+1:86ee0a0:     boolean getCollectAccessCounts() {
+1:86ee0a0:         return collectAccessCounts;
+1:86ee0a0:     }
+1:86ee0a0: 
+1:86ee0a0:     /** Get the number of cache hits. */
+1:86ee0a0:     long getHitCount() {
+1:86ee0a0:         return hits.get();
+1:86ee0a0:     }
+1:86ee0a0: 
+1:86ee0a0:     /** Get the number of cache misses. */
+1:86ee0a0:     long getMissCount() {
+1:86ee0a0:         return misses.get();
+1:86ee0a0:     }
+1:86ee0a0: 
+1:86ee0a0:     /** Get the number of evictions from the cache. */
+1:86ee0a0:     long getEvictionCount() {
+1:86ee0a0:         return evictions.get();
+1:86ee0a0:     }
+1:86ee0a0: 
+1:86ee0a0:     /** Get the maximum number of entries in the cache. */
+1:86ee0a0:     long getMaxEntries() {
+1:86ee0a0:         return maxSize;
+1:86ee0a0:     }
+1:86ee0a0: 
+1:6da88fc:     /** Get the number of allocated entries in the cache. */
+1:86ee0a0:     long getAllocatedEntries() {
+1:6da88fc:         return replacementPolicy.size();
+1:86ee0a0:     }
+1:86ee0a0: 
+1:6da88fc:     /** Get the number of cached objects. */
+1:86ee0a0:     long getUsedEntries() {
+1:6da88fc:         return cache.size();
+1:86ee0a0:     }
+1:56c1dc2:     
+1:56c1dc2:     /**
+1:56c1dc2:      * Privileged module lookup. Must be private so that user code
+1:56c1dc2:      * can't call this entry point.
+1:56c1dc2:      */
+1:56c1dc2:     private static  Object getSystemModule( final String factoryInterface )
+1:56c1dc2:     {
+1:56c1dc2:         return AccessController.doPrivileged
+1:56c1dc2:             (
+1:56c1dc2:              new PrivilegedAction<Object>()
+1:56c1dc2:              {
+1:56c1dc2:                  public Object run()
+1:56c1dc2:                  {
+1:56c1dc2:                      return Monitor.getSystemModule( factoryInterface );
+1:56c1dc2:                  }
+1:56c1dc2:              }
+1:56c1dc2:              );
+1:56c1dc2:     }
+1:56c1dc2: 
+1:a854464: }
+============================================================================
+author:Richard N. Hillegas
+-------------------------------------------------------------------------------
+commit:56c1dc2
+/////////////////////////////////////////////////////////////////////////
+1: import java.security.AccessController;
+1: import java.security.PrivilegedAction;
+/////////////////////////////////////////////////////////////////////////
+1:                 (ManagementService) getSystemModule(Module.JMX);
+/////////////////////////////////////////////////////////////////////////
+1:                 (ManagementService) getSystemModule(Module.JMX);
+/////////////////////////////////////////////////////////////////////////
+1:     
+1:     /**
+1:      * Privileged module lookup. Must be private so that user code
+1:      * can't call this entry point.
+1:      */
+1:     private static  Object getSystemModule( final String factoryInterface )
+1:     {
+1:         return AccessController.doPrivileged
+1:             (
+1:              new PrivilegedAction<Object>()
+1:              {
+1:                  public Object run()
+1:                  {
+1:                      return Monitor.getSystemModule( factoryInterface );
+1:                  }
+1:              }
+1:              );
+1:     }
+1: 
+author:Knut Anders Hatlen
+-------------------------------------------------------------------------------
+commit:6da88fc
+/////////////////////////////////////////////////////////////////////////
+1:         deregisterMBean();
+/////////////////////////////////////////////////////////////////////////
+1:     @Override
+1:     public void deregisterMBean() {
+1:         if (mbean != null) {
+1:             ManagementService managementService =
+0:                 (ManagementService) Monitor.getSystemModule(Module.JMX);
+1:             if (managementService != null) {
+1:                 managementService.unregisterMBean(mbean);
+1:             }
+1:             mbean = null;
+1:         }
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     /** Get the number of allocated entries in the cache. */
+1:         return replacementPolicy.size();
+1:     /** Get the number of cached objects. */
+1:         return cache.size();
+commit:86ee0a0
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.atomic.AtomicLong;
+1: import org.apache.derby.iapi.reference.Module;
+1: import org.apache.derby.iapi.services.jmx.ManagementService;
+1: import org.apache.derby.iapi.services.monitor.Monitor;
+1: import org.apache.derby.mbeans.CacheManagerMBean;
+/////////////////////////////////////////////////////////////////////////
+1:     // Fields used by the MBean that monitors this instance.
+1: 
+1:     /** The identifier of the MBean that allows monitoring of this instance. */
+1:     private Object mbean;
+1:     /** Flag that tells if hit/miss/eviction counts should be collected. */
+1:     private volatile boolean collectAccessCounts;
+1:     /** The number of cache hits. */
+1:     private final AtomicLong hits = new AtomicLong();
+1:     /** The number of cache misses. */
+1:     private final AtomicLong misses = new AtomicLong();
+1:     /** The number of evictions from the cache. */
+1:     private final AtomicLong evictions = new AtomicLong();
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         countEviction();
+/////////////////////////////////////////////////////////////////////////
+1:                 countHit();
+1:                 countMiss();
+/////////////////////////////////////////////////////////////////////////
+1:             countMiss();
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:                 countHit();
+1:             } else {
+1:                 countMiss();
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:         if (mbean != null) {
+1:             ManagementService managementService =
+0:                 (ManagementService) Monitor.getSystemModule(Module.JMX);
+1:             if (managementService != null) {
+0:                 managementService.unregisterMBean(mbean);
+1:             }
+1:         }
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:     @Override
+1:     public void registerMBean(String dbName) throws StandardException {
+1:         if (SanityManager.DEBUG) {
+1:             SanityManager.ASSERT(mbean == null, "registerMBean() called twice");
+1:         }
+1: 
+0:         ManagementService managementService =
+0:                 (ManagementService) Monitor.getSystemModule(Module.JMX);
+1: 
+0:         if (managementService != null) {
+1:             mbean = managementService.registerMBean(
+1:                     new ConcurrentCacheMBeanImpl(this),
+1:                     CacheManagerMBean.class,
+1:                     "type=CacheManager,name=" + name +
+1:                     ",db=" + managementService.quotePropertyValue(dbName));
+1:         }
+1:     }
+1: 
+1:     /** Count a cache hit. */
+1:     private void countHit() {
+1:         if (collectAccessCounts) {
+1:             hits.getAndIncrement();
+1:         }
+1:     }
+1: 
+1:     /** Count a cache miss. */
+1:     private void countMiss() {
+1:         if (collectAccessCounts) {
+1:             misses.getAndIncrement();
+1:         }
+1:     }
+1: 
+1:     /** Count an eviction from the cache. */
+1:     private void countEviction() {
+1:         if (collectAccessCounts) {
+1:             evictions.getAndIncrement();
+1:         }
+1:     }
+1: 
+1:     /** Enable or disable collection of hit/miss/eviction counts. */
+1:     void setCollectAccessCounts(boolean collect) {
+1:         collectAccessCounts = collect;
+1:     }
+1: 
+1:     /** Check if collection of hit/miss/eviction counts is enabled. */
+1:     boolean getCollectAccessCounts() {
+1:         return collectAccessCounts;
+1:     }
+1: 
+1:     /** Get the number of cache hits. */
+1:     long getHitCount() {
+1:         return hits.get();
+1:     }
+1: 
+1:     /** Get the number of cache misses. */
+1:     long getMissCount() {
+1:         return misses.get();
+1:     }
+1: 
+1:     /** Get the number of evictions from the cache. */
+1:     long getEvictionCount() {
+1:         return evictions.get();
+1:     }
+1: 
+1:     /** Get the maximum number of entries in the cache. */
+1:     long getMaxEntries() {
+1:         return maxSize;
+1:     }
+1: 
+0:     /** Get the number of allocated entries. */
+1:     long getAllocatedEntries() {
+0:         return cache.size();
+1:     }
+1: 
+0:     /** Get the number of allocated entries that hold valid objects. */
+1:     long getUsedEntries() {
+0:         return cache.size() - replacementPolicy.freeEntries();
+1:     }
+commit:2d09c33
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+commit:086dee2
+/////////////////////////////////////////////////////////////////////////
+1:                 // Found an entry in the cache, lock it.
+1:                 entry.lock();
+1:                 // If someone else is setting the identity of the Cacheable
+1:                 // in this entry, we'll need to wait for them to complete.
+1:                 entry.waitUntilIdentityIsSet();
+/////////////////////////////////////////////////////////////////////////
+1:         entry.lock();
+1:             // If the identity of the cacheable is being set, we need to wait
+1:             // for it to complete so that we don't return a cacheable that
+1:             // isn't fully initialized.
+1:             entry.waitUntilIdentityIsSet();
+commit:3141a3b
+/////////////////////////////////////////////////////////////////////////
+1:      * Evict an entry to make room for a new entry that is being inserted into
+1:      * the cache. Clear the identity of its {@code Cacheable} and set it to
+1:      * {@code null}. When this method is called, the caller has already chosen
+1:      * the {@code Cacheable} for reuse. Therefore, this method won't call
+1:      * {@code CacheEntry.free()} as that would make the {@code Cacheable} free
+1:      * for reuse by other entries as well.
+1:      *
+1:      * <p>
+1:      *
+1:      * The caller must have locked the entry that is about to be evicted.
+/////////////////////////////////////////////////////////////////////////
+1:         // Use get() instead of getEntry() so that we don't insert an empty
+1:         // entry if the requested object isn't there.
+/////////////////////////////////////////////////////////////////////////
+1:         // The entry must be present and kept when this method is called, so we
+1:         // don't need the complexity of getEntry() to ensure that the entry is
+1:         // not added to or removed from the cache before we have locked
+1:         // it. Just call get() which is cheaper.
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         // The entry must be present and kept when this method is called, so we
+1:         // don't need the complexity of getEntry() to ensure that the entry is
+1:         // not added to or removed from the cache before we have locked
+1:         // it. Just call get() which is cheaper.
+1: 
+commit:f30ee41
+/////////////////////////////////////////////////////////////////////////
+1:      * Insert a {@code CacheEntry} into a free slot in the {@code
+1:      * ReplacementPolicy}'s internal data structure, and return a {@code
+1:      * Cacheable} that the caller can reuse. The entry must have been locked
+1:      * before this method is called.
+1:      * @param key the identity of the object being inserted
+1:      * @param entry the entry that is being inserted
+1:      * @return a {@code Cacheable} object that the caller can reuse
+1:      * @throws StandardException if an error occurs while inserting the entry
+1:      * or while allocating a new {@code Cacheable}
+1:     private Cacheable insertIntoFreeSlot(Object key, CacheEntry entry)
+1:             replacementPolicy.insertEntry(entry);
+1:         } catch (StandardException se) {
+1:             // Failed to insert the entry into the replacement policy. Make
+1:             // sure that it's also removed from the hash table.
+1:             removeEntry(key);
+1:             throw se;
+1:         }
+1: 
+1:         Cacheable free = entry.getCacheable();
+1: 
+1:         if (free == null) {
+1:             // We didn't get a reusable cacheable. Create a new one.
+1:             free = holderFactory.newCacheable(this);
+1:         }
+1: 
+1:         entry.keep(true);
+1: 
+1:         return free;
+1:     }
+1: 
+1:     /**
+1:      * Complete the setting of the identity. This includes notifying the
+1:      * threads that are waiting for the setting of the identity to complete,
+1:      * so that they can wake up and continue. If setting the identity failed,
+1:      * the entry will be removed from the cache.
+1:      *
+1:      * @param key the identity of the object being inserted
+1:      * @param entry the entry which is going to hold the cached object
+1:      * @param item a {@code Cacheable} object with the identity set (if
+1:      * the identity was successfully set), or {@code null} if setting the
+1:      * identity failed
+1:      */
+1:     private void settingIdentityComplete(
+1:             Object key, CacheEntry entry, Cacheable item) {
+1:         entry.lock();
+1:         try {
+1:             entry.settingIdentityComplete();
+1:                 entry.setCacheable(item);
+1:             } else {
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         if (stopped) {
+1:             return null;
+1:         }
+1: 
+1:         CacheEntry entry = getEntry(key);
+1: 
+1:         Cacheable item;
+1:         try {
+1:             item = entry.getCacheable();
+1:             if (item != null) {
+1:                 // The object is already cached. Increase the use count and
+1:                 // return it.
+1:                 entry.keep(true);
+1:                 return item;
+1:             } else {
+1:                 // The object is not cached. Insert the entry into a free
+1:                 // slot and retrieve a reusable Cacheable.
+1:                 item = insertIntoFreeSlot(key, entry);
+1:             }
+1:         } finally {
+1:             entry.unlock();
+1:         }
+1: 
+1:         // Set the identity without holding the lock on the entry. If we
+1:         // hold the lock, we may run into a deadlock if the user code in
+1:         // setIdentity() re-enters the buffer manager.
+1:         Cacheable itemWithIdentity = null;
+1:         try {
+1:             itemWithIdentity = item.setIdentity(key);
+1:         } finally {
+1:             // Always invoke settingIdentityComplete(), also on error,
+1:             // otherwise other threads may wait forever. If setIdentity()
+1:             // fails, itemWithIdentity is going to be null.
+1:             settingIdentityComplete(key, entry, itemWithIdentity);
+1:         }
+1: 
+1:         return itemWithIdentity;
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         if (stopped) {
+1:             return null;
+1:         }
+1: 
+1:         CacheEntry entry = new CacheEntry();
+1:         entry.lock();
+1: 
+1:         if (cache.putIfAbsent(key, entry) != null) {
+1:             // We can't create the object if it's already in the cache.
+1:             throw StandardException.newException(
+1:                     SQLState.OBJECT_EXISTS_IN_CACHE, name, key);
+1:         }
+1: 
+1:         Cacheable item;
+1:         try {
+1:             item = insertIntoFreeSlot(key, entry);
+1:         } finally {
+1:             entry.unlock();
+1:         }
+1: 
+1:         // Create the identity without holding the lock on the entry.
+1:         // Otherwise, we may run into a deadlock if the user code in
+1:         // createIdentity() re-enters the buffer manager.
+1:         Cacheable itemWithIdentity = null;
+1:         try {
+1:             itemWithIdentity = item.createIdentity(key, createParameter);
+1:         } finally {
+1:             // Always invoke settingIdentityComplete(), also on error,
+1:             // otherwise other threads may wait forever. If createIdentity()
+1:             // fails, itemWithIdentity is going to be null.
+1:             settingIdentityComplete(key, entry, itemWithIdentity);
+1:         }
+1: 
+1:         return itemWithIdentity;
+commit:d7a1ddd
+/////////////////////////////////////////////////////////////////////////
+1:      * @param initialSize the initial capacity of the cache
+1:     ConcurrentCache(CacheableFactory holderFactory, String name,
+1:                     int initialSize, int maxSize) {
+1:         cache = new ConcurrentHashMap<Object, CacheEntry>(initialSize);
+1:         replacementPolicy = new ClockPolicy(this, initialSize, maxSize);
+commit:45c4ca4
+/////////////////////////////////////////////////////////////////////////
+1:      * not kept. If another thread is currently setting the identity of this
+1:      * entry, this method will block until the identity has been set.
+/////////////////////////////////////////////////////////////////////////
+0:                 // Found an entry in the cache. Lock it, but wait until its
+0:                 // identity has been set.
+0:                 entry.lockWhenIdentityIsSet();
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+0:      * Find or create an object in the cache. If the object is not presently
+0:      * in the cache, it will be added to the cache.
+0:      * @param key the identity of the object to find or create
+0:      * @param create whether or not the object should be created
+0:      * @param createParameter used as argument to <code>createIdentity()</code>
+0:      * when <code>create</code> is <code>true</code>
+1:      * @return the cached object, or <code>null</code> if it cannot be found
+0:      * @throws StandardException if an error happens when accessing the object
+0:     private Cacheable findOrCreateObject(Object key, boolean create,
+0:                                          Object createParameter)
+1: 
+1:         if (SanityManager.DEBUG) {
+0:             SanityManager.ASSERT(createParameter == null || create,
+0:                     "createParameter should be null when create is false");
+1:         }
+1: 
+1:         if (stopped) {
+1:             return null;
+1:         }
+1: 
+0:         // A free cacheable which we'll initialize if we don't find the object
+1:         // in the cache.
+0:         Cacheable free;
+1: 
+0:         CacheEntry entry = getEntry(key);
+1:         try {
+1:             Cacheable item = entry.getCacheable();
+1:             if (item != null) {
+0:                 if (create) {
+0:                     throw StandardException.newException(
+0:                             SQLState.OBJECT_EXISTS_IN_CACHE, name, key);
+1:                 }
+1:                 entry.keep(true);
+1:                 return item;
+1:             }
+1: 
+0:             // not currently in the cache
+1:             try {
+0:                 replacementPolicy.insertEntry(entry);
+0:             } catch (StandardException se) {
+1:                 removeEntry(key);
+0:                 throw se;
+1:             }
+1: 
+0:             free = entry.getCacheable();
+0:             if (free == null) {
+0:                 // We didn't get a reusable cacheable. Create a new one.
+0:                 free = holderFactory.newCacheable(this);
+1:             }
+1: 
+1:             entry.keep(true);
+1: 
+1:         } finally {
+1:             entry.unlock();
+1:         }
+1: 
+0:         // Set the identity in a try/finally so that we can remove the entry
+0:         // if the operation fails. We have released the lock on the entry so
+0:         // that we don't run into deadlocks if the user code (setIdentity() or
+0:         // createIdentity()) reenters the cache.
+0:                 c = free.createIdentity(key, createParameter);
+0:                 c = free.setIdentity(key);
+1:             entry.lock();
+1:             try {
+0:                 // Notify the entry that setIdentity() or createIdentity() has
+0:                 // finished.
+0:                 entry.settingIdentityComplete();
+1:                 if (c == null) {
+0:                     // Setting identity failed, or the object was not found.
+1:                     removeEntry(key);
+1:                 } else {
+0:                     // Successfully set the identity.
+0:                     entry.setCacheable(c);
+1:                 }
+1:             } finally {
+1:                 entry.unlock();
+/////////////////////////////////////////////////////////////////////////
+0:         return findOrCreateObject(key, false, null);
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         // Lock the entry, but wait until its identity has been set.
+0:         entry.lockWhenIdentityIsSet();
+/////////////////////////////////////////////////////////////////////////
+0:         return findOrCreateObject(key, true, createParameter);
+commit:d8bdc4c
+/////////////////////////////////////////////////////////////////////////
+1:      * Return the <code>ReplacementPolicy</code> instance for this cache.
+1:      *
+1:      * @return replacement policy
+1:      */
+1:     ReplacementPolicy getReplacementPolicy() {
+1:         return replacementPolicy;
+1:     }
+1: 
+1:     /**
+/////////////////////////////////////////////////////////////////////////
+0:         boolean shrunk = false;
+/////////////////////////////////////////////////////////////////////////
+0:                         shrunk = true;
+0:         if (shrunk) {
+0:             replacementPolicy.trimToSize();
+1:         }
+/////////////////////////////////////////////////////////////////////////
+0:         boolean shrunk = false;
+/////////////////////////////////////////////////////////////////////////
+0:                 shrunk = true;
+0:         if (shrunk) {
+0:             replacementPolicy.trimToSize();
+1:         }
+commit:651fa21
+/////////////////////////////////////////////////////////////////////////
+1:     /** The maximum size (number of elements) for this cache. */
+1:     private final int maxSize;
+/////////////////////////////////////////////////////////////////////////
+1:      * Background cleaner which can be used to clean cached objects in a
+1:      * separate thread to avoid blocking the user threads.
+1:      */
+1:     private BackgroundCleaner cleaner;
+1: 
+1:     /**
+/////////////////////////////////////////////////////////////////////////
+1:         this.maxSize = maxSize;
+/////////////////////////////////////////////////////////////////////////
+0:             entry.keep(true);
+/////////////////////////////////////////////////////////////////////////
+0:                 entry.keep(true);
+/////////////////////////////////////////////////////////////////////////
+0:                 entry.keep(true);
+/////////////////////////////////////////////////////////////////////////
+1:             final Cacheable dirtyObject;
+1:                 if (!entry.isValid()) {
+1:                     // no need to clean an invalid entry
+1:                     continue;
+1:                 Cacheable c = entry.getCacheable();
+1:                 if (partialKey != null && !partialKey.match(c.getIdentity())) {
+1:                     // don't clean objects that don't match the partial key
+1:                     continue;
+1:                 }
+1:                 if (!c.isDirty()) {
+1:                     // already clean
+1:                     continue;
+1:                 }
+1: 
+1:                 // Increment the keep count for this entry to prevent others
+1:                 // from removing it. Then release the lock on the entry to
+1:                 // avoid blocking others when the object is cleaned.
+1:                 entry.keep(false);
+1:                 dirtyObject = c;
+1: 
+1:             } finally {
+1:                 entry.unlock();
+1:             }
+1: 
+1:             // Clean the object and decrement the keep count.
+1:             cleanAndUnkeepEntry(entry, dirtyObject);
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Clean an entry in the cache.
+1:      *
+1:      * @param entry the entry to clean
+1:      * @exception StandardException if an error occurs while cleaning
+1:      */
+1:     void cleanEntry(CacheEntry entry) throws StandardException {
+1:         // Fetch the cacheable while having exclusive access to the entry.
+1:         // Release the lock before cleaning to avoid blocking others.
+1:         Cacheable item;
+1:         entry.lock();
+1:         try {
+1:             item = entry.getCacheable();
+1:             if (item == null) {
+1:                 // nothing to do
+1:                 return;
+1:             }
+1:             entry.keep(false);
+1:         } finally {
+1:             entry.unlock();
+1:         }
+1:         cleanAndUnkeepEntry(entry, item);
+1:     }
+1: 
+1:     /**
+1:      * Clean an entry in the cache and decrement its keep count. The entry must
+1:      * be kept before this method is called, and it must contain the specified
+1:      * <code>Cacheable</code>.
+1:      *
+1:      * @param entry the entry to clean
+1:      * @param item the cached object contained in the entry
+1:      * @exception StandardException if an error occurs while cleaning
+1:      */
+1:     void cleanAndUnkeepEntry(CacheEntry entry, Cacheable item)
+1:             throws StandardException {
+1:         try {
+1:             // Clean the cacheable while we're not holding
+1:             // the lock on its entry.
+1:             item.clean(false);
+1:         } finally {
+1:             // Re-obtain the lock on the entry, and reduce the keep count
+1:             // since the entry should not be kept by the cleaner any longer.
+1:             entry.lock();
+1:             try {
+1:                 if (SanityManager.DEBUG) {
+1:                     // Since the entry is kept, the Cacheable shouldn't
+1:                     // have changed.
+1:                     SanityManager.ASSERT(entry.getCacheable() == item,
+1:                             "CacheEntry didn't contain the expected Cacheable");
+1:                 }
+1:                 entry.unkeep();
+/////////////////////////////////////////////////////////////////////////
+1:         if (cleaner != null) {
+1:             cleaner.unsubscribe();
+1:         }
+1:     /**
+1:      * Specify a daemon service that can be used to perform operations in
+1:      * the background. Callers must provide enough synchronization so that
+1:      * they have exclusive access to the cache when this method is called.
+1:      *
+1:      * @param daemon the daemon service to use
+1:      */
+1:         if (cleaner != null) {
+1:             cleaner.unsubscribe();
+1:         }
+1:         // Create a background cleaner that can queue up 1/10 of the elements
+0:         // in the cache.
+1:         cleaner = new BackgroundCleaner(this, daemon, Math.max(maxSize/10, 1));
+1:     }
+1: 
+1:     BackgroundCleaner getBackgroundCleaner() {
+1:         return cleaner;
+commit:7a816cb
+/////////////////////////////////////////////////////////////////////////
+1:     /** Replacement policy to be used for this cache. */
+1:     private final ReplacementPolicy replacementPolicy;
+/////////////////////////////////////////////////////////////////////////
+1:      * @param maxSize maximum number of elements in the cache
+0:     ConcurrentCache(CacheableFactory holderFactory, String name, int maxSize) {
+0:         replacementPolicy = new ClockPolicy(this, maxSize);
+/////////////////////////////////////////////////////////////////////////
+0:      * @exception StandardException if an error occurs during the search for
+0:      * a free cacheable
+0:     private void findFreeCacheable(CacheEntry entry) throws StandardException {
+0:         replacementPolicy.insertEntry(entry);
+0:         if (!entry.isValid()) {
+0:             entry.setCacheable(holderFactory.newCacheable(this));
+1:         }
+1:      * if the entry is present in the cache and locked by the current thread.
+/////////////////////////////////////////////////////////////////////////
+1:             c.clearIdentity();
+1:         entry.free();
+1:     }
+1: 
+1:     /**
+0:      * Remove an entry from the cache. Clear the identity of its
+0:      * <code>Cacheable</code> and set it to null. This method is called when
+0:      * the replacement algorithm needs to evict an entry from the cache in
+0:      * order to make room for a new entry. The caller must have locked the
+0:      * entry that is about to be evicted.
+1:      *
+1:      * @param key identity of the entry to remove
+1:      */
+1:     void evictEntry(Object key) {
+1:         CacheEntry entry = cache.remove(key);
+1:         entry.getCacheable().clearIdentity();
+commit:df17cb0
+/////////////////////////////////////////////////////////////////////////
+1:         Cacheable c = entry.getCacheable();
+1:         if (c != null && c.getIdentity() != null) {
+1:             // The cacheable should not have an identity when it has been
+1:             // removed.
+0:             entry.getCacheable().clearIdentity();
+1:         }
+1:     /**
+0:      * Initialize an entry by finding a free <code>Cacheable</code> and setting
+0:      * its identity. If the identity is successfully set, the entry is kept and
+0:      * the <code>Cacheable</code> is inserted into the entry and returned.
+0:      * Otherwise, the entry is removed from the cache and <code>null</code>
+0:      * is returned.
+1:      *
+0:      * @param entry the entry to initialize
+0:      * @param key the identity to set
+0:      * @param createParameter parameter to <code>createIdentity()</code>
+0:      * (ignored if <code>create</code> is <code>false</code>)
+0:      * @param create if <code>true</code>, create new identity with
+0:      * <code>Cacheable.createIdentity()</code>; otherwise, set identity with
+0:      * <code>Cacheable.setIdentity()</code>
+0:      * @return a <code>Cacheable</code> if the identity could be set,
+0:      * <code>null</code> otherwise
+0:      * @exception StandardException if an error occured while searching for a
+0:      * free <code>Cacheable</code> or while setting the identity
+0:      * @see Cacheable#setIdentity(Object)
+1:      * @see Cacheable#createIdentity(Object,Object)
+1:      */
+0:     private Cacheable initIdentity(CacheEntry entry,
+0:             Object key, Object createParameter, boolean create)
+1:             throws StandardException {
+0:         Cacheable c = null;
+1:         try {
+0:             findFreeCacheable(entry);
+0:             if (create) {
+0:                 c = entry.getCacheable().createIdentity(key, createParameter);
+1:             } else {
+0:                 c = entry.getCacheable().setIdentity(key);
+1:             }
+1:         } finally {
+0:             if (c == null) {
+0:                 // Either an exception was thrown, or setIdentity() or
+0:                 // createIdentity() returned null. In either case, the entry is
+0:                 // invalid and must be removed.
+0:                 removeEntry(key);
+1:             }
+1:         }
+1: 
+0:         // If we successfully set the identity, insert the cacheable and mark
+0:         // the entry as kept.
+1:         if (c != null) {
+0:             entry.setCacheable(c);
+0:             entry.keep();
+1:         }
+0:         return c;
+1:     }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             if (item != null) {
+0:                 entry.keep();
+0:                 return item;
+0:             // not currently in the cache
+0:             return initIdentity(entry, key, null, false);
+/////////////////////////////////////////////////////////////////////////
+0:             return initIdentity(entry, key, createParameter, true);
+commit:dbc7584
+/////////////////////////////////////////////////////////////////////////
+0:      * Find a free cacheable and give the specified entry a pointer to it. If
+0:      * a free cacheable cannot be found, allocate a new one. The entry must be
+0:      * locked by the current thread.
+0:      * @param entry the entry for which a <code>Cacheable</code> is needed
+0:     private void findFreeCacheable(CacheEntry entry) {
+0:         entry.setCacheable(holderFactory.newCacheable(this));
+/////////////////////////////////////////////////////////////////////////
+1:      * @param key the identity of the entry to remove
+1:     private void removeEntry(Object key) {
+1:         CacheEntry entry = cache.remove(key);
+0:         entry.getCacheable().clearIdentity();
+/////////////////////////////////////////////////////////////////////////
+0:                 findFreeCacheable(entry);
+0:                 item = entry.getCacheable().setIdentity(key);
+0:                     removeEntry(key);
+/////////////////////////////////////////////////////////////////////////
+0:             findFreeCacheable(entry);
+0:             Cacheable c =
+0:                     entry.getCacheable().createIdentity(key, createParameter);
+0:                 // Could not create an object with that identity. Remove the
+0:                 // entry from the cache.
+0:                 removeEntry(key);
+/////////////////////////////////////////////////////////////////////////
+1:         Object key = item.getIdentity();
+1:         CacheEntry entry = cache.get(key);
+/////////////////////////////////////////////////////////////////////////
+0:             removeEntry(key);
+/////////////////////////////////////////////////////////////////////////
+1:                         removeEntry(c.getIdentity());
+/////////////////////////////////////////////////////////////////////////
+1:                 removeEntry(c.getIdentity());
+commit:e450130
+/////////////////////////////////////////////////////////////////////////
+1:      * Flag that indicates whether this cache instance has been shut down. When
+1:      * it has been stopped, <code>find()</code>, <code>findCached()</code> and
+1:      * <code>create()</code> will return <code>null</code>. The flag is
+1:      * declared <code>volatile</code> so that no synchronization is needed when
+1:      * it is accessed by concurrent threads.
+1:      */
+1:     private volatile boolean stopped;
+1: 
+1:     /**
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:         if (stopped) {
+1:             return null;
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:         if (stopped) {
+0:             return null;
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1: 
+0:         if (stopped) {
+0:             return null;
+1:         }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Shut down the cache.
+1:      */
+0:         // TODO - unsubscribe background writer
+1:         stopped = true;
+1:         cleanAll();
+1:         ageOut();
+commit:a854464
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.ArrayList;
+/////////////////////////////////////////////////////////////////////////
+1:     /**
+1:      * Return a collection view of all the <code>Cacheable</code>s in the
+1:      * cache. There is no guarantee that the objects in the collection can be
+1:      * accessed in a thread-safe manner once this method has returned, so it
+1:      * should only be used for diagnostic purposes. (Currently, it is only used
+1:      * by the <code>StatementCache</code> VTI.)
+1:      *
+1:      * @return a collection view of the objects in the cache
+1:      */
+1:     public Collection<Cacheable> values() {
+1:         ArrayList<Cacheable> values = new ArrayList<Cacheable>();
+1:         for (CacheEntry entry : cache.values()) {
+1:             entry.lock();
+1:             try {
+1:                 Cacheable c = entry.getCacheable();
+0:                 if (c != null) {
+1:                     values.add(c);
+1:                 }
+1:             } finally {
+1:                 entry.unlock();
+1:             }
+1:         }
+1:         return values;
+commit:73a34db
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1: 
+1:    Derby - Class org.apache.derby.impl.services.cache.ConcurrentCache
+1: 
+1:    Licensed to the Apache Software Foundation (ASF) under one or more
+1:    contributor license agreements.  See the NOTICE file distributed with
+1:    this work for additional information regarding copyright ownership.
+1:    The ASF licenses this file to you under the Apache License, Version 2.0
+1:    (the "License"); you may not use this file except in compliance with
+1:    the License.  You may obtain a copy of the License at
+1: 
+1:       http://www.apache.org/licenses/LICENSE-2.0
+1: 
+1:    Unless required by applicable law or agreed to in writing, software
+1:    distributed under the License is distributed on an "AS IS" BASIS,
+1:    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:    See the License for the specific language governing permissions and
+1:    limitations under the License.
+1: 
+1:  */
+1: 
+1: package org.apache.derby.impl.services.cache;
+1: 
+1: import java.util.Collection;
+1: import java.util.concurrent.ConcurrentHashMap;
+1: import org.apache.derby.iapi.error.StandardException;
+1: import org.apache.derby.iapi.reference.SQLState;
+1: import org.apache.derby.iapi.services.cache.CacheManager;
+1: import org.apache.derby.iapi.services.cache.Cacheable;
+1: import org.apache.derby.iapi.services.cache.CacheableFactory;
+1: import org.apache.derby.iapi.services.daemon.DaemonService;
+0: import org.apache.derby.iapi.services.sanity.SanityManager;
+1: import org.apache.derby.iapi.util.Matchable;
+1: 
+1: /**
+1:  * A cache manager based on the utilities found in the
+1:  * <code>java.util.concurrent</code> package. It allows multiple threads to
+1:  * access the cache concurrently without blocking each other, given that they
+1:  * request different objects and the requested objects are present in the
+1:  * cache.
+1:  *
+1:  * <p>
+1:  *
+1:  * All methods of this class should be thread safe. When exclusive access to an
+1:  * entry is required, it is achieved by calling the <code>lock()</code> method
+1:  * on the <code>CacheEntry</code> object. To ensure that the entry is always
+1:  * unlocked, all calls to <code>CacheEntry.lock()</code> should be followed by
+1:  * a <code>try</code> block with a <code>finally</code> clause that unlocks the
+1:  * entry.
+1:  */
+1: final class ConcurrentCache implements CacheManager {
+1: 
+1:     /** Map with all the cached objects. */
+1:     private final ConcurrentHashMap<Object, CacheEntry> cache;
+1:     /** Factory which creates <code>Cacheable</code>s. */
+1:     private final CacheableFactory holderFactory;
+1:     /** Name of this cache. */
+1:     private final String name;
+1: 
+1:     /**
+1:      * Creates a new cache manager.
+1:      *
+1:      * @param holderFactory factory which creates <code>Cacheable</code>s
+1:      * @param name the name of the cache
+1:      */
+0:     ConcurrentCache(CacheableFactory holderFactory, String name) {
+0:         cache = new ConcurrentHashMap<Object, CacheEntry>();
+1:         this.holderFactory = holderFactory;
+1:         this.name = name;
+1:     }
+1: 
+1:     /**
+1:      * Get the entry associated with the specified key from the cache. If the
+1:      * entry does not exist, insert an empty one and return it. The returned
+1:      * entry is always locked for exclusive access by the current thread, but
+0:      * not kept.
+1:      *
+1:      * @param key the identity of the cached object
+1:      * @return an entry for the specified key, always locked
+1:      */
+1:     private CacheEntry getEntry(Object key) {
+1:         CacheEntry entry = cache.get(key);
+1:         while (true) {
+1:             if (entry != null) {
+0:                 // Found an entry in the cache. Lock it and validate that it's
+0:                 // still there.
+1:                 entry.lock();
+1:                 if (entry.isValid()) {
+1:                     // Entry is still valid. Return it.
+1:                     return entry;
+1:                 } else {
+1:                     // This entry has been removed from the cache while we were
+1:                     // waiting for the lock. Unlock it and try again.
+1:                     entry.unlock();
+1:                     entry = cache.get(key);
+1:                 }
+1:             } else {
+1:                 CacheEntry freshEntry = new CacheEntry();
+1:                 // Lock the entry before it's inserted to avoid window for
+1:                 // others to remove it.
+1:                 freshEntry.lock();
+1:                 CacheEntry oldEntry = cache.putIfAbsent(key, freshEntry);
+1:                 if (oldEntry != null) {
+1:                     // Someone inserted the entry while we created a new
+1:                     // one. Retry with the entry currently in the cache. Don't
+1:                     // bother unlocking freshEntry since no one else could have
+1:                     // seen it.
+1:                     entry = oldEntry;
+1:                 } else {
+1:                     // We successfully inserted a new entry.
+1:                     return freshEntry;
+1:                 }
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+0:      * Find a free cacheable. If a free one cannot be found, allocate a new
+0:      * one.
+1:      *
+0:      * @return a cacheable with no identity
+1:      */
+0:     private Cacheable findFreeCacheable() {
+0:         // TODO - When the replacement algorithm has been implemented, we
+0:         // should reuse a cacheable if possible.
+0:         return holderFactory.newCacheable(this);
+1:     }
+1: 
+1:     /**
+1:      * Remove an entry from the cache. Its <code>Cacheable</code> is cleared
+1:      * and made available for other entries. This method should only be called
+0:      * if the entry is locked by the current thread.
+1:      *
+0:      * @param entry the entry to remove from the cache
+1:      */
+0:     private void removeEntry(CacheEntry entry) {
+1:         Cacheable c = entry.getCacheable();
+0:         cache.remove(c.getIdentity());
+1:         entry.setCacheable(null);
+0:         c.clearIdentity();
+0:         // TODO - When replacement policy is implemented, return the
+0:         // cacheable to the free list
+1:     }
+1: 
+1:     // Implementation of the CacheManager interface
+1: 
+1:     /**
+1:      * Find an object in the cache. If it is not present, add it to the
+1:      * cache. The returned object is kept until <code>release()</code> is
+1:      * called.
+1:      *
+1:      * @param key identity of the object to find
+0:      * @return the cached object, or <code>null</code> if it cannot be found
+1:      */
+1:     public Cacheable find(Object key) throws StandardException {
+0:         CacheEntry entry = getEntry(key);
+1:         try {
+0:             Cacheable item = entry.getCacheable();
+0:             if (item == null) {
+0:                 // not currently in the cache
+0:                 Cacheable free = findFreeCacheable();
+0:                 item = free.setIdentity(key);
+0:                 if (item == null) {
+0:                     // Could not find an object with that identity. Remove its
+0:                     // entry from the cache and return null.
+0:                     cache.remove(key);
+1: 
+0:                     // TODO - When the replacement algorithm has been
+0:                     // implemented, the cacheable (free) should be returned to
+0:                     // the free list.
+1: 
+0:                     return null;
+1:                 }
+0:                 entry.setCacheable(item);
+1:             }
+0:             // increase keep count to prevent others from removing the entry
+0:             // while it's not locked
+0:             entry.keep();
+0:             return item;
+1:         } finally {
+1:             entry.unlock();
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Find an object in the cache. If it is not present, return
+1:      * <code>null</code>. The returned object is kept until
+1:      * <code>release()</code> is called.
+1:      *
+1:      * @param key identity of the object to find
+1:      * @return the cached object, or <code>null</code> if it's not in the cache
+1:      */
+1:     public Cacheable findCached(Object key) throws StandardException {
+0:         // We don't want to insert it if it's not there, so there's no need to
+0:         // use getEntry().
+1:         CacheEntry entry = cache.get(key);
+1:         if (entry == null) {
+1:             // No such object was found in the cache.
+0:             return null;
+1:         }
+1:         entry.lock();
+1:         try {
+1:             // Return the cacheable. If the entry was removed right before we
+1:             // locked it, getCacheable() returns null and so should we do.
+0:             Cacheable item = entry.getCacheable();
+0:             if (item != null) {
+0:                 entry.keep();
+1:             }
+0:             return item;
+1:         } finally {
+1:             entry.unlock();
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Create an object in the cache. The object is kept until
+1:      * <code>release()</code> is called.
+1:      *
+1:      * @param key identity of the object to create
+1:      * @param createParameter parameters passed to
+1:      * <code>Cacheable.createIdentity()</code>
+1:      * @return a reference to the cached object, or <code>null</code> if the
+1:      * object cannot be created
+1:      * @exception StandardException if the object is already in the cache, or
+1:      * if some other error occurs
+0:      * @see Cacheable#createIdentity(Object,Object)
+1:      */
+1:     public Cacheable create(Object key, Object createParameter)
+1:             throws StandardException {
+0:         CacheEntry entry = getEntry(key);
+1:         try {
+1:             if (entry.isValid()) {
+0:                 throw StandardException.newException(
+0:                     SQLState.OBJECT_EXISTS_IN_CACHE, name, key);
+1:             }
+0:             Cacheable free = findFreeCacheable();
+0:             Cacheable c = free.createIdentity(key, createParameter);
+0:             if (c != null) {
+0:                 entry.setCacheable(c);
+0:                 entry.keep();
+1:             } else {
+0:                 // TODO - When replacement policy is implemented, return the
+0:                 // cacheable (free) to the free list
+1:             }
+0:             return c;
+1:         } finally {
+1:             entry.unlock();
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Release an object that has been fetched from the cache with
+1:      * <code>find()</code>, <code>findCached()</code> or <code>create()</code>.
+1:      *
+1:      * @param item a <code>Cacheable</code> value
+1:      */
+1:     public void release(Cacheable item) {
+0:         // The entry must be present, so we don't need to call getEntry().
+1:         CacheEntry entry = cache.get(item.getIdentity());
+1:         entry.lock();
+1:         try {
+1:             if (SanityManager.DEBUG) {
+1:                 SanityManager.ASSERT(item == entry.getCacheable());
+1:             }
+1:             entry.unkeep();
+1:         } finally {
+1:             entry.unlock();
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Remove an object from the cache. The object must previously have been
+1:      * fetched from the cache with <code>find()</code>,
+1:      * <code>findCached()</code> or <code>create()</code>. The user of the
+1:      * cache must make sure that only one caller executes this method on a
+1:      * cached object. This method will wait until the object has been removed
+1:      * (its keep count must drop to zero before it can be removed).
+1:      *
+1:      * @param item the object to remove from the cache
+1:      */
+1:     public void remove(Cacheable item) throws StandardException {
+0:         // The entry must be present, so we don't need to call getEntry().
+1:         CacheEntry entry = cache.get(item.getIdentity());
+1:         entry.lock();
+1:         try {
+1:             if (SanityManager.DEBUG) {
+1:                 SanityManager.ASSERT(item == entry.getCacheable());
+1:             }
+1:             entry.unkeepForRemove();
+1:             item.clean(true);
+0:             removeEntry(entry);
+1:         } finally {
+1:             entry.unlock();
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Clean all dirty objects in the cache. All objects that existed in the
+1:      * cache at the time of the call will be cleaned. Objects added later may
+1:      * or may not be cleaned.
+1:      */
+1:     public void cleanAll() throws StandardException {
+1:         cleanCache(null);
+1:     }
+1: 
+1:     /**
+1:      * Clean all dirty objects matching a partial key.
+1:      *
+1:      * @param partialKey the partial (or exact) key to match
+1:      */
+1:     public void clean(Matchable partialKey) throws StandardException {
+1:         cleanCache(partialKey);
+1:     }
+1: 
+1:     /**
+1:      * Clean all dirty objects matching a partial key. If no key is specified,
+1:      * clean all dirty objects in the cache.
+1:      *
+1:      * @param partialKey the partial (or exact) key to match, or
+1:      * <code>null</code> to match all keys
+1:      */
+1:     private void cleanCache(Matchable partialKey) throws StandardException {
+1:         for (CacheEntry entry : cache.values()) {
+1:             entry.lock();
+1:             try {
+1:                 Cacheable c = entry.getCacheable();
+0:                 if (c != null && c.isDirty() &&
+0:                         (partialKey == null ||
+0:                              partialKey.match(c.getIdentity()))) {
+0:                     c.clean(false);
+1:                 }
+1:             } finally {
+1:                 entry.unlock();
+1:             }
+1:         }
+1:     }
+1: 
+1:     /**
+1:      * Remove all objects that are not kept and not dirty.
+1:      */
+1:     public void ageOut() {
+1:         for (CacheEntry entry : cache.values()) {
+1:             entry.lock();
+1:             try {
+1:                 // never remove kept entries
+1:                 if (!entry.isKept()) {
+1:                     Cacheable c = entry.getCacheable();
+1:                     // If c is null, it's not in the cache and there's no need
+1:                     // to remove it. If c is dirty, we can't remove it yet.
+1:                     if (c != null && !c.isDirty()) {
+0:                         removeEntry(entry);
+1:                     }
+1:                 }
+1:             } finally {
+1:                 entry.unlock();
+1:             }
+1:         }
+1:     }
+1: 
+1:     public void shutdown() throws StandardException {
+0:         // TODO
+1:     }
+1: 
+1:     public void useDaemonService(DaemonService daemon) {
+0:         // TODO
+1:     }
+1: 
+1:     /**
+1:      * Discard all unused objects that match a partial key. Dirty objects will
+1:      * not be cleaned before their removal.
+1:      *
+1:      * @param partialKey the partial (or exact) key, or <code>null</code> to
+1:      * match all keys
+1:      * @return <code>true</code> if all matching objects were removed,
+1:      * <code>false</code> otherwise
+1:      */
+1:     public boolean discard(Matchable partialKey) {
+1:         boolean allRemoved = true;
+1:         for (CacheEntry entry : cache.values()) {
+1:             entry.lock();
+1:             try {
+1:                 Cacheable c = entry.getCacheable();
+0:                 if (c == null) {
+1:                     // not in the cache - no need to remove it
+1:                     continue;
+1:                 }
+1:                 if (partialKey != null && !partialKey.match(c.getIdentity())) {
+1:                     // not a match, don't remove it
+1:                     continue;
+1:                 }
+1:                 if (entry.isKept()) {
+1:                     // still in use, don't remove it
+1:                     allRemoved = false;
+1:                     continue;
+1:                 }
+0:                 removeEntry(entry);
+1:             } finally {
+1:                 entry.unlock();
+1:             }
+1:         }
+1:         return allRemoved;
+1:     }
+1: 
+0:     public Collection values() {
+0:         // TODO
+0:         return null;
+1:     }
+1: }
+author:Bryan Pendleton
+-------------------------------------------------------------------------------
+commit:7e51e9d
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.derby.shared.common.sanity.SanityManager;
+============================================================================

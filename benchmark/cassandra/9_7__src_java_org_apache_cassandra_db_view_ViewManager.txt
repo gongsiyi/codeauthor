@@ -1,0 +1,600 @@
+1:a3a8dbc: /*
+1:a3a8dbc:  * Licensed to the Apache Software Foundation (ASF) under one
+1:a3a8dbc:  * or more contributor license agreements.  See the NOTICE file
+1:a3a8dbc:  * distributed with this work for additional information
+1:a3a8dbc:  * regarding copyright ownership.  The ASF licenses this file
+1:a3a8dbc:  * to you under the Apache License, Version 2.0 (the
+1:a3a8dbc:  * "License"); you may not use this file except in compliance
+1:a3a8dbc:  * with the License.  You may obtain a copy of the License at
+1:a3a8dbc:  *
+1:a3a8dbc:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:a3a8dbc:  *
+1:a3a8dbc:  * Unless required by applicable law or agreed to in writing, software
+1:a3a8dbc:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:a3a8dbc:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:a3a8dbc:  * See the License for the specific language governing permissions and
+1:a3a8dbc:  * limitations under the License.
+2:a3a8dbc:  */
+1:a3a8dbc: package org.apache.cassandra.db.view;
+1:2bc5f0c: 
+1:62ffa35: import java.util.*;
+1:86ba227: import java.util.concurrent.ConcurrentMap;
+1:86ba227: import java.util.concurrent.ConcurrentHashMap;
+1:a3a8dbc: import java.util.concurrent.locks.Lock;
+15:a3a8dbc: 
+1:a3a8dbc: import com.google.common.util.concurrent.Striped;
+1:86ba227: import org.slf4j.Logger;
+1:86ba227: import org.slf4j.LoggerFactory;
+1:a3a8dbc: 
+1:86ba227: import org.apache.cassandra.config.CFMetaData;
+1:a3a8dbc: import org.apache.cassandra.config.DatabaseDescriptor;
+1:a3a8dbc: import org.apache.cassandra.config.ViewDefinition;
+1:62ffa35: import org.apache.cassandra.db.*;
+1:86ba227: import org.apache.cassandra.db.partitions.*;
+1:21448c5: import org.apache.cassandra.repair.SystemDistributedKeyspace;
+1:2bc5f0c: import org.apache.cassandra.service.StorageService;
+1:86ba227: 
+2:a3a8dbc: /**
+1:a3a8dbc:  * Manages {@link View}'s for a single {@link ColumnFamilyStore}. All of the views for that table are created when this
+1:a3a8dbc:  * manager is initialized.
+1:a3a8dbc:  *
+1:a3a8dbc:  * The main purposes of the manager are to provide a single location for updates to be vetted to see whether they update
+1:fe7eee0:  * any views {@link #updatesAffectView(Collection, boolean)}, provide locks to prevent multiple
+1:fe7eee0:  * updates from creating incoherent updates in the view {@link #acquireLockFor(int)}, and
+1:a3a8dbc:  * to affect change on the view.
+1:86ba227:  *
+1:86ba227:  * TODO: I think we can get rid of that class. For addition/removal of view by names, we could move it Keyspace. And we
+1:86ba227:  * not sure it's even worth keeping viewsByName as none of the related operation are performance sensitive so we could
+1:86ba227:  * find the view by iterating over the CFStore.viewManager directly.
+1:86ba227:  * For the lock, it could move to Keyspace too, but I don't remmenber why it has to be at the keyspace level and if it
+1:86ba227:  * can be at the table level, maybe that's where it should be.
+1:a3a8dbc:  */
+1:a3a8dbc: public class ViewManager
+15:a3a8dbc: {
+1:83f8ccc:     private static final Logger logger = LoggerFactory.getLogger(ViewManager.class);
+1:a3a8dbc: 
+1:a3a8dbc:     private static final Striped<Lock> LOCKS = Striped.lazyWeakLock(DatabaseDescriptor.getConcurrentViewWriters() * 1024);
+1:a3a8dbc: 
+1:a3a8dbc:     private static final boolean enableCoordinatorBatchlog = Boolean.getBoolean("cassandra.mv_enable_coordinator_batchlog");
+1:a3a8dbc: 
+1:86ba227:     private final ConcurrentMap<String, View> viewsByName = new ConcurrentHashMap<>();
+1:86ba227:     private final ConcurrentMap<UUID, TableViews> viewsByBaseTable = new ConcurrentHashMap<>();
+1:a3a8dbc:     private final Keyspace keyspace;
+1:a3a8dbc: 
+1:a3a8dbc:     public ViewManager(Keyspace keyspace)
+1:a3a8dbc:     {
+1:a3a8dbc:         this.keyspace = keyspace;
+15:a3a8dbc:     }
+1:a3a8dbc: 
+1:a3a8dbc:     public boolean updatesAffectView(Collection<? extends IMutation> mutations, boolean coordinatorBatchlog)
+1:a3a8dbc:     {
+1:54836ec:         if (!enableCoordinatorBatchlog && coordinatorBatchlog)
+1:a3a8dbc:             return false;
+1:a3a8dbc: 
+1:a3a8dbc:         for (IMutation mutation : mutations)
+1:a3a8dbc:         {
+1:86ba227:             for (PartitionUpdate update : mutation.getPartitionUpdates())
+1:a3a8dbc:             {
+1:86ba227:                 assert keyspace.getName().equals(update.metadata().ksName);
+1:a3a8dbc: 
+1:a3a8dbc:                 if (coordinatorBatchlog && keyspace.getReplicationStrategy().getReplicationFactor() == 1)
+2:a3a8dbc:                     continue;
+1:a3a8dbc: 
+1:86ba227:                 if (!forTable(update.metadata()).updatedViews(update).isEmpty())
+1:86ba227:                     return true;
+1:a3a8dbc:             }
+1:a3a8dbc:         }
+1:a3a8dbc: 
+1:a3a8dbc:         return false;
+1:a3a8dbc:     }
+1:a3a8dbc: 
+1:86ba227:     private Iterable<View> allViews()
+1:a3a8dbc:     {
+2:a3a8dbc:         return viewsByName.values();
+1:a3a8dbc:     }
+1:a3a8dbc: 
+1:a3a8dbc:     public void update(String viewName)
+1:a3a8dbc:     {
+1:a3a8dbc:         View view = viewsByName.get(viewName);
+1:a3a8dbc:         assert view != null : "When updating a view, it should already be in the ViewManager";
+1:a3a8dbc:         view.build();
+1:a3a8dbc: 
+1:a3a8dbc:         // We provide the new definition from the base metadata
+1:a3a8dbc:         Optional<ViewDefinition> viewDefinition = keyspace.getMetadata().views.get(viewName);
+1:a3a8dbc:         assert viewDefinition.isPresent() : "When updating a view, it should still be in the Keyspaces views";
+1:a3a8dbc:         view.updateDefinition(viewDefinition.get());
+1:a3a8dbc:     }
+1:a3a8dbc: 
+1:a3a8dbc:     public void reload()
+1:a3a8dbc:     {
+1:a3a8dbc:         Map<String, ViewDefinition> newViewsByName = new HashMap<>();
+1:a3a8dbc:         for (ViewDefinition definition : keyspace.getMetadata().views)
+1:a3a8dbc:         {
+1:a3a8dbc:             newViewsByName.put(definition.viewName, definition);
+1:a3a8dbc:         }
+1:a3a8dbc: 
+1:a3a8dbc:         for (String viewName : viewsByName.keySet())
+1:a3a8dbc:         {
+1:a3a8dbc:             if (!newViewsByName.containsKey(viewName))
+1:a3a8dbc:                 removeView(viewName);
+1:a3a8dbc:         }
+1:a3a8dbc: 
+1:a3a8dbc:         for (Map.Entry<String, ViewDefinition> entry : newViewsByName.entrySet())
+1:a3a8dbc:         {
+1:a3a8dbc:             if (!viewsByName.containsKey(entry.getKey()))
+1:a3a8dbc:                 addView(entry.getValue());
+1:a3a8dbc:         }
+1:a3a8dbc: 
+1:2bc5f0c:         // Building views involves updating view build status in the system_distributed
+1:2bc5f0c:         // keyspace and therefore it requires ring information. This check prevents builds
+1:2bc5f0c:         // being submitted when Keyspaces are initialized during CassandraDaemon::setup as
+1:2bc5f0c:         // that happens before StorageService & gossip are initialized. After SS has been
+1:2bc5f0c:         // init'd we schedule builds for *all* views anyway, so this doesn't have any effect
+1:2bc5f0c:         // on startup. It does mean however, that builds will not be triggered if gossip is
+1:2bc5f0c:         // disabled via JMX or nodetool as that sets SS to an uninitialized state.
+1:2bc5f0c:         if (!StorageService.instance.isInitialized())
+1:2bc5f0c:         {
+1:2bc5f0c:             logger.info("Not submitting build tasks for views in keyspace {} as " +
+1:2bc5f0c:                         "storage service is not initialized", keyspace.getName());
+1:2bc5f0c:             return;
+1:2bc5f0c:         }
+1:2bc5f0c: 
+3:a3a8dbc:         for (View view : allViews())
+1:a3a8dbc:         {
+1:a3a8dbc:             view.build();
+1:a3a8dbc:             // We provide the new definition from the base metadata
+1:a3a8dbc:             view.updateDefinition(newViewsByName.get(view.name));
+1:a3a8dbc:         }
+1:a3a8dbc:     }
+1:a3a8dbc: 
+1:a3a8dbc:     public void addView(ViewDefinition definition)
+1:a3a8dbc:     {
+1:a3a8dbc:         View view = new View(definition, keyspace.getColumnFamilyStore(definition.baseTableId));
+1:86ba227:         forTable(view.getDefinition().baseTableMetadata()).add(view);
+1:a3a8dbc:         viewsByName.put(definition.viewName, view);
+1:a3a8dbc:     }
+1:a3a8dbc: 
+2:a3a8dbc:     public void removeView(String name)
+1:a3a8dbc:     {
+1:a3a8dbc:         View view = viewsByName.remove(name);
+1:a3a8dbc: 
+1:a3a8dbc:         if (view == null)
+1:a3a8dbc:             return;
+1:a3a8dbc: 
+1:86ba227:         forTable(view.getDefinition().baseTableMetadata()).removeByName(name);
+1:a3a8dbc:         SystemKeyspace.setViewRemoved(keyspace.getName(), view.name);
+1:21448c5:         SystemDistributedKeyspace.setViewRemoved(keyspace.getName(), view.name);
+1:a3a8dbc:     }
+1:a3a8dbc: 
+1:a3a8dbc:     public void buildAllViews()
+1:a3a8dbc:     {
+1:a3a8dbc:         for (View view : allViews())
+1:a3a8dbc:             view.build();
+1:a3a8dbc:     }
+1:a3a8dbc: 
+1:86ba227:     public TableViews forTable(CFMetaData metadata)
+1:a3a8dbc:     {
+1:86ba227:         UUID baseId = metadata.cfId;
+1:86ba227:         TableViews views = viewsByBaseTable.get(baseId);
+1:86ba227:         if (views == null)
+1:a3a8dbc:         {
+1:86ba227:             views = new TableViews(metadata);
+1:86ba227:             TableViews previous = viewsByBaseTable.putIfAbsent(baseId, views);
+1:a3a8dbc:             if (previous != null)
+1:86ba227:                 views = previous;
+1:a3a8dbc:         }
+1:86ba227:         return views;
+1:a3a8dbc:     }
+1:a3a8dbc: 
+1:20e6750:     public static Lock acquireLockFor(int keyAndCfidHash)
+1:a3a8dbc:     {
+1:20e6750:         Lock lock = LOCKS.get(keyAndCfidHash);
+1:a3a8dbc: 
+1:a3a8dbc:         if (lock.tryLock())
+1:a3a8dbc:             return lock;
+1:a3a8dbc: 
+1:a3a8dbc:         return null;
+1:a3a8dbc:     }
+1:a3a8dbc: }
+============================================================================
+author:Robert Stupp
+-------------------------------------------------------------------------------
+commit:54836ec
+/////////////////////////////////////////////////////////////////////////
+1:         if (!enableCoordinatorBatchlog && coordinatorBatchlog)
+author:Josh McKenzie
+-------------------------------------------------------------------------------
+commit:e31e216
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+author:Sylvain Lebresne
+-------------------------------------------------------------------------------
+commit:a87fd71
+commit:86ba227
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.concurrent.ConcurrentMap;
+1: import java.util.concurrent.ConcurrentHashMap;
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: import org.apache.cassandra.config.CFMetaData;
+0: import org.apache.cassandra.db.rows.*;
+1: import org.apache.cassandra.db.partitions.*;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:  *
+1:  * TODO: I think we can get rid of that class. For addition/removal of view by names, we could move it Keyspace. And we
+1:  * not sure it's even worth keeping viewsByName as none of the related operation are performance sensitive so we could
+1:  * find the view by iterating over the CFStore.viewManager directly.
+1:  * For the lock, it could move to Keyspace too, but I don't remmenber why it has to be at the keyspace level and if it
+1:  * can be at the table level, maybe that's where it should be.
+1:     private final ConcurrentMap<String, View> viewsByName = new ConcurrentHashMap<>();
+1:     private final ConcurrentMap<UUID, TableViews> viewsByBaseTable = new ConcurrentHashMap<>();
+/////////////////////////////////////////////////////////////////////////
+1:             for (PartitionUpdate update : mutation.getPartitionUpdates())
+1:                 assert keyspace.getName().equals(update.metadata().ksName);
+1:                 if (!forTable(update.metadata()).updatedViews(update).isEmpty())
+1:                     return true;
+1:     private Iterable<View> allViews()
+/////////////////////////////////////////////////////////////////////////
+1:         forTable(view.getDefinition().baseTableMetadata()).add(view);
+/////////////////////////////////////////////////////////////////////////
+1:         forTable(view.getDefinition().baseTableMetadata()).removeByName(name);
+/////////////////////////////////////////////////////////////////////////
+1:     public TableViews forTable(CFMetaData metadata)
+1:         UUID baseId = metadata.cfId;
+1:         TableViews views = viewsByBaseTable.get(baseId);
+1:         if (views == null)
+1:             views = new TableViews(metadata);
+1:             TableViews previous = viewsByBaseTable.putIfAbsent(baseId, views);
+1:                 views = previous;
+1:         return views;
+author:Dave Brosius
+-------------------------------------------------------------------------------
+commit:fe7eee0
+/////////////////////////////////////////////////////////////////////////
+1:  * any views {@link #updatesAffectView(Collection, boolean)}, provide locks to prevent multiple
+1:  * updates from creating incoherent updates in the view {@link #acquireLockFor(int)}, and
+author:Sam Tunnicliffe
+-------------------------------------------------------------------------------
+commit:2bc5f0c
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.service.StorageService;
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         // Building views involves updating view build status in the system_distributed
+1:         // keyspace and therefore it requires ring information. This check prevents builds
+1:         // being submitted when Keyspaces are initialized during CassandraDaemon::setup as
+1:         // that happens before StorageService & gossip are initialized. After SS has been
+1:         // init'd we schedule builds for *all* views anyway, so this doesn't have any effect
+1:         // on startup. It does mean however, that builds will not be triggered if gossip is
+1:         // disabled via JMX or nodetool as that sets SS to an uninitialized state.
+1:         if (!StorageService.instance.isInitialized())
+1:         {
+1:             logger.info("Not submitting build tasks for views in keyspace {} as " +
+1:                         "storage service is not initialized", keyspace.getName());
+1:             return;
+1:         }
+1: 
+author:Carl Yeksigian
+-------------------------------------------------------------------------------
+commit:21448c5
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.repair.SystemDistributedKeyspace;
+/////////////////////////////////////////////////////////////////////////
+1:         SystemDistributedKeyspace.setViewRemoved(keyspace.getName(), view.name);
+commit:a3a8dbc
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.db.view;
+1: 
+0: import java.nio.ByteBuffer;
+0: import java.util.ArrayList;
+0: import java.util.Collection;
+0: import java.util.HashMap;
+0: import java.util.List;
+0: import java.util.Map;
+0: import java.util.Optional;
+0: import java.util.UUID;
+0: import java.util.concurrent.ConcurrentNavigableMap;
+0: import java.util.concurrent.ConcurrentSkipListMap;
+1: import java.util.concurrent.locks.Lock;
+1: 
+0: import com.google.common.collect.Lists;
+1: import com.google.common.util.concurrent.Striped;
+1: 
+1: import org.apache.cassandra.config.DatabaseDescriptor;
+1: import org.apache.cassandra.config.ViewDefinition;
+0: import org.apache.cassandra.db.ColumnFamilyStore;
+0: import org.apache.cassandra.db.IMutation;
+0: import org.apache.cassandra.db.Keyspace;
+0: import org.apache.cassandra.db.Mutation;
+0: import org.apache.cassandra.db.SystemKeyspace;
+0: import org.apache.cassandra.db.commitlog.ReplayPosition;
+0: import org.apache.cassandra.db.partitions.PartitionUpdate;
+0: import org.apache.cassandra.dht.Token;
+0: import org.apache.cassandra.service.StorageProxy;
+1: 
+1: /**
+1:  * Manages {@link View}'s for a single {@link ColumnFamilyStore}. All of the views for that table are created when this
+1:  * manager is initialized.
+1:  *
+1:  * The main purposes of the manager are to provide a single location for updates to be vetted to see whether they update
+0:  * any views {@link ViewManager#updatesAffectView(Collection, boolean)}, provide locks to prevent multiple
+0:  * updates from creating incoherent updates in the view {@link ViewManager#acquireLockFor(ByteBuffer)}, and
+1:  * to affect change on the view.
+1:  */
+1: public class ViewManager
+1: {
+0:     public class ForStore
+1:     {
+0:         private final ConcurrentNavigableMap<String, View> viewsByName;
+1: 
+0:         public ForStore()
+1:         {
+0:             this.viewsByName = new ConcurrentSkipListMap<>();
+1:         }
+1: 
+0:         public Iterable<View> allViews()
+1:         {
+1:             return viewsByName.values();
+1:         }
+1: 
+0:         public Iterable<ColumnFamilyStore> allViewsCfs()
+1:         {
+0:             List<ColumnFamilyStore> viewColumnFamilies = new ArrayList<>();
+1:             for (View view : allViews())
+0:                 viewColumnFamilies.add(keyspace.getColumnFamilyStore(view.getDefinition().viewName));
+0:             return viewColumnFamilies;
+1:         }
+1: 
+0:         public void forceBlockingFlush()
+1:         {
+0:             for (ColumnFamilyStore viewCfs : allViewsCfs())
+0:                 viewCfs.forceBlockingFlush();
+1:         }
+1: 
+0:         public void dumpMemtables()
+1:         {
+0:             for (ColumnFamilyStore viewCfs : allViewsCfs())
+0:                 viewCfs.dumpMemtable();
+1:         }
+1: 
+0:         public void truncateBlocking(long truncatedAt)
+1:         {
+0:             for (ColumnFamilyStore viewCfs : allViewsCfs())
+1:             {
+0:                 ReplayPosition replayAfter = viewCfs.discardSSTables(truncatedAt);
+0:                 SystemKeyspace.saveTruncationRecord(viewCfs, truncatedAt, replayAfter);
+1:             }
+1:         }
+1: 
+0:         public void addView(View view)
+1:         {
+0:             viewsByName.put(view.name, view);
+1:         }
+1: 
+1:         public void removeView(String name)
+1:         {
+0:             viewsByName.remove(name);
+1:         }
+1:     }
+1: 
+1:     private static final Striped<Lock> LOCKS = Striped.lazyWeakLock(DatabaseDescriptor.getConcurrentViewWriters() * 1024);
+1: 
+1:     private static final boolean enableCoordinatorBatchlog = Boolean.getBoolean("cassandra.mv_enable_coordinator_batchlog");
+1: 
+0:     private final ConcurrentNavigableMap<UUID, ForStore> viewManagersByStore;
+0:     private final ConcurrentNavigableMap<String, View> viewsByName;
+1:     private final Keyspace keyspace;
+1: 
+1:     public ViewManager(Keyspace keyspace)
+1:     {
+0:         this.viewManagersByStore = new ConcurrentSkipListMap<>();
+0:         this.viewsByName = new ConcurrentSkipListMap<>();
+1:         this.keyspace = keyspace;
+1:     }
+1: 
+1:     /**
+0:      * Calculates and pushes updates to the views replicas. The replicas are determined by
+0:      * {@link ViewUtils#getViewNaturalEndpoint(String, Token, Token)}.
+1:      */
+0:     public void pushViewReplicaUpdates(PartitionUpdate update, boolean writeCommitLog)
+1:     {
+0:         List<Mutation> mutations = null;
+0:         TemporalRow.Set temporalRows = null;
+0:         for (Map.Entry<String, View> view : viewsByName.entrySet())
+1:         {
+0:             temporalRows = view.getValue().getTemporalRowSet(update, temporalRows, false);
+1: 
+0:             Collection<Mutation> viewMutations = view.getValue().createMutations(update, temporalRows, false);
+0:             if (viewMutations != null && !viewMutations.isEmpty())
+1:             {
+0:                 if (mutations == null)
+0:                     mutations = Lists.newLinkedList();
+0:                 mutations.addAll(viewMutations);
+1:             }
+1:         }
+1: 
+0:         if (mutations != null)
+0:             StorageProxy.mutateMV(update.partitionKey().getKey(), mutations, writeCommitLog);
+1:     }
+1: 
+1:     public boolean updatesAffectView(Collection<? extends IMutation> mutations, boolean coordinatorBatchlog)
+1:     {
+0:         if (coordinatorBatchlog && !enableCoordinatorBatchlog)
+1:             return false;
+1: 
+1:         for (IMutation mutation : mutations)
+1:         {
+0:             for (PartitionUpdate cf : mutation.getPartitionUpdates())
+1:             {
+0:                 assert keyspace.getName().equals(cf.metadata().ksName);
+1: 
+1:                 if (coordinatorBatchlog && keyspace.getReplicationStrategy().getReplicationFactor() == 1)
+1:                     continue;
+1: 
+1:                 for (View view : allViews())
+1:                 {
+0:                     if (!cf.metadata().cfId.equals(view.getDefinition().baseTableId))
+1:                         continue;
+1: 
+0:                     if (view.updateAffectsView(cf))
+0:                         return true;
+1:                 }
+1:             }
+1:         }
+1: 
+1:         return false;
+1:     }
+1: 
+0:     public Iterable<View> allViews()
+1:     {
+1:         return viewsByName.values();
+1:     }
+1: 
+1:     public void update(String viewName)
+1:     {
+1:         View view = viewsByName.get(viewName);
+1:         assert view != null : "When updating a view, it should already be in the ViewManager";
+1:         view.build();
+1: 
+1:         // We provide the new definition from the base metadata
+1:         Optional<ViewDefinition> viewDefinition = keyspace.getMetadata().views.get(viewName);
+1:         assert viewDefinition.isPresent() : "When updating a view, it should still be in the Keyspaces views";
+1:         view.updateDefinition(viewDefinition.get());
+1:     }
+1: 
+1:     public void reload()
+1:     {
+1:         Map<String, ViewDefinition> newViewsByName = new HashMap<>();
+1:         for (ViewDefinition definition : keyspace.getMetadata().views)
+1:         {
+1:             newViewsByName.put(definition.viewName, definition);
+1:         }
+1: 
+1:         for (String viewName : viewsByName.keySet())
+1:         {
+1:             if (!newViewsByName.containsKey(viewName))
+1:                 removeView(viewName);
+1:         }
+1: 
+1:         for (Map.Entry<String, ViewDefinition> entry : newViewsByName.entrySet())
+1:         {
+1:             if (!viewsByName.containsKey(entry.getKey()))
+1:                 addView(entry.getValue());
+1:         }
+1: 
+1:         for (View view : allViews())
+1:         {
+1:             view.build();
+1:             // We provide the new definition from the base metadata
+1:             view.updateDefinition(newViewsByName.get(view.name));
+1:         }
+1:     }
+1: 
+1:     public void addView(ViewDefinition definition)
+1:     {
+1:         View view = new View(definition, keyspace.getColumnFamilyStore(definition.baseTableId));
+0:         forTable(view.getDefinition().baseTableId).addView(view);
+1:         viewsByName.put(definition.viewName, view);
+1:     }
+1: 
+1:     public void removeView(String name)
+1:     {
+1:         View view = viewsByName.remove(name);
+1: 
+1:         if (view == null)
+1:             return;
+1: 
+0:         forTable(view.getDefinition().baseTableId).removeView(name);
+1:         SystemKeyspace.setViewRemoved(keyspace.getName(), view.name);
+1:     }
+1: 
+1:     public void buildAllViews()
+1:     {
+1:         for (View view : allViews())
+1:             view.build();
+1:     }
+1: 
+0:     public ForStore forTable(UUID baseId)
+1:     {
+0:         ForStore forStore = viewManagersByStore.get(baseId);
+0:         if (forStore == null)
+1:         {
+0:             forStore = new ForStore();
+0:             ForStore previous = viewManagersByStore.put(baseId, forStore);
+1:             if (previous != null)
+0:                 forStore = previous;
+1:         }
+0:         return forStore;
+1:     }
+1: 
+0:     public static Lock acquireLockFor(ByteBuffer key)
+1:     {
+0:         Lock lock = LOCKS.get(key);
+1: 
+1:         if (lock.tryLock())
+1:             return lock;
+1: 
+1:         return null;
+1:     }
+1: }
+author:Tyler Hobbs
+-------------------------------------------------------------------------------
+commit:20e6750
+/////////////////////////////////////////////////////////////////////////
+1:     public static Lock acquireLockFor(int keyAndCfidHash)
+1:         Lock lock = LOCKS.get(keyAndCfidHash);
+commit:83f8ccc
+/////////////////////////////////////////////////////////////////////////
+0: import org.slf4j.Logger;
+0: import org.slf4j.LoggerFactory;
+/////////////////////////////////////////////////////////////////////////
+1:     private static final Logger logger = LoggerFactory.getLogger(ViewManager.class);
+0: 
+author:Jeff Jirsa
+-------------------------------------------------------------------------------
+commit:dc61fa6
+/////////////////////////////////////////////////////////////////////////
+0:             // Make sure that we only get mutations from views which are affected since the set includes all views for a
+0:             // keyspace. This will prevent calling getTemporalRowSet for the wrong base table.
+0:             if (view.getValue().updateAffectsView(update))
+0:                 temporalRows = view.getValue().getTemporalRowSet(update, temporalRows, false);
+0: 
+0:                 Collection<Mutation> viewMutations = view.getValue().createMutations(update, temporalRows, false);
+0:                 if (viewMutations != null && !viewMutations.isEmpty())
+0:                 {
+0:                     if (mutations == null)
+0:                         mutations = Lists.newLinkedList();
+0:                     mutations.addAll(viewMutations);
+0:                 }
+/////////////////////////////////////////////////////////////////////////
+author:Chris Lohfink
+-------------------------------------------------------------------------------
+commit:62ffa35
+/////////////////////////////////////////////////////////////////////////
+1: import java.util.*;
+0: import java.util.concurrent.atomic.AtomicLong;
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.db.*;
+/////////////////////////////////////////////////////////////////////////
+0:     public void pushViewReplicaUpdates(PartitionUpdate update, boolean writeCommitLog, AtomicLong baseComplete)
+/////////////////////////////////////////////////////////////////////////
+0:             StorageProxy.mutateMV(update.partitionKey().getKey(), mutations, writeCommitLog, baseComplete);
+============================================================================

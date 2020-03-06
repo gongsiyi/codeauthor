@@ -1,0 +1,1446 @@
+1:72790dc: /*
+1:72790dc:  * Licensed to the Apache Software Foundation (ASF) under one
+1:72790dc:  * or more contributor license agreements.  See the NOTICE file
+1:72790dc:  * distributed with this work for additional information
+1:72790dc:  * regarding copyright ownership.  The ASF licenses this file
+1:72790dc:  * to you under the Apache License, Version 2.0 (the
+1:72790dc:  * "License"); you may not use this file except in compliance
+1:72790dc:  * with the License.  You may obtain a copy of the License at
+1:72790dc:  *
+1:72790dc:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:72790dc:  *
+1:72790dc:  * Unless required by applicable law or agreed to in writing, software
+1:72790dc:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:72790dc:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:72790dc:  * See the License for the specific language governing permissions and
+1:72790dc:  * limitations under the License.
+1:72790dc:  */
+1:72790dc: package org.apache.cassandra.index.sasi.disk;
+2:72790dc: 
+1:72790dc: import java.io.File;
+1:72790dc: import java.io.IOException;
+1:72790dc: import java.nio.ByteBuffer;
+1:72790dc: import java.util.*;
+1:72790dc: 
+1:72790dc: import org.apache.cassandra.db.DecoratedKey;
+1:7d857b4: import org.apache.cassandra.dht.*;
+1:3928665: import org.apache.cassandra.index.sasi.plan.Expression.Op;
+1:2ca2fff: import org.apache.cassandra.index.sasi.sa.IndexedTerm;
+1:72790dc: import org.apache.cassandra.index.sasi.sa.IntegralSA;
+1:72790dc: import org.apache.cassandra.index.sasi.sa.SA;
+1:72790dc: import org.apache.cassandra.index.sasi.sa.TermIterator;
+1:72790dc: import org.apache.cassandra.index.sasi.sa.SuffixSA;
+1:72790dc: import org.apache.cassandra.db.marshal.*;
+1:72790dc: import org.apache.cassandra.io.FSWriteError;
+1:72790dc: import org.apache.cassandra.io.util.*;
+1:72790dc: import org.apache.cassandra.utils.ByteBufferUtil;
+1:72790dc: import org.apache.cassandra.utils.FBUtilities;
+1:72790dc: import org.apache.cassandra.utils.Pair;
+1:72790dc: 
+1:72790dc: import com.carrotsearch.hppc.LongArrayList;
+1:72790dc: import com.carrotsearch.hppc.ShortArrayList;
+1:72790dc: import com.google.common.annotations.VisibleForTesting;
+1:72790dc: 
+1:72790dc: import org.slf4j.Logger;
+1:72790dc: import org.slf4j.LoggerFactory;
+1:72790dc: 
+1:72790dc: public class OnDiskIndexBuilder
+2:72790dc: {
+1:72790dc:     private static final Logger logger = LoggerFactory.getLogger(OnDiskIndexBuilder.class);
+1:72790dc: 
+1:72790dc:     public enum Mode
+1:72790dc:     {
+1:479e8af:         PREFIX(EnumSet.of(Op.EQ, Op.MATCH, Op.PREFIX, Op.NOT_EQ, Op.RANGE)),
+1:2ca2fff:         CONTAINS(EnumSet.of(Op.EQ, Op.MATCH, Op.CONTAINS, Op.PREFIX, Op.SUFFIX, Op.NOT_EQ)),
+1:3928665:         SPARSE(EnumSet.of(Op.EQ, Op.NOT_EQ, Op.RANGE));
+1:3928665: 
+1:3928665:         Set<Op> supportedOps;
+1:3928665: 
+1:3928665:         Mode(Set<Op> ops)
+1:3928665:         {
+1:3928665:             supportedOps = ops;
+1:3928665:         }
+1:72790dc: 
+1:72790dc:         public static Mode mode(String mode)
+1:72790dc:         {
+1:72790dc:             return Mode.valueOf(mode.toUpperCase());
+2:72790dc:         }
+1:3928665: 
+1:3928665:         public boolean supports(Op op)
+1:3928665:         {
+1:3928665:             return supportedOps.contains(op);
+1:3928665:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     public enum TermSize
+1:72790dc:     {
+1:72790dc:         INT(4), LONG(8), UUID(16), VARIABLE(-1);
+1:72790dc: 
+1:72790dc:         public final int size;
+1:72790dc: 
+1:72790dc:         TermSize(int size)
+1:72790dc:         {
+1:72790dc:             this.size = size;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public boolean isConstant()
+1:72790dc:         {
+1:72790dc:             return this != VARIABLE;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public static TermSize of(int size)
+1:72790dc:         {
+1:72790dc:             switch (size)
+1:72790dc:             {
+1:72790dc:                 case -1:
+1:72790dc:                     return VARIABLE;
+1:72790dc: 
+1:72790dc:                 case 4:
+1:72790dc:                     return INT;
+1:72790dc: 
+1:72790dc:                 case 8:
+1:72790dc:                     return LONG;
+1:72790dc: 
+1:72790dc:                 case 16:
+1:72790dc:                     return UUID;
+1:72790dc: 
+1:72790dc:                 default:
+1:72790dc:                     throw new IllegalStateException("unknown state: " + size);
+1:72790dc:             }
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public static TermSize sizeOf(AbstractType<?> comparator)
+1:72790dc:         {
+1:72790dc:             if (comparator instanceof Int32Type || comparator instanceof FloatType)
+1:72790dc:                 return INT;
+1:72790dc: 
+1:72790dc:             if (comparator instanceof LongType || comparator instanceof DoubleType
+1:72790dc:                     || comparator instanceof TimestampType || comparator instanceof DateType)
+1:72790dc:                 return LONG;
+1:72790dc: 
+1:72790dc:             if (comparator instanceof TimeUUIDType || comparator instanceof UUIDType)
+1:72790dc:                 return UUID;
+1:72790dc: 
+1:72790dc:             return VARIABLE;
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     public static final int BLOCK_SIZE = 4096;
+1:72790dc:     public static final int MAX_TERM_SIZE = 1024;
+1:72790dc:     public static final int SUPER_BLOCK_SIZE = 64;
+1:2ca2fff:     public static final int IS_PARTIAL_BIT = 15;
+1:72790dc: 
+1:fb22109:     private static final SequentialWriterOption WRITER_OPTION = SequentialWriterOption.newBuilder()
+1:fb22109:                                                                                       .bufferSize(BLOCK_SIZE)
+1:fb22109:                                                                                       .build();
+1:fb22109: 
+1:72790dc:     private final List<MutableLevel<InMemoryPointerTerm>> levels = new ArrayList<>();
+1:72790dc:     private MutableLevel<InMemoryDataTerm> dataLevel;
+1:72790dc: 
+1:72790dc:     private final TermSize termSize;
+1:72790dc: 
+1:72790dc:     private final AbstractType<?> keyComparator, termComparator;
+1:72790dc: 
+1:72790dc:     private final Map<ByteBuffer, TokenTreeBuilder> terms;
+1:72790dc:     private final Mode mode;
+1:2ca2fff:     private final boolean marksPartials;
+1:72790dc: 
+1:72790dc:     private ByteBuffer minKey, maxKey;
+1:72790dc:     private long estimatedBytes;
+1:72790dc: 
+1:72790dc:     public OnDiskIndexBuilder(AbstractType<?> keyComparator, AbstractType<?> comparator, Mode mode)
+1:72790dc:     {
+1:2ca2fff:         this(keyComparator, comparator, mode, true);
+1:2ca2fff:     }
+1:2ca2fff: 
+1:2ca2fff:     public OnDiskIndexBuilder(AbstractType<?> keyComparator, AbstractType<?> comparator, Mode mode, boolean marksPartials)
+1:2ca2fff:     {
+1:72790dc:         this.keyComparator = keyComparator;
+1:72790dc:         this.termComparator = comparator;
+1:72790dc:         this.terms = new HashMap<>();
+1:72790dc:         this.termSize = TermSize.sizeOf(comparator);
+1:72790dc:         this.mode = mode;
+1:2ca2fff:         this.marksPartials = marksPartials;
+1:72790dc:     }
+1:72790dc: 
+1:7d857b4:     public OnDiskIndexBuilder add(ByteBuffer term, DecoratedKey key, long partitionOffset, long rowOffset)
+1:72790dc:     {
+1:72790dc:         if (term.remaining() >= MAX_TERM_SIZE)
+1:72790dc:         {
+1:db68ac9:             logger.error("Rejecting value (value size {}, maximum size {}).",
+1:db68ac9:                          FBUtilities.prettyPrintMemory(term.remaining()),
+1:db68ac9:                          FBUtilities.prettyPrintMemory(Short.MAX_VALUE));
+1:72790dc:             return this;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         TokenTreeBuilder tokens = terms.get(term);
+1:72790dc:         if (tokens == null)
+1:72790dc:         {
+1:5c4d5c7:             terms.put(term, (tokens = new DynamicTokenTreeBuilder()));
+1:72790dc: 
+1:72790dc:             // on-heap size estimates from jol
+1:72790dc:             // 64 bytes for TTB + 48 bytes for TreeMap in TTB + size bytes for the term (map key)
+1:72790dc:             estimatedBytes += 64 + 48 + term.remaining();
+1:72790dc:         }
+1:72790dc: 
+1:7d857b4:         tokens.add((Long) key.getToken().getTokenValue(), partitionOffset, rowOffset);
+1:72790dc: 
+1:72790dc:         // calculate key range (based on actual key values) for current index
+1:72790dc:         minKey = (minKey == null || keyComparator.compare(minKey, key.getKey()) > 0) ? key.getKey() : minKey;
+1:72790dc:         maxKey = (maxKey == null || keyComparator.compare(maxKey, key.getKey()) < 0) ? key.getKey() : maxKey;
+1:72790dc: 
+1:7d857b4:         // 84 ((boolean(1)*4) + (long(8)*4) + 24 + 24) bytes for the LongObjectOpenHashMap<long[]> created
+1:7d857b4:         // when the keyPosition was added + 40 bytes for the TreeMap.Entry + 8 bytes for the token (key).
+1:72790dc:         // in the case of hash collision for the token we may overestimate but this is extremely rare
+1:7d857b4:         estimatedBytes += 84 + 40 + 8;
+1:72790dc: 
+1:72790dc:         return this;
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     public long estimatedMemoryUse()
+1:72790dc:     {
+1:72790dc:         return estimatedBytes;
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private void addTerm(InMemoryDataTerm term, SequentialWriter out) throws IOException
+1:72790dc:     {
+1:72790dc:         InMemoryPointerTerm ptr = dataLevel.add(term);
+1:72790dc:         if (ptr == null)
+1:72790dc:             return;
+1:72790dc: 
+1:72790dc:         int levelIdx = 0;
+1:72790dc:         for (;;)
+1:72790dc:         {
+1:72790dc:             MutableLevel<InMemoryPointerTerm> level = getIndexLevel(levelIdx++, out);
+1:72790dc:             if ((ptr = level.add(ptr)) == null)
+1:72790dc:                 break;
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     public boolean isEmpty()
+1:72790dc:     {
+1:72790dc:         return terms.isEmpty();
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     public void finish(Pair<ByteBuffer, ByteBuffer> range, File file, TermIterator terms)
+1:72790dc:     {
+1:72790dc:         finish(Descriptor.CURRENT, range, file, terms);
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     /**
+1:72790dc:      * Finishes up index building process by creating/populating index file.
+1:72790dc:      *
+1:72790dc:      * @param indexFile The file to write index contents to.
+1:72790dc:      *
+1:72790dc:      * @return true if index was written successfully, false otherwise (e.g. if index was empty).
+1:72790dc:      *
+1:72790dc:      * @throws FSWriteError on I/O error.
+1:72790dc:      */
+1:72790dc:     public boolean finish(File indexFile) throws FSWriteError
+1:72790dc:     {
+1:72790dc:         return finish(Descriptor.CURRENT, indexFile);
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     @VisibleForTesting
+1:72790dc:     protected boolean finish(Descriptor descriptor, File file) throws FSWriteError
+1:72790dc:     {
+1:72790dc:         // no terms means there is nothing to build
+1:72790dc:         if (terms.isEmpty())
+1:72790dc:             return false;
+1:72790dc: 
+1:72790dc:         // split terms into suffixes only if it's text, otherwise (even if CONTAINS is set) use terms in original form
+1:72790dc:         SA sa = ((termComparator instanceof UTF8Type || termComparator instanceof AsciiType) && mode == Mode.CONTAINS)
+1:72790dc:                     ? new SuffixSA(termComparator, mode) : new IntegralSA(termComparator, mode);
+1:72790dc: 
+1:72790dc:         for (Map.Entry<ByteBuffer, TokenTreeBuilder> term : terms.entrySet())
+1:72790dc:             sa.add(term.getKey(), term.getValue());
+1:72790dc: 
+1:72790dc:         finish(descriptor, Pair.create(minKey, maxKey), file, sa.finish());
+1:72790dc:         return true;
+1:72790dc:     }
+1:72790dc: 
+1:733d1ee:     @SuppressWarnings("resource")
+1:72790dc:     protected void finish(Descriptor descriptor, Pair<ByteBuffer, ByteBuffer> range, File file, TermIterator terms)
+1:72790dc:     {
+1:72790dc:         SequentialWriter out = null;
+1:72790dc: 
+1:72790dc:         try
+1:72790dc:         {
+1:fb22109:             out = new SequentialWriter(file, WRITER_OPTION);
+1:72790dc: 
+1:72790dc:             out.writeUTF(descriptor.version.toString());
+1:72790dc: 
+1:72790dc:             out.writeShort(termSize.size);
+1:72790dc: 
+1:72790dc:             // min, max term (useful to find initial scan range from search expressions)
+1:72790dc:             ByteBufferUtil.writeWithShortLength(terms.minTerm(), out);
+1:72790dc:             ByteBufferUtil.writeWithShortLength(terms.maxTerm(), out);
+1:72790dc: 
+1:72790dc:             // min, max keys covered by index (useful when searching across multiple indexes)
+1:72790dc:             ByteBufferUtil.writeWithShortLength(range.left, out);
+1:72790dc:             ByteBufferUtil.writeWithShortLength(range.right, out);
+1:72790dc: 
+1:72790dc:             out.writeUTF(mode.toString());
+1:2ca2fff:             out.writeBoolean(marksPartials);
+1:72790dc: 
+1:72790dc:             out.skipBytes((int) (BLOCK_SIZE - out.position()));
+1:72790dc: 
+1:5c4d5c7:             dataLevel = mode == Mode.SPARSE ? new DataBuilderLevel(out, new MutableDataBlock(termComparator, mode))
+1:5c4d5c7:                                             : new MutableLevel<>(out, new MutableDataBlock(termComparator, mode));
+1:72790dc:             while (terms.hasNext())
+1:72790dc:             {
+1:2ca2fff:                 Pair<IndexedTerm, TokenTreeBuilder> term = terms.next();
+1:72790dc:                 addTerm(new InMemoryDataTerm(term.left, term.right), out);
+1:72790dc:             }
+1:72790dc: 
+1:72790dc:             dataLevel.finalFlush();
+1:72790dc:             for (MutableLevel l : levels)
+1:72790dc:                 l.flush(); // flush all of the buffers
+1:72790dc: 
+1:72790dc:             // and finally write levels index
+1:72790dc:             final long levelIndexPosition = out.position();
+1:72790dc: 
+1:72790dc:             out.writeInt(levels.size());
+1:72790dc:             for (int i = levels.size() - 1; i >= 0; i--)
+1:72790dc:                 levels.get(i).flushMetadata();
+1:72790dc: 
+1:72790dc:             dataLevel.flushMetadata();
+1:72790dc: 
+1:72790dc:             out.writeLong(levelIndexPosition);
+1:72790dc: 
+1:72790dc:             // sync contents of the output and disk,
+1:72790dc:             // since it's not done implicitly on close
+1:72790dc:             out.sync();
+1:72790dc:         }
+1:72790dc:         catch (IOException e)
+1:72790dc:         {
+1:72790dc:             throw new FSWriteError(e, file);
+1:72790dc:         }
+1:72790dc:         finally
+1:72790dc:         {
+1:72790dc:             FileUtils.closeQuietly(out);
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private MutableLevel<InMemoryPointerTerm> getIndexLevel(int idx, SequentialWriter out)
+1:72790dc:     {
+1:72790dc:         if (levels.size() == 0)
+1:72790dc:             levels.add(new MutableLevel<>(out, new MutableBlock<>()));
+1:72790dc: 
+1:72790dc:         if (levels.size() - 1 < idx)
+1:72790dc:         {
+1:72790dc:             int toAdd = idx - (levels.size() - 1);
+1:72790dc:             for (int i = 0; i < toAdd; i++)
+1:72790dc:                 levels.add(new MutableLevel<>(out, new MutableBlock<>()));
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         return levels.get(idx);
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     protected static void alignToBlock(SequentialWriter out) throws IOException
+1:72790dc:     {
+1:72790dc:         long endOfBlock = out.position();
+1:72790dc:         if ((endOfBlock & (BLOCK_SIZE - 1)) != 0) // align on the block boundary if needed
+1:72790dc:             out.skipBytes((int) (FBUtilities.align(endOfBlock, BLOCK_SIZE) - endOfBlock));
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private class InMemoryTerm
+1:72790dc:     {
+1:2ca2fff:         protected final IndexedTerm term;
+1:72790dc: 
+1:2ca2fff:         public InMemoryTerm(IndexedTerm term)
+1:72790dc:         {
+1:72790dc:             this.term = term;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public int serializedSize()
+1:72790dc:         {
+1:2ca2fff:             return (termSize.isConstant() ? 0 : 2) + term.getBytes().remaining();
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void serialize(DataOutputPlus out) throws IOException
+1:72790dc:         {
+1:72790dc:             if (termSize.isConstant())
+1:2ca2fff:             {
+1:2ca2fff:                 out.write(term.getBytes());
+1:2ca2fff:             }
+1:72790dc:             else
+1:2ca2fff:             {
+1:2ca2fff:                 out.writeShort(term.getBytes().remaining() | ((marksPartials && term.isPartial() ? 1 : 0) << IS_PARTIAL_BIT));
+1:2ca2fff:                 out.write(term.getBytes());
+1:2ca2fff:             }
+1:2ca2fff: 
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private class InMemoryPointerTerm extends InMemoryTerm
+1:72790dc:     {
+1:72790dc:         protected final int blockCnt;
+1:72790dc: 
+1:2ca2fff:         public InMemoryPointerTerm(IndexedTerm term, int blockCnt)
+1:72790dc:         {
+1:72790dc:             super(term);
+1:72790dc:             this.blockCnt = blockCnt;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public int serializedSize()
+1:72790dc:         {
+1:72790dc:             return super.serializedSize() + 4;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void serialize(DataOutputPlus out) throws IOException
+1:72790dc:         {
+1:72790dc:             super.serialize(out);
+1:72790dc:             out.writeInt(blockCnt);
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private class InMemoryDataTerm extends InMemoryTerm
+1:72790dc:     {
+1:72790dc:         private final TokenTreeBuilder keys;
+1:72790dc: 
+1:2ca2fff:         public InMemoryDataTerm(IndexedTerm term, TokenTreeBuilder keys)
+1:72790dc:         {
+1:72790dc:             super(term);
+1:72790dc:             this.keys = keys;
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private class MutableLevel<T extends InMemoryTerm>
+1:72790dc:     {
+1:72790dc:         private final LongArrayList blockOffsets = new LongArrayList();
+1:72790dc: 
+1:72790dc:         protected final SequentialWriter out;
+1:72790dc: 
+1:72790dc:         private final MutableBlock<T> inProcessBlock;
+1:72790dc:         private InMemoryPointerTerm lastTerm;
+1:72790dc: 
+1:72790dc:         public MutableLevel(SequentialWriter out, MutableBlock<T> block)
+1:72790dc:         {
+1:72790dc:             this.out = out;
+1:72790dc:             this.inProcessBlock = block;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         /**
+1:72790dc:          * @return If we flushed a block, return the last term of that block; else, null.
+1:72790dc:          */
+1:72790dc:         public InMemoryPointerTerm add(T term) throws IOException
+1:72790dc:         {
+1:72790dc:             InMemoryPointerTerm toPromote = null;
+1:72790dc: 
+1:72790dc:             if (!inProcessBlock.hasSpaceFor(term))
+1:72790dc:             {
+1:72790dc:                 flush();
+1:72790dc:                 toPromote = lastTerm;
+1:72790dc:             }
+1:72790dc: 
+1:72790dc:             inProcessBlock.add(term);
+1:72790dc: 
+1:72790dc:             lastTerm = new InMemoryPointerTerm(term.term, blockOffsets.size());
+1:72790dc:             return toPromote;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void flush() throws IOException
+1:72790dc:         {
+1:72790dc:             blockOffsets.add(out.position());
+1:72790dc:             inProcessBlock.flushAndClear(out);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void finalFlush() throws IOException
+1:72790dc:         {
+1:72790dc:             flush();
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void flushMetadata() throws IOException
+1:72790dc:         {
+1:72790dc:             flushMetadata(blockOffsets);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         protected void flushMetadata(LongArrayList longArrayList) throws IOException
+1:72790dc:         {
+1:72790dc:             out.writeInt(longArrayList.size());
+1:72790dc:             for (int i = 0; i < longArrayList.size(); i++)
+1:72790dc:                 out.writeLong(longArrayList.get(i));
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     /** builds standard data blocks and super blocks, as well */
+1:72790dc:     private class DataBuilderLevel extends MutableLevel<InMemoryDataTerm>
+1:72790dc:     {
+1:72790dc:         private final LongArrayList superBlockOffsets = new LongArrayList();
+1:72790dc: 
+1:72790dc:         /** count of regular data blocks written since current super block was init'd */
+1:72790dc:         private int dataBlocksCnt;
+1:72790dc:         private TokenTreeBuilder superBlockTree;
+1:72790dc: 
+1:72790dc:         public DataBuilderLevel(SequentialWriter out, MutableBlock<InMemoryDataTerm> block)
+1:72790dc:         {
+1:72790dc:             super(out, block);
+1:5c4d5c7:             superBlockTree = new DynamicTokenTreeBuilder();
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public InMemoryPointerTerm add(InMemoryDataTerm term) throws IOException
+1:72790dc:         {
+1:72790dc:             InMemoryPointerTerm ptr = super.add(term);
+1:72790dc:             if (ptr != null)
+1:72790dc:             {
+1:72790dc:                 dataBlocksCnt++;
+1:72790dc:                 flushSuperBlock(false);
+1:72790dc:             }
+1:5c4d5c7:             superBlockTree.add(term.keys);
+1:72790dc:             return ptr;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void flushSuperBlock(boolean force) throws IOException
+1:72790dc:         {
+1:5c4d5c7:             if (dataBlocksCnt == SUPER_BLOCK_SIZE || (force && !superBlockTree.isEmpty()))
+1:72790dc:             {
+1:72790dc:                 superBlockOffsets.add(out.position());
+1:72790dc:                 superBlockTree.finish().write(out);
+1:72790dc:                 alignToBlock(out);
+1:72790dc: 
+1:72790dc:                 dataBlocksCnt = 0;
+1:5c4d5c7:                 superBlockTree = new DynamicTokenTreeBuilder();
+1:72790dc:             }
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void finalFlush() throws IOException
+1:72790dc:         {
+1:72790dc:             super.flush();
+1:72790dc:             flushSuperBlock(true);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void flushMetadata() throws IOException
+1:72790dc:         {
+1:72790dc:             super.flushMetadata();
+1:72790dc:             flushMetadata(superBlockOffsets);
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:72790dc:     private static class MutableBlock<T extends InMemoryTerm>
+1:72790dc:     {
+1:72790dc:         protected final DataOutputBufferFixed buffer;
+1:72790dc:         protected final ShortArrayList offsets;
+1:72790dc: 
+1:72790dc:         public MutableBlock()
+1:72790dc:         {
+1:72790dc:             buffer = new DataOutputBufferFixed(BLOCK_SIZE);
+1:72790dc:             offsets = new ShortArrayList();
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public final void add(T term) throws IOException
+1:72790dc:         {
+1:72790dc:             offsets.add((short) buffer.position());
+1:72790dc:             addInternal(term);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         protected void addInternal(T term) throws IOException
+1:72790dc:         {
+1:72790dc:             term.serialize(buffer);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public boolean hasSpaceFor(T element)
+1:72790dc:         {
+1:72790dc:             return sizeAfter(element) < BLOCK_SIZE;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         protected int sizeAfter(T element)
+1:72790dc:         {
+1:72790dc:             return getWatermark() + 4 + element.serializedSize();
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         protected int getWatermark()
+1:72790dc:         {
+1:72790dc:             return 4 + offsets.size() * 2 + (int) buffer.position();
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void flushAndClear(SequentialWriter out) throws IOException
+1:72790dc:         {
+1:72790dc:             out.writeInt(offsets.size());
+1:72790dc:             for (int i = 0; i < offsets.size(); i++)
+1:72790dc:                 out.writeShort(offsets.get(i));
+1:72790dc: 
+1:72790dc:             out.write(buffer.buffer());
+1:72790dc: 
+1:72790dc:             alignToBlock(out);
+1:72790dc: 
+1:72790dc:             offsets.clear();
+1:72790dc:             buffer.clear();
+1:72790dc:         }
+1:72790dc:     }
+1:72790dc: 
+1:7d857b4:     private class MutableDataBlock extends MutableBlock<InMemoryDataTerm>
+1:72790dc:     {
+1:5c4d5c7:         private static final int MAX_KEYS_SPARSE = 5;
+1:5c4d5c7: 
+1:5c4d5c7:         private final AbstractType<?> comparator;
+1:72790dc:         private final Mode mode;
+1:72790dc: 
+1:72790dc:         private int offset = 0;
+1:72790dc: 
+1:72790dc:         private final List<TokenTreeBuilder> containers = new ArrayList<>();
+1:72790dc:         private TokenTreeBuilder combinedIndex;
+1:72790dc: 
+1:5c4d5c7:         public MutableDataBlock(AbstractType<?> comparator, Mode mode)
+1:72790dc:         {
+1:5c4d5c7:             this.comparator = comparator;
+1:72790dc:             this.mode = mode;
+1:5c4d5c7:             this.combinedIndex = initCombinedIndex();
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         protected void addInternal(InMemoryDataTerm term) throws IOException
+1:72790dc:         {
+1:72790dc:             TokenTreeBuilder keys = term.keys;
+1:72790dc: 
+1:5c4d5c7:             if (mode == Mode.SPARSE)
+1:72790dc:             {
+1:5c4d5c7:                 if (keys.getTokenCount() > MAX_KEYS_SPARSE)
+1:5c4d5c7:                     throw new IOException(String.format("Term - '%s' belongs to more than %d keys in %s mode, which is not allowed.",
+1:2ca2fff:                                                         comparator.getString(term.term.getBytes()), MAX_KEYS_SPARSE, mode.name()));
+1:5c4d5c7: 
+1:72790dc:                 writeTerm(term, keys);
+1:72790dc:             }
+1:72790dc:             else
+1:72790dc:             {
+1:72790dc:                 writeTerm(term, offset);
+1:72790dc: 
+1:72790dc:                 offset += keys.serializedSize();
+1:72790dc:                 containers.add(keys);
+1:72790dc:             }
+1:72790dc: 
+1:72790dc:             if (mode == Mode.SPARSE)
+1:5c4d5c7:                 combinedIndex.add(keys);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         protected int sizeAfter(InMemoryDataTerm element)
+1:72790dc:         {
+1:72790dc:             return super.sizeAfter(element) + ptrLength(element);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         public void flushAndClear(SequentialWriter out) throws IOException
+1:72790dc:         {
+1:72790dc:             super.flushAndClear(out);
+1:72790dc: 
+1:5c4d5c7:             out.writeInt(mode == Mode.SPARSE ? offset : -1);
+1:72790dc: 
+1:72790dc:             if (containers.size() > 0)
+1:72790dc:             {
+1:72790dc:                 for (TokenTreeBuilder tokens : containers)
+1:72790dc:                     tokens.write(out);
+1:72790dc:             }
+1:72790dc: 
+1:5c4d5c7:             if (mode == Mode.SPARSE && combinedIndex != null)
+1:72790dc:                 combinedIndex.finish().write(out);
+1:72790dc: 
+1:72790dc:             alignToBlock(out);
+1:72790dc: 
+1:72790dc:             containers.clear();
+1:5c4d5c7:             combinedIndex = initCombinedIndex();
+1:72790dc: 
+1:72790dc:             offset = 0;
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         private int ptrLength(InMemoryDataTerm term)
+1:72790dc:         {
+1:72790dc:             return (term.keys.getTokenCount() > 5)
+1:72790dc:                     ? 5 // 1 byte type + 4 byte offset to the tree
+1:72790dc:                     : 1 + (8 * (int) term.keys.getTokenCount()); // 1 byte size + n 8 byte tokens
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         private void writeTerm(InMemoryTerm term, TokenTreeBuilder keys) throws IOException
+1:72790dc:         {
+1:72790dc:             term.serialize(buffer);
+1:72790dc:             buffer.writeByte((byte) keys.getTokenCount());
+1:7d857b4:             for (Pair<Long, KeyOffsets> key : keys)
+1:5c4d5c7:                 buffer.writeLong(key.left);
+1:72790dc:         }
+1:72790dc: 
+1:72790dc:         private void writeTerm(InMemoryTerm term, int offset) throws IOException
+1:72790dc:         {
+1:72790dc:             term.serialize(buffer);
+1:72790dc:             buffer.writeByte(0x0);
+1:72790dc:             buffer.writeInt(offset);
+1:72790dc:         }
+1:5c4d5c7: 
+1:5c4d5c7:         private TokenTreeBuilder initCombinedIndex()
+1:5c4d5c7:         {
+1:5c4d5c7:             return mode == Mode.SPARSE ? new DynamicTokenTreeBuilder() : null;
+1:5c4d5c7:         }
+1:72790dc:     }
+1:72790dc: }
+============================================================================
+author:Alex Petrov
+-------------------------------------------------------------------------------
+commit:7d857b4
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.dht.*;
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     public OnDiskIndexBuilder add(ByteBuffer term, DecoratedKey key, long partitionOffset, long rowOffset)
+/////////////////////////////////////////////////////////////////////////
+1:         tokens.add((Long) key.getToken().getTokenValue(), partitionOffset, rowOffset);
+1:         // 84 ((boolean(1)*4) + (long(8)*4) + 24 + 24) bytes for the LongObjectOpenHashMap<long[]> created
+1:         // when the keyPosition was added + 40 bytes for the TreeMap.Entry + 8 bytes for the token (key).
+1:         estimatedBytes += 84 + 40 + 8;
+/////////////////////////////////////////////////////////////////////////
+1:     private class MutableDataBlock extends MutableBlock<InMemoryDataTerm>
+/////////////////////////////////////////////////////////////////////////
+1:             for (Pair<Long, KeyOffsets> key : keys)
+author:Yuki Morishita
+-------------------------------------------------------------------------------
+commit:fb22109
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+1:     private static final SequentialWriterOption WRITER_OPTION = SequentialWriterOption.newBuilder()
+1:                                                                                       .bufferSize(BLOCK_SIZE)
+1:                                                                                       .build();
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:             out = new SequentialWriter(file, WRITER_OPTION);
+author:Jordan West
+-------------------------------------------------------------------------------
+commit:2ca2fff
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.index.sasi.sa.IndexedTerm;
+/////////////////////////////////////////////////////////////////////////
+1:         CONTAINS(EnumSet.of(Op.EQ, Op.MATCH, Op.CONTAINS, Op.PREFIX, Op.SUFFIX, Op.NOT_EQ)),
+/////////////////////////////////////////////////////////////////////////
+1:     public static final int IS_PARTIAL_BIT = 15;
+/////////////////////////////////////////////////////////////////////////
+1:     private final boolean marksPartials;
+1:         this(keyComparator, comparator, mode, true);
+1:     }
+1: 
+1:     public OnDiskIndexBuilder(AbstractType<?> keyComparator, AbstractType<?> comparator, Mode mode, boolean marksPartials)
+1:     {
+1:         this.marksPartials = marksPartials;
+/////////////////////////////////////////////////////////////////////////
+1:             out.writeBoolean(marksPartials);
+/////////////////////////////////////////////////////////////////////////
+1:                 Pair<IndexedTerm, TokenTreeBuilder> term = terms.next();
+/////////////////////////////////////////////////////////////////////////
+1:         protected final IndexedTerm term;
+1:         public InMemoryTerm(IndexedTerm term)
+1:             return (termSize.isConstant() ? 0 : 2) + term.getBytes().remaining();
+1:             {
+1:                 out.write(term.getBytes());
+1:             }
+1:             {
+1:                 out.writeShort(term.getBytes().remaining() | ((marksPartials && term.isPartial() ? 1 : 0) << IS_PARTIAL_BIT));
+1:                 out.write(term.getBytes());
+1:             }
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:         public InMemoryPointerTerm(IndexedTerm term, int blockCnt)
+/////////////////////////////////////////////////////////////////////////
+1:         public InMemoryDataTerm(IndexedTerm term, TokenTreeBuilder keys)
+/////////////////////////////////////////////////////////////////////////
+1:                                                         comparator.getString(term.term.getBytes()), MAX_KEYS_SPARSE, mode.name()));
+commit:5c4d5c7
+/////////////////////////////////////////////////////////////////////////
+1:             terms.put(term, (tokens = new DynamicTokenTreeBuilder()));
+/////////////////////////////////////////////////////////////////////////
+1:             dataLevel = mode == Mode.SPARSE ? new DataBuilderLevel(out, new MutableDataBlock(termComparator, mode))
+1:                                             : new MutableLevel<>(out, new MutableDataBlock(termComparator, mode));
+/////////////////////////////////////////////////////////////////////////
+1:             superBlockTree = new DynamicTokenTreeBuilder();
+/////////////////////////////////////////////////////////////////////////
+1:             superBlockTree.add(term.keys);
+1:             if (dataBlocksCnt == SUPER_BLOCK_SIZE || (force && !superBlockTree.isEmpty()))
+1:                 superBlockTree = new DynamicTokenTreeBuilder();
+/////////////////////////////////////////////////////////////////////////
+1:         private static final int MAX_KEYS_SPARSE = 5;
+1: 
+1:         private final AbstractType<?> comparator;
+1:         public MutableDataBlock(AbstractType<?> comparator, Mode mode)
+1:             this.comparator = comparator;
+1:             this.combinedIndex = initCombinedIndex();
+1:             if (mode == Mode.SPARSE)
+1:                 if (keys.getTokenCount() > MAX_KEYS_SPARSE)
+1:                     throw new IOException(String.format("Term - '%s' belongs to more than %d keys in %s mode, which is not allowed.",
+0:                                                         comparator.getString(term.term), MAX_KEYS_SPARSE, mode.name()));
+1: 
+/////////////////////////////////////////////////////////////////////////
+1:                 combinedIndex.add(keys);
+/////////////////////////////////////////////////////////////////////////
+1:             out.writeInt(mode == Mode.SPARSE ? offset : -1);
+/////////////////////////////////////////////////////////////////////////
+1:             if (mode == Mode.SPARSE && combinedIndex != null)
+1:             combinedIndex = initCombinedIndex();
+/////////////////////////////////////////////////////////////////////////
+0:             for (Pair<Long, LongSet> key : keys)
+1:                 buffer.writeLong(key.left);
+/////////////////////////////////////////////////////////////////////////
+1: 
+1:         private TokenTreeBuilder initCombinedIndex()
+1:         {
+1:             return mode == Mode.SPARSE ? new DynamicTokenTreeBuilder() : null;
+1:         }
+author:Giampaolo Trapasso
+-------------------------------------------------------------------------------
+commit:db68ac9
+/////////////////////////////////////////////////////////////////////////
+1:             logger.error("Rejecting value (value size {}, maximum size {}).",
+1:                          FBUtilities.prettyPrintMemory(term.remaining()),
+1:                          FBUtilities.prettyPrintMemory(Short.MAX_VALUE));
+author:Pavel Yaskevich
+-------------------------------------------------------------------------------
+commit:b6ff7f6
+commit:479e8af
+/////////////////////////////////////////////////////////////////////////
+1:         PREFIX(EnumSet.of(Op.EQ, Op.MATCH, Op.PREFIX, Op.NOT_EQ, Op.RANGE)),
+0:         CONTAINS(EnumSet.of(Op.MATCH, Op.CONTAINS, Op.SUFFIX, Op.NOT_EQ)),
+commit:3928665
+/////////////////////////////////////////////////////////////////////////
+1: import org.apache.cassandra.index.sasi.plan.Expression.Op;
+/////////////////////////////////////////////////////////////////////////
+0:         PREFIX(EnumSet.of(Op.EQ, Op.PREFIX, Op.NOT_EQ, Op.RANGE)),
+0:         CONTAINS(EnumSet.of(Op.EQ, Op.CONTAINS, Op.SUFFIX, Op.NOT_EQ)),
+1:         SPARSE(EnumSet.of(Op.EQ, Op.NOT_EQ, Op.RANGE));
+1: 
+1:         Set<Op> supportedOps;
+1: 
+1:         Mode(Set<Op> ops)
+1:         {
+1:             supportedOps = ops;
+1:         }
+1: 
+1:         public boolean supports(Op op)
+1:         {
+1:             return supportedOps.contains(op);
+1:         }
+commit:72790dc
+/////////////////////////////////////////////////////////////////////////
+1: /*
+1:  * Licensed to the Apache Software Foundation (ASF) under one
+1:  * or more contributor license agreements.  See the NOTICE file
+1:  * distributed with this work for additional information
+1:  * regarding copyright ownership.  The ASF licenses this file
+1:  * to you under the Apache License, Version 2.0 (the
+1:  * "License"); you may not use this file except in compliance
+1:  * with the License.  You may obtain a copy of the License at
+1:  *
+1:  *     http://www.apache.org/licenses/LICENSE-2.0
+1:  *
+1:  * Unless required by applicable law or agreed to in writing, software
+1:  * distributed under the License is distributed on an "AS IS" BASIS,
+1:  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+1:  * See the License for the specific language governing permissions and
+1:  * limitations under the License.
+1:  */
+1: package org.apache.cassandra.index.sasi.disk;
+1: 
+1: import java.io.File;
+1: import java.io.IOException;
+1: import java.nio.ByteBuffer;
+1: import java.util.*;
+1: 
+1: import org.apache.cassandra.db.DecoratedKey;
+1: import org.apache.cassandra.index.sasi.sa.IntegralSA;
+1: import org.apache.cassandra.index.sasi.sa.SA;
+1: import org.apache.cassandra.index.sasi.sa.TermIterator;
+1: import org.apache.cassandra.index.sasi.sa.SuffixSA;
+1: import org.apache.cassandra.db.marshal.*;
+1: import org.apache.cassandra.io.FSWriteError;
+0: import org.apache.cassandra.io.compress.BufferType;
+1: import org.apache.cassandra.io.util.*;
+1: import org.apache.cassandra.utils.ByteBufferUtil;
+1: import org.apache.cassandra.utils.FBUtilities;
+1: import org.apache.cassandra.utils.Pair;
+1: 
+1: import com.carrotsearch.hppc.LongArrayList;
+0: import com.carrotsearch.hppc.LongSet;
+1: import com.carrotsearch.hppc.ShortArrayList;
+1: import com.google.common.annotations.VisibleForTesting;
+1: 
+1: import org.slf4j.Logger;
+1: import org.slf4j.LoggerFactory;
+1: 
+1: public class OnDiskIndexBuilder
+1: {
+1:     private static final Logger logger = LoggerFactory.getLogger(OnDiskIndexBuilder.class);
+1: 
+1:     public enum Mode
+1:     {
+0:         PREFIX, CONTAINS, SPARSE;
+1: 
+1:         public static Mode mode(String mode)
+1:         {
+1:             return Mode.valueOf(mode.toUpperCase());
+1:         }
+1:     }
+1: 
+1:     public enum TermSize
+1:     {
+1:         INT(4), LONG(8), UUID(16), VARIABLE(-1);
+1: 
+1:         public final int size;
+1: 
+1:         TermSize(int size)
+1:         {
+1:             this.size = size;
+1:         }
+1: 
+1:         public boolean isConstant()
+1:         {
+1:             return this != VARIABLE;
+1:         }
+1: 
+1:         public static TermSize of(int size)
+1:         {
+1:             switch (size)
+1:             {
+1:                 case -1:
+1:                     return VARIABLE;
+1: 
+1:                 case 4:
+1:                     return INT;
+1: 
+1:                 case 8:
+1:                     return LONG;
+1: 
+1:                 case 16:
+1:                     return UUID;
+1: 
+1:                 default:
+1:                     throw new IllegalStateException("unknown state: " + size);
+1:             }
+1:         }
+1: 
+1:         public static TermSize sizeOf(AbstractType<?> comparator)
+1:         {
+1:             if (comparator instanceof Int32Type || comparator instanceof FloatType)
+1:                 return INT;
+1: 
+1:             if (comparator instanceof LongType || comparator instanceof DoubleType
+1:                     || comparator instanceof TimestampType || comparator instanceof DateType)
+1:                 return LONG;
+1: 
+1:             if (comparator instanceof TimeUUIDType || comparator instanceof UUIDType)
+1:                 return UUID;
+1: 
+1:             return VARIABLE;
+1:         }
+1:     }
+1: 
+1:     public static final int BLOCK_SIZE = 4096;
+1:     public static final int MAX_TERM_SIZE = 1024;
+1:     public static final int SUPER_BLOCK_SIZE = 64;
+1: 
+1:     private final List<MutableLevel<InMemoryPointerTerm>> levels = new ArrayList<>();
+1:     private MutableLevel<InMemoryDataTerm> dataLevel;
+1: 
+1:     private final TermSize termSize;
+1: 
+1:     private final AbstractType<?> keyComparator, termComparator;
+1: 
+1:     private final Map<ByteBuffer, TokenTreeBuilder> terms;
+1:     private final Mode mode;
+1: 
+1:     private ByteBuffer minKey, maxKey;
+1:     private long estimatedBytes;
+1: 
+1:     public OnDiskIndexBuilder(AbstractType<?> keyComparator, AbstractType<?> comparator, Mode mode)
+1:     {
+1:         this.keyComparator = keyComparator;
+1:         this.termComparator = comparator;
+1:         this.terms = new HashMap<>();
+1:         this.termSize = TermSize.sizeOf(comparator);
+1:         this.mode = mode;
+1:     }
+1: 
+0:     public OnDiskIndexBuilder add(ByteBuffer term, DecoratedKey key, long keyPosition)
+1:     {
+1:         if (term.remaining() >= MAX_TERM_SIZE)
+1:         {
+0:             logger.error("Rejecting value (value size {}, maximum size {} bytes).", term.remaining(), Short.MAX_VALUE);
+1:             return this;
+1:         }
+1: 
+1:         TokenTreeBuilder tokens = terms.get(term);
+1:         if (tokens == null)
+1:         {
+0:             terms.put(term, (tokens = new TokenTreeBuilder()));
+1: 
+1:             // on-heap size estimates from jol
+1:             // 64 bytes for TTB + 48 bytes for TreeMap in TTB + size bytes for the term (map key)
+1:             estimatedBytes += 64 + 48 + term.remaining();
+1:         }
+1: 
+0:         tokens.add((Long) key.getToken().getTokenValue(), keyPosition);
+1: 
+1:         // calculate key range (based on actual key values) for current index
+1:         minKey = (minKey == null || keyComparator.compare(minKey, key.getKey()) > 0) ? key.getKey() : minKey;
+1:         maxKey = (maxKey == null || keyComparator.compare(maxKey, key.getKey()) < 0) ? key.getKey() : maxKey;
+1: 
+0:         // 60 ((boolean(1)*4) + (long(8)*4) + 24) bytes for the LongOpenHashSet created when the keyPosition was added
+0:         // + 40 bytes for the TreeMap.Entry + 8 bytes for the token (key).
+1:         // in the case of hash collision for the token we may overestimate but this is extremely rare
+0:         estimatedBytes += 60 + 40 + 8;
+1: 
+1:         return this;
+1:     }
+1: 
+1:     public long estimatedMemoryUse()
+1:     {
+1:         return estimatedBytes;
+1:     }
+1: 
+1:     private void addTerm(InMemoryDataTerm term, SequentialWriter out) throws IOException
+1:     {
+1:         InMemoryPointerTerm ptr = dataLevel.add(term);
+1:         if (ptr == null)
+1:             return;
+1: 
+1:         int levelIdx = 0;
+1:         for (;;)
+1:         {
+1:             MutableLevel<InMemoryPointerTerm> level = getIndexLevel(levelIdx++, out);
+1:             if ((ptr = level.add(ptr)) == null)
+1:                 break;
+1:         }
+1:     }
+1: 
+1:     public boolean isEmpty()
+1:     {
+1:         return terms.isEmpty();
+1:     }
+1: 
+1:     public void finish(Pair<ByteBuffer, ByteBuffer> range, File file, TermIterator terms)
+1:     {
+1:         finish(Descriptor.CURRENT, range, file, terms);
+1:     }
+1: 
+1:     /**
+1:      * Finishes up index building process by creating/populating index file.
+1:      *
+1:      * @param indexFile The file to write index contents to.
+1:      *
+1:      * @return true if index was written successfully, false otherwise (e.g. if index was empty).
+1:      *
+1:      * @throws FSWriteError on I/O error.
+1:      */
+1:     public boolean finish(File indexFile) throws FSWriteError
+1:     {
+1:         return finish(Descriptor.CURRENT, indexFile);
+1:     }
+1: 
+1:     @VisibleForTesting
+1:     protected boolean finish(Descriptor descriptor, File file) throws FSWriteError
+1:     {
+1:         // no terms means there is nothing to build
+1:         if (terms.isEmpty())
+1:             return false;
+1: 
+1:         // split terms into suffixes only if it's text, otherwise (even if CONTAINS is set) use terms in original form
+1:         SA sa = ((termComparator instanceof UTF8Type || termComparator instanceof AsciiType) && mode == Mode.CONTAINS)
+1:                     ? new SuffixSA(termComparator, mode) : new IntegralSA(termComparator, mode);
+1: 
+1:         for (Map.Entry<ByteBuffer, TokenTreeBuilder> term : terms.entrySet())
+1:             sa.add(term.getKey(), term.getValue());
+1: 
+1:         finish(descriptor, Pair.create(minKey, maxKey), file, sa.finish());
+1:         return true;
+1:     }
+1: 
+1:     protected void finish(Descriptor descriptor, Pair<ByteBuffer, ByteBuffer> range, File file, TermIterator terms)
+1:     {
+1:         SequentialWriter out = null;
+1: 
+1:         try
+1:         {
+0:             out = new SequentialWriter(file, BLOCK_SIZE, BufferType.ON_HEAP);
+1: 
+1:             out.writeUTF(descriptor.version.toString());
+1: 
+1:             out.writeShort(termSize.size);
+1: 
+1:             // min, max term (useful to find initial scan range from search expressions)
+1:             ByteBufferUtil.writeWithShortLength(terms.minTerm(), out);
+1:             ByteBufferUtil.writeWithShortLength(terms.maxTerm(), out);
+1: 
+1:             // min, max keys covered by index (useful when searching across multiple indexes)
+1:             ByteBufferUtil.writeWithShortLength(range.left, out);
+1:             ByteBufferUtil.writeWithShortLength(range.right, out);
+1: 
+1:             out.writeUTF(mode.toString());
+1: 
+1:             out.skipBytes((int) (BLOCK_SIZE - out.position()));
+1: 
+0:             dataLevel = mode == Mode.SPARSE ? new DataBuilderLevel(out, new MutableDataBlock(mode))
+0:                                             : new MutableLevel<>(out, new MutableDataBlock(mode));
+1:             while (terms.hasNext())
+1:             {
+0:                 Pair<ByteBuffer, TokenTreeBuilder> term = terms.next();
+1:                 addTerm(new InMemoryDataTerm(term.left, term.right), out);
+1:             }
+1: 
+1:             dataLevel.finalFlush();
+1:             for (MutableLevel l : levels)
+1:                 l.flush(); // flush all of the buffers
+1: 
+1:             // and finally write levels index
+1:             final long levelIndexPosition = out.position();
+1: 
+1:             out.writeInt(levels.size());
+1:             for (int i = levels.size() - 1; i >= 0; i--)
+1:                 levels.get(i).flushMetadata();
+1: 
+1:             dataLevel.flushMetadata();
+1: 
+1:             out.writeLong(levelIndexPosition);
+1: 
+1:             // sync contents of the output and disk,
+1:             // since it's not done implicitly on close
+1:             out.sync();
+1:         }
+1:         catch (IOException e)
+1:         {
+1:             throw new FSWriteError(e, file);
+1:         }
+1:         finally
+1:         {
+1:             FileUtils.closeQuietly(out);
+1:         }
+1:     }
+1: 
+1:     private MutableLevel<InMemoryPointerTerm> getIndexLevel(int idx, SequentialWriter out)
+1:     {
+1:         if (levels.size() == 0)
+1:             levels.add(new MutableLevel<>(out, new MutableBlock<>()));
+1: 
+1:         if (levels.size() - 1 < idx)
+1:         {
+1:             int toAdd = idx - (levels.size() - 1);
+1:             for (int i = 0; i < toAdd; i++)
+1:                 levels.add(new MutableLevel<>(out, new MutableBlock<>()));
+1:         }
+1: 
+1:         return levels.get(idx);
+1:     }
+1: 
+1:     protected static void alignToBlock(SequentialWriter out) throws IOException
+1:     {
+1:         long endOfBlock = out.position();
+1:         if ((endOfBlock & (BLOCK_SIZE - 1)) != 0) // align on the block boundary if needed
+1:             out.skipBytes((int) (FBUtilities.align(endOfBlock, BLOCK_SIZE) - endOfBlock));
+1:     }
+1: 
+1:     private class InMemoryTerm
+1:     {
+0:         protected final ByteBuffer term;
+1: 
+0:         public InMemoryTerm(ByteBuffer term)
+1:         {
+1:             this.term = term;
+1:         }
+1: 
+1:         public int serializedSize()
+1:         {
+0:             return (termSize.isConstant() ? 0 : 2) + term.remaining();
+1:         }
+1: 
+1:         public void serialize(DataOutputPlus out) throws IOException
+1:         {
+1:             if (termSize.isConstant())
+0:                 out.write(term);
+1:             else
+0:                 ByteBufferUtil.writeWithShortLength(term, out);
+1:         }
+1:     }
+1: 
+1:     private class InMemoryPointerTerm extends InMemoryTerm
+1:     {
+1:         protected final int blockCnt;
+1: 
+0:         public InMemoryPointerTerm(ByteBuffer term, int blockCnt)
+1:         {
+1:             super(term);
+1:             this.blockCnt = blockCnt;
+1:         }
+1: 
+1:         public int serializedSize()
+1:         {
+1:             return super.serializedSize() + 4;
+1:         }
+1: 
+1:         public void serialize(DataOutputPlus out) throws IOException
+1:         {
+1:             super.serialize(out);
+1:             out.writeInt(blockCnt);
+1:         }
+1:     }
+1: 
+1:     private class InMemoryDataTerm extends InMemoryTerm
+1:     {
+1:         private final TokenTreeBuilder keys;
+1: 
+0:         public InMemoryDataTerm(ByteBuffer term, TokenTreeBuilder keys)
+1:         {
+1:             super(term);
+1:             this.keys = keys;
+1:         }
+1:     }
+1: 
+1:     private class MutableLevel<T extends InMemoryTerm>
+1:     {
+1:         private final LongArrayList blockOffsets = new LongArrayList();
+1: 
+1:         protected final SequentialWriter out;
+1: 
+1:         private final MutableBlock<T> inProcessBlock;
+1:         private InMemoryPointerTerm lastTerm;
+1: 
+1:         public MutableLevel(SequentialWriter out, MutableBlock<T> block)
+1:         {
+1:             this.out = out;
+1:             this.inProcessBlock = block;
+1:         }
+1: 
+1:         /**
+1:          * @return If we flushed a block, return the last term of that block; else, null.
+1:          */
+1:         public InMemoryPointerTerm add(T term) throws IOException
+1:         {
+1:             InMemoryPointerTerm toPromote = null;
+1: 
+1:             if (!inProcessBlock.hasSpaceFor(term))
+1:             {
+1:                 flush();
+1:                 toPromote = lastTerm;
+1:             }
+1: 
+1:             inProcessBlock.add(term);
+1: 
+1:             lastTerm = new InMemoryPointerTerm(term.term, blockOffsets.size());
+1:             return toPromote;
+1:         }
+1: 
+1:         public void flush() throws IOException
+1:         {
+1:             blockOffsets.add(out.position());
+1:             inProcessBlock.flushAndClear(out);
+1:         }
+1: 
+1:         public void finalFlush() throws IOException
+1:         {
+1:             flush();
+1:         }
+1: 
+1:         public void flushMetadata() throws IOException
+1:         {
+1:             flushMetadata(blockOffsets);
+1:         }
+1: 
+1:         protected void flushMetadata(LongArrayList longArrayList) throws IOException
+1:         {
+1:             out.writeInt(longArrayList.size());
+1:             for (int i = 0; i < longArrayList.size(); i++)
+1:                 out.writeLong(longArrayList.get(i));
+1:         }
+1:     }
+1: 
+1:     /** builds standard data blocks and super blocks, as well */
+1:     private class DataBuilderLevel extends MutableLevel<InMemoryDataTerm>
+1:     {
+1:         private final LongArrayList superBlockOffsets = new LongArrayList();
+1: 
+1:         /** count of regular data blocks written since current super block was init'd */
+1:         private int dataBlocksCnt;
+1:         private TokenTreeBuilder superBlockTree;
+1: 
+1:         public DataBuilderLevel(SequentialWriter out, MutableBlock<InMemoryDataTerm> block)
+1:         {
+1:             super(out, block);
+0:             superBlockTree = new TokenTreeBuilder();
+1:         }
+1: 
+1:         public InMemoryPointerTerm add(InMemoryDataTerm term) throws IOException
+1:         {
+1:             InMemoryPointerTerm ptr = super.add(term);
+1:             if (ptr != null)
+1:             {
+1:                 dataBlocksCnt++;
+1:                 flushSuperBlock(false);
+1:             }
+0:             superBlockTree.add(term.keys.getTokens());
+1:             return ptr;
+1:         }
+1: 
+1:         public void flushSuperBlock(boolean force) throws IOException
+1:         {
+0:             if (dataBlocksCnt == SUPER_BLOCK_SIZE || (force && !superBlockTree.getTokens().isEmpty()))
+1:             {
+1:                 superBlockOffsets.add(out.position());
+1:                 superBlockTree.finish().write(out);
+1:                 alignToBlock(out);
+1: 
+1:                 dataBlocksCnt = 0;
+0:                 superBlockTree = new TokenTreeBuilder();
+1:             }
+1:         }
+1: 
+1:         public void finalFlush() throws IOException
+1:         {
+1:             super.flush();
+1:             flushSuperBlock(true);
+1:         }
+1: 
+1:         public void flushMetadata() throws IOException
+1:         {
+1:             super.flushMetadata();
+1:             flushMetadata(superBlockOffsets);
+1:         }
+1:     }
+1: 
+1:     private static class MutableBlock<T extends InMemoryTerm>
+1:     {
+1:         protected final DataOutputBufferFixed buffer;
+1:         protected final ShortArrayList offsets;
+1: 
+1:         public MutableBlock()
+1:         {
+1:             buffer = new DataOutputBufferFixed(BLOCK_SIZE);
+1:             offsets = new ShortArrayList();
+1:         }
+1: 
+1:         public final void add(T term) throws IOException
+1:         {
+1:             offsets.add((short) buffer.position());
+1:             addInternal(term);
+1:         }
+1: 
+1:         protected void addInternal(T term) throws IOException
+1:         {
+1:             term.serialize(buffer);
+1:         }
+1: 
+1:         public boolean hasSpaceFor(T element)
+1:         {
+1:             return sizeAfter(element) < BLOCK_SIZE;
+1:         }
+1: 
+1:         protected int sizeAfter(T element)
+1:         {
+1:             return getWatermark() + 4 + element.serializedSize();
+1:         }
+1: 
+1:         protected int getWatermark()
+1:         {
+1:             return 4 + offsets.size() * 2 + (int) buffer.position();
+1:         }
+1: 
+1:         public void flushAndClear(SequentialWriter out) throws IOException
+1:         {
+1:             out.writeInt(offsets.size());
+1:             for (int i = 0; i < offsets.size(); i++)
+1:                 out.writeShort(offsets.get(i));
+1: 
+1:             out.write(buffer.buffer());
+1: 
+1:             alignToBlock(out);
+1: 
+1:             offsets.clear();
+1:             buffer.clear();
+1:         }
+1:     }
+1: 
+0:     private static class MutableDataBlock extends MutableBlock<InMemoryDataTerm>
+1:     {
+1:         private final Mode mode;
+1: 
+1:         private int offset = 0;
+0:         private int sparseValueTerms = 0;
+1: 
+1:         private final List<TokenTreeBuilder> containers = new ArrayList<>();
+1:         private TokenTreeBuilder combinedIndex;
+1: 
+0:         public MutableDataBlock(Mode mode)
+1:         {
+1:             this.mode = mode;
+0:             this.combinedIndex = new TokenTreeBuilder();
+1:         }
+1: 
+1:         protected void addInternal(InMemoryDataTerm term) throws IOException
+1:         {
+1:             TokenTreeBuilder keys = term.keys;
+1: 
+0:             if (mode == Mode.SPARSE && keys.getTokenCount() <= 5)
+1:             {
+1:                 writeTerm(term, keys);
+0:                 sparseValueTerms++;
+1:             }
+1:             else
+1:             {
+1:                 writeTerm(term, offset);
+1: 
+1:                 offset += keys.serializedSize();
+1:                 containers.add(keys);
+1:             }
+1: 
+1:             if (mode == Mode.SPARSE)
+0:                 combinedIndex.add(keys.getTokens());
+1:         }
+1: 
+1:         protected int sizeAfter(InMemoryDataTerm element)
+1:         {
+1:             return super.sizeAfter(element) + ptrLength(element);
+1:         }
+1: 
+1:         public void flushAndClear(SequentialWriter out) throws IOException
+1:         {
+1:             super.flushAndClear(out);
+1: 
+0:             out.writeInt((sparseValueTerms == 0) ? -1 : offset);
+1: 
+1:             if (containers.size() > 0)
+1:             {
+1:                 for (TokenTreeBuilder tokens : containers)
+1:                     tokens.write(out);
+1:             }
+1: 
+0:             if (sparseValueTerms > 0)
+1:             {
+1:                 combinedIndex.finish().write(out);
+1:             }
+1: 
+1:             alignToBlock(out);
+1: 
+1:             containers.clear();
+0:             combinedIndex = new TokenTreeBuilder();
+1: 
+1:             offset = 0;
+0:             sparseValueTerms = 0;
+1:         }
+1: 
+1:         private int ptrLength(InMemoryDataTerm term)
+1:         {
+1:             return (term.keys.getTokenCount() > 5)
+1:                     ? 5 // 1 byte type + 4 byte offset to the tree
+1:                     : 1 + (8 * (int) term.keys.getTokenCount()); // 1 byte size + n 8 byte tokens
+1:         }
+1: 
+1:         private void writeTerm(InMemoryTerm term, TokenTreeBuilder keys) throws IOException
+1:         {
+1:             term.serialize(buffer);
+1:             buffer.writeByte((byte) keys.getTokenCount());
+1: 
+0:             Iterator<Pair<Long, LongSet>> tokens = keys.iterator();
+0:             while (tokens.hasNext())
+0:                 buffer.writeLong(tokens.next().left);
+1:         }
+1: 
+1:         private void writeTerm(InMemoryTerm term, int offset) throws IOException
+1:         {
+1:             term.serialize(buffer);
+1:             buffer.writeByte(0x0);
+1:             buffer.writeInt(offset);
+1:         }
+1:     }
+1: }
+author:Jason Brown
+-------------------------------------------------------------------------------
+commit:733d1ee
+/////////////////////////////////////////////////////////////////////////
+1:     @SuppressWarnings("resource")
+============================================================================
