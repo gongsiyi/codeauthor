@@ -6,7 +6,7 @@ The authors of source files are important in many applications, but are often no
 
 In this project, we propose a benchmark called CodA. In our benchmark, we accurately extracted the code authors for source files. In a source file, we marked authors line by line. Furthermore, based on our benchmark, we conduct an empirical study to reveal the challenges of identifying code authors. 
 
-Here is the list of our [benchmark](/benchmark).
+Here is the list of our [benchmark](https://anonymous.4open.science/repository/643bb230-7da2-4b2c-858f-6ee267f7db9f/benchmark/).
 
 An example:
 ```Java
