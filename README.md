@@ -2,9 +2,10 @@
 
 ## Project summary
 
-The authors of source files are important in many applications, but are often not recorded. In the literature, various approaches (e.g., [1]) have been proposed to identify authors of source files. However, as a review [2] pointed out, there is no good benchmark, which hinders the exploration of this research line. In addition, although researchers analyze the challenges in this research line [2], their analysis is built upon their personal experience without sold empirical evidences. To the best of our knowledge, there is no empirical study to reveal the challenges
+The authors of source files are important in many applications, but are often not recorded. Even if they are recorded in a code repository, many authors are hidden in revision histories. In the literature, various approaches (e.g., [1]) have been proposed to identify authors of source files. However, the true authors of code lines are still largely unknown, and many fundamental questions along with code authors are still open. For example, a recent review [2] complains that most approaches assume
+that a source file is written by only an author, but source files in the wild are typically written by multiple programmersas. In addition, researchers analyze the challenges in this research line [2], although we agree that their visions are insightful, they did not provide any empirical evidences to support their listed challenges. To deepen the understanding on code authorship, there is a strong need for an empirical study.
 
-In this project, we propose a benchmark called CodA. In our benchmark, we accurately extracted the code authors for source files. In a source file, we marked authors line by line. Furthermore, based on our benchmark, we conduct an empirical study to reveal the challenges of identifying code authors. 
+To meet the timely need, we conducted the first empirical study on code authors. To assist our study, we implemented a tool called CODA. It extracts authors and their modifications from code repositories and matches modifications with the latest source files to determine the true author of each line.
 
 Here is the list of our [benchmark](https://anonymous.4open.science/repository/643bb230-7da2-4b2c-858f-6ee267f7db9f/benchmark/).
 
