@@ -1,4 +1,4 @@
-# The Tip of an Iceberg: A Story of Code Authors
+# Code Authors Hidden in File Revision Histories: An Empirical Study
 
 ## Project summary
 
