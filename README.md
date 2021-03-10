@@ -7,7 +7,7 @@ that a source file is written by only an author, but source files in the wild ar
 
 To meet the timely need, we conducted the first empirical study on code authors. To assist our study, we implemented a tool called CODA. It extracts authors and their modifications from code repositories and matches modifications with the latest source files to determine the true author of each line.
 
-Here is the list of our [dataset](https://anonymous.4open.science/repository/643bb230-7da2-4b2c-858f-6ee267f7db9f/dataset/).
+Here is the list of our [dataset](https://github.com/tohidemyname/codeauthor/tree/master/dataset).
 
 An example:
 ```Java
